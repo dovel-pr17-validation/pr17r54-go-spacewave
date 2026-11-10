@@ -1,0 +1,61 @@
+syntax = "proto3";
+package sobject.invite;
+
+option go_package = "github.com/s4wave/spacewave/core/sobject/invite;sobject_invite";
+
+import "github.com/s4wave/spacewave/core/sobject/sobject.proto";
+
+// SOInviteService admits invitees, withdraws their join requests and
+// acknowledges voluntary departures through native authority.
+service SOInviteService {
+  // AcceptInvite verifies admission proofs and issues native participant grants.
+  rpc AcceptInvite(AcceptInviteRequest) returns (AcceptInviteResponse);
+  // WithdrawJoinRequest removes the caller's pending join request.
+  rpc WithdrawJoinRequest(WithdrawJoinRequestRequest) returns (WithdrawJoinRequestResponse);
+  // Leave verifies signed consent and returns the owner's committed removal proof.
+  rpc Leave(.sobject.SOLeaveRequest) returns (.sobject.SOLeaveResponse);
+}
+
+// AcceptInviteRequest is sent by the invitee to the owner.
+message AcceptInviteRequest {
+  // JoinResponse is the signed join response from the invitee.
+  .sobject.SOJoinResponse join_response = 1;
+  // Token is the raw invite token.
+  // The owner SHA256 hashes it to verify against the on-chain token_hash.
+  // Only the owner sees the raw token on the authenticated stream.
+  // The cloud mailbox checks the token against token_hash.
+  bytes token = 2;
+  // StorageJoinResponse proves the persistent local storage identity that will
+  // read and write the joined copy.
+  .sobject.SOJoinResponse storage_join_response = 3;
+}
+
+// AcceptInviteResponse is returned by the owner after enrollment.
+message AcceptInviteResponse {
+  // Grant is the encrypted SOGrant for the invitee.
+  .sobject.SOGrant grant = 1;
+  // SharedObjectId is the ID of the shared object the invitee was enrolled in.
+  string shared_object_id = 2;
+  reserved 3;
+  // SharedObjectState is the owner's authorized state after enrollment. Its
+  // key epochs hold the grants of every participant, including the invitee.
+  .sobject.SOState shared_object_state = 4;
+  // Pending reports that the owner queued the redemption as a join request
+  // instead of admitting it. Every other field is empty.
+  bool pending = 5;
+  // ConfigLineage is the owner's retained configuration changes leading to the
+  // config of shared_object_state, oldest first. It lets the invitee resolve
+  // the config of every operation the state holds.
+  repeated .sobject.SOConfigChange config_lineage = 6;
+}
+
+// WithdrawJoinRequestRequest is sent by a requester to the owner. The owner
+// identifies the requester by the authenticated stream peer.
+message WithdrawJoinRequestRequest {
+  // SharedObjectId is the shared object the request asks to join.
+  string shared_object_id = 1;
+}
+
+// WithdrawJoinRequestResponse is returned once no request from the caller
+// remains.
+message WithdrawJoinRequestResponse {}

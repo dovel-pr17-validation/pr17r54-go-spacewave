@@ -1,0 +1,196 @@
+import React, { createContext, use, useSyncExternalStore } from 'react'
+
+export type BottomBarContextMenuOpenKind = 'mouse' | 'keyboard' | 'touch'
+
+export type BottomBarContextMenuActionVariant = 'default' | 'destructive'
+
+export type BottomBarContextMenuIcon = React.ComponentType<{
+  className?: string
+}>
+
+export interface BottomBarContextMenuActionContext {
+  itemId: string
+  openKind: BottomBarContextMenuOpenKind
+  closeMenu: () => void
+  openPrimaryOverlay: () => void
+}
+
+export interface BottomBarContextMenuAction {
+  type: 'action'
+  id: string
+  label: string
+  icon?: BottomBarContextMenuIcon
+  disabled?: boolean
+  variant?: BottomBarContextMenuActionVariant
+  shortcut?: string
+  onSelect: (context: BottomBarContextMenuActionContext) => void | Promise<void>
+}
+
+export interface BottomBarContextMenuSeparator {
+  type: 'separator'
+  id: string
+}
+
+export interface BottomBarContextMenuGroup {
+  type: 'group'
+  id: string
+  label: string
+  disabled?: boolean
+  items: readonly BottomBarContextMenuItem[]
+}
+
+export type BottomBarContextMenuItem =
+  | BottomBarContextMenuAction
+  | BottomBarContextMenuSeparator
+  | BottomBarContextMenuGroup
+
+/**
+ * Represents a single item in the bottom bar.
+ * Items are ordered by their nesting depth in the component tree.
+ */
+export interface BottomBarItem {
+  /** Unique identifier for this item */
+  id: string
+  /** Depth in the component tree (for ordering) */
+  depth: number
+  /** Function that renders the button, receiving selected state */
+  button: (
+    selected: boolean,
+    onClick: () => void,
+    className: string,
+  ) => React.ReactNode
+  /** Set when the item's level renders an overlay while its menu is open */
+  hasOverlay?: boolean
+  /** Optional label used when this item is collapsed into a menu */
+  menuLabel?: React.ReactNode
+  /** Optional label for the secondary context menu trigger. */
+  contextMenuLabel?: string
+  /** Typed secondary actions rendered by the frame's context menu */
+  contextMenuItems?: readonly BottomBarContextMenuItem[]
+  /** Optional handler called when the breadcrumb separator to the right of this item is clicked */
+  onBreadcrumbClick?: () => void
+  /** Position in the bottom bar. Defaults to 'left'. */
+  position?: 'left' | 'right'
+}
+
+/**
+ * Context value provided by BottomBarLevel components.
+ * Each nested BottomBarLevel has a reference to its parent and registers items imperatively.
+ */
+export interface BottomBarContextValue {
+  /** Reference to parent context (null for root) */
+  parent: BottomBarContextValue | null
+  /** Depth in the component tree (0 for root) */
+  depth: number
+  /** Register an item with the root context */
+  registerItem: (item: BottomBarItem) => void
+  /** Unregister an item from the root context */
+  unregisterItem: (id: string) => void
+  /** Get root context (for SessionFrame to consume items) */
+  getRoot: () => BottomBarRootContextValue | null
+}
+
+/**
+ * Root context value that holds the registration functions.
+ * Only the root BottomBarRoot component provides this.
+ */
+export interface BottomBarRootContextValue extends BottomBarContextValue {}
+
+/**
+ * Items context value for reading items via useSyncExternalStore.
+ * This is separate from BottomBarContext to prevent re-renders when items change.
+ */
+export interface BottomBarItemsContextValue {
+  subscribe: (listener: () => void) => () => void
+  getSnapshot: () => BottomBarItem[]
+  /** Subscribes to changes of the overlay host element. */
+  subscribeOverlayHost: (listener: () => void) => () => void
+  /** Returns the element the open level portals its overlay into, if any. */
+  getOverlayHost: () => HTMLElement | null
+  /** Ref callback for the frame's overlay host element. */
+  overlayHostRef: (el: HTMLElement | null) => () => void
+  openMenu?: string
+  setOpenMenu?: (id: string) => void
+}
+
+/**
+ * Context for managing bottom bar items hierarchically.
+ * Items are registered through nesting BottomBarLevel components.
+ * This context is stable and does NOT change when items change.
+ */
+export const BottomBarContext = createContext<BottomBarContextValue | null>(
+  null,
+)
+
+/**
+ * Context for reading bottom bar items.
+ * Components that need to read items should use useBottomBarItems() hook.
+ */
+export const BottomBarItemsContext =
+  createContext<BottomBarItemsContextValue | null>(null)
+
+// Stable fallback functions for when there's no context
+const emptyItems: BottomBarItem[] = []
+const emptySubscribe = () => () => {}
+const emptyGetSnapshot = () => emptyItems
+const noOverlayHost = () => null
+
+/**
+ * Hook to get the current bottom bar items.
+ * Only components that call this hook will re-render when items change.
+ */
+export function useBottomBarItems(): BottomBarItem[] {
+  const context = use(BottomBarItemsContext)
+  const subscribe = context?.subscribe ?? emptySubscribe
+  const getSnapshot = context?.getSnapshot ?? emptyGetSnapshot
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
+/**
+ * Hook to get the element the frame shows open overlays in.
+ */
+export function useBottomBarOverlayHost(): HTMLElement | null {
+  const context = use(BottomBarItemsContext)
+  const subscribe = context?.subscribeOverlayHost ?? emptySubscribe
+  const getHost = context?.getOverlayHost ?? noOverlayHost
+  return useSyncExternalStore(subscribe, getHost, getHost)
+}
+
+/**
+ * Hook to get the ref callback that names the frame's overlay host element.
+ */
+export function useBottomBarOverlayHostRef():
+  | ((el: HTMLElement | null) => () => void)
+  | undefined {
+  return use(BottomBarItemsContext)?.overlayHostRef
+}
+
+/**
+ * Hook to get openMenu from the BottomBarItemsContext.
+ */
+export function useBottomBarOpenMenu(): string | undefined {
+  const context = use(BottomBarItemsContext)
+  return context?.openMenu
+}
+
+/**
+ * Hook to get setOpenMenu from the BottomBarItemsContext.
+ */
+export function useBottomBarSetOpenMenu(): ((id: string) => void) | undefined {
+  const context = use(BottomBarItemsContext)
+  return context?.setOpenMenu
+}
+
+/**
+ * Hook to check if the current item is the last (deepest) item in the bottom bar.
+ */
+export function useIsLastBottomBarItem(itemId: string): boolean {
+  const items = useBottomBarItems()
+
+  if (items.length === 0) return false
+
+  const maxDepth = Math.max(...items.map((item) => item.depth))
+  const currentItem = items.find((item) => item.id === itemId)
+
+  return currentItem?.depth === maxDepth
+}

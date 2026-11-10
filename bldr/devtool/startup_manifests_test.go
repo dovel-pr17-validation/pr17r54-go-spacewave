@@ -1,0 +1,147 @@
+//go:build !js
+
+package devtool
+
+import (
+	"reflect"
+	"testing"
+
+	configset_proto "github.com/aperturerobotics/controllerbus/controller/configset/proto"
+	bldr_plugin_compiler_go "github.com/s4wave/spacewave/bldr/plugin/compiler/go"
+	bldr_plugin_compiler_js "github.com/s4wave/spacewave/bldr/plugin/compiler/js"
+	plugin_host_scheduler "github.com/s4wave/spacewave/bldr/plugin/host/scheduler"
+	bldr_project "github.com/s4wave/spacewave/bldr/project"
+	web_plugin_compiler "github.com/s4wave/spacewave/bldr/web/plugin/compiler"
+)
+
+func TestProjectOwnedStartupPlugins(t *testing.T) {
+	projectConfig := &bldr_project.ProjectConfig{
+		Start: &bldr_project.StartConfig{
+			Plugins: []string{"local-web", "external-web", "local-core"},
+		},
+		Manifests: map[string]*bldr_project.ManifestConfig{
+			"local-core": {},
+			"local-web":  {},
+		},
+	}
+
+	got := projectOwnedStartupPlugins(projectConfig)
+	want := []string{"local-web", "local-core"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("projectOwnedStartupPlugins() = %v, want %v", got, want)
+	}
+}
+
+func TestProjectOwnedStartupPluginsEmpty(t *testing.T) {
+	if got := projectOwnedStartupPlugins(&bldr_project.ProjectConfig{}); got != nil {
+		t.Fatalf("projectOwnedStartupPlugins() = %v, want nil", got)
+	}
+}
+
+func TestProjectOwnedStartupManifestPreflightsSelectBuilderPlatforms(t *testing.T) {
+	projectConfig := &bldr_project.ProjectConfig{
+		Start: &bldr_project.StartConfig{
+			Plugins: []string{"web", "spacewave-web", "spacewave-app", "spacewave-core", "spacewave-v86", "external"},
+		},
+		Manifests: map[string]*bldr_project.ManifestConfig{
+			"web": {
+				Builder: &configset_proto.ControllerConfig{Id: web_plugin_compiler.ConfigID},
+			},
+			"spacewave-web": {
+				Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_js.ConfigID},
+			},
+			"spacewave-app": {
+				Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_js.ConfigID},
+			},
+			"spacewave-core": {
+				Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_go.ConfigID},
+			},
+			"spacewave-v86": {
+				Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_js.ConfigID},
+			},
+		},
+	}
+
+	got := ProjectOwnedStartupManifestPreflights(projectConfig, "web/js/wasm")
+	want := []StartupManifestPreflight{
+		{PluginID: "web", PlatformIDs: []string{"web/js/wasm"}},
+		{PluginID: "spacewave-web", PlatformIDs: []string{"js", "web/js/wasm"}},
+		{PluginID: "spacewave-app", PlatformIDs: []string{"js", "web/js/wasm"}},
+		{PluginID: "spacewave-core", PlatformIDs: []string{"js", "web/js/wasm"}},
+		{PluginID: "spacewave-v86", PlatformIDs: []string{"js", "web/js/wasm"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ProjectOwnedStartupManifestPreflights() = %#v, want %#v", got, want)
+	}
+}
+
+func TestProjectOwnedStartupManifestPreflightsSelectActivePlatforms(t *testing.T) {
+	// Declare three startup plugins with web, js, and Go builders.
+	projectConfig := &bldr_project.ProjectConfig{
+		Start: &bldr_project.StartConfig{Plugins: []string{"web", "frontend", "core"}},
+		Manifests: map[string]*bldr_project.ManifestConfig{
+			"web":      {Builder: &configset_proto.ControllerConfig{Id: web_plugin_compiler.ConfigID}},
+			"frontend": {Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_js.ConfigID}},
+			"core":     {Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_go.ConfigID}},
+		},
+	}
+
+	// Select preflights for the js and web/js/wasm platforms.
+	got := ProjectOwnedStartupManifestPreflightsForPlatforms(projectConfig, "js", "web/js/wasm")
+	want := []StartupManifestPreflight{
+		{PluginID: "web", PlatformIDs: []string{"web/js/wasm"}},
+		{PluginID: "frontend", PlatformIDs: []string{"js"}},
+		{PluginID: "core", PlatformIDs: []string{"js"}},
+	}
+
+	// The preflights must exclude plugins that did not select those platforms.
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ProjectOwnedStartupManifestPreflights() = %#v, want %#v", got, want)
+	}
+
+	// The selection policies must deny each platform to the plugins it excludes.
+	policies := startupManifestPlatformSelectionPolicies(got)
+	wantPolicies := []*plugin_host_scheduler.PlatformSelectionPolicy{
+		{PlatformId: "js", DeniedPluginIds: []string{"web"}},
+		{PlatformId: "web/js/wasm", DeniedPluginIds: []string{"core", "frontend"}},
+	}
+	if !reflect.DeepEqual(policies, wantPolicies) {
+		t.Fatalf("startupManifestPlatformSelectionPolicies() = %#v, want %#v", policies, wantPolicies)
+	}
+
+	// A native-only plugin must not gain browser platforms during startup.
+	projectConfig.Manifests["core"].PlatformIds = []string{"desktop"}
+	got = ProjectOwnedStartupManifestPreflightsForPlatforms(projectConfig, "js", "web/js/wasm")
+	if len(got[2].PlatformIDs) != 0 {
+		t.Fatalf("native-only browser preflight = %v, want no platforms", got[2].PlatformIDs)
+	}
+	got = ProjectOwnedStartupManifestPreflightsForPlatforms(projectConfig, "desktop/linux/amd64", "web/js/wasm")
+	if !reflect.DeepEqual(got[2].PlatformIDs, []string{"desktop/linux/amd64"}) {
+		t.Fatalf("native-only desktop preflight = %v", got[2].PlatformIDs)
+	}
+}
+
+func TestNativeDesktopQuickJSPluginIDsSelectsJSBuilders(t *testing.T) {
+	projectConfig := &bldr_project.ProjectConfig{
+		Manifests: map[string]*bldr_project.ManifestConfig{
+			"spacewave-core": {
+				Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_go.ConfigID},
+			},
+			"spacewave-app": {
+				Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_js.ConfigID},
+			},
+			"spacewave-web": {
+				Builder: &configset_proto.ControllerConfig{Id: bldr_plugin_compiler_js.ConfigID},
+			},
+			"web": {
+				Builder: &configset_proto.ControllerConfig{Id: web_plugin_compiler.ConfigID},
+			},
+		},
+	}
+
+	got := nativeDesktopQuickJSPluginIDs(projectConfig)
+	want := []string{"spacewave-app", "spacewave-web"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("nativeDesktopQuickJSPluginIDs() = %v, want %v", got, want)
+	}
+}

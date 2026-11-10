@@ -1,0 +1,81 @@
+package plugin_host
+
+import (
+	"context"
+	"errors"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	"github.com/s4wave/spacewave/db/unixfs"
+)
+
+// ErrPluginUninitialized is returned if the plugin was not initialized.
+var ErrPluginUninitialized = errors.New("plugin is not yet initialized")
+
+// PluginRpcInitCb is a callback to be called when the RPC channel is ready.
+type PluginRpcInitCb func(client srpc.Client) error
+
+// PluginHost manages and executes plugins.
+type PluginHost interface {
+	// GetPlatformId returns the platform ID for this host.
+	// The plugin host must be capable of executing plugin manifests with this platform id.
+	// Must return a value.
+	GetPlatformId() string
+
+	// Execute executes the plugin host.
+	// If an error is returned, the plugin host execution will be retried.
+	// If nil is returned, this indicates PluginHost does not need the Execute goroutin.
+	// Return context.Canceled if context was canceled.
+	Execute(ctx context.Context) error
+
+	// ListPlugins lists the set of loaded plugins in the host.
+	ListPlugins(ctx context.Context) ([]string, error)
+
+	// ExecutePlugin executes the plugin with the given ID.
+	// If the plugin was already initialized, existing state can be reused.
+	// The plugin should be stopped if/when the function exits.
+	// Return ErrPluginUninitialized if the plugin was not ready.
+	// Should expect to be called only once (at a time) for a plugin ID.
+	// pluginDist contains the plugin distribution files (binaries and assets).
+	// rpcInit is called when the RPC client is ready, should return a mux for the server.
+	// instanceKey is the logical instance key passed to the plugin in its start
+	// info (empty for shared plugins).
+	// executionKey distinguishes concurrent executions of one instance, such
+	// as a replacement starting before its predecessor stops. Hosts derive
+	// worker and controller identities from it.
+	// manifestRoot identifies the exact files used by this execution.
+	ExecutePlugin(
+		ctx context.Context,
+		pluginID,
+		instanceKey,
+		executionKey,
+		manifestRoot,
+		entrypoint string,
+		pluginDist *unixfs.FSHandle,
+		pluginAssets *unixfs.FSHandle,
+		hostRpcMux srpc.Mux,
+		rpcInit PluginRpcInitCb,
+	) error
+
+	// DeletePlugin clears cached plugin data for the given plugin ID.
+	DeletePlugin(ctx context.Context, pluginID string) error
+}
+
+// PluginHostScheduler manages the PluginHosts and running plugins.
+type PluginHostScheduler interface {
+	// AddPluginReference adds a reference to the plugin, returning the RunningPlugin
+	// handle and a release function.
+	// instanceKey may be empty for shared (non-instanced) plugins.
+	AddPluginReference(pluginID, instanceKey string) (bldr_plugin.RunningPluginRef, func())
+
+	// AddPinnedPluginReference retains an exact executable without following replacement.
+	AddPinnedPluginReference(pluginID, instanceKey, manifestRoot string) (bldr_plugin.RunningPluginRef, func())
+
+	// AddSelectedPluginReference selects an installed artifact for a logical binding.
+	AddSelectedPluginReference(pluginID, instanceKey string, refs ...*manifest.ManifestRef) (bldr_plugin.RunningPluginRef, func())
+
+	// AddAssetsPluginReference retains a plugin whose files the caller serves
+	// to a browser, mounting a browser manifest when no host can run it.
+	AddAssetsPluginReference(pluginID, instanceKey, manifestRoot string) (bldr_plugin.RunningPluginRef, func())
+}

@@ -1,0 +1,56 @@
+syntax = "proto3";
+package cdn.world.controller;
+
+// WorldRefresh invalidates a mounted CDN World's published snapshot.
+// The service is scoped by engine ID through WorldRefreshServiceID.
+service WorldRefresh {
+  // Refresh queues a root fetch under the mount's lifetime.
+  rpc Refresh(RefreshRequest) returns (RefreshResponse) {}
+}
+
+// RefreshRequest optionally limits an invalidation to its published Space.
+message RefreshRequest {
+  // SpaceId is empty for an explicit refresh of the configured mount.
+  string space_id = 1;
+}
+
+// RefreshResponse confirms that a matching mount accepted the invalidation.
+message RefreshResponse {
+  // Accepted is true when the mount queued the requested refresh.
+  bool accepted = 1;
+}
+
+// Config configures a read-only CDN-backed world engine controller.
+message Config {
+  // EngineId is the world engine id exposed on the bus.
+  string engine_id = 1;
+  // SpaceId is the public CDN Space id.
+  string space_id = 2;
+  // CdnBaseUrl is the public CDN base URL.
+  string cdn_base_url = 3;
+  // PointerTtlDur is the cached root pointer TTL.
+  // Empty uses the CDN block store default. Negative disables expiry.
+  string pointer_ttl_dur = 4;
+  // CacheBlockStoreId optionally resolves the lifecycle-owned local block store
+  // used for durable writeback while reading remote pack ranges.
+  string cache_block_store_id = 5;
+  // WritebackWindowBytes sets the semantic co-block writeback window.
+  int64 writeback_window_bytes = 6;
+  // SuppliedBlockStoreId reads every block from that block store on the bus
+  // instead of opening a CDN transport for this mount. Set it where another
+  // process already owns the CDN transport, pack readers, index cache, and
+  // durable writeback for this Space and supplies that store over the block
+  // store RPC. The controller fetches the root pointer independently to build
+  // its world head. It resolves no LookupBlockStore because it owns no store.
+  // Mutually exclusive with cache_block_store_id.
+  string supplied_block_store_id = 7;
+  // RootPointerBaseUrl optionally serves root.packedmsg from another base URL,
+  // so an owner can serve the mutable pointer from its own server and keep the
+  // CDN hostname immutable. Empty reads the pointer from cdn_base_url.
+  string root_pointer_base_url = 8;
+  // PrivateSpace reads the Space's packs with CdnSpaceGrants from the
+  // GrantSource that cdn_bstore.LookupCdnSpaceGrants resolves on the bus.
+  // cdn_base_url then serves only the root pointer, when
+  // root_pointer_base_url is empty.
+  bool private_space = 9;
+}

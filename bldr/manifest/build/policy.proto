@@ -1,0 +1,36 @@
+syntax = "proto3";
+package bldr.manifest.build;
+
+import "github.com/aperturerobotics/util/enabled/enabled.proto";
+
+// BuildPolicy configures build-scoped behavior shared by Manifest builders.
+message BuildPolicy {
+  // JsMinification controls JavaScript minification.
+  //
+  // DEFAULT preserves build-type defaults: release builds minify JavaScript,
+  // while dev builds leave JavaScript readable.
+  .enabled.Enabled js_minification = 1;
+
+  // JsSourcemaps controls JavaScript sourcemap emission.
+  //
+  // DEFAULT preserves build-type defaults: dev builds emit sourcemaps where
+  // builders previously did, while release builds do not emit sourcemaps.
+  .enabled.Enabled js_sourcemaps = 2;
+
+  // GoScriptCodeSplitting controls Rolldown code splitting for GoScript
+  // wrapper bundles.
+  // DEFAULT emits split GoScript wrapper bundles. ENABLE also permits chunk
+  // output; DISABLE forces single-file output.
+  .enabled.Enabled goscript_code_splitting = 3;
+
+  // GoScriptDeadCodeElimination controls whether GoScript leaves the code a
+  // program cannot reach out of its output.
+  // DEFAULT eliminates dead code in release builds only, because elimination
+  // compiles without the GoScript compiler cache.
+  .enabled.Enabled goscript_dead_code_elimination = 5;
+
+  // FrontendDevelopment selects the active project service instead of immutable
+  // frontend bundles. Only an attached web development session enables it.
+  // It participates in build and startup-cache identity and propagates to children.
+  bool frontend_development = 4;
+}

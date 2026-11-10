@@ -1,0 +1,106 @@
+//go:build !js
+
+package bldr_project_starlark
+
+import (
+	"os"
+	"testing"
+
+	bldr_dist_compiler "github.com/s4wave/spacewave/bldr/dist/compiler"
+	bldr_plugin_compiler_go "github.com/s4wave/spacewave/bldr/plugin/compiler/go"
+)
+
+func TestEvaluateBldr(t *testing.T) {
+	// Locate the Bldr project source and skip when it is unavailable.
+	starPath := "../../../bldr/bldr.star"
+	if _, err := os.Stat(starPath); err != nil {
+		t.Skipf("bldr.star not found at %s: %v", starPath, err)
+	}
+
+	// Evaluate the Bldr project source into its configuration.
+	result, err := Evaluate(starPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the evaluated Bldr project identifier.
+	conf := result.Config
+	if conf.GetId() != "bldr-demo" {
+		t.Fatalf("project id: got %q, want %q", conf.GetId(), "bldr-demo")
+	}
+
+	// Verify the Bldr startup plugin configuration.
+	start := conf.GetStart()
+	if start == nil {
+		t.Fatal("missing start config")
+	}
+	if got := start.GetPlugins(); len(got) != 1 || got[0] != "bldr-demo" {
+		t.Fatalf("start plugins: got %v", got)
+	}
+
+	// Verify the Bldr project declares each expected manifest.
+	for _, manifestID := range []string{"web", "bldr-demo", "bldr-demo-cli", "bldr-demo-release"} {
+		if conf.GetManifests()[manifestID] == nil {
+			t.Fatalf("missing manifest %q", manifestID)
+		}
+	}
+
+	// Verify the Bldr demo manifest uses the default web Go compiler.
+	demo := conf.GetManifests()["bldr-demo"]
+	demoConf := &bldr_plugin_compiler_go.Config{}
+	if err := demoConf.UnmarshalJSON(demo.GetBuilder().GetConfig()); err != nil {
+		t.Fatalf("parse bldr-demo config: %v", err)
+	}
+	webConf := flattenGoConfigForPlatform(t, demoConf, "web/js/wasm")
+	if webConf.GetGoCompiler() != bldr_plugin_compiler_go.GoCompiler_GO_COMPILER_DEFAULT {
+		t.Fatalf("bldr-demo web goCompiler: got %s, want GO_COMPILER_DEFAULT", webConf.GetGoCompiler())
+	}
+
+	// Verify the web release build supplies its manifest override.
+	releaseWeb := conf.GetBuild()["release-web"]
+	if releaseWeb == nil {
+		t.Fatal("missing build target release-web")
+	}
+	override := releaseWeb.GetManifestOverrides()["bldr-demo-release"]
+	if override == nil {
+		t.Fatal("missing bldr-demo-release override on release-web")
+	}
+	if len(override.GetConfig()) == 0 {
+		t.Fatal("release-web override config is empty")
+	}
+
+	// Verify the web release override embeds both web manifests.
+	overrideConf := &bldr_dist_compiler.Config{}
+	if err := overrideConf.UnmarshalJSON(override.GetConfig()); err != nil {
+		t.Fatalf("parse release-web override config: %v", err)
+	}
+	embedManifests := overrideConf.GetEmbedManifests()
+	if len(embedManifests) != 2 {
+		t.Fatalf("release-web override embeds: got %d, want 2", len(embedManifests))
+	}
+	if embedManifests[0].GetManifestId() != "web" || embedManifests[0].GetPlatformId() != "web/js/wasm" {
+		t.Fatalf("unexpected first embed manifest: %s@%s", embedManifests[0].GetManifestId(), embedManifests[0].GetPlatformId())
+	}
+	if embedManifests[1].GetManifestId() != "bldr-demo" || embedManifests[1].GetPlatformId() != "web/js/wasm" {
+		t.Fatalf("unexpected second embed manifest: %s@%s", embedManifests[1].GetManifestId(), embedManifests[1].GetPlatformId())
+	}
+
+	// Verify the distribution publish target references the declared manifests.
+	publish := conf.GetPublish()["demo-dist"]
+	if publish == nil {
+		t.Fatal("missing publish target demo-dist")
+	}
+	wantPublishManifests := []string{"web", "bldr-demo", "bldr-demo-release"}
+	gotPublishManifests := publish.GetManifests()
+	if len(gotPublishManifests) != len(wantPublishManifests) {
+		t.Fatalf("publish manifests: got %v, want %v", gotPublishManifests, wantPublishManifests)
+	}
+	for i, want := range wantPublishManifests {
+		if gotPublishManifests[i] != want {
+			t.Fatalf("publish manifests: got %v, want %v", gotPublishManifests, wantPublishManifests)
+		}
+		if conf.GetManifests()[want] == nil {
+			t.Fatalf("publish manifest %q is not declared", want)
+		}
+	}
+}

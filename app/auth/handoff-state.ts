@@ -1,0 +1,102 @@
+import { HandoffRequest } from '@s4wave/core/session/handoff/handoff.pb.js'
+import type { Root } from '@s4wave/sdk/root/root.js'
+
+const handoffStorageKey = 'spacewave-auth-handoff-payload'
+
+function base64urlDecode(input: string): Uint8Array {
+  let base64 = input.replace(/-/g, '+').replace(/_/g, '/')
+  while (base64.length % 4 !== 0) {
+    base64 += '='
+  }
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return bytes
+}
+
+// clientTypeLabel returns a display label for the client type.
+export function clientTypeLabel(clientType: string): string {
+  switch (clientType) {
+    case 'cli':
+      return 'CLI'
+    case 'desktop':
+      return 'Desktop'
+    default:
+      return clientType || 'Desktop'
+  }
+}
+
+export function decodeHandoffRequest(
+  payload: string | null | undefined,
+): HandoffRequest | null {
+  if (!payload) return null
+  try {
+    const request = HandoffRequest.fromBinary(base64urlDecode(payload))
+    return request.protocolVersion === 1 &&
+      request.devicePublicKey?.length === 32 &&
+      request.sessionNonce
+      ? request
+      : null
+  } catch {
+    return null
+  }
+}
+
+export function setStoredHandoffPayload(payload: string) {
+  sessionStorage.setItem(handoffStorageKey, payload)
+}
+
+export function clearStoredHandoffPayload() {
+  sessionStorage.removeItem(handoffStorageKey)
+}
+
+export function getStoredHandoffRequest(): HandoffRequest | null {
+  return decodeHandoffRequest(sessionStorage.getItem(handoffStorageKey))
+}
+
+export function getStoredHandoffPath(): string | null {
+  const payload = sessionStorage.getItem(handoffStorageKey)
+  return decodeHandoffRequest(payload) ? `/auth/link/${payload}` : null
+}
+
+export function getAuthReturnPath(): string {
+  return getStoredHandoffPath() ?? '/login'
+}
+
+export async function enrollHandoffSession(
+  root: Root,
+  sessionIdx: number,
+  request: HandoffRequest,
+) {
+  if (sessionIdx < 1) {
+    throw new Error('Invalid session index')
+  }
+  const result = await root.mountSessionByIdx({ sessionIdx })
+  if (!result) {
+    throw new Error('Failed to mount session')
+  }
+  try {
+    await result.session.spacewave.enrollForHandoff({
+      devicePublicKey: request.devicePublicKey,
+      sessionNonce: request.sessionNonce,
+      deviceName: request.deviceName,
+    })
+  } finally {
+    result.session.release()
+  }
+}
+
+// completeStoredHandoff completes the handoff stored for this tab, if any,
+// with the given browser Session and returns the completed request.
+export async function completeStoredHandoff(
+  root: Root,
+  sessionIdx: number,
+): Promise<HandoffRequest | null> {
+  const request = getStoredHandoffRequest()
+  if (!request) return null
+  await enrollHandoffSession(root, sessionIdx, request)
+  clearStoredHandoffPayload()
+  return request
+}

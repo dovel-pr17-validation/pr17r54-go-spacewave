@@ -1,0 +1,159 @@
+package plugin_entrypoint_controller
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/starpc/rpcstream"
+	cbackoff "github.com/aperturerobotics/util/backoff/cbackoff"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/retry"
+	manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+)
+
+// resolveLoadPlugin resolves a LoadPlugin directive.
+func (c *Controller) resolveLoadPlugin(
+	dir bldr_plugin.LoadPlugin,
+) (directive.Resolver, error) {
+	return &loadPluginResolver{
+		c:                c,
+		pluginID:         dir.LoadPluginID(),
+		instanceKey:      dir.LoadPluginInstanceKey(),
+		manifestRoot:     dir.LoadPluginManifestRoot(),
+		manifests:        dir.LoadPluginManifests(),
+		runningPluginCtr: ccontainer.NewCContainer[bldr_plugin.RunningPlugin](nil),
+		pluginLoadStateCtr: ccontainer.NewCContainer[bldr_plugin.PluginLoadState](
+			bldr_plugin.NewPluginLoadState(
+				nil,
+				bldr_plugin.InitialCapabilityRegistrationPending,
+			),
+		),
+		bo: buildBackoff(),
+	}, nil
+}
+
+// loadPluginResolver resolves LoadPlugin with the controller.
+type loadPluginResolver struct {
+	// c is the controller
+	c *Controller
+	// pluginID is the plugin identifier
+	pluginID string
+	// instanceKey is the plugin instance key
+	instanceKey string
+	// manifestRoot selects a historical implementation without current registrations.
+	manifestRoot string
+	// manifests selects the installation and recovery artifacts for this binding.
+	manifests []*manifest.ManifestRef
+	// runningPluginCtr contains the running plugin when the plugin is running
+	// nil otherwise
+	runningPluginCtr *ccontainer.CContainer[bldr_plugin.RunningPlugin]
+	// pluginLoadStateCtr atomically tracks the remote plugin's readiness.
+	pluginLoadStateCtr *ccontainer.CContainer[bldr_plugin.PluginLoadState]
+	// bo is the backoff
+	bo cbackoff.BackOff
+}
+
+// Resolve resolves the values, emitting them to the handler.
+func (r *loadPluginResolver) Resolve(ctx context.Context, handler directive.ResolverHandler) error {
+	// Attach the plugin identity to the logger and log the load attempt.
+	le := r.c.le.WithField("load-plugin-id", r.pluginID)
+	if r.instanceKey != "" {
+		le = le.WithField("instance-key", r.instanceKey)
+	}
+	le.Debug("loading plugin via plugin host")
+
+	// load runs one plugin-load attempt against the plugin host.
+	load := func(ctx context.Context, success func()) error {
+		// Reset the published plugin state and clear prior resolver values.
+		r.runningPluginCtr.SetValue(nil)
+		r.pluginLoadStateCtr.SetValue(bldr_plugin.NewPluginLoadState(
+			nil,
+			bldr_plugin.InitialCapabilityRegistrationPending,
+		))
+		_ = handler.ClearValues()
+
+		// Stream the plugin load from the plugin host.
+		strm, err := r.c.srv.LoadPlugin(ctx, &bldr_plugin.LoadPluginRequest{
+			PluginId:     r.pluginID,
+			InstanceKey:  r.instanceKey,
+			ManifestRoot: r.manifestRoot,
+			Manifests:    r.manifests,
+		})
+		if err != nil {
+			return err
+		}
+		defer strm.Close()
+
+		// Consume load-status responses, updating the running plugin on transitions.
+		var running bool
+		for {
+			resp, err := strm.Recv()
+			if err != nil {
+				_ = handler.ClearValues()
+				return err
+			}
+
+			nextRunning := resp.GetPluginStatus().GetRunning()
+			success()
+			if nextRunning == running {
+				continue
+			}
+			running = nextRunning
+
+			if !running {
+				// Publish the not-yet-loaded state while the plugin is not running.
+				le.Debug("plugin not yet loaded")
+				r.runningPluginCtr.SetValue(nil)
+				r.pluginLoadStateCtr.SetValue(bldr_plugin.NewPluginLoadState(
+					nil,
+					bldr_plugin.InitialCapabilityRegistrationPending,
+				))
+				_ = handler.ClearValues()
+				continue
+			}
+
+			// Publish the running plugin and its RPC stream client.
+			// construct the rpc stream client
+			le.Debug("plugin loaded")
+			rpcClient := rpcstream.NewRpcStreamClient(
+				r.c.srv.PluginRpc,
+				bldr_plugin.BuildPluginRpcComponentID(r.pluginID, r.instanceKey, r.manifestRoot),
+				false,
+			)
+			val := bldr_plugin.NewRunningPlugin(rpcClient)
+			r.runningPluginCtr.SetValue(val)
+			r.pluginLoadStateCtr.SetValue(bldr_plugin.NewPluginLoadState(
+				rpcClient,
+				bldr_plugin.InitialCapabilityRegistrationComplete,
+			))
+			_, _ = handler.AddValue(val)
+			handler.MarkIdle(true)
+		}
+	}
+
+	// An exact request must settle when its retained executable is unavailable.
+	// The caller can retry when storage recovers; catalog loads keep reconnecting.
+	if r.manifestRoot != "" {
+		return load(ctx, func() {})
+	}
+	return retry.Retry(ctx, le, load, r.bo)
+}
+
+// GetRunningPluginCtr returns the current running plugin instance.
+// May be changed (or set to nil) when the instance changes.
+func (r *loadPluginResolver) GetRunningPluginCtr() ccontainer.Watchable[bldr_plugin.RunningPlugin] {
+	return r.runningPluginCtr
+}
+
+// GetPluginLoadStateCtr returns the atomic RPC-client and initial
+// capability-registration state for the remote plugin.
+func (r *loadPluginResolver) GetPluginLoadStateCtr() ccontainer.Watchable[bldr_plugin.PluginLoadState] {
+	return r.pluginLoadStateCtr
+}
+
+// _ is a type assertion
+var (
+	_ directive.Resolver           = (*loadPluginResolver)(nil)
+	_ bldr_plugin.RunningPluginRef = (*loadPluginResolver)(nil)
+)

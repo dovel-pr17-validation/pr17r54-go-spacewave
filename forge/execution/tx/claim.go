@@ -1,0 +1,55 @@
+package execution_tx
+
+import (
+	"github.com/pkg/errors"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	uuid "github.com/satori/go.uuid"
+)
+
+// implicitClaim fences legacy transaction callers to the current process. It
+// must not become a durable controller ID that survives reconstruction.
+var implicitClaim = &forge_execution.Claim{
+	ClaimId: uuid.NewV4().String(),
+	Epoch:   1,
+}
+
+// claimOrImplicit selects the caller's claim or the process's implicit claim.
+func claimOrImplicit(claims []*forge_execution.Claim) *forge_execution.Claim {
+	if len(claims) != 0 && claims[0] != nil {
+		return claims[0]
+	}
+	return implicitClaim
+}
+
+// checkClaimEpoch rejects every write outside the authoritative epoch.
+func checkClaimEpoch(rootEpoch, claimEpoch uint64) error {
+	if claimEpoch != 0 && claimEpoch == rootEpoch {
+		return nil
+	}
+	return &StaleClaimEpochError{
+		ClaimEpoch:   claimEpoch,
+		CurrentEpoch: rootEpoch,
+	}
+}
+
+// checkClaim requires both the authoritative epoch and its claimant identity.
+func checkClaim(root *forge_execution.Claim, claimID string, claimEpoch uint64) error {
+	if err := checkClaimEpoch(root.GetEpoch(), claimEpoch); err != nil {
+		return err
+	}
+	if claimID == root.GetClaimId() {
+		return nil
+	}
+	return &ClaimHeldError{
+		ClaimID: root.GetClaimId(),
+		Epoch:   root.GetEpoch(),
+	}
+}
+
+// IsClaimFenced reports whether err rejects a write because another claim owns
+// the execution.
+func IsClaimFenced(err error) bool {
+	var stale *StaleClaimEpochError
+	var held *ClaimHeldError
+	return errors.As(err, &stale) || errors.As(err, &held)
+}

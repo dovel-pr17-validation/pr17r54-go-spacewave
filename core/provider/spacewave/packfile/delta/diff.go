@@ -1,0 +1,122 @@
+package delta
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/go-kvfile"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/packfile"
+	packfile_order "github.com/s4wave/spacewave/db/packfile/order"
+	"github.com/s4wave/spacewave/db/packfile/writer"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+// ExistsChecker is the subset of block.StoreOps that DiffBlockStores needs to
+// filter the source iteration. *MirrorUnion and any block.Store implement it.
+type ExistsChecker interface {
+	// GetBlockExists reports whether a block is present.
+	GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error)
+}
+
+// DiffBlockStores returns a =writer.BlockIterator= that yields every block
+// in the pack =src= whose hash is NOT already present in =mirror=. Keys that
+// fail to parse as a packfile.BlockKey are skipped silently (kvfile entries
+// that are not hydra blocks).
+//
+// =mirror= may be nil; in that case every src block is emitted (mirror-absent
+// degenerate case).
+func DiffBlockStores(ctx context.Context, src *kvfile.Reader, mirror ExistsChecker) (writer.BlockIterator, error) {
+	return DiffBlockStoresByChildLists(ctx, src, mirror, nil)
+}
+
+// DiffBlockStoresByChildLists returns a diff iterator ordered by the locality
+// of the volume's child lists when lists is set.
+func DiffBlockStoresByChildLists(
+	ctx context.Context,
+	src *kvfile.Reader,
+	mirror ExistsChecker,
+	lists packfile_order.ChildLists,
+) (writer.BlockIterator, error) {
+	// Reject a missing source pack before scanning its index.
+	if src == nil {
+		return nil, errors.New("src kvfile reader is nil")
+	}
+
+	// Pre-collect the index entries so the returned iterator can walk them
+	// sequentially without holding scan-callback state across calls.
+	type diffEntry struct {
+		entry *kvfile.IndexEntry
+		hash  *hash.Hash
+	}
+
+	// Scan the src pack index, probing the mirror and collecting missing blocks.
+	var entries []diffEntry
+	err := src.ScanPrefixEntries(nil, func(ie *kvfile.IndexEntry, _ int) error {
+		// Skip non-block keys and blocks the mirror already holds.
+		h, err := packfile.ParseBlockKey(ie.GetKey())
+		if err != nil {
+			return nil
+		}
+		if mirror != nil {
+			exists, err := mirror.GetBlockExists(ctx, &block.BlockRef{Hash: h})
+			if err != nil {
+				return errors.Wrap(err, "mirror exists probe")
+			}
+			if exists {
+				return nil
+			}
+		}
+		entries = append(entries, diffEntry{
+			entry: ie.CloneVT(),
+			hash:  h,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "scan src kvfile entries")
+	}
+
+	// Reorder the collected entries by child list locality.
+	refs := make([]*block.BlockRef, 0, len(entries))
+	byKey := make(map[string]diffEntry, len(entries))
+	for _, entry := range entries {
+		key := entry.hash.MarshalString()
+		refs = append(refs, block.NewBlockRef(entry.hash))
+		byKey[key] = entry
+	}
+	orderedRefs, err := packfile_order.BlockRefs(ctx, lists, refs)
+	if err != nil {
+		return nil, errors.Wrap(err, "order diff block refs")
+	}
+	entries = entries[:0]
+	for _, ref := range orderedRefs {
+		entry, ok := byKey[ref.GetHash().MarshalString()]
+		if ok {
+			entries = append(entries, entry)
+		}
+	}
+
+	// Return an iterator that reads each ordered entry from the src pack.
+	idx := 0
+	return func() (*hash.Hash, *block.StoredBlock, error) {
+		for idx < len(entries) {
+			entry := entries[idx]
+			idx++
+
+			value, found, err := src.Get(entry.entry.GetKey())
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "read src block")
+			}
+			if !found {
+				continue
+			}
+			blk, err := block.DecodeBlockObject(value)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, entry.hash.MarshalString())
+			}
+			return entry.hash, blk, nil
+		}
+		return nil, nil, nil
+	}, nil
+}

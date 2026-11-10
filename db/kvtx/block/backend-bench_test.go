@@ -1,0 +1,1053 @@
+package kvtx_block
+
+import (
+	"context"
+	"encoding/binary"
+	"strconv"
+	"sync/atomic"
+	"testing"
+
+	"github.com/s4wave/spacewave/db/block"
+	block_mock "github.com/s4wave/spacewave/db/block/mock"
+	block_traverse "github.com/s4wave/spacewave/db/block/traverse"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+type benchBlockStore struct {
+	inner block.StoreOps
+
+	getBlocks        atomic.Int64
+	getBytes         atomic.Int64
+	existsBlocks     atomic.Int64
+	existsBatchCalls atomic.Int64
+	existsBatchRefs  atomic.Int64
+	putBlocks        atomic.Int64
+	putBytes         atomic.Int64
+	putRefs          atomic.Int64
+	putNewBlocks     atomic.Int64
+	putBatchCalls    atomic.Int64
+	putBatchEntries  atomic.Int64
+	putBatchMax      atomic.Int64
+	rmBlocks         atomic.Int64
+	statBlocks       atomic.Int64
+	syncCalls        atomic.Int64
+}
+
+// GetRoot reads the root from the inner store.
+func (s *benchBlockStore) GetRoot(ctx context.Context, name string) (*block.BlockRef, error) {
+	return s.inner.GetRoot(ctx, name)
+}
+
+// ListRoots lists the inner store's roots.
+func (s *benchBlockStore) ListRoots(ctx context.Context, prefix string, fn func(block.NamedRoot) error) error {
+	return s.inner.ListRoots(ctx, prefix, fn)
+}
+
+// SetRoots moves the roots on the inner store.
+func (s *benchBlockStore) SetRoots(ctx context.Context, entries []*block.PutBatchEntry, roots []block.NamedRoot) error {
+	return s.inner.SetRoots(ctx, entries, roots)
+}
+
+func newBenchBlockStore() *benchBlockStore {
+	return &benchBlockStore{inner: block_mock.NewMockStore(0)}
+}
+
+func (s *benchBlockStore) GetHashType() hash.HashType {
+	return s.inner.GetHashType()
+}
+
+func (s *benchBlockStore) GetSupportedFeatures() block.StoreFeature {
+	return s.inner.GetSupportedFeatures()
+}
+
+func (s *benchBlockStore) BeginReadOperation(context.Context) (block.StoreOps, func(), error) {
+	return s, func() {}, nil
+}
+
+func (s *benchBlockStore) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (*block.BlockRef, bool, error) {
+	ref, found, err := s.inner.PutBlock(ctx, data, opts)
+	if err == nil {
+		s.putBlocks.Add(1)
+		s.putBytes.Add(int64(len(data)))
+		if !found {
+			s.putNewBlocks.Add(1)
+		}
+		if opts != nil {
+			s.putRefs.Add(int64(len(opts.Refs)))
+		}
+	}
+	return ref, found, err
+}
+
+func (s *benchBlockStore) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	// Store the batch, which reports which entries already existed.
+	existed, err := s.inner.PutBlockBatch(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+
+	// Count the stored entries and the ones that were new.
+	s.putBatchCalls.Add(1)
+	s.putBatchEntries.Add(int64(len(entries)))
+	recordBenchMax(&s.putBatchMax, int64(len(entries)))
+	for i, entry := range entries {
+		if entry.Tombstone {
+			continue
+		}
+		s.putBlocks.Add(1)
+		s.putBytes.Add(int64(len(entry.Data)))
+		s.putRefs.Add(int64(len(entry.Refs)))
+		if !existed[i] {
+			s.putNewBlocks.Add(1)
+		}
+	}
+	return existed, nil
+}
+
+func (s *benchBlockStore) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	data, found, err := s.inner.GetBlock(ctx, ref)
+	if err == nil {
+		s.getBlocks.Add(1)
+		if found {
+			s.getBytes.Add(int64(len(data)))
+		}
+	}
+	return data, found, err
+}
+
+// GetStoredBlock serves the block without refs because this test store
+// keeps block bytes without their refs.
+func (s *benchBlockStore) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	return block.GetBlockWithoutRefs(ctx, s, ref)
+}
+
+func (s *benchBlockStore) GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error) {
+	found, err := s.inner.GetBlockExists(ctx, ref)
+	if err == nil {
+		s.existsBlocks.Add(1)
+	}
+	return found, err
+}
+
+func (s *benchBlockStore) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	found, err := s.inner.GetBlockExistsBatch(ctx, refs)
+	if err == nil {
+		s.existsBatchCalls.Add(1)
+		s.existsBatchRefs.Add(int64(len(refs)))
+	}
+	return found, err
+}
+
+func (s *benchBlockStore) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	err := s.inner.RmBlock(ctx, ref)
+	if err == nil {
+		s.rmBlocks.Add(1)
+	}
+	return err
+}
+
+func (s *benchBlockStore) StatBlock(ctx context.Context, ref *block.BlockRef) (*block.BlockStat, error) {
+	stat, err := s.inner.StatBlock(ctx, ref)
+	if err == nil {
+		s.statBlocks.Add(1)
+	}
+	return stat, err
+}
+
+func (s *benchBlockStore) Sync(ctx context.Context) (bool, error) {
+	fenced, err := s.inner.Sync(ctx)
+	if err == nil {
+		s.syncCalls.Add(1)
+	}
+	return fenced, err
+}
+
+func (s *benchBlockStore) resetCounts() {
+	// Reset the read and existence counters.
+	s.getBlocks.Store(0)
+	s.getBytes.Store(0)
+	s.existsBlocks.Store(0)
+	s.existsBatchCalls.Store(0)
+	s.existsBatchRefs.Store(0)
+
+	// Reset the write counters.
+	s.putBlocks.Store(0)
+	s.putBytes.Store(0)
+	s.putRefs.Store(0)
+	s.putNewBlocks.Store(0)
+	s.putBatchCalls.Store(0)
+	s.putBatchEntries.Store(0)
+	s.putBatchMax.Store(0)
+
+	// Reset the remove, stat, and sync counters.
+	s.rmBlocks.Store(0)
+	s.statBlocks.Store(0)
+	s.syncCalls.Store(0)
+}
+
+func (s *benchBlockStore) reportMetrics(b *testing.B, ops int64) {
+	// Report nothing when no operations ran.
+	if ops == 0 {
+		return
+	}
+
+	// Report the read and existence counters.
+	denom := float64(ops)
+	b.ReportMetric(float64(s.getBlocks.Load())/denom, "get-blocks/op")
+	b.ReportMetric(float64(s.getBytes.Load())/denom, "get-bytes/op")
+	b.ReportMetric(float64(s.existsBlocks.Load())/denom, "exists-blocks/op")
+	b.ReportMetric(float64(s.existsBatchCalls.Load())/denom, "exists-batches/op")
+	b.ReportMetric(float64(s.existsBatchRefs.Load())/denom, "exists-batch-refs/op")
+
+	// Report the write counters.
+	b.ReportMetric(float64(s.putBlocks.Load())/denom, "put-blocks/op")
+	b.ReportMetric(float64(s.putBytes.Load())/denom, "put-bytes/op")
+	b.ReportMetric(float64(s.putRefs.Load())/denom, "put-refs/op")
+	b.ReportMetric(float64(s.putNewBlocks.Load())/denom, "put-new-blocks/op")
+	b.ReportMetric(float64(s.putBatchCalls.Load())/denom, "put-batches/op")
+	b.ReportMetric(float64(s.putBatchEntries.Load())/denom, "put-batch-entries/op")
+	b.ReportMetric(float64(s.putBatchMax.Load()), "put-batch-max")
+
+	// Report the remove, stat, and sync counters.
+	b.ReportMetric(float64(s.rmBlocks.Load())/denom, "rm-blocks/op")
+	b.ReportMetric(float64(s.statBlocks.Load())/denom, "stat-blocks/op")
+	b.ReportMetric(float64(s.syncCalls.Load())/denom, "syncs/op")
+}
+
+func recordBenchMax(target *atomic.Int64, next int64) {
+	for {
+		current := target.Load()
+		if next <= current {
+			return
+		}
+		if target.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+type benchKVTree struct {
+	impl    KVImplType
+	store   *benchBlockStore
+	ops     block.StoreOps
+	rootRef *block.BlockRef
+	keys    [][]byte
+}
+
+type benchRootMetrics struct {
+	height    uint32
+	dagBlocks int
+	dagBytes  int64
+	maxDepth  int
+}
+
+type benchKeyKind string
+
+const (
+	benchKeySequential benchKeyKind = "sequential"
+	benchKeyGraph      benchKeyKind = "graph"
+
+	benchGraphGroupSize = 64
+)
+
+func TestKVTXBackendBenchHarness(t *testing.T) {
+	ctx := context.Background()
+	for _, impl := range benchKVImpls() {
+		t.Run(impl.String(), func(t *testing.T) {
+			// Build a graph-key KV tree and open its reader.
+			tree := buildBenchKVTree(t, impl, makeBenchKeys(64, benchKeyGraph), false, false)
+			tx := newBenchKVReadTx(t, ctx, tree)
+			defer tx.Discard()
+
+			// Verify a graph-key lookup succeeds.
+			_, found, err := tx.Get(ctx, tree.keys[17])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !found {
+				t.Fatal("key not found")
+			}
+
+			// Verify the graph-prefix scan returns a complete key group.
+			var count int
+			err = tx.ScanPrefixKeys(ctx, benchGraphPrefix(0), func([]byte) error {
+				count++
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != benchGraphGroupSize {
+				t.Fatalf("prefix count = %d, want %d", count, benchGraphGroupSize)
+			}
+
+			// Verify the KV root metrics describe a stored tree.
+			metrics := measureBenchKVRoot(t, ctx, tree)
+			if metrics.height == 0 || metrics.dagBlocks == 0 || metrics.dagBytes == 0 {
+				t.Fatalf("invalid root metrics: %#v", metrics)
+			}
+		})
+	}
+}
+
+func BenchmarkKVTXBackendGetCursorAtKey(b *testing.B) {
+	for _, size := range []int{16, 1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "cold", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					tx := newBenchKVReadTx(b, ctx, tree)
+					cursor, err := tx.GetCursorAtKey(ctx, tree.keys[benchLookupIndex(i, size)])
+					tx.Discard()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if cursor == nil {
+						b.Fatal("key not found")
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+			b.Run(benchKVName(impl, "warm", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tx := newBenchKVReadTx(b, ctx, tree)
+				defer tx.Discard()
+
+				// Warm the KV reader with every stored key.
+				for _, key := range tree.keys {
+					if _, err := tx.GetCursorAtKey(ctx, key); err != nil {
+						b.Fatal(err)
+					}
+				}
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					cursor, err := tx.GetCursorAtKey(ctx, tree.keys[benchLookupIndex(i, size)])
+					if err != nil {
+						b.Fatal(err)
+					}
+					if cursor == nil {
+						b.Fatal("key not found")
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendGetValue(b *testing.B) {
+	for _, size := range []int{16, 1024, 16384} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "cold", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					tx := newBenchKVReadTx(b, ctx, tree)
+					_, found, err := tx.Get(ctx, tree.keys[benchLookupIndex(i, size)])
+					tx.Discard()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if !found {
+						b.Fatal("key not found")
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+			b.Run(benchKVName(impl, "warm", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tx := newBenchKVReadTx(b, ctx, tree)
+				defer tx.Discard()
+
+				// Warm the KV reader with every stored key.
+				for _, key := range tree.keys {
+					_, found, err := tx.Get(ctx, key)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if !found {
+						b.Fatal("key not found")
+					}
+				}
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					_, found, err := tx.Get(ctx, tree.keys[benchLookupIndex(i, size)])
+					if err != nil {
+						b.Fatal(err)
+					}
+					if !found {
+						b.Fatal("key not found")
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendTinyMetadataUpdateCommit(b *testing.B) {
+	for _, size := range []int{16} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "tiny-metadata-updates_4", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					runBenchKVUpdates(b, ctx, tree, i, 4)
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendScanGraphPrefixKeys(b *testing.B) {
+	for _, size := range []int{1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "graph-prefix", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeyGraph), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					tx := newBenchKVReadTx(b, ctx, tree)
+					var count int
+					err := tx.ScanPrefixKeys(ctx, benchGraphPrefix(benchLookupIndex(i, size)/benchGraphGroupSize), func([]byte) error {
+						count++
+						return nil
+					})
+					tx.Discard()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if count == 0 {
+						b.Fatal("expected prefix keys")
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendScanGraphPrefixValues(b *testing.B) {
+	for _, size := range []int{1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "graph-prefix", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeyGraph), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					tx := newBenchKVReadTx(b, ctx, tree)
+					var count int
+					err := tx.ScanPrefix(ctx, benchGraphPrefix(benchLookupIndex(i, size)/benchGraphGroupSize), func(_, _ []byte) error {
+						count++
+						return nil
+					})
+					tx.Discard()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if count == 0 {
+						b.Fatal("expected prefix values")
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendIndexedLogNextIndex(b *testing.B) {
+	for _, size := range []int{1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "indexed-log", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeIndexedLogBenchKeys(size), true, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					tx := newBenchKVReadTx(b, ctx, tree)
+					next, err := NextIndexedLogIndex(ctx, tx)
+					tx.Discard()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if next != uint64(size) {
+						b.Fatalf("next index = %d, want %d", next, size)
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendIndexedLogAppend(b *testing.B) {
+	for _, size := range []int{1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "indexed-log-append", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeIndexedLogBenchKeys(size), true, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					runBenchKVIndexedLogAppend(b, ctx, tree)
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendCursorValueRead(b *testing.B) {
+	for _, size := range []int{1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "cursor-values", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, true)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					tx := newBenchKVReadTx(b, ctx, tree)
+					cursor, err := tx.GetCursorAtKey(ctx, tree.keys[benchLookupIndex(i, size)])
+					tx.Discard()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if cursor == nil {
+						b.Fatal("key not found")
+					}
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendUpdateCommit(b *testing.B) {
+	for _, size := range []int{1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "updates_16", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					runBenchKVUpdates(b, ctx, tree, i, 16)
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+func BenchmarkKVTXBackendDeleteCommit(b *testing.B) {
+	for _, size := range []int{1024} {
+		for _, impl := range benchKVImpls() {
+			b.Run(benchKVName(impl, "pure-deletes_16", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					runBenchKVDeletes(b, ctx, tree, i, 16)
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+			b.Run(benchKVName(impl, "delete-reinsert_16", size), func(b *testing.B) {
+				// Build the KV tree for this benchmark workload.
+				ctx := context.Background()
+				tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+				tree.store.resetCounts()
+
+				// Measure KV workload latency and allocations after clearing setup counts.
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					runBenchKVDeleteReinsert(b, ctx, tree, i, 16)
+				}
+
+				// Report KV store traffic and the final root shape outside the timed workload.
+				b.StopTimer()
+				tree.store.reportMetrics(b, int64(b.N))
+				reportBenchKVRoot(b, ctx, tree)
+			})
+		}
+	}
+}
+
+// BenchmarkKVTXBackendAdvancingCommit commits one change per iteration and
+// advances the root, so churn accumulates like a live store instead of
+// forking every commit from the same root.
+func BenchmarkKVTXBackendAdvancingCommit(b *testing.B) {
+	workloads := []struct {
+		name string
+		key  func(tree *benchKVTree, i int) []byte
+	}{
+		{"update_1", func(tree *benchKVTree, i int) []byte {
+			return tree.keys[benchLookupIndex(i, len(tree.keys))]
+		}},
+		{"insert-random_1", func(_ *benchKVTree, i int) []byte {
+			return makeSequentialBenchKey(int(uint64(i+1) * 0x9e3779b185ebca87 >> 1))
+		}},
+		{"append_1", func(tree *benchKVTree, i int) []byte {
+			return makeSequentialBenchKey(len(tree.keys) + i)
+		}},
+	}
+	for _, size := range []int{1024, 16384} {
+		for _, impl := range benchKVImpls() {
+			for _, workload := range workloads {
+				b.Run(benchKVName(impl, workload.name, size), func(b *testing.B) {
+					// Build the starting tree and clear its build counts.
+					ctx := context.Background()
+					tree := buildBenchKVTree(b, impl, makeBenchKeys(size, benchKeySequential), false, false)
+					tree.store.resetCounts()
+
+					// Commit one change per iteration and advance the root.
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := range b.N {
+						btx, tx := newBenchKVWriteTx(b, ctx, tree)
+						if err := tx.Set(ctx, workload.key(tree, i), benchValue(i+size)); err != nil {
+							tx.Discard()
+							b.Fatal(err)
+						}
+						tree.rootRef = commitBenchKVTx(b, ctx, btx, tx)
+					}
+
+					// Report the store traffic and the final tree shape.
+					b.StopTimer()
+					tree.store.reportMetrics(b, int64(b.N))
+					reportBenchKVRoot(b, ctx, tree)
+				})
+			}
+		}
+	}
+}
+
+func benchKVImpls() []KVImplType {
+	return []KVImplType{
+		KVImplType_KV_IMPL_TYPE_IAVL,
+		KVImplType_KV_IMPL_TYPE_OKRA,
+		KVImplType_KV_IMPL_TYPE_OKRA_INLINE,
+	}
+}
+
+func buildBenchKVTree(
+	tb testing.TB,
+	impl KVImplType,
+	keys [][]byte,
+	indexedLog bool,
+	cursorValues bool,
+) *benchKVTree {
+	tb.Helper()
+
+	store := newBenchBlockStore()
+	return buildBenchKVTreeWithOps(tb, impl, keys, store, store, indexedLog, cursorValues, nil)
+}
+
+func buildBenchKVTreeWithOps(
+	tb testing.TB,
+	impl KVImplType,
+	keys [][]byte,
+	countStore *benchBlockStore,
+	ops block.StoreOps,
+	indexedLog bool,
+	cursorValues bool,
+	afterBuild func(context.Context) error,
+) *benchKVTree {
+	// Open an empty writable KV root in the benchmark store.
+	tb.Helper()
+	ctx := context.Background()
+	btx, rootCursor := block.NewTransaction(ops, nil, nil, nil)
+	rootCursor.SetBlock(NewKeyValueStore(impl), true)
+	tx, err := BuildKvTransaction(ctx, rootCursor, true)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	// Populate the KV tree with cursor values or encoded values.
+	for i, key := range keys {
+		if cursorValues {
+			ref, _, err := ops.PutBlock(ctx, benchValue(i), nil)
+			if err != nil {
+				tx.Discard()
+				tb.Fatal(err)
+			}
+			_, valueCursor := block.NewTransaction(ops, nil, ref, nil)
+			if err := tx.SetCursorAtKey(ctx, key, valueCursor, false); err != nil {
+				tx.Discard()
+				tb.Fatal(err)
+			}
+		} else {
+			valueIndex := i
+			if indexedLog {
+				valueIndex += len(keys)
+			}
+			if err := tx.Set(ctx, key, benchValue(valueIndex)); err != nil {
+				tx.Discard()
+				tb.Fatal(err)
+			}
+		}
+	}
+
+	// Commit the populated KV tree and persist its block root.
+	if err := tx.Commit(ctx); err != nil {
+		tx.Discard()
+		tb.Fatal(err)
+	}
+	tx.Discard()
+	rootRef, _, err := btx.Write(ctx, true)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	// Flush the built KV tree and clear setup traffic counts.
+	if afterBuild != nil {
+		if err := afterBuild(ctx); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	countStore.resetCounts()
+
+	return &benchKVTree{
+		impl:    impl,
+		store:   countStore,
+		ops:     ops,
+		rootRef: rootRef,
+		keys:    keys,
+	}
+}
+
+func (t *benchKVTree) storeOps() block.StoreOps {
+	if t.ops != nil {
+		return t.ops
+	}
+	return t.store
+}
+
+func newBenchKVReadTx(tb testing.TB, ctx context.Context, tree *benchKVTree) kvtx.BlockTx {
+	// Open a KV reader against the benchmark root.
+	tb.Helper()
+	_, rootCursor := block.NewTransaction(tree.storeOps(), nil, tree.rootRef, nil)
+	tx, err := BuildKvTransaction(ctx, rootCursor, false)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return tx
+}
+
+func newBenchKVWriteTx(tb testing.TB, ctx context.Context, tree *benchKVTree) (*block.Transaction, kvtx.BlockTx) {
+	// Open a KV writer against the benchmark root.
+	tb.Helper()
+	btx, rootCursor := block.NewTransaction(tree.storeOps(), nil, tree.rootRef, nil)
+	tx, err := BuildKvTransaction(ctx, rootCursor, true)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return btx, tx
+}
+
+func runBenchKVUpdates(tb testing.TB, ctx context.Context, tree *benchKVTree, offset, count int) {
+	tb.Helper()
+
+	btx, tx := newBenchKVWriteTx(tb, ctx, tree)
+	for updateIndex := range count {
+		key := tree.keys[benchLookupIndex(offset+updateIndex, len(tree.keys))]
+		if err := tx.Set(ctx, key, benchValue(offset+updateIndex+len(tree.keys))); err != nil {
+			tx.Discard()
+			tb.Fatal(err)
+		}
+	}
+	commitBenchKVTx(tb, ctx, btx, tx)
+}
+
+func runBenchKVDeletes(tb testing.TB, ctx context.Context, tree *benchKVTree, offset, count int) {
+	tb.Helper()
+
+	btx, tx := newBenchKVWriteTx(tb, ctx, tree)
+	for deleteIndex := range count {
+		key := tree.keys[benchLookupIndex(offset+deleteIndex, len(tree.keys))]
+		if err := tx.Delete(ctx, key); err != nil {
+			tx.Discard()
+			tb.Fatal(err)
+		}
+	}
+	commitBenchKVTx(tb, ctx, btx, tx)
+}
+
+func runBenchKVDeleteReinsert(tb testing.TB, ctx context.Context, tree *benchKVTree, offset, count int) {
+	tb.Helper()
+
+	btx, tx := newBenchKVWriteTx(tb, ctx, tree)
+	for deleteIndex := range count {
+		key := tree.keys[benchLookupIndex(offset+deleteIndex, len(tree.keys))]
+		if err := tx.Delete(ctx, key); err != nil {
+			tx.Discard()
+			tb.Fatal(err)
+		}
+		if err := tx.Set(ctx, key, benchValue(offset+deleteIndex+len(tree.keys)*2)); err != nil {
+			tx.Discard()
+			tb.Fatal(err)
+		}
+	}
+	commitBenchKVTx(tb, ctx, btx, tx)
+}
+
+func runBenchKVIndexedLogAppend(tb testing.TB, ctx context.Context, tree *benchKVTree) {
+	// Find the next index and commit a KV log entry.
+	tb.Helper()
+	btx, tx := newBenchKVWriteTx(tb, ctx, tree)
+	next, err := NextIndexedLogIndex(ctx, tx)
+	if err != nil {
+		tx.Discard()
+		tb.Fatal(err)
+	}
+	if err := tx.Set(ctx, IndexedLogKey(next), benchValue(int(next))); err != nil {
+		tx.Discard()
+		tb.Fatal(err)
+	}
+	commitBenchKVTx(tb, ctx, btx, tx)
+}
+
+// commitBenchKVTx commits the write transaction and returns the new root.
+func commitBenchKVTx(tb testing.TB, ctx context.Context, btx *block.Transaction, tx kvtx.BlockTx) *block.BlockRef {
+	// Commit the key-value changes into the block transaction.
+	tb.Helper()
+	if err := tx.Commit(ctx); err != nil {
+		tx.Discard()
+		tb.Fatal(err)
+	}
+	tx.Discard()
+
+	// Write the block transaction and return its root.
+	rootRef, _, err := btx.Write(ctx, true)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return rootRef
+}
+
+func measureBenchKVRoot(tb testing.TB, ctx context.Context, tree *benchKVTree) benchRootMetrics {
+	// Load the root key-value store.
+	tb.Helper()
+	_, rootCursor := block.NewTransaction(tree.storeOps(), nil, tree.rootRef, nil)
+	root, err := LoadKeyValueStore(ctx, rootCursor)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	// Read the tree height from the implementation root.
+	metrics := benchRootMetrics{}
+	switch tree.impl {
+	case KVImplType_KV_IMPL_TYPE_IAVL:
+		metrics.height = root.GetIavlRoot().GetHeight()
+	case KVImplType_KV_IMPL_TYPE_OKRA, KVImplType_KV_IMPL_TYPE_OKRA_INLINE:
+		metrics.height = root.GetOkraRoot().GetHeight()
+	}
+
+	// Walk the DAG, counting stored blocks, their bytes, and the depth.
+	err = block_traverse.Visit(ctx, root, rootCursor, func(loc *block_traverse.Location) error {
+		// Track the deepest location, including inline sub-blocks.
+		if loc.Depth > metrics.maxDepth {
+			metrics.maxDepth = loc.Depth
+		}
+		if loc.Cursor.IsSubBlock() || loc.Cursor.GetRef().GetEmpty() {
+			return nil
+		}
+
+		// Count the stored block and its size.
+		metrics.dagBlocks++
+		stat, err := tree.storeOps().StatBlock(ctx, loc.Cursor.GetRef())
+		if err != nil {
+			return err
+		}
+		if stat != nil && stat.Size >= 0 {
+			metrics.dagBytes += stat.Size
+		}
+		return nil
+	}, false)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return metrics
+}
+
+func reportBenchKVRoot(b *testing.B, ctx context.Context, tree *benchKVTree) {
+	// Report the KV tree height and stored block DAG metrics.
+	b.Helper()
+	metrics := measureBenchKVRoot(b, ctx, tree)
+	b.ReportMetric(float64(metrics.height), "tree-height")
+	b.ReportMetric(float64(metrics.dagBlocks), "root-dag-blocks")
+	b.ReportMetric(float64(metrics.dagBytes), "root-dag-bytes")
+	b.ReportMetric(float64(metrics.maxDepth), "root-dag-max-depth")
+}
+
+func makeBenchKeys(size int, kind benchKeyKind) [][]byte {
+	keys := make([][]byte, size)
+	for i := range size {
+		switch kind {
+		case benchKeyGraph:
+			keys[i] = makeGraphBenchKey(i)
+		default:
+			keys[i] = makeSequentialBenchKey(i)
+		}
+	}
+	return keys
+}
+
+func makeIndexedLogBenchKeys(size int) [][]byte {
+	keys := make([][]byte, size)
+	for i := range size {
+		keys[i] = IndexedLogKey(uint64(i))
+	}
+	return keys
+}
+
+func makeSequentialBenchKey(i int) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, uint64(i))
+	return key
+}
+
+func makeGraphBenchKey(i int) []byte {
+	// Encode a graph benchmark key with group and node coordinates.
+	key := make([]byte, 16)
+	binary.BigEndian.PutUint32(key[0:4], uint32(i/benchGraphGroupSize))
+	binary.BigEndian.PutUint32(key[4:8], uint32(i%benchGraphGroupSize))
+	binary.BigEndian.PutUint64(key[8:16], uint64(i)*0x9e3779b185ebca87)
+	return key
+}
+
+func benchGraphPrefix(group int) []byte {
+	prefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(prefix, uint32(group))
+	return prefix
+}
+
+func benchValue(i int) []byte {
+	// Encode a deterministic value for KV benchmark operations.
+	value := make([]byte, 32)
+	binary.BigEndian.PutUint64(value[0:8], uint64(i))
+	binary.BigEndian.PutUint64(value[8:16], uint64(i*3+1))
+	binary.BigEndian.PutUint64(value[16:24], uint64(i*5+2))
+	binary.BigEndian.PutUint64(value[24:32], uint64(i*7+3))
+	return value
+}
+
+func benchLookupIndex(i, size int) int {
+	return (i * 8191) % size
+}
+
+func benchKVName(impl KVImplType, workload string, size int) string {
+	return impl.String() + "/" + workload + "/keys_" + strconv.Itoa(size)
+}

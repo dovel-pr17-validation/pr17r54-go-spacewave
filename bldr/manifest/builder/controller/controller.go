@@ -1,0 +1,568 @@
+//go:build !js
+
+package bldr_manifest_builder_controller
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	"github.com/aperturerobotics/controllerbus/directive"
+	backoff "github.com/aperturerobotics/util/backoff/cbackoff"
+	"github.com/aperturerobotics/util/keyed"
+	"github.com/aperturerobotics/util/promise"
+	"github.com/pkg/errors"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_builder "github.com/s4wave/spacewave/bldr/manifest/builder"
+	"github.com/s4wave/spacewave/bldr/manifest/builder/resultworld"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/sirupsen/logrus"
+)
+
+// Version is the version of the controller implementation.
+var Version = controller.MustParseVersion("0.0.1")
+
+// ControllerID is the ID of the controller.
+const ControllerID = "bldr/manifest/builder/controller"
+
+// Controller is the builder controller.
+type Controller struct {
+	// le is the controller logger.
+	le *logrus.Entry
+	// bus loads the configured manifest builder.
+	bus bus.Bus
+	// c selects the manifest builder configuration.
+	c *Config
+	// pluginBuildLimiter bounds whole-plugin build attempts.
+	pluginBuildLimiter *PluginBuildLimiter
+	// resultPromise reports the current build result.
+	resultPromise *promise.PromiseContainer[*bldr_manifest_builder.BuilderResult]
+	// subManifestBuilderTrackers manage watched sub-manifest builders.
+	subManifestBuilderTrackers *keyed.Keyed[string, *subManifestBuilderTracker]
+
+	// mtx guards lifecycleSink and lifecycleStatus.
+	mtx sync.Mutex
+	// lifecycleSink receives the latest lifecycle status.
+	lifecycleSink ManifestBuilderLifecycleSink
+	// lifecycleStatus is the latest lifecycle status.
+	lifecycleStatus ManifestBuilderLifecycleStatus
+}
+
+// NewController constructs a new controller.
+func NewController(le *logrus.Entry, bus bus.Bus, cc *Config) *Controller {
+	return newController(le, bus, cc, NewPluginBuildLimiter(0))
+}
+
+func newController(
+	le *logrus.Entry,
+	bus bus.Bus,
+	cc *Config,
+	pluginBuildLimiter *PluginBuildLimiter,
+) *Controller {
+	c := &Controller{
+		le:                 le,
+		bus:                bus,
+		c:                  cc,
+		pluginBuildLimiter: pluginBuildLimiter,
+		resultPromise:      promise.NewPromiseContainer[*bldr_manifest_builder.BuilderResult](),
+	}
+	c.subManifestBuilderTrackers = keyed.NewKeyedWithLogger(c.newSubManifestBuilderTracker, le)
+	return c
+}
+
+// GetConfig returns the config.
+func (c *Controller) GetConfig() *Config {
+	return c.c
+}
+
+// GetControllerInfo returns information about the controller.
+func (c *Controller) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(
+		ControllerID,
+		Version,
+		"bldr manifest builder: "+c.c.GetBuilderConfig().GetManifestMeta().GetManifestId(),
+	)
+}
+
+// GetResultPromise returns the result promise.
+func (c *Controller) GetResultPromise() *promise.PromiseContainer[*bldr_manifest_builder.BuilderResult] {
+	return c.resultPromise
+}
+
+// SetManifestBuilderLifecycleSink sets the lifecycle status sink.
+func (c *Controller) SetManifestBuilderLifecycleSink(sink ManifestBuilderLifecycleSink) {
+	// Store the sink and replay the current status to it.
+	c.mtx.Lock()
+	c.lifecycleSink = sink
+	status := c.lifecycleStatus
+	c.mtx.Unlock()
+	if sink != nil {
+		sink.SetManifestBuilderLifecycleStatus(status)
+	}
+}
+
+// Execute executes the controller goroutine.
+// Returning nil ends execution.
+// Returning an error triggers a retry with backoff.
+func (c *Controller) Execute(ctx context.Context) error {
+	// Reset the sub-manifest trackers, result promise, and lifecycle status.
+	c.subManifestBuilderTrackers.SetContext(ctx, true)
+	c.resultPromise.SetPromise(nil)
+	c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+		State:   ManifestBuilderLifecycleStateQueued,
+		Summary: "queued",
+	})
+
+	// Apply the environment's fixed manifest commit timestamp.
+	ctx, err := bldr_manifest_builder.WithManifestCommitTimestampFromEnvironment(ctx)
+	if err != nil {
+		c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+			State:   ManifestBuilderLifecycleStateError,
+			Summary: "parse manifest timestamp",
+			Error:   err.Error(),
+		})
+		c.resultPromise.SetResult(nil, err)
+		return err
+	}
+
+	// Collect the builder config, manifest id, and controller config.
+	builderConfig := c.GetConfig().GetBuilderConfig()
+	meta := builderConfig.GetManifestMeta()
+	manifestID := meta.GetManifestId()
+	le := c.le.WithField("manifest-id", manifestID)
+	controllerConfig := c.GetConfig().GetControllerConfig()
+
+	// Mark the build running and resolve the builder controller config.
+	le.Debugf("starting manifest build controller: %s", manifestID)
+	c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+		State:   ManifestBuilderLifecycleStateRunning,
+		Summary: "starting builder controller",
+	})
+	conf, err := controllerConfig.Resolve(ctx, c.bus)
+	if err != nil {
+		c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+			State:   ManifestBuilderLifecycleStateError,
+			Summary: "resolve builder controller config",
+			Error:   err.Error(),
+		})
+		c.resultPromise.SetResult(nil, err)
+		return err
+	}
+
+	// Cast the resolved config to a manifest_builder config.
+	pconf, ok := conf.GetConfig().(bldr_manifest_builder.ControllerConfig)
+	if !ok {
+		err := errors.Errorf(
+			"config must implement bldr_manifest_builder.ControllerConfig interface: %s",
+			conf.GetConfig().GetConfigID(),
+		)
+		c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+			State:   ManifestBuilderLifecycleStateError,
+			Summary: "resolve builder controller config",
+			Error:   err.Error(),
+		})
+		c.resultPromise.SetResult(nil, err)
+		return err
+	}
+
+	// Set the build backoff config for the builder controller.
+	execBackoff := func() backoff.BackOff {
+		// Configure an exponential backoff with a ten second cap.
+		ebo := backoff.NewExponentialBackOff()
+		ebo.InitialInterval = time.Second
+		ebo.Multiplier = 2
+		ebo.MaxInterval = time.Second * 10
+		return ebo
+	}
+
+	// Start the builder controller and wait for it to run.
+	nctx, nctxCancel := context.WithCancel(ctx)
+	defer nctxCancel()
+
+	// Track disposal and cancel the controller context on disposal.
+	var wasDisposed atomic.Bool
+	builderCtrlInter, _, ctrlRef, err := loader.WaitExecControllerRunning(
+		nctx,
+		c.bus,
+		resolver.NewLoadControllerWithConfigAndOpts(pconf, directive.ValueOptions{}, execBackoff),
+		func() {
+			wasDisposed.Store(true)
+			nctxCancel()
+		},
+	)
+	if err != nil {
+		c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+			State:   ManifestBuilderLifecycleStateError,
+			Summary: "start builder controller",
+			Error:   err.Error(),
+		})
+		c.resultPromise.SetResult(nil, err)
+		return err
+	}
+	defer ctrlRef.Release()
+
+	// Cast the running controller to a manifest builder controller.
+	builderCtrl, ok := builderCtrlInter.(bldr_manifest_builder.Controller)
+	if !ok {
+		err := errors.Errorf("builder must implement bldr_manifest_builder.Controller: %#v", builderCtrlInter)
+		c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+			State:   ManifestBuilderLifecycleStateError,
+			Summary: "start builder controller",
+			Error:   err.Error(),
+		})
+		c.resultPromise.SetResult(nil, err)
+		return err
+	}
+
+	// Create the build owner and loop until the context ends.
+	var startupValidated bool
+	buildOwner := newManifestBuildOwner(c, builderConfig)
+
+	// Watch sources across builds, so edits made during a build are kept.
+	var sourceWatcher *SourceWatcher
+	if c.c.GetWatch() {
+		sourceWatcher, err = NewSourceWatcher(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Rebuild the manifest on every restart until the context ends.
+	for {
+		// Stop when the controller context is canceled.
+		if ctx.Err() != nil {
+			return context.Canceled
+		}
+
+		// Take the next result promise and reset the attempt state.
+		resultPromise := buildOwner.nextResultPromise()
+
+		var result *bldr_manifest_builder.BuilderResult
+		var err error
+		cacheHit := false
+		var buildStart time.Time
+
+		// On the first attempt, try to reuse the startup cache result.
+		if !startupValidated {
+			startupValidated = true
+			startupValidationResult, startupErr := c.validateStartupBuilderResult(ctx, le, builderCtrl)
+			if startupErr != nil {
+				c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+					State:   ManifestBuilderLifecycleStateError,
+					Summary: "validate startup cache",
+					Error:   startupErr.Error(),
+				})
+				c.resultPromise.SetResult(nil, startupErr)
+				return startupErr
+			}
+			if startupValidationResult.builderResult != nil {
+				result = startupValidationResult.builderResult
+				cacheHit = true
+				c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+					State:    ManifestBuilderLifecycleStateDone,
+					CacheHit: true,
+					Summary:  "startup cache hit",
+				})
+				for _, subManifestID := range startupValidationResult.subManifestIDs {
+					le.WithField("manifest-id", subManifestID).
+						WithField("startup-cache", true).
+						Info("reused cached startup manifest build")
+				}
+				le.WithField("startup-cache", true).Info("reused cached startup manifest build")
+			}
+			if startupValidationResult.builderResult == nil {
+				le.WithField("reason", startupValidationResult.reason).Info("startup manifest cache miss")
+			}
+		}
+
+		// Begin the build attempt and publish its rebuild flags.
+		attempt := buildOwner.beginAttempt(ctx)
+		fullRebuild, hotRebuild := buildOwner.rebuildFlags(result)
+		if result == nil {
+			c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+				State:                   ManifestBuilderLifecycleStateRunning,
+				FullRebuild:             fullRebuild,
+				HotRebuild:              hotRebuild,
+				DependencyRebuildReason: buildOwner.rebuildReasonSnapshot(),
+				Summary:                 rebuildSummary(fullRebuild, hotRebuild),
+			})
+			args := buildOwner.buildArgs()
+			// The restart callback binds every nested manifest tracker to this attempt.
+			builderHost := newBuildManifestHost(c, builderConfig, attempt.restart)
+			for _, prevSubManifestTracker := range c.subManifestBuilderTrackers.GetKeysWithData() {
+				tkr := prevSubManifestTracker.Data
+				tkr.build.prepareParentAttempt(attempt.restart)
+			}
+
+			// Acquire a plugin build permit for this builder.
+			pluginBuildPermit, acquireErr := c.pluginBuildLimiter.Acquire(
+				attempt.ctx,
+				pconf.GetConfigID(),
+			)
+			if acquireErr != nil {
+				attempt.release()
+				return acquireErr
+			}
+
+			// Call the builder controller BuildManifest function.
+			buildStart = time.Now()
+			result, err = builderCtrl.BuildManifest(attempt.ctx, args, builderHost)
+			pluginBuildPermit.Release()
+			if ctx.Err() != nil {
+				attempt.release()
+				return context.Canceled
+			}
+			if attempt.ctx.Err() != nil {
+				if attempt.wasRestarted() {
+					attempt.release()
+					continue
+				}
+			}
+		}
+
+		// Delete sub-manifests that were not observed this run and persist the
+		// observed child provenance with a newly built parent result.
+		var subManifestCount int
+		for _, prevSubManifestTracker := range c.subManifestBuilderTrackers.GetKeysWithData() {
+			tkr := prevSubManifestTracker.Data
+			subManifestResult, subManifestErr, observed := tkr.build.observedResult()
+			if !observed {
+				c.subManifestBuilderTrackers.RemoveKey(prevSubManifestTracker.Key)
+				continue
+			}
+			subManifestCount++
+			if err == nil && subManifestErr != nil {
+				err = errors.Wrapf(subManifestErr, "persist sub-manifest %q", prevSubManifestTracker.Key)
+			}
+			if err == nil && result != nil && !cacheHit && subManifestResult != nil {
+				err = addSubManifestResultForStartupReuse(
+					result,
+					prevSubManifestTracker.Key,
+					subManifestResult,
+				)
+			}
+		}
+		if err == nil && !cacheHit {
+			var changedInput string
+			changedInput, err = enrichBuilderResultForStartupReuse(
+				builderConfig,
+				c.c.GetControllerConfig(),
+				result,
+				buildStart,
+			)
+			if changedInput != "" {
+				le.WithField("input", changedInput).
+					Warn("input changed during build, next startup will rebuild")
+			}
+		}
+
+		if attempt.wasRestarted() {
+			attempt.release()
+			continue
+		}
+		if err := buildOwner.publishResult(attempt.ctx, le, resultPromise, result, err, cacheHit, fullRebuild, hotRebuild); err != nil {
+			if attempt.wasRestarted() || attempt.ctx.Err() != nil {
+				attempt.release()
+				continue
+			}
+			attempt.release()
+			return err
+		}
+
+		// publishResult preserves prevResult after a successful build.
+		inputFiles := buildOwner.prevResult.GetInputManifest().GetFiles()
+		if err == nil {
+			le.Debugf("input manifest returned with %d files", len(inputFiles))
+		}
+		if err != nil {
+			le.WithError(err).Warn("build failed")
+		}
+		if !c.c.GetWatch() || (len(inputFiles) == 0 && subManifestCount == 0) {
+			if c.c.GetWatch() {
+				le.Info("builder provided no input files: not watching for changes")
+			}
+			attempt.release()
+			return buildOwner.prevErr
+		}
+
+		// ignoreWatchPrefixes are prefixes to ignore from watching
+		ignoreWatchPrefixes := []string{"vendor", "node_modules", ".bldr", "(disabled)"}
+
+		// build file watchlist
+		watchedFiles := make(map[string]*bldr_manifest_builder.InputManifest_File)
+	FilesLoop:
+		for _, inputFile := range inputFiles {
+			if inputFile.GetStartupOnly() {
+				continue
+			}
+			filePath := inputFile.GetPath()
+			for _, prefix := range ignoreWatchPrefixes {
+				if strings.HasPrefix(filePath, prefix) {
+					continue FilesLoop
+				}
+			}
+			if _, ok := watchedFiles[filePath]; !ok {
+				watchedFiles[filePath] = inputFile
+			}
+		}
+
+		if len(watchedFiles) == 0 {
+			c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+				State:                   ManifestBuilderLifecycleStateDone,
+				CacheHit:                cacheHit,
+				FullRebuild:             fullRebuild,
+				HotRebuild:              hotRebuild,
+				WatchedFileCount:        0,
+				DependencyRebuildReason: buildOwner.rebuildReasonSnapshot(),
+				Summary:                 "watching for rebuild triggers",
+			})
+
+			if subManifestCount == 0 {
+				// nothing to wait for, return.
+				le.Info("builder provided no files to watch: not watching for changes")
+				attempt.release()
+				return nil
+			}
+
+			// wait for sub-manifests to change or ctx to cancel
+			select {
+			case <-attempt.ctx.Done():
+				attempt.release()
+				continue
+			case <-ctx.Done():
+				attempt.release()
+				return context.Canceled
+			}
+		}
+
+		// Watch the directories of the watched source paths.
+		watchedSourcePaths := make(map[string]*bldr_manifest_builder.InputManifest_File, len(watchedFiles))
+		for filePath, v := range watchedFiles {
+			watchedSourcePaths[filepath.Join(builderConfig.GetSourcePath(), filePath)] = v
+		}
+		if err := sourceWatcher.SetPaths(watchedSourcePaths); err != nil {
+			attempt.release()
+			return err
+		}
+
+		// Wait for a quiet period after the watched files change.
+		le.Debugf("watching for changes in %d files and %d directories and %d sub-manifests", len(watchedFiles), sourceWatcher.GetDirCount(), subManifestCount)
+		c.setLifecycleStatus(ManifestBuilderLifecycleStatus{
+			State:                   ManifestBuilderLifecycleStateDone,
+			CacheHit:                cacheHit,
+			FullRebuild:             fullRebuild,
+			HotRebuild:              hotRebuild,
+			WatchedFileCount:        len(watchedFiles),
+			DependencyRebuildReason: buildOwner.rebuildReasonSnapshot(),
+			Summary:                 "watching for changes",
+		})
+		changedFiles, eventCount, err := sourceWatcher.Wait(attempt.ctx, time.Millisecond*100)
+		if ctx.Err() != nil {
+			attempt.release()
+			return context.Canceled
+		}
+		if attempt.ctx.Err() != nil {
+			attempt.release()
+			le.Info("re-building after sub-manifest changed")
+			continue
+		}
+		if err != nil {
+			attempt.release()
+			return err
+		}
+
+		le.Infof("re-building after %d filesystem events with %d changed files", eventCount, len(changedFiles))
+		buildOwner.setChangedFiles(changedFiles)
+		attempt.release()
+	}
+}
+
+// storeManifestBuildResult stores world-backed build provenance for startup reuse.
+func (c *Controller) storeManifestBuildResult(
+	ctx context.Context,
+	le *logrus.Entry,
+	result *bldr_manifest_builder.BuilderResult,
+) error {
+	// Open a transaction on the builder's World engine.
+	builderConfig := c.c.GetBuilderConfig()
+	objectKey := bldr_manifest.NewManifestArtifactKey(result.GetManifestRef().GetManifestRef())
+	busEngine := world.NewBusEngine(ctx, c.bus, builderConfig.GetEngineId())
+	tx, err := busEngine.NewTransaction(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer tx.Discard()
+
+	// Store the build result and commit the transaction.
+	ref, err := resultworld.SetManifestBuildResult(ctx, tx, objectKey, result)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	le.WithField("object-key", resultworld.ManifestBuildResultKey(objectKey)).
+		WithField("ref", ref).
+		Debug("stored manifest build result in world")
+	return nil
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+// If it can, it returns a resolver. If not, returns nil.
+// Any unexpected errors are returned for logging.
+// It is safe to add a reference to the directive during this call.
+func (c *Controller) HandleDirective(
+	ctx context.Context,
+	di directive.Instance,
+) ([]directive.Resolver, error) {
+	return nil, nil
+}
+
+// Close releases any resources used by the controller.
+// Error indicates any issue encountered releasing.
+func (c *Controller) Close() error {
+	return nil
+}
+
+// _ is a type assertion
+var _ controller.Controller = (*Controller)(nil)
+
+func (c *Controller) setLifecycleStatus(status ManifestBuilderLifecycleStatus) {
+	// Store the status and forward it to the sink.
+	c.mtx.Lock()
+	c.lifecycleStatus = status
+	sink := c.lifecycleSink
+	c.mtx.Unlock()
+	if sink != nil {
+		sink.SetManifestBuilderLifecycleStatus(status)
+	}
+}
+
+func rebuildSummary(fullRebuild, hotRebuild bool) string {
+	if hotRebuild {
+		return "hot rebuild"
+	}
+	if fullRebuild {
+		return "full rebuild"
+	}
+	return "build"
+}
+
+// changedFilesSummary summarizes a changed-file count for lifecycle status.
+func changedFilesSummary(count int) string {
+	switch count {
+	case 0:
+		return "filesystem change"
+	case 1:
+		return "filesystem change: 1 changed file"
+	default:
+		return "filesystem change: multiple changed files"
+	}
+}

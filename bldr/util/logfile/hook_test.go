@@ -1,0 +1,243 @@
+package logfile
+
+import (
+	"bytes"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/aperturerobotics/fastjson"
+	"github.com/sirupsen/logrus"
+)
+
+// safeBuffer is a thread-safe bytes.Buffer for concurrent test writes.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write implements io.Writer.
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// String returns the buffer contents.
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestFileHookTextFormat(t *testing.T) {
+	// Create a text file hook with a synchronized output buffer.
+	buf := &safeBuffer{}
+	hook := NewFileHook(buf, logrus.DebugLevel, "text")
+
+	// Send a text record through the file hook.
+	entry := &logrus.Entry{
+		Logger:  logrus.StandardLogger(),
+		Level:   logrus.InfoLevel,
+		Message: "hello world",
+		Data:    logrus.Fields{},
+	}
+	if err := hook.Fire(entry); err != nil {
+		t.Fatalf("Fire() error: %v", err)
+	}
+
+	// Drain the file hook before inspecting its output.
+	hook.Close()
+
+	// Verify the file hook retained the text message.
+	out := buf.String()
+	if !strings.Contains(out, "hello world") {
+		t.Errorf("expected output to contain 'hello world', got %q", out)
+	}
+}
+
+func TestFileHookJSONFormat(t *testing.T) {
+	// Create a JSON file hook with a synchronized output buffer.
+	buf := &safeBuffer{}
+	hook := NewFileHook(buf, logrus.DebugLevel, "json")
+
+	// Send a record with a structured field through the JSON hook.
+	entry := &logrus.Entry{
+		Logger:  logrus.StandardLogger(),
+		Level:   logrus.InfoLevel,
+		Message: "json test",
+		Data:    logrus.Fields{"key": "value"},
+	}
+	if err := hook.Fire(entry); err != nil {
+		t.Fatalf("Fire() error: %v", err)
+	}
+
+	// Drain the JSON hook before decoding its output.
+	hook.Close()
+
+	// Decode the file hook output as a JSON record.
+	out := buf.String()
+	var p fastjson.Parser
+	v, err := p.Parse(strings.TrimSpace(out))
+	if err != nil {
+		t.Fatalf("output is not valid JSON: %v\noutput: %q", err, out)
+	}
+
+	// Verify the JSON record preserves its message and structured field.
+	if msg := string(v.GetStringBytes("msg")); msg != "json test" {
+		t.Errorf("expected msg 'json test', got %v", msg)
+	}
+	if key := string(v.GetStringBytes("key")); key != "value" {
+		t.Errorf("expected key 'value', got %v", key)
+	}
+}
+
+func TestFileHookLevelFiltering(t *testing.T) {
+	// Create a file hook that subscribes to warning records.
+	buf := &safeBuffer{}
+	hook := NewFileHook(buf, logrus.WarnLevel, "text")
+
+	// Debug entry should not be written (below WARN threshold).
+	entry := &logrus.Entry{
+		Logger:  logrus.StandardLogger(),
+		Level:   logrus.DebugLevel,
+		Message: "debug message",
+		Data:    logrus.Fields{},
+	}
+
+	// The hook's Levels() method determines which levels are reported.
+	// Check that debug is NOT in the levels list.
+	levels := hook.Levels()
+	for _, lvl := range levels {
+		if lvl == logrus.DebugLevel {
+			t.Error("DebugLevel should not be in levels for WARN hook")
+		}
+	}
+
+	// Verify expected levels are present.
+	found := make(map[logrus.Level]bool)
+	for _, lvl := range levels {
+		found[lvl] = true
+	}
+	for _, expected := range []logrus.Level{logrus.PanicLevel, logrus.FatalLevel, logrus.ErrorLevel, logrus.WarnLevel} {
+		if !found[expected] {
+			t.Errorf("expected %v in levels", expected)
+		}
+	}
+
+	// Fire a warn entry -- should be written.
+	warnEntry := &logrus.Entry{
+		Logger:  logrus.StandardLogger(),
+		Level:   logrus.WarnLevel,
+		Message: "warn message",
+		Data:    logrus.Fields{},
+	}
+	_ = hook.Fire(warnEntry)
+
+	// Fire a debug entry directly -- it would be written since Fire doesn't
+	// filter (logrus does the filtering via Levels()). This verifies Fire works.
+	_ = hook.Fire(entry)
+
+	// Drain the warning hook before inspecting its output.
+	hook.Close()
+
+	// Verify the warning record reached the file hook output.
+	out := buf.String()
+	if !strings.Contains(out, "warn message") {
+		t.Errorf("expected 'warn message' in output, got %q", out)
+	}
+}
+
+func TestFileHookCloseDrains(t *testing.T) {
+	// Create a buffered file hook for the drain check.
+	buf := &safeBuffer{}
+	hook := NewFileHook(buf, logrus.DebugLevel, "text")
+
+	// Queue the records that closing the file hook must drain.
+	for range 10 {
+		entry := &logrus.Entry{
+			Logger:  logrus.StandardLogger(),
+			Level:   logrus.InfoLevel,
+			Message: "drain test",
+			Data:    logrus.Fields{},
+		}
+		_ = hook.Fire(entry)
+	}
+
+	// Close the file hook and wait for its writer to finish.
+	hook.Close()
+
+	// Verify closing the file hook wrote every queued record.
+	out := buf.String()
+	count := strings.Count(out, "drain test")
+	if count != 10 {
+		t.Errorf("expected 10 entries, got %d", count)
+	}
+}
+
+// TestFileHookDropsAfterClose checks entries fired after Close are not buffered.
+func TestFileHookDropsAfterClose(t *testing.T) {
+	// Create and close the file hook before delivering more records.
+	buf := &safeBuffer{}
+	hook := NewFileHook(buf, logrus.DebugLevel, "text")
+	hook.Close()
+
+	// Deliver records after the file hook has closed.
+	entry := &logrus.Entry{
+		Logger:  logrus.StandardLogger(),
+		Level:   logrus.InfoLevel,
+		Message: "after close",
+		Data:    logrus.Fields{},
+	}
+	for range 10 {
+		_ = hook.Fire(entry)
+	}
+
+	// Inspect the closed file hook buffer under its broadcast lock.
+	var buffered int
+	hook.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		buffered = len(hook.buf)
+	})
+
+	// Verify the closed hook neither buffered nor wrote later records.
+	if buffered != 0 {
+		t.Fatalf("expected no buffered entries after close, got %d", buffered)
+	}
+	if strings.Contains(buf.String(), "after close") {
+		t.Fatal("entry written after close")
+	}
+
+	// Confirm closing the file hook again completes.
+	hook.Close()
+}
+
+func TestFileHookConcurrentFire(t *testing.T) {
+	// Create a synchronized output buffer for concurrent hook writes.
+	buf := &safeBuffer{}
+	hook := NewFileHook(buf, logrus.DebugLevel, "text")
+
+	// Deliver records to the file hook from concurrent writers.
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Go(func() {
+			entry := &logrus.Entry{
+				Logger:  logrus.StandardLogger(),
+				Level:   logrus.InfoLevel,
+				Message: "concurrent",
+				Data:    logrus.Fields{},
+			}
+			_ = hook.Fire(entry)
+		})
+	}
+
+	// Wait for the writers and drain the file hook.
+	wg.Wait()
+	hook.Close()
+
+	// Verify every concurrent record reached the file hook output.
+	out := buf.String()
+	count := strings.Count(out, "concurrent")
+	if count != 50 {
+		t.Errorf("expected 50 entries, got %d", count)
+	}
+}

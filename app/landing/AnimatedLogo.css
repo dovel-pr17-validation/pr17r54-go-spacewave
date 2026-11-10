@@ -1,0 +1,85 @@
+@keyframes logoBlur {
+  0% {
+    transform: scale(1) rotate(0deg);
+    opacity: 0.35;
+    filter: blur(10px);
+  }
+  30% {
+    transform: scale(1.04) rotate(1deg);
+    opacity: 0.42;
+    filter: blur(12px);
+  }
+  50% {
+    transform: scale(1.02) rotate(-0.5deg);
+    opacity: 0.38;
+    filter: blur(11px);
+  }
+  70% {
+    transform: scale(1.05) rotate(1.5deg);
+    opacity: 0.45;
+    filter: blur(13px);
+  }
+  100% {
+    transform: scale(1) rotate(0deg);
+    opacity: 0.35;
+    filter: blur(10px);
+  }
+}
+
+.animated-logo-fixed-size {
+  width: var(--animated-logo-size);
+  height: var(--animated-logo-size);
+}
+
+.animated-logo-transform {
+  transform: var(--animated-logo-transform);
+  transition: var(--animated-logo-transition);
+}
+
+.animated-logo-fixed-content,
+.animated-logo-fixed-content > img {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+}
+
+.animated-logo-blur {
+  animation: logoBlur 10s ease-in-out infinite;
+  animation-play-state: running;
+  dynamic-range-limit: no-limit;
+}
+
+.animated-logo-blur-paused {
+  animation: none;
+  dynamic-range-limit: no-limit;
+}
+
+@media (dynamic-range: high) {
+  @keyframes logoBlur {
+    0% {
+      transform: scale(1) rotate(0deg);
+      opacity: 0.35;
+      filter: blur(10px) brightness(1);
+    }
+    30% {
+      transform: scale(1.04) rotate(1deg);
+      opacity: 0.5;
+      filter: blur(12px) brightness(1.15);
+    }
+    50% {
+      transform: scale(1.02) rotate(-0.5deg);
+      opacity: 0.42;
+      filter: blur(11px) brightness(1.08);
+    }
+    70% {
+      transform: scale(1.05) rotate(1.5deg);
+      opacity: 0.6;
+      filter: blur(13px) brightness(1.3);
+    }
+    100% {
+      transform: scale(1) rotate(0deg);
+      opacity: 0.35;
+      filter: blur(10px) brightness(1);
+    }
+  }
+}

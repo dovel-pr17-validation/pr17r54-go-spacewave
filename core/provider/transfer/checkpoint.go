@@ -1,0 +1,144 @@
+package provider_transfer
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/db/object"
+	"github.com/s4wave/spacewave/db/volume"
+)
+
+// checkpointKey is the object store key for the transfer checkpoint.
+var checkpointKey = []byte("transfer/checkpoint")
+
+// CheckpointStore provides read/write access to transfer checkpoint state.
+type CheckpointStore interface {
+	// LoadCheckpoint loads the checkpoint from the store.
+	// Returns nil, nil if no checkpoint exists.
+	LoadCheckpoint(ctx context.Context) (*TransferCheckpoint, error)
+	// SaveCheckpoint persists the checkpoint to the store.
+	SaveCheckpoint(ctx context.Context, cp *TransferCheckpoint) error
+	// DeleteCheckpoint removes the checkpoint from the store.
+	DeleteCheckpoint(ctx context.Context) error
+}
+
+// ObjectStoreCheckpoint implements CheckpointStore using an ObjectStore.
+type ObjectStoreCheckpoint struct {
+	store         object.ObjectStore
+	b             bus.Bus
+	objectStoreID string
+	volumeID      string
+}
+
+// NewObjectStoreCheckpoint creates a new ObjectStoreCheckpoint with a direct store handle.
+func NewObjectStoreCheckpoint(store object.ObjectStore) *ObjectStoreCheckpoint {
+	return &ObjectStoreCheckpoint{store: store}
+}
+
+// NewObjectStoreCheckpointLazy creates a new ObjectStoreCheckpoint that builds
+// the object store handle on first use via the bus.
+func NewObjectStoreCheckpointLazy(b bus.Bus, objectStoreID, volumeID string) *ObjectStoreCheckpoint {
+	return &ObjectStoreCheckpoint{
+		b:             b,
+		objectStoreID: objectStoreID,
+		volumeID:      volumeID,
+	}
+}
+
+// getStore returns the object store, building it lazily if needed.
+func (c *ObjectStoreCheckpoint) getStore(ctx context.Context) (object.ObjectStore, func(), error) {
+	if c.store != nil {
+		return c.store, func() {}, nil
+	}
+	handle, _, diRef, err := volume.ExBuildObjectStoreAPI(ctx, c.b, false, c.objectStoreID, c.volumeID, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return handle.GetObjectStore(), diRef.Release, nil
+}
+
+// LoadCheckpoint loads the checkpoint from the object store.
+func (c *ObjectStoreCheckpoint) LoadCheckpoint(ctx context.Context) (*TransferCheckpoint, error) {
+	// Open the checkpoint object store for the read transaction.
+	store, rel, err := c.getStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rel()
+
+	// Read and decode the saved transfer checkpoint in one transaction.
+	var cp *TransferCheckpoint
+	err = kvtx.RunTransaction(ctx, false,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return store.NewTransaction(ctx, false)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			// Read the checkpoint record, allowing an empty store.
+			data, found, err := tx.Get(ctx, checkpointKey)
+			if err != nil {
+				return err
+			}
+			if !found {
+				cp = nil
+				return nil
+			}
+
+			// Decode the checkpoint record before returning it to the transfer.
+			next := &TransferCheckpoint{}
+			if err := next.UnmarshalVT(data); err != nil {
+				return errors.Wrap(err, "unmarshal checkpoint")
+			}
+			cp = next
+			return nil
+		},
+	)
+	return cp, err
+}
+
+// SaveCheckpoint persists the checkpoint to the object store.
+func (c *ObjectStoreCheckpoint) SaveCheckpoint(ctx context.Context, cp *TransferCheckpoint) error {
+	// Encode the transfer checkpoint for storage.
+	data, err := cp.MarshalVT()
+	if err != nil {
+		return err
+	}
+
+	// Open the checkpoint object store for the write transaction.
+	store, rel, err := c.getStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer rel()
+
+	return kvtx.RunTransaction(ctx, true,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return store.NewTransaction(ctx, true)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			return tx.Set(ctx, checkpointKey, data)
+		},
+	)
+}
+
+// DeleteCheckpoint removes the checkpoint from the object store.
+func (c *ObjectStoreCheckpoint) DeleteCheckpoint(ctx context.Context) error {
+	store, rel, err := c.getStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer rel()
+
+	return kvtx.RunTransaction(ctx, true,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return store.NewTransaction(ctx, true)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			return tx.Delete(ctx, checkpointKey)
+		},
+	)
+}
+
+// _ is a type assertion
+var _ CheckpointStore = (*ObjectStoreCheckpoint)(nil)

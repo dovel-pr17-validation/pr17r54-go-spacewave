@@ -1,0 +1,296 @@
+syntax = "proto3";
+package s4wave.prom;
+
+import "github.com/aperturerobotics/common/typeid/typeid.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/prom;s4wave_prom";
+
+// Label is one name and value of a series.
+message Label {
+  // Name is the label name.
+  string name = 1;
+  // Value is the label value.
+  string value = 2;
+}
+
+// LabelSet is the sorted label set that identifies one series.
+message LabelSet {
+  // Labels holds the labels in ascending name order.
+  repeated Label labels = 1;
+}
+
+// ScrapeConfig says where and how often a target's process scrapes.
+message ScrapeConfig {
+  // Url is the http or https address of the exporter's metrics page, or
+  // device:metrics for the Spacewave process on the Device running the target.
+  string url = 1;
+  // IntervalMs is the time between scrapes. Zero scrapes every 15 seconds.
+  uint32 interval_ms = 2;
+  // TimeoutMs bounds one scrape. Zero or a value above the interval uses the
+  // interval.
+  uint32 timeout_ms = 3;
+}
+
+// TargetMeta is the identity and scrape configuration of a target.
+message TargetMeta {
+  // Labels are the labels, such as job and instance, that every series in the
+  // target carries. A query skips the target when a matcher on one of these
+  // names rejects its value.
+  LabelSet labels = 1;
+  // Scrape configures the target's scrape process.
+  ScrapeConfig scrape = 2;
+  // RetentionMs is how long the target keeps samples, measured back from its
+  // latest sample. Expired samples are dropped every two hours, so they can
+  // outlive it by that much. Zero keeps 15 days, as Prometheus does.
+  uint64 retention_ms = 3;
+}
+
+// TargetStatus is the scrape process's report on its latest scrape. The
+// process writes it in the same transaction as the scrape's samples.
+message TargetStatus {
+  // Up is set when the latest scrape succeeded.
+  bool up = 1;
+  // LastScrapeMs is the start of the latest scrape in Unix milliseconds.
+  int64 last_scrape_ms = 2;
+  // LastDurationMs is how long the latest scrape took.
+  uint32 last_duration_ms = 3;
+  // LastError describes why the latest scrape failed, when it did.
+  string last_error = 4;
+  // Series is the number of series the latest successful scrape returned.
+  uint64 series = 5;
+  // DevicePeerId is the peer of the Device whose process scrapes the target.
+  string device_peer_id = 6;
+  // CommitWindowMs is how often that Device commits the target's samples.
+  uint32 commit_window_ms = 7;
+}
+
+// PromQueryResourceService answers PromQL over every target in the Space.
+service PromQueryResourceService {
+  // Query evaluates one PromQL expression.
+  rpc Query(QueryRequest) returns (QueryResponse);
+  // LabelNames lists the label names of the matching series.
+  rpc LabelNames(LabelNamesRequest) returns (LabelsResponse);
+  // LabelValues lists the values of one label among the matching series.
+  rpc LabelValues(LabelValuesRequest) returns (LabelsResponse);
+  // WatchTargets sends every target, then each target that changed or was
+  // removed. A target changes on each scrape commit, so the stream also tells
+  // a reader when query answers may have changed. Changes are sent at most
+  // once per second.
+  rpc WatchTargets(WatchTargetsRequest) returns (stream WatchTargetsResponse);
+}
+
+// WatchTargetsRequest watches the targets of the World.
+message WatchTargetsRequest {}
+
+// WatchTargetsResponse is one change to the World's targets. The first
+// response lists every target.
+message WatchTargetsResponse {
+  // Changed holds each target that appeared or changed, by object key order.
+  repeated TargetInfo changed = 1;
+  // Removed holds the object keys of targets that no longer exist.
+  repeated string removed = 2;
+}
+
+// TargetInfo is one target's configuration and latest status.
+message TargetInfo {
+  // ObjectKey is the target's World object key.
+  string object_key = 1;
+  // Meta is the target's identity and scrape configuration.
+  TargetMeta meta = 2;
+  // Status is the latest scrape's report, unset until the first commit.
+  TargetStatus status = 3;
+}
+
+// LabelNamesRequest lists label names. Label lookups ignore time: they read
+// every committed series of every target.
+message LabelNamesRequest {
+  // Match holds series selectors such as up{job="node"}. A series matches
+  // when any selector matches it; none matches every series.
+  repeated string match = 1;
+}
+
+// LabelValuesRequest lists the values of one label.
+message LabelValuesRequest {
+  // Name is the label name, such as job or __name__.
+  string name = 1;
+  // Match holds series selectors as in LabelNamesRequest.
+  repeated string match = 2;
+}
+
+// LabelsResponse is a sorted list of label names or values without repeats.
+message LabelsResponse {
+  // Values holds the names or values.
+  repeated string values = 1;
+}
+
+// QueryRequest evaluates an expression at one instant or over a range.
+message QueryRequest {
+  // Expr is the PromQL expression.
+  string expr = 1;
+  // TimeMs is the instant of an instant query in Unix milliseconds. Zero uses
+  // the current time.
+  int64 time_ms = 2;
+  // StartMs is the first step of a range query in Unix milliseconds.
+  int64 start_ms = 3;
+  // EndMs is the last step of a range query in Unix milliseconds.
+  int64 end_ms = 4;
+  // StepMs is the step of a range query. Zero makes an instant query.
+  int64 step_ms = 5;
+}
+
+// ResultType is the PromQL value type of a query result.
+enum ResultType {
+  // RESULT_TYPE_UNKNOWN is the zero value.
+  RESULT_TYPE_UNKNOWN = 0;
+  // RESULT_TYPE_VECTOR is an instant vector: one sample per series.
+  RESULT_TYPE_VECTOR = 1;
+  // RESULT_TYPE_MATRIX is a range of samples per series.
+  RESULT_TYPE_MATRIX = 2;
+  // RESULT_TYPE_SCALAR is one sample with no labels.
+  RESULT_TYPE_SCALAR = 3;
+  // RESULT_TYPE_STRING is a string value.
+  RESULT_TYPE_STRING = 4;
+}
+
+// Sample is one value at one time.
+message Sample {
+  // TimeMs is the sample time in Unix milliseconds.
+  int64 time_ms = 1;
+  // Value is the sample value.
+  double value = 2;
+}
+
+// Series is the samples of one labeled series in a result.
+message Series {
+  // Labels identifies the series.
+  LabelSet labels = 1;
+  // Samples holds the series' samples in time order.
+  repeated Sample samples = 2;
+}
+
+// QueryResponse is the result of one PromQL expression.
+message QueryResponse {
+  // ResultType is the value type of the result.
+  ResultType result_type = 1;
+  // Series holds a vector, a matrix, or a scalar as one unlabeled series.
+  repeated Series series = 2;
+  // StringValue holds a string result.
+  string string_value = 3;
+  // Warnings are the query's annotations.
+  repeated string warnings = 4;
+}
+
+// PanelKind is how a panel shows its expression.
+enum PanelKind {
+  // PANEL_KIND_UNKNOWN is the zero value, shown as a chart.
+  PANEL_KIND_UNKNOWN = 0;
+  // PANEL_KIND_CHART draws a range query as lines over time.
+  PANEL_KIND_CHART = 1;
+  // PANEL_KIND_VALUE shows an instant query's value for each series.
+  PANEL_KIND_VALUE = 2;
+}
+
+// PanelUnit is the unit of a panel's values.
+enum PanelUnit {
+  // PANEL_UNIT_UNKNOWN shows plain numbers.
+  PANEL_UNIT_UNKNOWN = 0;
+  // PANEL_UNIT_PERCENT shows values from 0 to 100 as percentages.
+  PANEL_UNIT_PERCENT = 1;
+  // PANEL_UNIT_BYTES shows sizes in bytes.
+  PANEL_UNIT_BYTES = 2;
+  // PANEL_UNIT_BYTES_PER_SECOND shows rates in bytes per second.
+  PANEL_UNIT_BYTES_PER_SECOND = 3;
+  // PANEL_UNIT_SECONDS shows durations in seconds.
+  PANEL_UNIT_SECONDS = 4;
+  // PANEL_UNIT_CELSIUS shows temperatures in degrees Celsius.
+  PANEL_UNIT_CELSIUS = 5;
+}
+
+// Panel is one PromQL expression on a Dashboard.
+message Panel {
+  // Id identifies the panel within its Dashboard.
+  string id = 1;
+  // Title names the panel. A panel always has one.
+  string title = 2;
+  // Expr is the PromQL expression, stored as typed even when it does not
+  // parse.
+  string expr = 3;
+  // Unit is the unit of the expression's values.
+  PanelUnit unit = 4;
+  // Kind is how the panel shows the expression.
+  PanelKind kind = 5;
+}
+
+// Dashboard is the root of a prom/dashboard object: its panels in display
+// order. Every panel queries every target in the World.
+message Dashboard {
+  option (typeid.id) = "prom/dashboard";
+
+  // Panels holds the panels in display order.
+  repeated Panel panels = 1;
+}
+
+// PromDashboardResourceService reads and edits one Dashboard. Edits apply to
+// the Dashboard as it is when they commit, so concurrent edits to different
+// panels all land.
+service PromDashboardResourceService {
+  // WatchDashboard sends the Dashboard, then the Dashboard after each commit
+  // that changes it.
+  rpc WatchDashboard(WatchDashboardRequest) returns (stream Dashboard);
+  // PutPanel adds a panel or replaces one by its id.
+  rpc PutPanel(PutPanelRequest) returns (PutPanelResponse);
+  // RemovePanel removes a panel by its id.
+  rpc RemovePanel(RemovePanelRequest) returns (RemovePanelResponse);
+  // MovePanel moves a panel to a new position.
+  rpc MovePanel(MovePanelRequest) returns (MovePanelResponse);
+  // CreateTarget creates a target in the Dashboard's World.
+  rpc CreateTarget(CreateTargetRequest) returns (CreateTargetResponse);
+}
+
+// WatchDashboardRequest watches the Dashboard.
+message WatchDashboardRequest {}
+
+// PutPanelRequest adds or replaces a panel.
+message PutPanelRequest {
+  // Panel is the panel to store. An empty id adds it at the end under a new
+  // id; any other id replaces that panel, and fails with ErrPanelRemoved when
+  // another writer removed it.
+  Panel panel = 1;
+}
+
+// PutPanelResponse is the stored panel's id.
+message PutPanelResponse {
+  // Id identifies the stored panel.
+  string id = 1;
+}
+
+// RemovePanelRequest removes a panel. Removing a missing panel succeeds.
+message RemovePanelRequest {
+  // Id identifies the panel.
+  string id = 1;
+}
+
+// RemovePanelResponse is the response to RemovePanel.
+message RemovePanelResponse {}
+
+// MovePanelRequest moves a panel.
+message MovePanelRequest {
+  // Id identifies the panel.
+  string id = 1;
+  // Index is the panel's new position, clamped to the last one.
+  uint32 index = 2;
+}
+
+// MovePanelResponse is the response to MovePanel.
+message MovePanelResponse {}
+
+// CreateTargetRequest creates a target.
+message CreateTargetRequest {
+  // ObjectKey is the new target's World object key.
+  string object_key = 1;
+  // Meta is the target's identity and scrape configuration.
+  TargetMeta meta = 2;
+}
+
+// CreateTargetResponse is the response to CreateTarget.
+message CreateTargetResponse {}

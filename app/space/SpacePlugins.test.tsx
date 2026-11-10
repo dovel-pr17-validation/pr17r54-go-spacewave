@@ -1,0 +1,442 @@
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  SpacePluginLifecycleState,
+  type SpaceContentsState,
+} from '@s4wave/sdk/space/space.pb.js'
+import type { BackgroundPlugin } from '@s4wave/core/session/session.pb.js'
+
+const mocks = vi.hoisted(() => ({
+  useResourceValue: vi.fn(),
+  useWatchStateRpc: vi.fn(),
+  addSpacePlugin: vi.fn().mockResolvedValue(undefined),
+  importSpacePlugin: vi.fn().mockResolvedValue(undefined),
+  removeSpacePlugin: vi.fn().mockResolvedValue(undefined),
+  setBackgroundPlugin: vi.fn().mockResolvedValue(undefined),
+  toastError: vi.fn(),
+}))
+
+let contentsState: SpaceContentsState | null = null
+let sourceContentsState: SpaceContentsState | null = null
+let spacesList: unknown[] = []
+let backgroundPlugins: {
+  entries: BackgroundPlugin[]
+  set: typeof mocks.setBackgroundPlugin
+} = { entries: [], set: vi.fn() }
+
+const spaceResource = { kind: 'space' }
+const contentsResource = { kind: 'contents' }
+const spaceMock = {
+  addSpacePlugin: mocks.addSpacePlugin,
+  importSpacePlugin: mocks.importSpacePlugin,
+  removeSpacePlugin: mocks.removeSpacePlugin,
+}
+const sourceSpaceResource = { kind: 'source-space', error: null }
+const sourceContentsResource = { kind: 'source-contents', error: null }
+const sourceSpaceMock = { id: 9 }
+const contentsMock = { watchState: () => 'self' }
+const sourceContentsMock = { watchState: () => 'source' }
+
+vi.mock('@aptre/bldr-react', () => ({
+  useWatchStateRpc: mocks.useWatchStateRpc,
+}))
+
+vi.mock('@aptre/bldr-sdk/hooks/useResource.js', () => ({
+  useResourceValue: mocks.useResourceValue,
+}))
+
+vi.mock('@s4wave/app/system/useSystemStatus.js', () => ({
+  useWatchSpacesList: () => spacesList,
+}))
+
+vi.mock('@s4wave/app/hooks/useSharedMounts.js', () => ({
+  useSharedObjectMount: () => ({ error: null }),
+  useSharedObjectBodyMount: () => ({ error: null }),
+  useSpaceMount: () => sourceSpaceResource,
+  useSpaceContentsMount: () => sourceContentsResource,
+}))
+
+vi.mock('@s4wave/web/contexts/contexts.js', () => ({
+  SessionContext: { useContext: () => ({ kind: 'session' }) },
+  SpaceContext: { useContext: () => spaceResource },
+  SpaceContentsContext: { useContext: () => contentsResource },
+}))
+
+vi.mock('@s4wave/web/contexts/SpaceContainerContext.js', () => ({
+  SpaceContainerContext: {
+    useContext: () => ({ spaceId: 'space-1' }),
+    useContextSafe: () => null,
+  },
+}))
+
+vi.mock('@s4wave/app/session/useBackgroundPlugins.js', () => ({
+  useBackgroundPlugins: () => backgroundPlugins,
+}))
+
+vi.mock('@s4wave/web/ui/toaster.js', () => ({
+  toast: { error: mocks.toastError },
+}))
+
+import { SpacePlugins } from './SpacePlugins.js'
+
+describe('SpacePlugins', () => {
+  beforeEach(() => {
+    contentsState = null
+    sourceContentsState = null
+    spacesList = []
+    backgroundPlugins = { entries: [], set: mocks.setBackgroundPlugin }
+    mocks.useResourceValue.mockImplementation((res: unknown) => {
+      if (res === spaceResource) return spaceMock
+      if (res === contentsResource) return contentsMock
+      if (res === sourceSpaceResource) return sourceSpaceMock
+      if (res === sourceContentsResource) return sourceContentsMock
+      return {}
+    })
+    mocks.useWatchStateRpc.mockImplementation(
+      (watch: (req: object, signal: AbortSignal) => unknown) =>
+        watch({}, new AbortController().signal) === 'source'
+          ? sourceContentsState
+          : contentsState,
+    )
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  it('shows configured plugins with lifecycle badges', () => {
+    contentsState = {
+      plugins: [
+        {
+          pluginId: 'loading-plugin',
+          loaded: false,
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADING,
+        },
+        {
+          pluginId: 'loaded-plugin',
+          loaded: true,
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADED,
+        },
+      ],
+    }
+
+    render(<SpacePlugins />)
+
+    expect(screen.getByText('loading-plugin')).toBeDefined()
+    expect(screen.getByText('loaded-plugin')).toBeDefined()
+    expect(screen.getByText('Loading')).toBeDefined()
+    expect(screen.getByText('Loaded')).toBeDefined()
+    expect(screen.getByText('2 installed')).toBeDefined()
+  })
+
+  it('shows every projected lifecycle label and scheduler detail', () => {
+    contentsState = {
+      plugins: [
+        {
+          pluginId: 'configured-plugin',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_CONFIGURED,
+        },
+        {
+          pluginId: 'failed-plugin',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_FAILED,
+          detail: 'fetch plugin manifest: copy failed',
+        },
+        {
+          pluginId: 'retrying-plugin',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_RETRYING,
+        },
+        {
+          pluginId: 'removed-plugin',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_REMOVED,
+        },
+        {
+          pluginId: 'upgraded-plugin',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_UPGRADED,
+        },
+      ],
+    }
+
+    render(<SpacePlugins />)
+
+    for (const label of [
+      'Configured',
+      'Failed',
+      'Retrying',
+      'Removed',
+      'Upgraded',
+    ]) {
+      expect(screen.getByText(label)).toBeDefined()
+    }
+    expect(screen.getByText('fetch plugin manifest: copy failed')).toBeDefined()
+  })
+
+  it('shows an empty state and add control with no plugins', () => {
+    render(<SpacePlugins />)
+
+    expect(screen.getByText('No plugins installed')).toBeDefined()
+    expect(screen.getByText('0 installed')).toBeDefined()
+    expect(screen.getByLabelText('Add plugin')).toBeDefined()
+  })
+
+  it('opens the add form with known-plugin suggestions', () => {
+    render(<SpacePlugins />)
+
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+
+    expect(screen.getByLabelText('Plugin manifest ID')).toBeDefined()
+    expect(screen.getByText('Notes')).toBeDefined()
+    expect(screen.getByText('x86 VM')).toBeDefined()
+  })
+
+  it('installs a suggested plugin via addSpacePlugin', () => {
+    render(<SpacePlugins />)
+
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+    fireEvent.click(screen.getByText('Notes'))
+
+    expect(mocks.addSpacePlugin).toHaveBeenCalledWith('spacewave-notes')
+  })
+
+  it('imports a plugin from another Space, then installs it', async () => {
+    spacesList = [
+      { entry: { ref: { providerResourceRef: { id: 'space-1' } } } },
+      {
+        entry: { ref: { providerResourceRef: { id: 'space-2' } } },
+        spaceMeta: { name: 'Aperture' },
+      },
+    ]
+    sourceContentsState = {
+      availablePlugins: [{ pluginId: 'glados-core', revision: '4' }],
+    }
+
+    render(<SpacePlugins />)
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+    expect(screen.queryByText('space-1')).toBeNull()
+    fireEvent.click(screen.getByText('Aperture'))
+    fireEvent.click(screen.getByText('glados-core'))
+
+    await waitFor(() =>
+      expect(mocks.addSpacePlugin).toHaveBeenCalledWith('glados-core'),
+    )
+    expect(mocks.importSpacePlugin).toHaveBeenCalledWith(9, 'glados-core')
+    expect(mocks.importSpacePlugin.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.addSpacePlugin.mock.invocationCallOrder[0],
+    )
+  })
+
+  it('hides already-installed plugins from suggestions', () => {
+    contentsState = {
+      plugins: [
+        {
+          pluginId: 'spacewave-notes',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADED,
+        },
+      ],
+    }
+
+    render(<SpacePlugins />)
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+
+    expect(screen.queryByText('Notes')).toBeNull()
+    expect(screen.getByText('x86 VM')).toBeDefined()
+  })
+
+  it('lists backend catalog plugins with revision and installs them', () => {
+    contentsState = {
+      plugins: [],
+      availablePlugins: [
+        {
+          pluginId: 'spacewave-chat',
+          description: 'Realtime chat rooms',
+          revision: '7',
+        },
+      ],
+    }
+
+    render(<SpacePlugins />)
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+
+    expect(screen.getByText('spacewave-chat')).toBeDefined()
+    expect(screen.getByText('Realtime chat rooms')).toBeDefined()
+    expect(screen.getByText('rev 7')).toBeDefined()
+
+    fireEvent.click(screen.getByText('spacewave-chat'))
+    expect(mocks.addSpacePlugin).toHaveBeenCalledWith('spacewave-chat')
+  })
+
+  it('hides installed catalog plugins and falls back to known plugins when empty', () => {
+    contentsState = {
+      plugins: [
+        {
+          pluginId: 'spacewave-chat',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADED,
+        },
+      ],
+      availablePlugins: [{ pluginId: 'spacewave-chat', revision: '7' }],
+    }
+
+    render(<SpacePlugins />)
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+
+    // Installed catalog plugin is filtered out of the browsable list.
+    expect(screen.queryByText('rev 7')).toBeNull()
+    // Known-plugin fallbacks stay browsable when not installed.
+    expect(screen.getByText('Notes')).toBeDefined()
+    expect(screen.getByText('x86 VM')).toBeDefined()
+  })
+
+  it('validates and installs a manually entered manifest ID', () => {
+    render(<SpacePlugins />)
+
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+    const input = screen.getByLabelText('Plugin manifest ID')
+
+    fireEvent.change(input, { target: { value: 'Bad Id' } })
+    expect(
+      screen.getByText('Use a lowercase manifest ID (letters, digits, dashes)'),
+    ).toBeDefined()
+
+    fireEvent.change(input, { target: { value: 'my-plugin' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+
+    expect(mocks.addSpacePlugin).toHaveBeenCalledWith('my-plugin')
+  })
+
+  it('removes a plugin only after inline confirmation', () => {
+    contentsState = {
+      plugins: [
+        {
+          pluginId: 'spacewave-v86',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADED,
+        },
+      ],
+    }
+
+    render(<SpacePlugins />)
+
+    fireEvent.click(screen.getByLabelText('Remove spacewave-v86'))
+    expect(mocks.removeSpacePlugin).not.toHaveBeenCalled()
+
+    expect(screen.getByText('Remove spacewave-v86?')).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+
+    expect(mocks.removeSpacePlugin).toHaveBeenCalledWith('spacewave-v86')
+  })
+
+  it('adds a requested plugin whose manifest the Space stores', () => {
+    contentsState = {
+      requestedPluginIds: ['gizmo-core', 'gizmo-web'],
+      availablePlugins: [{ pluginId: 'gizmo-core' }],
+    }
+
+    render(<SpacePlugins />)
+
+    expect(screen.getAllByText('Requested')).toHaveLength(2)
+    expect(
+      screen.getByText('spacewave space deploy --manifest-id gizmo-web'),
+    ).toBeDefined()
+    expect(screen.queryByRole('button', { name: 'Add gizmo-web' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Add gizmo-core' }))
+
+    expect(mocks.addSpacePlugin).toHaveBeenCalledWith('gizmo-core')
+  })
+
+  it('asks to run an added background plugin while the Space is closed', async () => {
+    contentsState = {
+      plugins: [],
+      availablePlugins: [{ pluginId: 'gizmo-matrix', background: true }],
+    }
+
+    const { rerender } = render(<SpacePlugins />)
+    fireEvent.click(screen.getByLabelText('Add plugin'))
+    fireEvent.click(screen.getByText('gizmo-matrix'))
+    await waitFor(() =>
+      expect(mocks.addSpacePlugin).toHaveBeenCalledWith('gizmo-matrix'),
+    )
+
+    contentsState = {
+      ...contentsState,
+      plugins: [
+        {
+          pluginId: 'gizmo-matrix',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADED,
+        },
+      ],
+    }
+    rerender(<SpacePlugins />)
+    await screen.findByText(
+      'gizmo-matrix can keep running while this Space is closed. Allow?',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+
+    await waitFor(() =>
+      expect(mocks.setBackgroundPlugin).toHaveBeenCalledWith(
+        'space-1',
+        'gizmo-matrix',
+        true,
+        false,
+      ),
+    )
+  })
+
+  it('offers the background choice again after Not now', async () => {
+    contentsState = {
+      plugins: [
+        {
+          pluginId: 'gizmo-matrix',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADED,
+        },
+      ],
+      availablePlugins: [{ pluginId: 'gizmo-matrix', background: true }],
+    }
+
+    render(<SpacePlugins />)
+    fireEvent.click(screen.getByRole('button', { name: 'Allow background' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Not now' }))
+
+    expect(mocks.setBackgroundPlugin).not.toHaveBeenCalled()
+    expect(
+      screen.getByRole('button', { name: 'Allow background' }),
+    ).toBeDefined()
+  })
+
+  it('shows the saved choice and withdraws it when the plugin is removed', async () => {
+    contentsState = {
+      plugins: [
+        {
+          pluginId: 'gizmo-matrix',
+          state: SpacePluginLifecycleState.SpacePluginLifecycleState_LOADED,
+        },
+      ],
+      availablePlugins: [{ pluginId: 'gizmo-matrix', background: true }],
+    }
+    backgroundPlugins = {
+      entries: [
+        { spaceId: 'space-1', pluginId: 'gizmo-matrix', suspended: true },
+      ],
+      set: mocks.setBackgroundPlugin,
+    }
+
+    render(<SpacePlugins />)
+    expect(screen.getByText('Suspended')).toBeDefined()
+    fireEvent.click(screen.getByLabelText('Remove gizmo-matrix'))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+
+    await waitFor(() =>
+      expect(mocks.setBackgroundPlugin).toHaveBeenCalledWith(
+        'space-1',
+        'gizmo-matrix',
+        false,
+        false,
+      ),
+    )
+  })
+})

@@ -1,0 +1,101 @@
+package s4wave_sql_query_world
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/world"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_sql_query "github.com/s4wave/spacewave/sdk/sql/query"
+	"github.com/sirupsen/logrus"
+)
+
+// NewSqlQuerySetRootOp constructs a SQL query set-root operation.
+func NewSqlQuerySetRootOp(objectKey string, rootRef *bucket.ObjectRef) *SqlQuerySetRootOp {
+	return &SqlQuerySetRootOp{ObjectKey: objectKey, RootRef: rootRef.Clone()}
+}
+
+// NewSqlQueryInitializeRootOp constructs a create-once SQL query root operation.
+func NewSqlQueryInitializeRootOp(objectKey string, rootRef *bucket.ObjectRef) *SqlQuerySetRootOp {
+	return &SqlQuerySetRootOp{ObjectKey: objectKey, RootRef: rootRef.Clone(), InitializeOnly: true}
+}
+
+// Validate performs cursory checks on the operation.
+func (o *SqlQuerySetRootOp) Validate() error {
+	if o.GetObjectKey() == "" {
+		return world.ErrEmptyObjectKey
+	}
+	rootRef := o.GetRootRef()
+	if rootRef == nil || rootRef.GetEmpty() {
+		return errors.New("sql/query: root ref is required")
+	}
+	return rootRef.Validate()
+}
+
+// ApplyWorldOp applies the SQL query set-root operation to a world.
+func (o *SqlQuerySetRootOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	sender peer.ID,
+) (bool, error) {
+	// Validate the root operation and its SQL query target type.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+	if err := world_types.CheckObjectType(ctx, ws, o.GetObjectKey(), s4wave_sql_query.SqlQueryTypeID); err != nil {
+		return false, err
+	}
+
+	// Open the query object and apply the requested root transition.
+	obj, err := world.MustGetObject(ctx, ws, o.GetObjectKey())
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		return false, err
+	}
+	if sysErr, err := o.ApplyWorldObjectOp(ctx, le, obj, sender); err != nil || sysErr {
+		return sysErr, err
+	}
+	return false, s4wave_sql_query.SyncTargetDbQuad(ctx, ws, o.GetObjectKey())
+}
+
+// ApplyWorldObjectOp applies the SQL query set-root operation to an object.
+func (o *SqlQuerySetRootOp) ApplyWorldObjectOp(
+	ctx context.Context,
+	_ *logrus.Entry,
+	os world.ObjectState,
+	_ peer.ID,
+) (bool, error) {
+	// Validate that the root operation targets this object.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+	if os == nil {
+		return false, world.ErrObjectNotFound
+	}
+	if os.GetKey() != o.GetObjectKey() {
+		return false, errors.Errorf("sql/query: op target %s does not match object %s", o.GetObjectKey(), os.GetKey())
+	}
+
+	// Preserve the existing root when initialization is create-once.
+	if o.GetInitializeOnly() {
+		rootRef, _, err := os.GetRootRef(ctx)
+		if err != nil {
+			return false, err
+		}
+		if rootRef != nil && !rootRef.GetRootRef().GetEmpty() {
+			return false, ErrQueryAlreadyInitialized
+		}
+	}
+
+	// Advance the query object to the requested root reference.
+	_, err := os.SetRootRef(ctx, o.GetRootRef())
+	return false, err
+}
+
+var _ block.Block = (*SqlQuerySetRootOp)(nil)
+
+var _ world.Operation = (*SqlQuerySetRootOp)(nil)

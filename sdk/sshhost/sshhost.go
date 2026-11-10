@@ -1,0 +1,123 @@
+package s4wave_sshhost
+
+import (
+	"context"
+	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+)
+
+const (
+	// DefaultSshPort is the default SSH port applied by create paths.
+	DefaultSshPort uint32 = 22
+)
+
+// NewSshHostBlock constructs a new SSH Host block.
+func NewSshHostBlock() block.Block {
+	return &SshHost{}
+}
+
+// UnmarshalSshHost unmarshals an SSH Host from a cursor.
+func UnmarshalSshHost(ctx context.Context, bcs *block.Cursor) (*SshHost, error) {
+	return block.UnmarshalBlock[SshHost](ctx, bcs)
+}
+
+// NormalizeSshHostEndpoint fills endpoint defaults without changing identity.
+func NormalizeSshHostEndpoint(endpoint *SshHostEndpoint) *SshHostEndpoint {
+	// Supply the default port when the SSH endpoint is absent.
+	if endpoint == nil {
+		return &SshHostEndpoint{Port: DefaultSshPort}
+	}
+
+	// Normalize a copy of the SSH endpoint and fill its missing port.
+	out := endpoint.CloneVT()
+	out.Host = strings.TrimSpace(out.GetHost())
+	out.Username = strings.TrimSpace(out.GetUsername())
+	if out.GetPort() == 0 {
+		out.Port = DefaultSshPort
+	}
+	return out
+}
+
+// Validate performs cursory checks on the SSH Host block.
+func (h *SshHost) Validate() error {
+	// Require a label for the SSH Host.
+	if strings.TrimSpace(h.GetLabel()) == "" {
+		return errors.New("ssh host label is required")
+	}
+
+	// Require a complete SSH endpoint with a usable port.
+	endpoint := h.GetEndpoint()
+	if endpoint == nil {
+		return errors.New("ssh host endpoint is required")
+	}
+	if strings.TrimSpace(endpoint.GetHost()) == "" {
+		return errors.New("ssh host endpoint host is required")
+	}
+	if endpoint.GetPort() == 0 || endpoint.GetPort() > 65535 {
+		return errors.New("ssh host endpoint port is invalid")
+	}
+	if strings.TrimSpace(endpoint.GetUsername()) == "" {
+		return errors.New("ssh host endpoint username is required")
+	}
+
+	// Validate the SSH Host credential references.
+	if err := validateCredentialRefs(h.GetCredentials()); err != nil {
+		return err
+	}
+
+	// Validate every SSH Host trust pin.
+	for _, pin := range h.GetHostKeyPins() {
+		if err := validateHostKeyPin(pin); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCredentialRefs(refs *SshHostCredentialRefs) error {
+	if refs == nil {
+		return nil
+	}
+	for _, ref := range []struct {
+		name string
+		key  string
+	}{
+		{name: "private_key_secret_object_key", key: refs.GetPrivateKeySecretObjectKey()},
+		{name: "password_secret_object_key", key: refs.GetPasswordSecretObjectKey()},
+		{name: "passphrase_secret_object_key", key: refs.GetPassphraseSecretObjectKey()},
+	} {
+		key := strings.TrimSpace(ref.key)
+		if ref.key != "" && (key == "" || key != ref.key) {
+			return errors.Errorf("ssh host credential %s is empty", ref.name)
+		}
+		if strings.ContainsAny(ref.key, " \r\n\t") {
+			return errors.Errorf("ssh host credential %s must be a Secret object key", ref.name)
+		}
+	}
+	return nil
+}
+
+func validateHostKeyPin(pin *SshHostKeyPin) error {
+	// Require an SSH Host trust pin with an algorithm and key identity.
+	if pin == nil {
+		return errors.New("ssh host key pin is required")
+	}
+	if strings.TrimSpace(pin.GetAlgorithm()) == "" {
+		return errors.New("ssh host key pin algorithm is required")
+	}
+	if strings.TrimSpace(pin.GetPublicKey()) == "" && strings.TrimSpace(pin.GetSha256Fingerprint()) == "" {
+		return errors.New("ssh host key pin public_key or sha256_fingerprint is required")
+	}
+
+	// Validate the trust pin acceptance timestamp when present.
+	if pin.GetAcceptedAt() != nil {
+		if err := pin.GetAcceptedAt().Validate(false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var _ block.Block = (*SshHost)(nil)

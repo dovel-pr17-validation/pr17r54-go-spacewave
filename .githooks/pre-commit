@@ -1,0 +1,196 @@
+#!/bin/sh
+set -e
+
+# Git exports GIT_DIR to a hook in a linked worktree. Every git command here
+# finds the same repository from the working directory, while Go runs git in
+# its module cache to fetch modules, where an inherited GIT_DIR turns its
+# git init --bare into a write to this repository's config.
+#
+# Git also exports GIT_INDEX_FILE, naming the index this commit records: the
+# repository index, or a temporary one for git commit -a or a path list. Only
+# this hook's git commands may read it. Go runs git in other repositories, such
+# as the golangci-lint clone it stamps with VCS data, where a foreign index
+# fails with exit status 128.
+index_file=${GIT_INDEX_FILE:-$(git rev-parse --path-format=absolute --git-path index)}
+case $index_file in
+/*) ;;
+*) index_file=$(pwd)/$index_file ;;
+esac
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
+# git runs a git command against the index this commit records.
+git() {
+	GIT_INDEX_FILE=$index_file command git "$@"
+}
+
+files=$(git diff --cached --name-only -z --diff-filter=ACMR | tr '\0' '\n')
+if [ -z "$files" ]; then
+	exit 0
+fi
+
+# node_bin holds the JS tools. A linked worktree has no node_modules, so it
+# runs the main checkout's tools.
+node_bin=$(pwd)/node_modules/.bin
+if [ ! -d node_modules ]; then
+	# A submodule's common directory names its checkout in core.worktree; a
+	# clone's common directory is the .git directory inside its checkout.
+	common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+	main_dir=$(command git -C "$common_dir" rev-parse --show-toplevel 2>/dev/null) ||
+		main_dir=$(dirname "$common_dir")
+	node_bin=$main_dir/node_modules/.bin
+fi
+PATH=$node_bin:$PATH
+
+# Format and restage only files whose worktree matches the index. Restaging a
+# partially staged file would fold its unstaged edits into the commit, so
+# compare its staged blob with the formatter output instead and refuse the
+# commit when they differ.
+unstaged_list=$(mktemp)
+staged_blob=$(mktemp)
+formatted_blob=$(mktemp)
+trap 'rm -f "$unstaged_list" "$staged_blob" "$formatted_blob"' EXIT HUP INT TERM
+git diff --name-only -z | tr '\0' '\n' >"$unstaged_list"
+
+# whole_files prints the listed files that have no unstaged edits.
+whole_files() {
+	printf "%s\n" "$1" | grep -Fxv -f "$unstaged_list" || true
+}
+
+# check_partial_files fails the commit when the staged blob of a listed file
+# with unstaged edits differs from the output of the formatter command "$2",
+# which reads the blob on stdin and receives the path as its last argument.
+check_partial_files() {
+	unformatted=
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		git show ":$f" >"$staged_blob"
+		$2 "$f" <"$staged_blob" >"$formatted_blob"
+		if ! cmp -s "$staged_blob" "$formatted_blob"; then
+			unformatted="$unformatted$f
+"
+		fi
+	done <<PARTIAL_FILES
+$(printf "%s\n" "$1" | grep -Fx -f "$unstaged_list" || true)
+PARTIAL_FILES
+	if [ -n "$unformatted" ]; then
+		printf 'staged content needs formatting; format and restage these partially staged files:\n%s' "$unformatted" >&2
+		exit 1
+	fi
+}
+
+# oxfmt_stdin formats stdin as the file named by $1.
+oxfmt_stdin() {
+	"$node_bin/oxfmt" --stdin-filepath="$1"
+}
+
+# gofmt_stdin formats Go source from stdin.
+gofmt_stdin() {
+	gofmt
+}
+
+format_files=$(printf "%s\n" "$files" | grep -E '^((app|web|core|sdk|net)/.*\.(ts|tsx|js|html|css|scss)|[^/]+\.json|\.github/.*\.(json|yml)|\.oxfmtrc\.json|\.golangci\.yml|tsconfig.*\.json)$' | grep -vE '^\.protoc(-[a-z-]+)?-manifest\.json$' || true)
+if [ -n "$format_files" ]; then
+	format_whole=$(whole_files "$format_files")
+	if [ -n "$format_whole" ]; then
+		printf "%s\n" "$format_whole" | tr '\n' '\0' | xargs -0 "$node_bin/oxfmt"
+		printf "%s\n" "$format_whole" | tr '\n' '\0' | xargs -0 env GIT_INDEX_FILE="$index_file" git add
+	fi
+	check_partial_files "$format_files" oxfmt_stdin
+fi
+
+js_files=$(printf "%s\n" "$files" | grep -E '\.(js|mjs|ts|tsx)$' || true)
+if [ -n "$js_files" ]; then
+	printf "%s\n" "$js_files" | tr '\n' '\0' | xargs -0 "$node_bin/oxlint" --no-error-on-unmatched-pattern
+fi
+
+go_files=$(printf "%s\n" "$files" | grep -E '\.go$' || true)
+if [ -n "$go_files" ]; then
+	go_whole=$(whole_files "$go_files")
+	if [ -n "$go_whole" ]; then
+		printf "%s\n" "$go_whole" | tr '\n' '\0' | xargs -0 gofmt -w
+		printf "%s\n" "$go_whole" | tr '\n' '\0' | xargs -0 env GIT_INDEX_FILE="$index_file" git add
+	fi
+	check_partial_files "$go_files" gofmt_stdin
+
+	# Functions this commit changes must be written as code paragraphs.
+	go run ./.githooks/go-paragraphs
+
+	go_pkg_dirs=$(printf "%s\n" "$go_files" | tr '\n' '\0' | xargs -0 -n1 dirname | sort -u | sed 's#^\.$#.#; s#^\./##; s#^#./#')
+
+	# A package whose files the host platform excludes, such as a js-only one,
+	# cannot be listed or compiled here; the wasm build in CI covers it. Drop it
+	# and treat every other listing error as a failure. Read one directory per
+	# line and pass them as quoted arguments so names with spaces survive.
+	list_err=$(mktemp)
+	set --
+	while IFS= read -r go_pkg_dir; do
+		[ -n "$go_pkg_dir" ] || continue
+		# The go tool never builds testdata as a package; analyzer fixtures
+		# there resolve only inside their analysistest GOPATH.
+		case "$go_pkg_dir" in
+		*/testdata | */testdata/*) continue ;;
+		esac
+		# Nested tool modules own their dependency graph and have no aptre setup.
+		# Check them from their package directory instead of the root module.
+		module_file=$(cd "$go_pkg_dir" && go env GOMOD)
+		if [ "$module_file" != "$(pwd)/go.mod" ]; then
+			(cd "$go_pkg_dir" && go test -run '^$' . && go vet .)
+			continue
+		fi
+		# Keep stderr only from a failed listing; a successful one may still
+		# report module downloads there.
+		if pkg_err=$(GOFLAGS="-mod=mod" go list "$go_pkg_dir" 2>&1 >/dev/null); then
+			set -- "$@" "$go_pkg_dir"
+		else
+			printf '%s\n' "$pkg_err" >>"$list_err"
+		fi
+	done <<GO_PKG_DIRS
+$go_pkg_dirs
+GO_PKG_DIRS
+	if grep -v 'build constraints exclude all Go files' "$list_err" | grep -q .; then
+		cat "$list_err" >&2
+		rm -f "$list_err"
+		exit 1
+	fi
+	rm -f "$list_err"
+fi
+
+if [ "$#" -gt 0 ]; then
+	# go fix runs in the Go Fix workflow on master, not here: its analyzers walk
+	# every dependency of the package, which made a cold commit take over ten
+	# seconds. The purego build is checked by the aptre lint below and by CI.
+	#
+	# The compile check (tests included) and the aptre lint both read the same
+	# packages, so run them in parallel. Capture each output and fail the commit
+	# if either fails, printing both logs. The lint loads packages from vendor/
+	# (.golangci.yml), which a linked worktree lacks until it is vendored.
+	if [ ! -d vendor ]; then
+		go mod vendor
+	fi
+	compile_out=$(mktemp)
+	lint_out=$(mktemp)
+	GOFLAGS="-mod=mod" go test -run '^$' "$@" >"$compile_out" 2>&1 &
+	compile_pid=$!
+	bun run go:aptre -- lint "$@" >"$lint_out" 2>&1 &
+	lint_pid=$!
+	go_rc=0
+	wait "$compile_pid" || go_rc=1
+	wait "$lint_pid" || go_rc=1
+	if [ "$go_rc" -ne 0 ]; then
+		cat "$compile_out" "$lint_out" >&2
+		rm -f "$compile_out" "$lint_out"
+		exit 1
+	fi
+	rm -f "$compile_out" "$lint_out"
+fi
+
+# Check the staged go.mod. The check runs go, so it reads the file instead of
+# the index this commit records.
+if printf "%s\n" "$files" | grep -Eq '^go\.mod$'; then
+	staged_go_mod=$(mktemp)
+	git show :go.mod >"$staged_go_mod"
+	pins_rc=0
+	GO_MOD_REF_PINS_FILE=$staged_go_mod .githooks/check-go-mod-ref-pins || pins_rc=$?
+	rm -f "$staged_go_mod"
+	exit "$pins_rc"
+fi

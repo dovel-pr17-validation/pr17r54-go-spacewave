@@ -1,0 +1,340 @@
+package publish
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/aperturerobotics/go-kvfile"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/core/provider/spacewave/clouderror"
+	"github.com/s4wave/spacewave/db/block/bloom"
+	"github.com/s4wave/spacewave/db/packfile"
+	"github.com/s4wave/spacewave/db/packfile/identity"
+	"github.com/s4wave/spacewave/db/packfile/writer"
+)
+
+// FetchSourcePackToTempFile downloads one source pack into a temporary file.
+func FetchSourcePackToTempFile(
+	ctx context.Context,
+	opts Options,
+	entry *packfile.PackfileEntry,
+) (string, error) {
+	// Bound downloads by the advertised pack size before creating a local file.
+	// The read limit adds one byte past the budget to detect oversized bodies.
+	if entry.GetSizeBytes() >= math.MaxInt64-4096 {
+		return "", errors.Errorf("source pack size exceeds local reader limit: %d", entry.GetSizeBytes())
+	}
+	maxBytes := int64(entry.GetSizeBytes()) + 4096 //nolint:gosec // the MaxInt64-4096 check keeps this sum and the read limit representable.
+
+	// Read through the authenticated source rather than a public cache.
+	body, err := opts.Client.ReadPack(ctx, opts.SrcSpaceID, entry.GetId())
+	if err != nil {
+		return "", errors.Wrap(err, "read source pack")
+	}
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return "", errors.Wrap(err, "read source pack body")
+	}
+	if int64(len(data)) > maxBytes {
+		return "", errors.New("source pack exceeds declared size budget")
+	}
+
+	// The caller owns the completed file; partial files are removed here.
+	tmp, err := opts.tempFileFactory()("spacewave-cdn-pack-*.kvf")
+	if err != nil {
+		return "", errors.Wrap(err, "create temp pack file")
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", errors.Wrap(err, "write temp pack file")
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", errors.Wrap(err, "close temp pack file")
+	}
+	return tmp.Name(), nil
+}
+
+// PushSinglePack uploads a local kvfile pack to the destination Space.
+func PushSinglePack(
+	ctx context.Context,
+	opts Options,
+	packPath string,
+	bloomFilter []byte,
+) error {
+	packBytes, err := os.ReadFile(packPath)
+	if err != nil {
+		return errors.Wrap(err, "read pack file")
+	}
+	return PushPackData(ctx, opts, packBytes, bloomFilter)
+}
+
+// PushPackData verifies and uploads a kvfile with the shared publication retry
+// policy. Callers retain ownership of the bytes until the operation returns.
+func PushPackData(ctx context.Context, opts Options, packBytes, bloomFilter []byte) error {
+	return pushPackData(ctx, opts, packBytes, bloomFilter, nil)
+}
+
+// PushReplacementData uploads a kvfile like PushPackData that atomically
+// supersedes the replaced packs. The caller must first make every block still
+// reachable from the destination's checkpoint available outside them. At most
+// 32 packs may be replaced.
+func PushReplacementData(ctx context.Context, opts Options, packBytes, bloomFilter []byte, replaced []string) error {
+	return pushPackData(ctx, opts, packBytes, bloomFilter, replaced)
+}
+
+// pushPackData verifies and uploads a kvfile that supersedes replaced.
+func pushPackData(ctx context.Context, opts Options, packBytes, bloomFilter []byte, replaced []string) error {
+	// Derive resource-scoped identity from verified content and pack policy.
+	metadata, err := BuildKVFilePushMetadata(ctx, packBytes)
+	if err != nil {
+		return errors.Wrap(err, "build kvfile metadata")
+	}
+	if len(bloomFilter) == 0 {
+		bloomFilter = metadata.BloomFilter
+	}
+	packID, err := identity.BuildPackID(opts.DstSpaceID, metadata.PackResult())
+	if err != nil {
+		return errors.Wrap(err, "build pack id")
+	}
+
+	// Transient service failures retry the same immutable content identity.
+	packHash := sha256.Sum256(packBytes)
+	push := func() error {
+		if len(replaced) == 0 {
+			return opts.Client.SyncPushData(ctx, opts.DstSpaceID, packID, metadata.BlockCount, packBytes, packHash[:], bloomFilter, packfile.BloomFormatVersionV1)
+		}
+		return opts.Client.SyncReplaceData(ctx, opts.DstSpaceID, packID, metadata.BlockCount, packBytes, packHash[:], bloomFilter, packfile.BloomFormatVersionV1, replaced)
+	}
+	if err := retrySyncPush(ctx, push); err != nil {
+		return errors.Wrap(err, "sync push")
+	}
+	_, err = io.WriteString(
+		opts.output(),
+		"  pushed pack "+packID+
+			" size="+strconv.Itoa(len(packBytes))+
+			" blocks="+strconv.Itoa(metadata.BlockCount)+
+			" replaced="+strconv.Itoa(len(replaced))+"\n",
+	)
+	return err
+}
+
+// StagingClient is a session client that pushes a pack in two steps, so a
+// caller uploading several packs at once commits them in an order it chooses.
+type StagingClient interface {
+	SessionClient
+	// SyncPushUpload admits and uploads a pack, and reports whether it awaits
+	// SyncPushCommit.
+	SyncPushUpload(ctx context.Context, resourceID, packID string, blockCount int, packData, bodyHash, bloomFilter []byte, bloomFormatVersion uint32) (bool, error)
+	// SyncPushCommit adds an uploaded pack to the catalog.
+	SyncPushCommit(ctx context.Context, resourceID, packID string) error
+}
+
+// StagedPack is a pack uploaded to the destination and not yet committed.
+type StagedPack struct {
+	// client commits the pack.
+	client StagingClient
+	// spaceID is the destination Space.
+	spaceID string
+	// id is the pack ID.
+	id string
+	// pending is set when the pack awaits its commit.
+	pending bool
+}
+
+// StagePackData verifies and uploads a kvfile like PushPackData, leaving its
+// commit to Commit. opts.Client must be a StagingClient.
+func StagePackData(ctx context.Context, opts Options, packBytes, bloomFilter []byte) (*StagedPack, error) {
+	// Require a client that pushes in two steps.
+	client, ok := opts.Client.(StagingClient)
+	if !ok {
+		return nil, errors.New("the session client cannot stage a pack")
+	}
+
+	// Derive the pack's identity from its verified content.
+	metadata, err := BuildKVFilePushMetadata(ctx, packBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "build kvfile metadata")
+	}
+	if len(bloomFilter) == 0 {
+		bloomFilter = metadata.BloomFilter
+	}
+	packID, err := identity.BuildPackID(opts.DstSpaceID, metadata.PackResult())
+	if err != nil {
+		return nil, errors.Wrap(err, "build pack id")
+	}
+
+	// Upload under the shared retry policy.
+	packHash := sha256.Sum256(packBytes)
+	staged := &StagedPack{client: client, spaceID: opts.DstSpaceID, id: packID}
+	err = retrySyncPush(ctx, func() error {
+		var err error
+		staged.pending, err = client.SyncPushUpload(ctx, opts.DstSpaceID, packID, metadata.BlockCount, packBytes, packHash[:], bloomFilter, packfile.BloomFormatVersionV1)
+		return err
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "sync push upload")
+	}
+	return staged, nil
+}
+
+// ID returns the pack ID.
+func (p *StagedPack) ID() string {
+	return p.id
+}
+
+// Commit adds the staged pack to the destination's catalog, under the shared
+// retry policy. A pack the catalog already held commits at once.
+func (p *StagedPack) Commit(ctx context.Context) error {
+	if !p.pending {
+		return nil
+	}
+	if err := retrySyncPush(ctx, func() error { return p.client.SyncPushCommit(ctx, p.spaceID, p.id) }); err != nil {
+		return err
+	}
+	p.pending = false
+	return nil
+}
+
+// retrySyncPush bounds transient retries of push and honors cancellation. A
+// retried replacement of a pack the catalog already committed succeeds.
+func retrySyncPush(ctx context.Context, push func() error) error {
+	var lastErr error
+	for attempt := range 3 {
+		err := push()
+		if err == nil {
+			return nil
+		}
+		if !isRetryableSyncPushError(err) || attempt == 2 {
+			return err
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(1<<attempt) * time.Second):
+		}
+	}
+	return lastErr
+}
+
+// isRetryableSyncPushError classifies service and transport failures eligible
+// for the bounded publication retry policy: a 429 or 5xx answer, a timeout,
+// or a connection dropped or refused. It reads the error's type, never its
+// text, which carries URLs and pack IDs.
+func isRetryableSyncPushError(err error) bool {
+	// Retry an answer the service marks as transient.
+	var cerr *clouderror.Error
+	if errors.As(err, &cerr) {
+		return cerr.Retryable || cerr.StatusCode == http.StatusTooManyRequests || cerr.StatusCode >= 500
+	}
+
+	// Retry a timeout or a lost connection.
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// KVFilePushMetadata is verified metadata for one kvfile pack.
+type KVFilePushMetadata struct {
+	// BlockCount is the number of verified content entries.
+	BlockCount int
+	// BloomFilter describes the pack's content keys.
+	BloomFilter []byte
+	// SortedKeyDigest binds the ordered content-key set.
+	SortedKeyDigest []byte
+	// PackBytesDigest binds the exact uploaded bytes.
+	PackBytesDigest []byte
+	// PolicyTag identifies the writer policy included in pack identity.
+	PolicyTag string
+	// ValueOrderPolicy identifies the ordering used by the pack writer.
+	ValueOrderPolicy string
+}
+
+// PackResult returns the metadata needed for v1 pack identity.
+func (m KVFilePushMetadata) PackResult() *writer.PackResult {
+	return &writer.PackResult{
+		BlockCount:       uint64(m.BlockCount), //nolint:gosec // block counts are nonnegative in KVFilePushMetadata.
+		BloomFilter:      m.BloomFilter,
+		SortedKeyDigest:  m.SortedKeyDigest,
+		PackBytesDigest:  m.PackBytesDigest,
+		PolicyTag:        m.PolicyTag,
+		ValueOrderPolicy: m.ValueOrderPolicy,
+	}
+}
+
+// BuildKVFilePushMetadata verifies a kvfile and builds sync/push metadata.
+func BuildKVFilePushMetadata(ctx context.Context, data []byte) (*KVFilePushMetadata, error) {
+	// Open the kvfile index and bound its block count to the local integer range.
+	rdr, err := kvfile.BuildReader(bytesReaderAt(data), uint64(len(data))) //nolint:gosec // len(data) is the actual in-memory byte slice length.
+	if err != nil {
+		return nil, err
+	}
+	if rdr.Size() > uint64(^uint(0)>>1) {
+		return nil, errors.Errorf("kvfile block count exceeds local int range: %d", rdr.Size())
+	}
+	blockCount := int(rdr.Size()) //nolint:gosec // the preceding check bounds the reader count to int's range.
+
+	// Size the membership filter for the complete indexed block set.
+	policy := writer.DefaultPolicy()
+	bf := policy.NewBloomFilter(rdr.Size())
+	keys := make([][]byte, 0, blockCount)
+
+	// Reject corrupt content before publication can make the pack reachable.
+	err = rdr.ScanPrefixEntries(nil, func(ie *kvfile.IndexEntry, _ int) error {
+		// Stop verifying the pack when publication is canceled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Read and verify the indexed block against its content key.
+		key := ie.GetKey()
+		value, found, err := rdr.Get(key)
+		if err != nil {
+			return errors.Wrap(err, "read indexed block")
+		}
+		if !found {
+			return errors.New("indexed block not found")
+		}
+		if _, _, err := packfile.DecodeBlockValue(key, value); err != nil {
+			return errors.Wrap(err, "verify indexed block")
+		}
+
+		// Include the verified block in pack membership and identity metadata.
+		bf.Add(key)
+		keys = append(keys, bytes.Clone(key))
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "scan kvfile index")
+	}
+
+	// Pack identity covers the bytes, key set, and storage policy together.
+	bloomBytes, err := bloom.NewBloom(bf).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal bloom filter")
+	}
+	packHash := sha256.Sum256(data)
+	return &KVFilePushMetadata{
+		BlockCount:       blockCount,
+		BloomFilter:      bloomBytes,
+		SortedKeyDigest:  writer.DigestSortedKeys(keys),
+		PackBytesDigest:  packHash[:],
+		PolicyTag:        writer.PolicyTag(policy),
+		ValueOrderPolicy: writer.ValueOrderIterator,
+	}, nil
+}

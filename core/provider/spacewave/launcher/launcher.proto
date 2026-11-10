@@ -1,0 +1,304 @@
+syntax = "proto3";
+package spacewave.launcher;
+
+import "github.com/aperturerobotics/controllerbus/controller/configset/proto/configset.proto";
+import "github.com/s4wave/spacewave/bldr/desktop/update/update.proto";
+import "google/protobuf/timestamp.proto";
+
+// DistConfig is the encoded and signed object that is exposed on the
+// distribution URL endpoints. The config with the highest valid revision field
+// and valid signature is accepted as the latest config.
+//
+// Usually encoded with packedmsg(peer.SignedMsg(DistConfig))
+message DistConfig {
+  // ProjectId is the identifier of the project.
+  // usually matches the id: field in the project config.
+  // if this doesn't match the app config is ignored.
+  string project_id = 1;
+  // Rev is the revision of this app config object.
+  uint64 rev = 2;
+
+  // LauncherConfigSet is a ConfigSet to apply to the launcher host bus.
+  // This signed field carries trusted release-time host services such as the
+  // Release World CDN block-store provider.
+  map<string, .configset.proto.ControllerConfig> launcher_config_set = 3;
+
+  // ChannelKey selects the release channel this DistConfig targets.
+  string channel_key = 8;
+
+  // Reserved field numbers. Previously:
+  //   4 -> string entrypoint_version
+  //   5 -> map<string, EntrypointAsset> entrypoint_assets
+  //   6 -> string plugin_version
+  //   7 -> map<string, PluginAsset> plugin_assets
+  reserved 4, 5, 6, 7;
+  reserved "entrypoint_version", "entrypoint_assets", "plugin_version",
+    "plugin_assets";
+}
+
+// LauncherInfo contains information about the state of the launcher.
+message LauncherInfo {
+  // DistConfig contains the latest app dist config object.
+  // May be empty if the config is not known / fetched yet.
+  DistConfig dist_config = 1;
+  // UpdateState describes the installed-app update state.
+  UpdateState update_state = 2;
+  // FetchStatus describes DistConfig fetching and release selection.
+  FetchStatus fetch_status = 3;
+  // DaemonUpdateState describes the separately staged daemon artifact.
+  UpdateState daemon_update_state = 4;
+  // DaemonUpdateWait describes an accepted daemon update waiting for other work.
+  DaemonUpdateWait daemon_update_wait = 5;
+  // DistConfigMsg is the signed packedmsg dist_config was parsed from.
+  // Empty when dist_config is empty.
+  string dist_config_msg = 6;
+}
+
+// DaemonUpdateWait reports the work keeping an accepted daemon update from
+// its handoff. The desktop shell is not counted: the handoff reopens it.
+message DaemonUpdateWait {
+  // OtherWork names the clients and services besides the desktop, sorted,
+  // with a count suffix on a repeated name.
+  repeated string other_work = 1;
+  // RestartNow asks the daemon to hand off without waiting for other work.
+  bool restart_now = 2;
+}
+
+// FetchStatus describes the launcher's DistConfig fetch and Release World
+// selection state. The launcher controller replaces it on every transition.
+message FetchStatus {
+  // Fetching is true while an endpoint fetch is in flight.
+  bool fetching = 1;
+  // HasConfig is true once the launcher selected a non-empty DistConfig from
+  // storage, the package, the built-in default, or an endpoint.
+  bool has_config = 2;
+  // SelectedConfigRev is the revision of the selected DistConfig.
+  uint64 selected_config_rev = 3;
+  // SelectedConfigSource is the source of the selected DistConfig.
+  DistConfigSource selected_config_source = 4;
+  // FetchedConfigRev is the most recent valid endpoint DistConfig revision.
+  uint64 fetched_config_rev = 5;
+  // FetchedConfigSource is the endpoint URL that produced FetchedConfigRev.
+  string fetched_config_source = 6;
+  // ReleaseMetadataOutcome is the latest Release World metadata resolution
+  // result for the selected DistConfig.
+  ReleaseMetadataOutcome release_metadata_outcome = 7;
+  // ReleaseWorldHeadRef is the Release World root ref used for the latest
+  // metadata resolution.
+  string release_world_head_ref = 8;
+  // SelectedEntrypointManifestId identifies the native entrypoint manifest
+  // selected from release metadata for staging.
+  string selected_entrypoint_manifest_id = 9;
+  // SelectedEntrypointPlatformId is the desktop platform of the selected
+  // native entrypoint manifest.
+  string selected_entrypoint_platform_id = 10;
+  // SelectedEntrypointManifestRev is the revision of the selected native
+  // entrypoint manifest.
+  uint64 selected_entrypoint_manifest_rev = 11;
+  // SelectedEntrypointManifestRef is the selected native entrypoint object
+  // ref in string form.
+  string selected_entrypoint_manifest_ref = 12;
+  // SelectedCliManifestId identifies the CLI entrypoint manifest selected
+  // from release metadata for the desktop-managed CLI.
+  string selected_cli_manifest_id = 13;
+  // SelectedCliPlatformId is the desktop platform of the selected CLI
+  // entrypoint manifest.
+  string selected_cli_platform_id = 14;
+  // SelectedCliManifestRev is the revision of the selected CLI entrypoint
+  // manifest.
+  uint64 selected_cli_manifest_rev = 15;
+  // SelectedCliManifestRef is the selected CLI entrypoint object ref in
+  // string form.
+  string selected_cli_manifest_ref = 16;
+  // SelectedCliBinaryPath is the local staged CLI binary path written to the
+  // managed CLI release sidecar.
+  string selected_cli_binary_path = 17;
+  // LastError is the most recent endpoint fetch error, empty when the last
+  // attempt succeeded or no fetch has run.
+  string last_error = 18;
+  // Attempts counts endpoint rounds since the last successful fetch.
+  uint32 attempts = 19;
+  // NextRetryAt is the time of the next scheduled fetch. Empty while a fetch
+  // is in flight or when none is scheduled.
+  google.protobuf.Timestamp next_retry_at = 20;
+}
+
+// DistConfigSource is where the launcher found its selected DistConfig.
+enum DistConfigSource {
+  // DIST_CONFIG_SOURCE_UNKNOWN means the launcher has not selected a config.
+  DIST_CONFIG_SOURCE_UNKNOWN = 0;
+  // DIST_CONFIG_SOURCE_NONE means no DistConfig was available at startup.
+  DIST_CONFIG_SOURCE_NONE = 1;
+  // DIST_CONFIG_SOURCE_STORED means the config came from launcher storage.
+  DIST_CONFIG_SOURCE_STORED = 2;
+  // DIST_CONFIG_SOURCE_PACKAGE means the config came from the app package.
+  DIST_CONFIG_SOURCE_PACKAGE = 3;
+  // DIST_CONFIG_SOURCE_EMBEDDED_DEFAULT means the config came from the
+  // default built into the launcher.
+  DIST_CONFIG_SOURCE_EMBEDDED_DEFAULT = 4;
+  // DIST_CONFIG_SOURCE_ENDPOINT means the config came from a dist endpoint.
+  DIST_CONFIG_SOURCE_ENDPOINT = 5;
+  // DIST_CONFIG_SOURCE_PUSH means the config was pushed to the launcher,
+  // such as by a linked peer.
+  DIST_CONFIG_SOURCE_PUSH = 6;
+}
+
+// ReleaseMetadataOutcome is the state of Release World metadata resolution
+// for the selected DistConfig.
+enum ReleaseMetadataOutcome {
+  // RELEASE_METADATA_OUTCOME_UNKNOWN means resolution has not reported.
+  RELEASE_METADATA_OUTCOME_UNKNOWN = 0;
+  // RELEASE_METADATA_OUTCOME_PENDING means the launcher started and has not
+  // resolved release metadata yet.
+  RELEASE_METADATA_OUTCOME_PENDING = 1;
+  // RELEASE_METADATA_OUTCOME_IDLE means no DistConfig is selected.
+  RELEASE_METADATA_OUTCOME_IDLE = 2;
+  // RELEASE_METADATA_OUTCOME_RESOLVING means the launcher is reading the
+  // channel from the Release World.
+  RELEASE_METADATA_OUTCOME_RESOLVING = 3;
+  // RELEASE_METADATA_OUTCOME_REFRESHING means the Release World head is behind
+  // the selector and the launcher is refreshing it.
+  RELEASE_METADATA_OUTCOME_REFRESHING = 4;
+  // RELEASE_METADATA_OUTCOME_CURRENT means the running entrypoint matches the
+  // selected release.
+  RELEASE_METADATA_OUTCOME_CURRENT = 5;
+  // RELEASE_METADATA_OUTCOME_DOWNLOADING means the selected entrypoint is
+  // being downloaded.
+  RELEASE_METADATA_OUTCOME_DOWNLOADING = 6;
+  // RELEASE_METADATA_OUTCOME_STAGED means the selected entrypoint is staged
+  // for install.
+  RELEASE_METADATA_OUTCOME_STAGED = 7;
+  // RELEASE_METADATA_OUTCOME_ERROR means resolution failed and will retry.
+  RELEASE_METADATA_OUTCOME_ERROR = 8;
+}
+
+// UpdateState describes one explicit installed-app or daemon update target.
+message UpdateState {
+  // Phase is the current update phase.
+  UpdatePhase phase = 1;
+  // Version is the target update version.
+  string version = 2;
+  // DownloadProgress is download progress percentage (0-100).
+  uint32 download_progress = 3;
+  // StagedPath is the path to the staged binary (when phase is STAGED).
+  string staged_path = 4;
+  // ErrorMessage contains any error message.
+  string error_message = 5;
+  // Target identifies the component this state can replace.
+  .bldr.desktop.update.UpdateTarget target = 6;
+  // ArtifactManifestId identifies the selected signed release artifact.
+  string artifact_manifest_id = 7;
+  // StagedSha256 identifies the verified executable bytes for a daemon handoff.
+  string staged_sha256 = 8;
+}
+
+// UpdatePhase is the phase of the entrypoint update.
+enum UpdatePhase {
+  // UPDATE_PHASE_UNKNOWN means no update is in progress.
+  UPDATE_PHASE_UNKNOWN = 0;
+  // UPDATE_PHASE_DOWNLOADING means the update is being downloaded.
+  UPDATE_PHASE_DOWNLOADING = 1;
+  // UPDATE_PHASE_STAGED means the update is downloaded and ready to install.
+  UPDATE_PHASE_STAGED = 2;
+  // UPDATE_PHASE_APPLYING means the update is being applied.
+  UPDATE_PHASE_APPLYING = 3;
+  // UPDATE_PHASE_ERROR means the update failed.
+  UPDATE_PHASE_ERROR = 4;
+}
+
+// Launcher exposes the launcher controller's DistConfig and update state.
+service Launcher {
+  // WatchLauncherInfo streams the launcher state on every change.
+  rpc WatchLauncherInfo(WatchLauncherInfoRequest) returns (stream LauncherInfo) {}
+  // PushDistConfigMsg offers a signed DistConfig found in a block of text.
+  rpc PushDistConfigMsg(PushDistConfigRequest) returns (PushDistConfigResponse) {}
+  // RecheckDistConfig starts an immediate DistConfig fetch.
+  rpc RecheckDistConfig(RecheckDistConfigRequest) returns (RecheckDistConfigResponse) {}
+  // ApplyUpdate prepares the explicitly selected staged target for its owner.
+  rpc ApplyUpdate(.bldr.desktop.update.ApplyUpdateRequest) returns (.bldr.desktop.update.ApplyUpdateResponse) {}
+  // ReportDaemonUpdateFailure records a failed accepted daemon handoff.
+  rpc ReportDaemonUpdateFailure(ReportDaemonUpdateFailureRequest) returns (ReportDaemonUpdateFailureResponse) {}
+  // ClaimDaemonUpdate marks a completed daemon idle claim before watch teardown.
+  rpc ClaimDaemonUpdate(ClaimDaemonUpdateRequest) returns (ClaimDaemonUpdateResponse) {}
+  // ReportDaemonUpdateWait publishes the work an accepted daemon update waits for.
+  rpc ReportDaemonUpdateWait(ReportDaemonUpdateWaitRequest) returns (ReportDaemonUpdateWaitResponse) {}
+  // RestartDaemonUpdateNow asks the daemon to hand off without waiting.
+  rpc RestartDaemonUpdateNow(RestartDaemonUpdateNowRequest) returns (RestartDaemonUpdateNowResponse) {}
+}
+
+// ReportDaemonUpdateWaitRequest identifies the accepted selection and its wait.
+message ReportDaemonUpdateWaitRequest {
+  // Selection is the APPLYING state observed by the serving daemon.
+  UpdateState selection = 1;
+  // OtherWork names the clients and services besides the desktop, sorted,
+  // with a count suffix on a repeated name.
+  repeated string other_work = 2;
+}
+
+// ReportDaemonUpdateWaitResponse says whether the current selection was updated.
+message ReportDaemonUpdateWaitResponse {
+  // Reported is false if the accepted selection has already changed.
+  bool reported = 1;
+}
+
+// RestartDaemonUpdateNowRequest asks the waiting daemon update to proceed.
+message RestartDaemonUpdateNowRequest {}
+
+// RestartDaemonUpdateNowResponse is returned once the request is published.
+message RestartDaemonUpdateNowResponse {}
+
+// ClaimDaemonUpdateRequest identifies the accepted selection claimed by the daemon.
+message ClaimDaemonUpdateRequest {
+  // Selection is the APPLYING state observed by the serving daemon.
+  UpdateState selection = 1;
+}
+
+// ClaimDaemonUpdateResponse says whether the current selection was claimed.
+message ClaimDaemonUpdateResponse {
+  // Claimed is false if the accepted selection has already changed.
+  bool claimed = 1;
+}
+
+// ReportDaemonUpdateFailureRequest identifies the accepted selection that failed.
+message ReportDaemonUpdateFailureRequest {
+  // Selection is the APPLYING state observed by the serving daemon.
+  UpdateState selection = 1;
+  // ErrorMessage describes the failure before the daemon claimed full idle.
+  string error_message = 2;
+}
+
+// ReportDaemonUpdateFailureResponse says whether the current selection failed.
+message ReportDaemonUpdateFailureResponse {
+  // Reported is false if the selected update has already changed.
+  bool reported = 1;
+}
+
+// RecheckDistConfigRequest is a request to immediately recheck for updates.
+message RecheckDistConfigRequest {}
+
+// RecheckDistConfigResponse is returned as soon as the fetch starts.
+message RecheckDistConfigResponse {}
+
+// WatchLauncherInfoRequest is the request to get the launcher info.
+message WatchLauncherInfoRequest {
+  // DaemonOwner registers this stream as the serving daemon's update watch.
+  bool daemon_owner = 1;
+}
+
+// PushDistConfigRequest is the request to push an app dist config signed message.
+message PushDistConfigRequest {
+  // Body is the block of text containing the packedmsg.
+  // We will scan the body of message for a valid signed packedmsg.
+  string body = 1;
+}
+
+// PushDistConfigResponse is the response to PushDistConfigRequest.
+// A body without a valid packedmsg fails the call instead.
+message PushDistConfigResponse {
+  // Updated indicates that the found packedmsg is now the latest.
+  bool updated = 1;
+  // Rev is the revision of the found app config object.
+  uint64 rev = 2;
+  // PrevRev is the revision of the previous app config object. 0 if none.
+  uint64 prev_rev = 3;
+}

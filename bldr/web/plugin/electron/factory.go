@@ -1,0 +1,98 @@
+package electron
+
+import (
+	"context"
+	"os"
+	"runtime"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller"
+)
+
+// Factory constructs a Electron runtime controller.
+type Factory struct {
+	// bus is the controller bus
+	bus bus.Bus
+}
+
+// NewFactory builds a Browser runtime factory.
+func NewFactory(bus bus.Bus) *Factory {
+	return &Factory{bus: bus}
+}
+
+// GetConfigID returns the configuration ID for the controller.
+func (t *Factory) GetConfigID() string {
+	return ConfigID
+}
+
+// GetControllerID returns the unique ID for the controller.
+func (t *Factory) GetControllerID() string {
+	return ControllerID
+}
+
+// ConstructConfig constructs an instance of the controller configuration.
+func (t *Factory) ConstructConfig() config.Config {
+	return &Config{}
+}
+
+// Construct constructs the associated controller given configuration.
+func (t *Factory) Construct(
+	ctx context.Context,
+	conf config.Config,
+	opts controller.ConstructOpts,
+) (controller.Controller, error) {
+
+	// Read the factory options and config.
+	le := opts.GetLogger()
+	cc := conf.(*Config)
+
+	// Default the web runtime ID when unset.
+	webRuntimeId := cc.GetWebRuntimeId()
+	if webRuntimeId == "" {
+		webRuntimeId = "default"
+	}
+
+	// Default the workdir path to the current directory.
+	workdirPath := cc.GetWorkdirPath()
+	if workdirPath == "" {
+		var err error
+		workdirPath, err = os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Construct the Electron controller.
+	return NewController(
+		le,
+		t.bus,
+		cc.GetElectronPath(),
+		workdirPath,
+		cc.GetRendererPath(),
+		webRuntimeId,
+		cc.GetElectronFlags(),
+		&ElectronInit{
+			ExternalLinks:             cc.GetExternalLinks(),
+			AppName:                   cc.GetAppName(),
+			WindowTitle:               cc.GetWindowTitle(),
+			WindowWidth:               cc.GetWindowWidth(),
+			WindowHeight:              cc.GetWindowHeight(),
+			DevTools:                  cc.GetDevTools(),
+			ThemeSource:               cc.GetThemeSource(),
+			QuitPolicy:                cc.GetQuitPolicy(),
+			DesktopPresencePolicy:     effectiveDesktopPresencePolicy(cc.GetDesktopPresencePolicy(), runtime.GOOS),
+			TrayIconPath:              cc.GetTrayIconPath(),
+			MacosTemplateTrayIconPath: cc.GetMacosTemplateTrayIconPath(),
+			ManagedCliRelease:         cc.GetManagedCliRelease().CloneVT(),
+		},
+	)
+}
+
+// GetVersion returns the version of this controller.
+func (t *Factory) GetVersion() controller.Version {
+	return Version
+}
+
+// _ is a type assertion
+var _ controller.Factory = (*Factory)(nil)

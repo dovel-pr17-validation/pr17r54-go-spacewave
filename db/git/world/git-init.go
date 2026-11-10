@@ -1,0 +1,142 @@
+package git_world
+
+import (
+	"context"
+
+	timestamppb "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	unixfs_world "github.com/s4wave/spacewave/db/unixfs/world"
+	"github.com/s4wave/spacewave/db/world"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// NewGitInitOp constructs a new GitInitOp block.
+// repoRef, worktreeArgs, ts can be empty
+func NewGitInitOp(
+	objKey string,
+	repoRef *bucket.ObjectRef,
+	disableCheckout bool,
+	worktreeArgs *GitCreateWorktreeOp,
+	ts *timestamppb.Timestamp,
+) *GitInitOp {
+	if disableCheckout {
+		worktreeArgs = nil
+	}
+	return &GitInitOp{
+		ObjectKey:       objKey,
+		RepoRef:         repoRef,
+		DisableCheckout: disableCheckout,
+		CreateWorktree:  worktreeArgs,
+		Timestamp:       ts,
+	}
+}
+
+// Validate checks the init operation.
+func (o *GitInitOp) Validate() error {
+	if o.GetObjectKey() == "" {
+		return world.ErrEmptyObjectKey
+	}
+	if !o.GetRepoRef().GetEmpty() {
+		if err := o.GetRepoRef().Validate(); err != nil {
+			return errors.Wrap(err, "repo_ref")
+		}
+	}
+	if !o.GetDisableCheckout() && o.GetCreateWorktree() != nil {
+		if err := o.GetCreateWorktree().Validate(); err != nil {
+			return errors.Wrap(err, "create_worktree")
+		}
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *GitInitOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Read the repository object identifier and initial root reference.
+	objKey := o.GetObjectKey()
+	repoRef := o.GetRepoRef()
+
+	// Create or validate the repository root reference.
+	repoRef, err = ValidateOrCreateRepo(ctx, worldHandle.AccessWorldState, repoRef)
+	if err != nil {
+		return false, err
+	}
+
+	// Register the repository object in world state.
+	var createdObject world.ObjectState
+	createdObject, err = worldHandle.CreateObject(ctx, objKey, repoRef)
+	world.ReleaseObjectState(createdObject)
+	if err != nil {
+		return false, err
+	}
+
+	// Record the repository type metadata.
+	if err := world_types.SetObjectType(ctx, worldHandle, objKey, GitRepoTypeID); err != nil {
+		return false, err
+	}
+
+	// Create the configured worktree and checkout when enabled.
+	if !o.GetDisableCheckout() {
+		op := o.GetCreateWorktree()
+		if op == nil {
+			op = &GitCreateWorktreeOp{
+				ObjectKey:     objKey + "/worktree",
+				CreateWorkdir: true,
+				WorkdirRef: &unixfs_world.UnixfsRef{
+					ObjectKey: objKey + "/workdir",
+				},
+				Timestamp: o.GetTimestamp(),
+			}
+		}
+		op.RepoObjectKey = objKey
+		_, sysErr, err = worldHandle.ApplyWorldOp(ctx, op, sender)
+		if err != nil {
+			return sysErr, err
+		}
+	}
+
+	return false, nil
+}
+
+// ApplyWorldObjectOp applies the operation to a world object handle.
+func (o *GitInitOp) ApplyWorldObjectOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	objectHandle world.ObjectState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Applying to an existing object.
+	// Disable checkout, ignore object key.
+	repoRef := o.GetRepoRef()
+
+	// Create or validate the repository root for the existing object.
+	repoRef, err = ValidateOrCreateRepo(ctx, objectHandle.AccessWorldState, repoRef)
+	if err != nil {
+		return false, err
+	}
+
+	// Publish the validated repository root on the object handle.
+	_, err = objectHandle.SetRootRef(ctx, repoRef)
+	return false, err
+}
+
+// GetPayloadRefs returns the root of the repository the operation imports,
+// which its writer stored before the operation, or none for a new repository.
+func (o *GitInitOp) GetPayloadRefs() []*block.BlockRef {
+	root := o.GetRepoRef().GetRootRef()
+	if root.GetEmpty() {
+		return nil
+	}
+	return []*block.BlockRef{root}
+}
+
+// _ is a type assertion
+var _ world.PayloadOperation = (*GitInitOp)(nil)

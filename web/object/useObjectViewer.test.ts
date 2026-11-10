@@ -1,0 +1,533 @@
+import {
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createElement, type ReactNode } from 'react'
+import type { Resource } from '@aptre/bldr-sdk/hooks/useResource.js'
+import type { IWorldState } from '@s4wave/sdk/world/world-state.js'
+import {
+  buildSpaceObjectActionTargets,
+  type SpaceObjectActionTarget,
+} from '@s4wave/web/space/object-tree.js'
+import { DocumentTitleProvider } from '@s4wave/web/title/DocumentTitleContext.js'
+import { DocumentTitleFocusContext } from '@s4wave/web/title/DocumentTitleFocusContext.js'
+
+import type { ObjectViewerComponent } from './object.js'
+import { TabContextProvider } from './TabContext.js'
+import {
+  getDefaultStateNamespace,
+  resolveObjectViewerSelection,
+  shouldHoldDebugViewerFallback,
+  useObjectViewer,
+} from './useObjectViewer.js'
+
+const h = vi.hoisted(() => {
+  return {
+    worldSetup: {
+      typeID: 'canvas',
+      rootRef: '',
+      visibleComponents: [] as ObjectViewerComponent[],
+      objectState: {
+        value: { id: 'visible-doc' },
+        loading: false,
+        error: null,
+        retry: vi.fn(),
+      },
+    },
+    spaceContext: {
+      objectKey: 'visible-doc',
+      spaceName: 'Research',
+      spaceState: { ready: true },
+      spaceObjectTargets: {
+        targets: [] as SpaceObjectActionTarget[],
+        more: false,
+      },
+      navigateToObjects: vi.fn(),
+      navigateToRoot: vi.fn(),
+      canDeleteObjects: true,
+      spaceWorld: {
+        deleteObject: vi.fn().mockResolvedValue({ deleted: true }),
+      },
+    },
+  }
+})
+
+vi.mock('@s4wave/web/hooks/useViewerRegistry.js', () => ({
+  useAllViewers: () => [],
+  getViewersForType: () => [],
+}))
+
+vi.mock('./useObjectViewerSetup.js', () => ({
+  useObjectViewerSetup: () => h.worldSetup,
+}))
+
+vi.mock('@s4wave/web/contexts/SpaceContainerContext.js', () => ({
+  SpaceContainerContext: {
+    useContextSafe: () => h.spaceContext,
+  },
+}))
+
+beforeEach(() => {
+  h.worldSetup = {
+    typeID: 'canvas',
+    rootRef: '',
+    visibleComponents: [],
+    objectState: {
+      value: { id: 'visible-doc' },
+      loading: false,
+      error: null,
+      retry: vi.fn(),
+    },
+  }
+  h.spaceContext = {
+    objectKey: 'visible-doc',
+    spaceName: 'Research',
+    spaceState: { ready: true },
+    spaceObjectTargets: {
+      targets: buildSpaceObjectActionTargets([
+        { objectKey: 'visible-doc', typeId: 'canvas' },
+      ]),
+      more: false,
+    },
+    navigateToObjects: vi.fn(),
+    navigateToRoot: vi.fn(),
+    canDeleteObjects: true,
+    spaceWorld: {
+      deleteObject: vi.fn().mockResolvedValue({ deleted: true }),
+    },
+  }
+})
+
+afterEach(() => {
+  cleanup()
+})
+
+function component(
+  componentID: string,
+  name = componentID,
+): ObjectViewerComponent {
+  return {
+    componentID,
+    typeID: 'gizmo/worklist',
+    name,
+    component: () => null,
+  }
+}
+
+describe('getDefaultStateNamespace', () => {
+  it('uses an explicit namespace over the object-derived default', () => {
+    expect(
+      getDefaultStateNamespace(
+        {
+          info: {
+            case: 'worldObjectInfo',
+            value: {
+              objectKey: 'drive',
+            },
+          },
+        },
+        'drive',
+        ['space', 'primary', 'drive'],
+      ),
+    ).toEqual(['space', 'primary', 'drive'])
+  })
+
+  it('keys world object viewer state by object key by default', () => {
+    expect(
+      getDefaultStateNamespace(
+        {
+          info: {
+            case: 'worldObjectInfo',
+            value: {
+              objectKey: 'drive',
+            },
+          },
+        },
+        'drive',
+        undefined,
+      ),
+    ).toEqual(['objectViewer', 'drive'])
+  })
+
+  it('keys UnixFS viewer state by UnixFS id and scoped path', () => {
+    expect(
+      getDefaultStateNamespace(
+        {
+          info: {
+            case: 'unixfsObjectInfo',
+            value: {
+              unixfsId: 'files',
+              path: '/photos/2026',
+            },
+          },
+        },
+        undefined,
+        undefined,
+      ),
+    ).toEqual(['objectViewer', 'unixfs', 'files', '/photos/2026'])
+  })
+
+  it('changes the UnixFS viewer namespace when the scoped path changes', () => {
+    const rootNs = getDefaultStateNamespace(
+      {
+        info: {
+          case: 'unixfsObjectInfo',
+          value: {
+            unixfsId: 'files',
+            path: '/',
+          },
+        },
+      },
+      undefined,
+      undefined,
+    )
+    const nestedNs = getDefaultStateNamespace(
+      {
+        info: {
+          case: 'unixfsObjectInfo',
+          value: {
+            unixfsId: 'files',
+            path: '/nested',
+          },
+        },
+      },
+      undefined,
+      undefined,
+    )
+
+    expect(rootNs).not.toEqual(nestedNs)
+  })
+})
+
+describe('resolveObjectViewerSelection', () => {
+  it('uses the ObjectLayout preferred component when no local selection exists', () => {
+    const viewers = [
+      component('spacewave.debug.viewer', 'Debug'),
+      component('gizmo.worklist.viewer', 'Worklist'),
+    ]
+
+    expect(
+      resolveObjectViewerSelection(viewers, undefined, 'gizmo.worklist.viewer')
+        .selectedComponent?.componentID,
+    ).toBe('gizmo.worklist.viewer')
+  })
+
+  it('keeps the browser-local selection ahead of the ObjectLayout preference', () => {
+    const viewers = [
+      component('spacewave.debug.viewer', 'Debug'),
+      component('gizmo.worklist.viewer', 'Worklist'),
+    ]
+
+    expect(
+      resolveObjectViewerSelection(
+        viewers,
+        'spacewave.debug.viewer',
+        'gizmo.worklist.viewer',
+      ).selectedComponent?.componentID,
+    ).toBe('spacewave.debug.viewer')
+  })
+
+  it('does not fall back from component ID selection to display names', () => {
+    const viewers = [
+      component('spacewave.debug.viewer', 'gizmo.worklist.viewer'),
+      component('gizmo.worklist.viewer', 'Worklist'),
+    ]
+
+    expect(
+      resolveObjectViewerSelection(viewers, undefined, 'gizmo.worklist.viewer')
+        .selectedComponent?.name,
+    ).toBe('Worklist')
+  })
+
+  it('falls back to the first visible viewer and exposes missing component IDs', () => {
+    const viewers = [
+      component('spacewave.debug.viewer', 'Debug'),
+      component('gizmo.worklist.viewer', 'Worklist'),
+    ]
+
+    const selection = resolveObjectViewerSelection(
+      viewers,
+      undefined,
+      'missing.viewer',
+    )
+
+    expect(selection.selectedComponent?.componentID).toBe(
+      'spacewave.debug.viewer',
+    )
+    expect(selection.missingComponentID).toBe('missing.viewer')
+  })
+
+  it('uses the authored component when a plugin reload makes it visible', () => {
+    const beforeReload = [component('spacewave.debug.viewer', 'Debug')]
+    const afterReload = [
+      component('spacewave.debug.viewer', 'Debug'),
+      component('gizmo.decision', 'Decision'),
+    ]
+
+    expect(
+      resolveObjectViewerSelection(beforeReload, undefined, 'gizmo.decision'),
+    ).toMatchObject({
+      selectedComponent: { componentID: 'spacewave.debug.viewer' },
+      missingComponentID: 'gizmo.decision',
+    })
+    expect(
+      resolveObjectViewerSelection(afterReload, undefined, 'gizmo.decision'),
+    ).toMatchObject({
+      selectedComponent: { componentID: 'gizmo.decision' },
+      missingComponentID: undefined,
+    })
+  })
+})
+
+describe('shouldHoldDebugViewerFallback', () => {
+  it('holds the debug viewer when it was only selected as a wildcard fallback', () => {
+    expect(
+      shouldHoldDebugViewerFallback(
+        'gizmo/unknown',
+        component('spacewave.debug.viewer', 'Debug'),
+        undefined,
+        undefined,
+      ),
+    ).toBe(true)
+  })
+
+  it('allows the debug viewer when the user selected it directly', () => {
+    expect(
+      shouldHoldDebugViewerFallback(
+        'gizmo/unknown',
+        component('spacewave.debug.viewer', 'Debug'),
+        'spacewave.debug.viewer',
+        undefined,
+      ),
+    ).toBe(false)
+  })
+
+  it('allows the debug viewer when a layout requested it directly', () => {
+    expect(
+      shouldHoldDebugViewerFallback(
+        'gizmo/unknown',
+        component('spacewave.debug.viewer', 'Debug'),
+        undefined,
+        'spacewave.debug.viewer',
+      ),
+    ).toBe(false)
+  })
+
+  it('does not hold a real viewer selection', () => {
+    expect(
+      shouldHoldDebugViewerFallback(
+        'gizmo/worklist',
+        component('gizmo.worklist.viewer', 'Worklist'),
+        undefined,
+        undefined,
+      ),
+    ).toBe(false)
+  })
+})
+
+describe('useObjectViewer context menu targets', () => {
+  it('lists the Space object targets and notes objects past them', () => {
+    h.spaceContext.spaceObjectTargets.more = true
+
+    const { result } = renderHook(() =>
+      useObjectViewer({
+        objectInfo: {
+          info: {
+            case: 'worldObjectInfo',
+            value: {
+              objectKey: 'visible-doc',
+              objectType: 'canvas',
+            },
+          },
+        },
+        worldState: emptyWorldState,
+      }),
+    )
+
+    const labels = JSON.stringify(result.current.contextMenuItems)
+    expect(labels).toContain('Visible Doc')
+    expect(labels).toContain('More objects in the object browser')
+  })
+
+  it('deletes through the space world owner and returns to the space root', async () => {
+    const { result } = renderHook(() =>
+      useObjectViewer({
+        objectInfo: {
+          info: {
+            case: 'worldObjectInfo',
+            value: {
+              objectKey: 'visible-doc',
+              objectType: 'canvas',
+            },
+          },
+        },
+        worldState: emptyWorldState,
+      }),
+    )
+
+    render(result.current.overlayContent)
+    fireEvent.click(screen.getByRole('button', { name: 'Danger Zone' }))
+    fireEvent.click(screen.getByRole('button', { name: /Delete Object/ }))
+    const deleteButtons = screen.getAllByRole('button', {
+      name: 'Delete Object',
+    })
+    fireEvent.click(deleteButtons.at(-1)!)
+
+    await waitFor(() => {
+      expect(h.spaceContext.spaceWorld.deleteObject).toHaveBeenCalledWith(
+        'visible-doc',
+      )
+    })
+    expect(h.spaceContext.navigateToRoot).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not expose deletion without object mutation permission', () => {
+    h.spaceContext.canDeleteObjects = false
+    const { result } = renderHook(() =>
+      useObjectViewer({
+        objectInfo: {
+          info: {
+            case: 'worldObjectInfo',
+            value: {
+              objectKey: 'visible-doc',
+              objectType: 'canvas',
+            },
+          },
+        },
+        worldState: emptyWorldState,
+      }),
+    )
+
+    render(result.current.overlayContent)
+    expect(screen.queryByText('Danger Zone')).toBeNull()
+  })
+})
+
+describe('useObjectViewer bottom bar button', () => {
+  it('keeps the viewer selector out of the item button', () => {
+    h.worldSetup.visibleComponents = [
+      component('canvas.viewer', 'Canvas'),
+      component('debug.viewer', 'Debug'),
+    ]
+    const { result } = renderHook(() =>
+      useObjectViewer({
+        objectInfo: {
+          info: {
+            case: 'worldObjectInfo',
+            value: {
+              objectKey: 'visible-doc',
+              objectType: 'canvas',
+            },
+          },
+        },
+        worldState: emptyWorldState,
+      }),
+    )
+    const onClick = vi.fn()
+
+    const { container } = render(result.current.buttonRender(true, onClick, ''))
+
+    const buttons = Array.from(container.querySelectorAll('button'))
+    expect(buttons).toHaveLength(2)
+    for (const button of buttons) {
+      expect(button.parentElement?.closest('button')).toBeNull()
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }))
+    expect(onClick).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'visible-doc' }))
+    expect(onClick).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('useObjectViewer document title', () => {
+  it('publishes live object and selected viewer context', async () => {
+    h.worldSetup.visibleComponents = [
+      component('canvas.viewer', 'Canvas'),
+      component('debug.viewer', 'Debug'),
+    ]
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(DocumentTitleProvider, null, children)
+
+    renderHook(
+      () =>
+        useObjectViewer({
+          objectInfo: {
+            info: {
+              case: 'worldObjectInfo',
+              value: {
+                objectKey: 'visible-doc',
+                objectType: 'canvas',
+              },
+            },
+          },
+          worldState: emptyWorldState,
+        }),
+      { wrapper },
+    )
+
+    await waitFor(() =>
+      expect(document.title).toBe(
+        'Visible Doc · Canvas - Research - Spacewave',
+      ),
+    )
+  })
+
+  it('publishes only the focused ObjectLayout pane', async () => {
+    h.spaceContext.objectKey = 'object-layout'
+    h.worldSetup.visibleComponents = [component('canvas.viewer', 'Canvas')]
+    let focusedTabId = 'tab-a'
+    const tabContext = {
+      tabId: 'tab-a',
+      addTab: vi.fn(),
+      navigateTab: vi.fn(),
+      isObjectLayout: true,
+    }
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(
+        DocumentTitleProvider,
+        null,
+        createElement(
+          DocumentTitleFocusContext.Provider,
+          { value: focusedTabId },
+          createElement(TabContextProvider, { value: tabContext }, children),
+        ),
+      )
+
+    const view = renderHook(
+      () =>
+        useObjectViewer({
+          objectInfo: {
+            info: {
+              case: 'worldObjectInfo',
+              value: {
+                objectKey: 'visible-doc',
+                objectType: 'canvas',
+              },
+            },
+          },
+          worldState: emptyWorldState,
+        }),
+      { wrapper },
+    )
+    await waitFor(() =>
+      expect(document.title).toBe('Visible Doc - Research - Spacewave'),
+    )
+
+    focusedTabId = 'tab-b'
+    view.rerender()
+    await waitFor(() => expect(document.title).toBe('Spacewave'))
+  })
+})
+
+const emptyWorldState: Resource<IWorldState> = {
+  value: null,
+  loading: false,
+  error: null,
+  retry: vi.fn(),
+}

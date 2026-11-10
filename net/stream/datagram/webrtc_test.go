@@ -1,0 +1,128 @@
+//go:build !js
+
+package stream_datagram
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/s4wave/spacewave/net/link"
+	signaling "github.com/s4wave/spacewave/net/signaling/rpc"
+	signaling_client "github.com/s4wave/spacewave/net/signaling/rpc/client"
+	signaling_server "github.com/s4wave/spacewave/net/signaling/rpc/server"
+	"github.com/s4wave/spacewave/net/sim/graph"
+	"github.com/s4wave/spacewave/net/sim/tests"
+	"github.com/s4wave/spacewave/net/stream"
+	stream_echo "github.com/s4wave/spacewave/net/stream/echo"
+	stream_client "github.com/s4wave/spacewave/net/stream/srpc/client"
+	stream_server "github.com/s4wave/spacewave/net/stream/srpc/server"
+	"github.com/s4wave/spacewave/net/transport/webrtc"
+	"github.com/sirupsen/logrus"
+)
+
+// The endpoint peers have no shared simulated LAN. Only their signaling peer
+// bridges the LANs, forcing the application stream through native WebRTC.
+func TestDatagramsOverWebRTC(t *testing.T) {
+	// Bound the test and build the two-LAN simulation graph.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	g := graph.NewGraph()
+	source, signal, target := tests.AddPeer(t, g), tests.AddPeer(t, g), tests.AddPeer(t, g)
+
+	// Run the signaling server on the bridge peer.
+	signal.AddFactory(func(b bus.Bus) controller.Factory { return signaling_server.NewFactory(b) })
+	signal.AddConfig("signaling-server", &signaling_server.Config{Server: &stream_server.Config{
+		PeerIds: []string{signal.GetPeerID().String()}, ProtocolIds: []string{string(signaling.ProtocolID)},
+	}})
+
+	// Attach signaling and WebRTC controllers to each endpoint peer.
+	for _, p := range []*graph.Peer{source, target} {
+		p.AddFactory(func(b bus.Bus) controller.Factory { return signaling_client.NewFactory(b) })
+		p.AddFactory(func(b bus.Bus) controller.Factory { return webrtc.NewFactory(b) })
+		p.AddConfig("signaling-client", &signaling_client.Config{
+			SignalingId: "signal", Client: &stream_client.Config{ServerPeerIds: []string{signal.GetPeerID().String()}},
+		})
+		p.AddConfig("webrtc", &webrtc.Config{SignalingId: "signal", AllPeers: true, BlockPeers: []string{signal.GetPeerID().String()}})
+		lan := graph.AddLAN(g)
+		lan.AddPeer(g, p)
+		lan.AddPeer(g, signal)
+	}
+
+	// Start the simulator for the assembled graph.
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+	sim := tests.InitSimulator(t, ctx, logrus.NewEntry(logger), g)
+	defer sim.Close()
+
+	// Open an unreliable echo stream from source to target.
+	mounted, release, err := link.OpenStreamWithPeerEx(ctx,
+		sim.GetPeerByID(source.GetPeerID()).GetTestbed().Bus, stream_echo.DefaultProtocolID,
+		source.GetPeerID(), target.GetPeerID(), 0, stream.OpenOpts{Unreliable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	// Assert the stream authenticated to the target peer.
+	if mounted.GetPeerID() != target.GetPeerID() {
+		t.Fatal("wrong authenticated remote peer")
+	}
+
+	// Assert the stream carries datagram messages.
+	messages, ok := mounted.GetStream().(stream.MessageStream)
+	if !ok {
+		t.Fatalf("unreliable stream is a %T", mounted.GetStream())
+	}
+
+	// Forward datagrams between the local UDP socket and the stream.
+	endpoint, client := udpSocket(t), udpSocket(t)
+	result := make(chan error, 1)
+	go func() { result <- ForwardLocal(ctx, endpoint, messages) }()
+
+	// Messages may be dropped, such as one arriving before the echo peer
+	// binds the stream, so each payload is resent until it echoes, as a game
+	// client resends its handshake. The 8192 byte payload takes the control
+	// stream fallback. The echo peer cannot echo an empty message.
+	// Echo each payload over UDP, resending until it returns.
+	packet := make([]byte, MaxPacketSize)
+	for _, payload := range [][]byte{[]byte("initial game handshake"), bytes.Repeat([]byte{0x5a}, 1000), bytes.Repeat([]byte{0xa5}, 8192)} {
+		for {
+			// Send one payload attempt and read the echo back.
+			if _, err := client.WriteToUDP(payload, endpoint.LocalAddr().(*net.UDPAddr)); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			n, _, err := client.ReadFromUDP(packet)
+			if errors.Is(err, os.ErrDeadlineExceeded) && ctx.Err() == nil {
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(payload, packet[:n]) {
+				t.Fatalf("UDP echo differs for %d byte payload", len(payload))
+			}
+			break
+		}
+	}
+
+	// Stop forwarding and confirm the goroutine exits cleanly.
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WebRTC datagram forwarding did not stop")
+	}
+}

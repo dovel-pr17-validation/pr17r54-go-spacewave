@@ -1,0 +1,67 @@
+package resource_listener
+
+import (
+	"os"
+	"path/filepath"
+
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/s4wave/spacewave/bldr/entrypoint/storagepath"
+)
+
+// ConfigID is the config identifier.
+const ConfigID = ControllerID
+
+// Validate validates the configuration.
+func (c *Config) Validate() error {
+	return nil
+}
+
+// DetermineSocketPath returns the configured socket path. An explicit path
+// takes precedence; otherwise the socket lives under the project storage
+// root, which the invocation's state path scopes when present.
+func (c *Config) DetermineSocketPath() (string, error) {
+
+	// Prefer the explicitly configured socket path, falling back to the project ID.
+	if socketPath := c.GetListenerSocketPath(); socketPath != "" {
+		return socketPath, nil
+	}
+	projectID := c.GetStorageProjectId()
+	if projectID == "" {
+		return "", nil
+	}
+
+	// Honor a per-project socket path override from the environment.
+	if socketPath := os.Getenv(storagepath.SocketPathEnvVar(projectID)); socketPath != "" {
+		return socketPath, nil
+	}
+
+	// Place the managed socket under the project storage root.
+	storageRoot, err := storagepath.DetermineStorageRoot(projectID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(storageRoot, projectID+".sock"), nil
+}
+
+// SocketPathManaged reports whether the configured socket uses the managed
+// state/storage parent rather than an explicitly selected path.
+func (c *Config) SocketPathManaged() bool {
+	if c.GetListenerSocketPath() != "" {
+		return false
+	}
+	return c.GetStorageProjectId() != "" &&
+		os.Getenv(storagepath.SocketPathEnvVar(c.GetStorageProjectId())) == ""
+}
+
+// GetConfigID returns the unique string for this configuration type.
+func (c *Config) GetConfigID() string {
+	return ConfigID
+}
+
+// EqualsConfig checks if the config is equal to another.
+func (c *Config) EqualsConfig(other config.Config) bool {
+	return config.EqualsConfig(c, other)
+}
+
+// _ is a type assertion
+var _ config.Config = (*Config)(nil)

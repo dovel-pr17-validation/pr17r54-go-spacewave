@@ -1,0 +1,415 @@
+//go:build !tinygo
+
+package s4wave_forge_world
+
+import (
+	"context"
+	"path"
+	"slices"
+	"strconv"
+	"sync"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/world"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	forge_lib_docker "github.com/s4wave/spacewave/forge/lib/docker"
+	forge_runtime "github.com/s4wave/spacewave/forge/runtime"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_device "github.com/s4wave/spacewave/sdk/device"
+)
+
+// ErrWorkerStopPending reports a durable pending stop whose owner claim must
+// keep renewing until the runtime stop confirms.
+var ErrWorkerStopPending = errors.New("Worker runtime stop remains pending")
+
+// WorkerAdmission owns one Worker's World capacity claim and Docker reservations.
+type WorkerAdmission struct {
+	// admission owns the durable capacity and reservation state.
+	admission *forge_runtime.WorldRuntimeAdmission
+	// engine reads Execution placement before reserving capacity.
+	engine world.Engine
+	// workerKey identifies the Worker served by this plugin resource.
+	workerKey string
+	// peerID is the authenticated Device peer serving this Worker resource.
+	peerID peer.ID
+	// claimID identifies this Worker execution lifetime.
+	claimID string
+
+	// launchMtx serializes Docker launch with declaration drain and close.
+	launchMtx sync.Mutex
+	// mtx guards the claim and admission fence without covering Docker create.
+	mtx sync.Mutex
+	// ref is the current Device and invocation claim.
+	ref forge_runtime.WorkerClaimRef
+	// epoch is the current durable owner epoch.
+	epoch uint64
+	// active permits new Docker reservations.
+	active bool
+	// changed closes and is replaced whenever active changes.
+	changed chan struct{}
+	// declaration is the last declaration to restore after pending stops finish.
+	declaration *s4wave_device.ForgeWorkerDeclaration
+}
+
+// NewWorkerAdmission constructs one Worker admission with a Docker stopper.
+func NewWorkerAdmission(eng world.Engine, workerKey string, peerID peer.ID, claimID string, stopper forge_runtime.RuntimeStopper) *WorkerAdmission {
+	return &WorkerAdmission{
+		admission: forge_runtime.NewWorldRuntimeAdmission(eng, stopper, 0, 0),
+		engine:    eng,
+		workerKey: workerKey,
+		peerID:    peerID,
+		claimID:   claimID,
+		changed:   make(chan struct{}),
+	}
+}
+
+// ApplyDeclaration claims and observes this Worker or drains it when the
+// declaration is nil or names another Worker.
+func (w *WorkerAdmission) ApplyDeclaration(ctx context.Context, deviceKey string, declared *s4wave_device.ForgeWorkerDeclaration) error {
+	// Fence new Worker reservations before changing the declaration.
+	w.mtx.Lock()
+	w.setActive(false)
+	w.mtx.Unlock()
+
+	// Serialize the declaration transition with Docker launches and claim changes.
+	w.launchMtx.Lock()
+	defer w.launchMtx.Unlock()
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+
+	// Resolve the enrolled Device identity required by the Worker claim.
+	if deviceKey == "" {
+		deviceKey = w.ref.DeviceObjectKey
+	}
+	if deviceKey == "" && declared == nil {
+		return nil
+	}
+	if deviceKey == "" {
+		return errors.New("enrolled Device identity is required for Worker capacity")
+	}
+
+	// Retain the Worker claim reference and requested declaration.
+	firstClaim := w.epoch == 0
+	w.ref = forge_runtime.WorkerClaimRef{DeviceObjectKey: deviceKey, ClaimID: w.claimID}
+	w.declaration = nil
+	if declared != nil {
+		w.declaration = declared.CloneVT()
+	}
+
+	// Reclaim the durable record before either observing or draining it.
+	if declared == nil || declared.GetWorkerObjectKey() != w.workerKey {
+		if _, err := w.admission.LookupWorkerCapacityAdmission(ctx, w.workerKey); errors.Is(err, forge_runtime.ErrWorkerNotObserved) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+	}
+	capacity, err := w.admission.ClaimWorkerCapacity(ctx, w.workerKey, w.ref)
+	if err != nil {
+		return err
+	}
+	w.epoch = capacity.OwnerEpoch
+	if capacity.OwnerState == forge_runtime.CapacityOwnerStateDraining {
+		ref, epoch := w.ref, w.epoch
+		w.mtx.Unlock()
+		_, err := w.admission.ReconcilePendingStops(ctx, ref)
+		if err == nil {
+			err = w.admission.StopWorkerReservations(ctx, w.workerKey, ref, epoch)
+		}
+		w.mtx.Lock()
+		if err != nil {
+			return errors.Wrap(ErrWorkerStopPending, err.Error())
+		}
+	}
+	if firstClaim && declared != nil && declared.GetWorkerObjectKey() == w.workerKey {
+		if _, err := w.admission.BeginDrainCapacity(ctx, w.workerKey, w.ref, w.epoch); err != nil {
+			return err
+		}
+		ref, epoch := w.ref, w.epoch
+		w.mtx.Unlock()
+		err := w.admission.StopWorkerReservations(ctx, w.workerKey, ref, epoch)
+		w.mtx.Lock()
+		if err != nil {
+			return errors.Wrap(ErrWorkerStopPending, err.Error())
+		}
+	}
+
+	// A removed Docker backend must stop existing Docker custody before the
+	// remaining declaration can reopen admission.
+	if declared != nil && declared.GetWorkerObjectKey() == w.workerKey && !slices.Contains(declared.GetBackends(), "docker") {
+		if _, err := w.admission.BeginDrainCapacity(ctx, w.workerKey, w.ref, w.epoch); err != nil {
+			return err
+		}
+		ref, epoch := w.ref, w.epoch
+		w.mtx.Unlock()
+		err := w.admission.StopWorkerReservations(ctx, w.workerKey, ref, epoch)
+		w.mtx.Lock()
+		if err != nil {
+			return errors.Wrap(ErrWorkerStopPending, err.Error())
+		}
+	}
+
+	// An absent or retargeted declaration must stop every persisted runtime.
+	if declared == nil || declared.GetWorkerObjectKey() != w.workerKey {
+		ref, epoch := w.ref, w.epoch
+		w.mtx.Unlock()
+		err := w.drain(ctx, ref, epoch)
+		w.mtx.Lock()
+		if err != nil {
+			return errors.Wrap(ErrWorkerStopPending, err.Error())
+		}
+		w.epoch = 0
+		return nil
+	}
+
+	// Observe the new Worker capacity and stop reservations if it remains draining.
+	capacity, err = w.admission.ObserveWorker(ctx, w.workerKey, w.ref, w.epoch,
+		declared.GetMilliCpu(), declared.GetMemoryBytes(), declared.GetBackends())
+	if err != nil {
+		return err
+	}
+	w.setActive(capacity.OwnerState == forge_runtime.CapacityOwnerStateActive)
+	if !w.active {
+		ref, epoch := w.ref, w.epoch
+		w.mtx.Unlock()
+		err := w.admission.StopWorkerReservations(ctx, w.workerKey, ref, epoch)
+		w.mtx.Lock()
+		if err != nil {
+			return errors.Wrap(ErrWorkerStopPending, err.Error())
+		}
+		capacity, err = w.admission.LookupWorkerCapacityAdmission(ctx, w.workerKey)
+		if err != nil {
+			return err
+		}
+		w.setActive(capacity.OwnerState == forge_runtime.CapacityOwnerStateActive)
+		if !w.active {
+			return ErrWorkerStopPending
+		}
+	}
+	return nil
+}
+
+// Renew extends the live Worker claim while this execution owns capacity.
+func (w *WorkerAdmission) Renew(ctx context.Context) error {
+	// Hold the Worker claim state and skip renewal after drain completes.
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	if w.epoch == 0 {
+		return nil
+	}
+
+	// Extend the Worker claim and reservation leases.
+	capacity, err := w.admission.RenewWorkerClaim(ctx, w.workerKey, w.ref)
+	if err != nil {
+		return err
+	}
+	w.epoch = capacity.OwnerEpoch
+	if err := w.admission.RenewWorkerReservations(ctx, w.workerKey, w.ref); err != nil {
+		return err
+	}
+
+	// Reconcile draining capacity only when Docker launch permits cleanup.
+	if capacity.OwnerState != forge_runtime.CapacityOwnerStateDraining {
+		return nil
+	}
+	if !w.launchMtx.TryLock() {
+		return nil
+	}
+	defer w.launchMtx.Unlock()
+
+	// Bound pending runtime stop reconciliation by the owner lease.
+	stopCtx, cancel := context.WithTimeout(ctx, forge_runtime.DefaultOwnerLeaseDuration/3)
+	defer cancel()
+	if _, err := w.admission.ReconcilePendingStops(stopCtx, w.ref); err != nil {
+		return errors.Wrap(ErrWorkerStopPending, err.Error())
+	}
+
+	// Complete drain when the declaration is absent or retargeted.
+	if w.declaration == nil || w.declaration.GetWorkerObjectKey() != w.workerKey {
+		ref, epoch := w.ref, w.epoch
+		w.mtx.Unlock()
+		err := w.drain(stopCtx, ref, epoch)
+		w.mtx.Lock()
+		if err != nil {
+			return errors.Wrap(ErrWorkerStopPending, err.Error())
+		}
+		w.epoch = 0
+		return nil
+	}
+
+	// Stop remaining reservations before restoring the declared Worker capacity.
+	if err := w.admission.StopWorkerReservations(stopCtx, w.workerKey, w.ref, w.epoch); err != nil {
+		return errors.Wrap(ErrWorkerStopPending, err.Error())
+	}
+
+	// Observe the retained declaration and reopen active admission.
+	capacity, err = w.admission.ObserveWorker(ctx, w.workerKey, w.ref, w.epoch,
+		w.declaration.GetMilliCpu(), w.declaration.GetMemoryBytes(), w.declaration.GetBackends())
+	if err != nil {
+		return err
+	}
+	w.setActive(capacity.OwnerState == forge_runtime.CapacityOwnerStateActive)
+	if !w.active {
+		return ErrWorkerStopPending
+	}
+	return nil
+}
+
+// Close drains this Worker's remaining runtimes on a clean execution exit.
+// A crashed process leaves the claim to expire at its lease deadline.
+func (w *WorkerAdmission) Close(ctx context.Context) error {
+	// Fence new Worker reservations on execution exit.
+	w.mtx.Lock()
+	w.setActive(false)
+	w.mtx.Unlock()
+
+	// Wait for Docker launches before inspecting the remaining Worker claim.
+	w.launchMtx.Lock()
+	defer w.launchMtx.Unlock()
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	if w.ref.DeviceObjectKey == "" {
+		return nil
+	}
+
+	// Skip cleanup when the durable Worker capacity record is already absent.
+	if _, err := w.admission.LookupWorkerCapacityAdmission(ctx, w.workerKey); errors.Is(err, forge_runtime.ErrWorkerNotObserved) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	// Drain Worker runtimes without blocking claim renewal.
+	ref, epoch := w.ref, w.epoch
+	w.mtx.Unlock()
+	err := w.drain(ctx, ref, epoch)
+	w.mtx.Lock()
+	if err != nil {
+		return err
+	}
+	w.epoch = 0
+	return nil
+}
+
+// drain stops the Worker's runtimes before removing its claim, allowing
+// renewal until stop custody has been confirmed.
+func (w *WorkerAdmission) drain(ctx context.Context, ref forge_runtime.WorkerClaimRef, epoch uint64) error {
+	if _, err := w.admission.BeginDrainCapacity(ctx, w.workerKey, ref, epoch); err != nil {
+		return err
+	}
+	if err := w.admission.StopWorkerReservations(ctx, w.workerKey, ref, epoch); err != nil {
+		return err
+	}
+	return w.admission.CompleteDrainCapacity(ctx, w.workerKey, ref, epoch)
+}
+
+// setActive changes whether new Docker reservations are admitted and wakes the
+// reservations waiting for admission. The caller holds mtx.
+func (w *WorkerAdmission) setActive(active bool) {
+	if w.active == active {
+		return
+	}
+	w.active = active
+	close(w.changed)
+	w.changed = make(chan struct{})
+}
+
+// Reserve debits the Docker target's explicit request under the current claim.
+// While the Worker is draining or undeclared it holds the reservation until
+// admission reopens, so the Execution waits instead of failing. It returns
+// only when the debit is made, the context ends, or the request fails.
+func (w *WorkerAdmission) Reserve(ctx context.Context, executionKey string, conf *forge_lib_docker.Config) (forge_lib_docker.Reservation, error) {
+	// Read Execution placement from a scoped World transaction.
+	tx, err := w.engine.NewTransaction(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	execution, executionState, err := forge_execution.LookupExecution(ctx, tx, executionKey)
+	world.ReleaseObjectState(executionState)
+	tx.Discard()
+	if err != nil {
+		return nil, err
+	}
+
+	// Require the Execution placement to match this Worker and peer.
+	if placement := execution.GetPlacement(); placement != nil &&
+		(placement.GetWorkerObjectKey() != w.workerKey || placement.GetPeerId() != w.peerID.String()) {
+		return nil, errors.Errorf("execution %s is placed on Worker %s peer %s", executionKey, placement.GetWorkerObjectKey(), placement.GetPeerId())
+	}
+
+	// Wait for the Worker to admit work.
+	w.mtx.Lock()
+	for !w.active {
+		changed := w.changed
+		w.mtx.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+		w.mtx.Lock()
+	}
+	defer w.mtx.Unlock()
+
+	// Reserve Docker capacity under the active Worker claim.
+	request := forge_runtime.ResourceRequest{MilliCPU: conf.GetMilliCpu(), MemoryBytes: conf.GetMemoryBytes(), Backend: "docker"}
+	res, err := w.admission.ReserveForClaim(ctx, w.workerKey, executionKey, request, w.ref, w.epoch)
+	if err != nil {
+		return nil, err
+	}
+	name := "spacewave-" + path.Base(res.ObjectKey()) + "-" + strconv.FormatUint(res.Generation, 10)
+	return &workerDockerReservation{worker: w, key: res.ObjectKey(), generation: res.Generation, name: name, conf: conf.CloneVT()}, nil
+}
+
+// workerDockerReservation couples a durable reservation to one named runtime.
+type workerDockerReservation struct {
+	worker     *WorkerAdmission
+	key        string
+	generation uint64
+	name       string
+	conf       *forge_lib_docker.Config
+}
+
+// Launch records stop custody and holds the launch fence through create and start.
+func (r *workerDockerReservation) Launch(ctx context.Context, createAndStart func(string) error) error {
+	// Hold the Docker launch fence and require active Worker capacity.
+	w := r.worker
+	w.launchMtx.Lock()
+	defer w.launchMtx.Unlock()
+	w.mtx.Lock()
+	if !w.active {
+		w.mtx.Unlock()
+		return forge_runtime.ErrCapacityDraining
+	}
+
+	// Resolve the Docker stop command and persist runtime custody.
+	command := r.conf.GetDockerPath()
+	if command == "" {
+		command = "docker"
+	}
+	identity := forge_runtime.BackendRuntimeIdentity{
+		Backend: "docker", ID: r.name, StopCommand: command,
+		StopEnv: forge_lib_docker.BuildDockerEnv(r.conf), StopTimeoutSeconds: r.conf.GetStopTimeoutSeconds(),
+	}
+	if _, err := w.admission.ActivateForClaim(ctx, r.key, identity, w.ref, w.epoch); err != nil {
+		w.mtx.Unlock()
+		return err
+	}
+
+	// Release the Worker state lock before creating the named runtime.
+	w.mtx.Unlock()
+	return createAndStart(r.name)
+}
+
+// Release stops the named runtime and credits its reservation once.
+func (r *workerDockerReservation) Release(ctx context.Context) error {
+	// Stop and credit the reservation under the Worker claim lock.
+	w := r.worker
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	_, err := w.admission.StopAndRelease(ctx, w.ref, w.epoch, r.key, r.generation)
+	return err
+}
+
+// _ is a type assertion.
+var _ forge_lib_docker.Admission = (*WorkerAdmission)(nil)

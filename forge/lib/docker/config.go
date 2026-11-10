@@ -1,0 +1,110 @@
+package forge_lib_docker
+
+import (
+	"slices"
+	"strings"
+
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+)
+
+// ConfigID is the string used to identify this config object.
+const ConfigID = ControllerID
+
+// Validate validates the configuration.
+func (c *Config) Validate() error {
+	// Validate the container image, resource requests, environments, and mounts.
+	if c.GetImage() == "" {
+		return errors.New("image cannot be empty")
+	}
+	if c.GetMilliCpu() == 0 || c.GetMemoryBytes() == 0 {
+		return errors.New("docker milli_cpu and memory_bytes requests must be set")
+	}
+	if err := validateEnvMap(c.GetDockerEnv()); err != nil {
+		return errors.Wrap(err, "docker_env")
+	}
+	if err := validateEnvMap(c.GetEnv()); err != nil {
+		return errors.Wrap(err, "env")
+	}
+	for _, mount := range c.GetMounts() {
+		if mount.GetHostPath() == "" {
+			return errors.New("mount host_path cannot be empty")
+		}
+		if mount.GetContainerPath() == "" {
+			return errors.New("mount container_path cannot be empty")
+		}
+		if strings.Contains(mount.GetHostPath(), ",") || strings.Contains(mount.GetContainerPath(), ",") {
+			return errors.New("mount paths cannot contain comma")
+		}
+	}
+	return validateOutputs(c.GetOutputDir(), c.GetOutputs())
+}
+
+// validateOutputs requires an output directory for declared outputs, each a
+// distinct plain file name within it.
+func validateOutputs(dir string, outputs []string) error {
+	// Require a mountable directory whenever outputs are declared.
+	if len(outputs) == 0 {
+		return nil
+	}
+	if dir == "" {
+		return errors.New("output_dir must be set with outputs")
+	}
+	if strings.Contains(dir, ",") {
+		return errors.New("output_dir cannot contain comma")
+	}
+
+	// Require each output to name one distinct file in the directory.
+	seen := make(map[string]struct{}, len(outputs))
+	for _, name := range outputs {
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
+			return errors.Errorf("output name %q must be a plain file name", name)
+		}
+		if _, ok := seen[name]; ok {
+			return errors.Errorf("output name %q is duplicated", name)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+// GetConfigID returns the unique string for this configuration type.
+func (c *Config) GetConfigID() string {
+	return ConfigID
+}
+
+// EqualsConfig checks if the other config is equal.
+func (c *Config) EqualsConfig(other config.Config) bool {
+	oc, ok := other.(*Config)
+	return ok && c.EqualVT(oc)
+}
+
+// validateEnvMap rejects empty keys and keys containing '='.
+func validateEnvMap(env map[string]string) error {
+	for key := range env {
+		if key == "" {
+			return errors.New("key cannot be empty")
+		}
+		if strings.Contains(key, "=") {
+			return errors.Errorf("key cannot contain =: %s", key)
+		}
+	}
+	return nil
+}
+
+// sortedMapKeys returns the map keys in sorted order.
+func sortedMapKeys(vals map[string]string) []string {
+	keys := make([]string, 0, len(vals))
+	for key := range vals {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// _ is a type assertion
+var (
+	_ config.Config = (*Config)(nil)
+	_ block.Block   = (*Config)(nil)
+)

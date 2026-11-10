@@ -1,0 +1,249 @@
+package cli
+
+import (
+	"context"
+	"crypto/rand"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/aperturerobotics/cli"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/daemon"
+	"github.com/s4wave/spacewave/net/keypem/keyfile"
+	link_holdopen_controller "github.com/s4wave/spacewave/net/link/hold-open"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/transport/common/dialer"
+	udptpt "github.com/s4wave/spacewave/net/transport/udp"
+	"github.com/s4wave/spacewave/net/util/confparse"
+	"github.com/sirupsen/logrus"
+)
+
+// DefaultPipeProtocolID is the default protocol ID for pipe streams.
+const DefaultPipeProtocolID = "/pipe/stream"
+
+// PipeArgs contains the arguments for the pipe command.
+type PipeArgs struct {
+	// ListenAddr is the address to listen on (server mode).
+	// Example: ":5112"
+	ListenAddr string
+	// ConnectAddr is the address to connect to (client mode).
+	// Format: "peer-id@host:port"
+	ConnectAddr string
+	// ProtocolID is the stream protocol ID.
+	ProtocolID string
+	// PrivKeyPath is the path to the private key file.
+	// If empty, a key will be generated.
+	PrivKeyPath string
+	// Quiet suppresses status messages to stderr.
+	Quiet bool
+}
+
+// BuildFlags returns the CLI flags for the pipe command.
+func (a *PipeArgs) BuildFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{
+			Name:        "listen",
+			Aliases:     []string{"l"},
+			Usage:       "listen address for server mode (e.g., :5112)",
+			Destination: &a.ListenAddr,
+		},
+		&cli.StringFlag{
+			Name:        "connect",
+			Aliases:     []string{"c"},
+			Usage:       "connect address for client mode (peer-id@host:port)",
+			Destination: &a.ConnectAddr,
+		},
+		&cli.StringFlag{
+			Name:        "protocol-id",
+			Aliases:     []string{"p"},
+			Usage:       "stream protocol ID",
+			Value:       DefaultPipeProtocolID,
+			Destination: &a.ProtocolID,
+		},
+		&cli.StringFlag{
+			Name:        "key",
+			Aliases:     []string{"k"},
+			Usage:       "path to private key file (auto-generated if empty)",
+			Destination: &a.PrivKeyPath,
+		},
+		&cli.BoolFlag{
+			Name:        "quiet",
+			Aliases:     []string{"q"},
+			Usage:       "suppress status messages",
+			Destination: &a.Quiet,
+		},
+	}
+}
+
+// Run executes the pipe command.
+func (a *PipeArgs) Run(c *cli.Context) error {
+	// Use the CLI context for the selected pipe operation.
+	ctx := c.Context
+
+	// Validate arguments
+	if a.ListenAddr == "" && a.ConnectAddr == "" {
+		return errors.New("must specify either -l (listen) or -c (connect)")
+	}
+	if a.ListenAddr != "" && a.ConnectAddr != "" {
+		return errors.New("cannot specify both -l (listen) and -c (connect)")
+	}
+
+	// Run the pipe listener or connector selected by the addresses.
+	if a.ListenAddr != "" {
+		return a.runListen(ctx)
+	}
+	return a.runConnect(ctx)
+}
+
+// setupDaemon creates an in-process daemon with UDP transport.
+// Returns the daemon and a cleanup function that releases controller references.
+func (a *PipeArgs) setupDaemon(ctx context.Context, listenAddr string, dialers map[string]*dialer.DialerOpts) (*daemon.Daemon, func(), error) {
+	// Build the logger used by the daemon and transport controllers.
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+	if a.Quiet {
+		logger.SetOutput(io.Discard)
+	}
+	le := logrus.NewEntry(logger)
+
+	// Load or generate the node private key.
+	privKey, err := a.loadOrGenerateKey(le)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "load/generate key")
+	}
+
+	// Construct the daemon around the node identity.
+	d, err := daemon.NewDaemon(ctx, privKey, daemon.ConstructOpts{
+		LogEntry: le,
+	})
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "construct daemon")
+	}
+
+	// Register and start the hold-open controller.
+	b := d.GetControllerBus()
+	sr := d.GetStaticResolver()
+
+	// Add hold-open controller (prevents link timeout during streaming)
+	sr.AddFactory(link_holdopen_controller.NewFactory(b))
+	_, _, hoRef, err := loader.WaitExecControllerRunning(
+		ctx,
+		b,
+		resolver.NewLoadControllerWithConfig(&link_holdopen_controller.Config{}),
+		nil,
+	)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "start hold-open controller")
+	}
+
+	// Start the UDP transport with the requested listen address.
+	_, _, udpRef, err := loader.WaitExecControllerRunning(
+		ctx,
+		b,
+		resolver.NewLoadControllerWithConfig(&udptpt.Config{
+			ListenAddr: listenAddr,
+			Dialers:    dialers,
+		}),
+		nil,
+	)
+	if err != nil {
+		hoRef.Release()
+		return nil, nil, errors.Wrap(err, "start UDP transport")
+	}
+
+	// Return cleanup for both controller references.
+	cleanup := func() {
+		udpRef.Release()
+		hoRef.Release()
+	}
+
+	return d, cleanup, nil
+}
+
+// loadOrGenerateKey loads a private key from file or generates a new one.
+func (a *PipeArgs) loadOrGenerateKey(le *logrus.Entry) (crypto.PrivKey, error) {
+	if a.PrivKeyPath != "" {
+		// Use keyfile helper to load or generate key
+		return keyfile.OpenOrWritePrivKey(le, a.PrivKeyPath)
+	}
+
+	// No path specified, just generate an ephemeral key
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		return nil, errors.Wrap(err, "generate key")
+	}
+	return privKey, nil
+}
+
+// parseConnectAddr parses a "peer-id@host:port" string.
+func parseConnectAddr(addr string) (peer.ID, string, error) {
+	// Separate the remote peer identifier from its transport address.
+	parts := strings.SplitN(addr, "@", 2)
+	if len(parts) != 2 {
+		return "", "", errors.New("connect address must be in format peer-id@host:port")
+	}
+
+	// Trim the peer identifier and transport address for validation.
+	peerIDStr := strings.TrimSpace(parts[0])
+	hostPort := strings.TrimSpace(parts[1])
+
+	// Require both the remote peer identifier and transport address.
+	if peerIDStr == "" {
+		return "", "", errors.New("peer ID cannot be empty")
+	}
+	if hostPort == "" {
+		return "", "", errors.New("host:port cannot be empty")
+	}
+
+	// Decode the remote peer identifier for the pipe connection.
+	peerID, err := confparse.ParsePeerID(peerIDStr)
+	if err != nil {
+		return "", "", errors.Wrap(err, "parse peer ID")
+	}
+
+	return peerID, hostPort, nil
+}
+
+// pipeStream performs bidirectional copying between a stream and stdin/stdout.
+func pipeStream(strm io.ReadWriteCloser, stdin io.Reader, stdout io.Writer) error {
+	// Track completion of copying the remote stream to stdout.
+	done := make(chan struct{})
+
+	// stdin -> stream
+	go func() {
+		buf := make([]byte, 8192)
+		_, _ = io.CopyBuffer(strm, stdin, buf)
+
+		// Signal EOF to the remote and keep reading its output.
+		if cw, ok := strm.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = strm.Close()
+		}
+	}()
+
+	// stream -> stdout (blocks until stream closes or errors)
+	go func() {
+		buf := make([]byte, 8192)
+		_, _ = io.CopyBuffer(stdout, strm, buf)
+		close(done)
+	}()
+
+	// Wait for stream->stdout to complete
+	<-done
+	return nil
+}
+
+// logStatus prints a status message to stderr if not in quiet mode.
+func (a *PipeArgs) logStatus(format string, args ...any) {
+	if a.Quiet {
+		return
+	}
+	logger := logrus.New()
+	logger.SetOutput(os.Stderr)
+	logger.Infof(format, args...)
+}

@@ -1,0 +1,129 @@
+//go:build !js
+
+package goscriptbench
+
+import (
+	"slices"
+
+	"github.com/pkg/errors"
+)
+
+var optionalSampleFields = []string{
+	"decodedBodySize",
+	"responseEndMs",
+	"responseStartMs",
+	"transferSize",
+}
+
+// RunMetadata identifies one engine run and its measured state boundary.
+type RunMetadata struct {
+	// runID groups independent engine results from one matrix invocation
+	RunID string
+	// engine names the selected browser engine
+	Engine string
+	// engineVersion identifies the launched browser binary
+	EngineVersion string
+	// compiler names the Go-to-browser compiler
+	Compiler string
+	// spacewaveRevision identifies the Spacewave source tree
+	SpacewaveRevision string
+	// goScriptRevision identifies the GoScript source tree
+	GoScriptRevision string
+	// buildMode names the measured build shape
+	BuildMode string
+	// workerMode names the GoScript runtime worker shape
+	WorkerMode string
+	// storageBackend names the measured persistent storage backend
+	StorageBackend string
+	// runtimeState names the retained and recreated cache cell
+	RuntimeState string
+	// projectedURLTemplate identifies the measured request family
+	ProjectedURLTemplate string
+	// fixture identifies the measured bytes
+	Fixture Fixture
+	// state declares the boundary between samples
+	State StateBoundary
+	// unavailableFields names optional browser timing fields omitted by this engine
+	UnavailableFields []string
+}
+
+// Validate checks that the run identity and state boundary are complete.
+func (m RunMetadata) Validate() error {
+	// Require safe run and engine artifact identities.
+	if !validArtifactID(m.RunID) {
+		return errors.New("run ID must be a safe artifact path component")
+	}
+	if !validArtifactID(m.Engine) {
+		return errors.New("engine must be a safe artifact path component")
+	}
+
+	// Require the engine, source, mode, and state identification fields.
+	if m.EngineVersion == "" || m.Compiler == "" {
+		return errors.New("engine version and compiler are required")
+	}
+	if m.SpacewaveRevision == "" || m.GoScriptRevision == "" {
+		return errors.New("Spacewave and GoScript revisions are required")
+	}
+	if m.BuildMode == "" || m.WorkerMode == "" || m.StorageBackend == "" {
+		return errors.New("build, worker, and storage modes are required")
+	}
+	if m.RuntimeState == "" || m.ProjectedURLTemplate == "" {
+		return errors.New("runtime state and projected URL template are required")
+	}
+
+	// Validate the fixture, state boundary, and optional-field list.
+	if err := m.Fixture.Validate(); err != nil {
+		return errors.Wrap(err, "validate fixture")
+	}
+	if err := m.State.Validate(); err != nil {
+		return errors.Wrap(err, "validate state boundary")
+	}
+	if err := validateUnavailableFields(m.UnavailableFields); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fieldUnavailable reports whether one optional sample field is omitted.
+func (m RunMetadata) fieldUnavailable(field string) bool {
+	return slices.Contains(m.UnavailableFields, field)
+}
+
+// validateUnavailableFields checks names and duplicates in the optional-field list.
+func validateUnavailableFields(fields []string) error {
+	// Require the optional-field list to be present.
+	if fields == nil {
+		return errors.New("unavailable-field metadata is required")
+	}
+
+	// Require each field to be a known, non-duplicated sample field.
+	for idx, field := range fields {
+		if !slices.Contains(optionalSampleFields, field) {
+			return errors.Errorf("unavailable sample field %q is unknown", field)
+		}
+		if slices.Contains(fields[:idx], field) {
+			return errors.Errorf("unavailable sample field %q is duplicated", field)
+		}
+	}
+	return nil
+}
+
+// validArtifactID reports whether a value is a safe artifact path component.
+func validArtifactID(value string) bool {
+	// Reject empty and relative-path values.
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+
+	// Allow alphanumerics and interior separators only.
+	for idx, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
+			continue
+		}
+		if idx != 0 && (char == '-' || char == '_' || char == '.') {
+			continue
+		}
+		return false
+	}
+	return true
+}

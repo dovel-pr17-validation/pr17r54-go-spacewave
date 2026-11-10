@@ -1,0 +1,188 @@
+package world_block_tx
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	"github.com/s4wave/spacewave/db/tx"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// ObjectState is an Object attached to a WorldState.
+type ObjectState struct {
+	// w is the WorldState
+	w *WorldState
+	// key is the object key
+	key string
+	// o is the underlying object
+	o world.ObjectState
+}
+
+// NewObjectState returns a new Object wrapped with a tx.
+func NewObjectState(w *WorldState, key string, o world.ObjectState) *ObjectState {
+	return &ObjectState{w: w, key: key, o: o}
+}
+
+// Release releases the object handle owned by this transaction wrapper.
+func (t *ObjectState) Release() {
+	world.ReleaseObjectState(t.o)
+}
+
+// GetKey returns the key this state object is for.
+func (t *ObjectState) GetKey() string {
+	return t.key
+}
+
+// GetRootRef returns the root reference of the object.
+func (t *ObjectState) GetRootRef(ctx context.Context) (*bucket.ObjectRef, uint64, error) {
+	t.w.mtx.Lock()
+	defer t.w.mtx.Unlock()
+
+	if t.w.discarded {
+		return nil, 0, tx.ErrDiscarded
+	}
+
+	return t.o.GetRootRef(ctx)
+}
+
+// GetModSeqno returns the World seqno after the last commit that changed the
+// object.
+func (t *ObjectState) GetModSeqno(ctx context.Context) (uint64, error) {
+	t.w.mtx.Lock()
+	defer t.w.mtx.Unlock()
+	if t.w.discarded {
+		return 0, tx.ErrDiscarded
+	}
+	return t.o.GetModSeqno(ctx)
+}
+
+// AccessWorldState builds a bucket lookup cursor with an optional ref.
+// If the ref is empty, will default to the object RootRef.
+// If the ref Bucket ID is empty, uses the same bucket + volume as the world.
+// The lookup cursor will be released after cb returns.
+func (t *ObjectState) AccessWorldState(
+	ctx context.Context,
+	ref *bucket.ObjectRef,
+	cb func(*bucket_lookup.Cursor) error,
+) error {
+	return t.o.AccessWorldState(ctx, ref, cb)
+}
+
+// SetRootRef changes the root reference of the object.
+func (t *ObjectState) SetRootRef(ctx context.Context, nref *bucket.ObjectRef) (uint64, error) {
+	// Require a writable WorldState before changing the object root.
+	if !t.w.write {
+		return 0, tx.ErrNotWrite
+	}
+
+	// Prepare the object root change entry for the transaction batch.
+	tt, err := NewTxObjectSet(t.key, nref)
+	if err != nil {
+		return 0, err
+	}
+
+	// Hold the WorldState lock through the object root change.
+	t.w.mtx.Lock()
+	defer t.w.mtx.Unlock()
+
+	// Reject object root changes after the WorldState is discarded.
+	if t.w.discarded {
+		return 0, tx.ErrDiscarded
+	}
+
+	// Change the underlying object root and obtain its sequence number.
+	seqno, err := t.o.SetRootRef(ctx, nref)
+	if err != nil {
+		return 0, err
+	}
+
+	// Record the successful object root change in the transaction batch.
+	t.w.recordLocked(tt, nil)
+	return seqno, nil
+}
+
+// ApplyObjectOp applies a batch operation at the object level.
+// The handling of the operation is operation-type specific.
+// Returns the revision following the operation execution.
+// If nil is returned for the error, implies success.
+func (t *ObjectState) ApplyObjectOp(ctx context.Context, op world.Operation, opSender peer.ID) (uint64, bool, error) {
+	// Reject a read transaction and an empty op.
+	if !t.w.write {
+		return 0, false, tx.ErrNotWrite
+	}
+	if op == nil {
+		return 0, false, world.ErrEmptyOp
+	}
+
+	// Build the batch entry that records the op.
+	operationTypeID := op.TypeID()
+	tt, err := NewTxApplyObjectOp(operationTypeID, op, t.key, opSender)
+	if err != nil {
+		return 0, false, err
+	}
+
+	// Hold the transaction open while the op applies.
+	t.w.mtx.Lock()
+	defer t.w.mtx.Unlock()
+	if t.w.discarded {
+		return 0, false, tx.ErrDiscarded
+	}
+
+	// Apply the op, then record it and its payload.
+	objRev, sysErr, err := t.o.ApplyObjectOp(ctx, op, opSender)
+	if err == nil {
+		t.w.recordLocked(tt, op)
+	}
+	return objRev, sysErr, err
+}
+
+// IncrementRev increments the revision of the object.
+// Returns the new latest revision.
+func (t *ObjectState) IncrementRev(ctx context.Context) (uint64, error) {
+	// Require a writable WorldState before incrementing the object revision.
+	if !t.w.write {
+		return 0, tx.ErrNotWrite
+	}
+
+	// Prepare the object revision increment entry for the transaction batch.
+	tt, err := NewTxObjectIncRev(t.key)
+	if err != nil {
+		return 0, err
+	}
+
+	// Hold the WorldState lock through the object revision increment.
+	t.w.mtx.Lock()
+	defer t.w.mtx.Unlock()
+
+	// Reject object revision increments after the WorldState is discarded.
+	if t.w.discarded {
+		return 0, tx.ErrDiscarded
+	}
+
+	// Increment the underlying object revision.
+	orev, err := t.o.IncrementRev(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	// Record the successful object revision increment in the transaction batch.
+	t.w.txBatch.Txs = append(t.w.txBatch.Txs, tt)
+	return orev, nil
+}
+
+// WaitRev waits until the object rev is >= the specified.
+// Returns ErrObjectNotFound if the object is deleted.
+// If ignoreNotFound is set, waits for the object to exist.
+// Returns the new rev.
+func (t *ObjectState) WaitRev(
+	ctx context.Context,
+	rev uint64,
+	ignoreNotFound bool,
+) (uint64, error) {
+	return t.o.WaitRev(ctx, rev, ignoreNotFound)
+}
+
+// _ is a type assertion
+var _ world.ObjectState = (*ObjectState)(nil)

@@ -1,0 +1,152 @@
+package pass_controller
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/world"
+	world_control "github.com/s4wave/spacewave/db/world/control"
+	execution_transaction "github.com/s4wave/spacewave/forge/execution/tx"
+	forge_pass "github.com/s4wave/spacewave/forge/pass"
+	pass_transaction "github.com/s4wave/spacewave/forge/pass/tx"
+	forge_value "github.com/s4wave/spacewave/forge/value"
+	"github.com/sirupsen/logrus"
+)
+
+// ProcessState implements the state reconciliation loop.
+func (c *Controller) ProcessState(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	obj world.ObjectState, // may be nil if not found
+	rootRef *bucket.ObjectRef, rev uint64,
+) (waitForChanges bool, err error) {
+	// Wait for the Pass object to appear before reconciling its state.
+	objKey := c.objKey
+	if obj == nil {
+		le.Debug("object does not exist, waiting")
+		return true, nil
+	}
+
+	// unmarshal Pass state
+	var passState *forge_pass.Pass
+	_, err = world.AccessObject(ctx, ws.AccessWorldState, rootRef, func(bcs *block.Cursor) error {
+		var berr error
+		passState, berr = forge_pass.UnmarshalPass(ctx, bcs)
+		return berr
+	})
+	if err != nil {
+		return false, err
+	}
+
+	// Keep observing linked executions while they run or drain.
+	currState := passState.GetPassState()
+	if currState != forge_pass.State_PassState_RUNNING &&
+		currState != forge_pass.State_PassState_CANCELING {
+		c.pushWatchExecStates(nil)
+	}
+
+	// check if completed
+	if currState == forge_pass.State_PassState_COMPLETE {
+		le.Debug("pass is marked as complete")
+		return false, nil
+	}
+
+	// check if peer id matches
+	if c.peerIDStr != passState.GetPeerId() {
+		le.Warnf("pass peer id %q does not match ours %q", passState.GetPeerId(), c.peerIDStr)
+		return true, nil
+	}
+
+	// Replay cancellation to unfinished Pass executions and refresh their watched states.
+	execStates := passState.GetExecStates()
+	if currState == forge_pass.State_PassState_CANCELING {
+		executions, executionKeys, err := forge_pass.CollectPassExecutions(ctx, ws, objKey)
+		if err != nil {
+			return true, err
+		}
+		for i, execution := range executions {
+			if execution.IsComplete() {
+				continue
+			}
+			executionObj, err := world.MustGetObject(ctx, ws, executionKeys[i])
+			if err != nil {
+				return true, err
+			}
+			_, _, err = executionObj.ApplyObjectOp(
+				ctx,
+				execution_transaction.NewTxCancel(),
+				c.peerID,
+			)
+			world.ReleaseObjectState(executionObj)
+			if err != nil {
+				return true, err
+			}
+		}
+
+		c.pushWatchExecStates(passState.GetExecStates())
+		txd := pass_transaction.NewTxUpdateExecStates(objKey)
+		_, _, err = ws.ApplyWorldOp(ctx, txd, c.peerID)
+		return true, err
+	}
+
+	// Complete a checking Pass with its validated execution result.
+	if currState == forge_pass.State_PassState_CHECKING {
+		// asserts that len(execStates) != 0
+		if err := passState.Validate(false); err != nil {
+			// COMPLETE w/ success=false
+			le.WithError(err).Warn("marking pass as failed w/ error")
+			txd := pass_transaction.NewTxComplete(objKey, forge_value.NewResultWithError(err))
+			_, _, err = ws.ApplyWorldOp(ctx, txd, c.peerID)
+			return false, err
+		}
+
+		// COMPLETE w/ success=true
+		// TxComplete recomputes the output set against the target and fails
+		// the pass if the exec states do not agree with it.
+		txd := pass_transaction.NewTxComplete(objKey, forge_value.NewResultWithSuccess())
+		_, _, err = ws.ApplyWorldOp(ctx, txd, c.peerID)
+		return true, err
+	}
+
+	// promote pending -> running
+	if currState == forge_pass.State_PassState_PENDING {
+		var execSpecs []*pass_transaction.ExecSpec
+		if len(execStates)+len(execSpecs) < int(passState.GetReplicas()) {
+			if placement := passState.GetPlacement(); placement != nil {
+				execSpecs = []*pass_transaction.ExecSpec{{PeerId: placement.GetPeerId()}}
+			} else if c.conf.GetAssignSelf() {
+				execSpecs = []*pass_transaction.ExecSpec{{
+					PeerId: c.peerID.String(),
+				}}
+			}
+		}
+
+		// apply the transaction to start the executions
+		// the control loop will see the change & run ProcessState again
+		le.Debug("starting pass")
+		txd := pass_transaction.NewTxStart(objKey, execSpecs, true)
+		_, _, err = ws.ApplyWorldOp(ctx, txd, c.peerID)
+		return true, err
+	}
+
+	// Keep watching running Pass executions until they complete.
+	if currState == forge_pass.State_PassState_RUNNING {
+		le.Debug("waiting for pass executions to complete")
+
+		// signal to the controller to start / update watchers
+		c.pushWatchExecStates(passState.GetExecStates())
+		return true, nil
+	}
+
+	// unknown state
+	return true, errors.Wrapf(
+		forge_value.ErrUnknownState,
+		"%s", currState.String(),
+	)
+}
+
+// _ is a type assertion
+var _ world_control.WatchLoopHandler = (*Controller)(nil).ProcessState

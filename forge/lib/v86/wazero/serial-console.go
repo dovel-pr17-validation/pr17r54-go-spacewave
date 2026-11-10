@@ -1,0 +1,149 @@
+package v86_wazero
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"time"
+)
+
+// serialConsoleInputBuffer sizes the per-read chunk the input goroutine hands
+// to the console goroutine.
+const serialConsoleInputBuffer = 256
+
+var guestHaltSerialMarkers = [][]byte{
+	[]byte("System halted"),
+}
+
+// RunSerialConsole drives the v86 CPU and bridges COM1 to in and out until the
+// context is canceled or input ends. It runs every wasm call on this single
+// goroutine: MainLoop and WriteSerialInput (which raises the UART IRQ) must
+// never run concurrently, so a helper goroutine only reads in and forwards
+// bytes over a channel that this goroutine drains. The next tick is scheduled
+// after the delay MainLoop requests, so an idle guest does not busy-spin; this
+// honors the emulator's own clock rather than polling guest state. Returns nil
+// when in reaches EOF or ctx is canceled with no other error.
+func (h *HostRuntime) RunSerialConsole(ctx context.Context, in io.Reader, out io.Writer) error {
+	// Route COM1 output through the guest halt detector for this console run.
+	haltDetector := &guestHaltDetectingWriter{dst: out}
+	h.SetSerialSink(haltDetector)
+	defer h.SetSerialSink(nil)
+
+	// Forward console input and read errors to the goroutine driving the guest.
+	inputCh := make(chan []byte)
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, serialConsoleInputBuffer)
+		for {
+			n, err := in.Read(buf)
+			if n > 0 {
+				chunk := append([]byte(nil), buf[:n]...)
+				select {
+				case inputCh <- chunk:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
+				select {
+				case readErr <- err:
+				case <-ctx.Done():
+				}
+				return
+			}
+		}
+	}()
+
+	// Start stopped and drained so every Reset below acts on a clean timer.
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	// Drive guest ticks and wait for console input, network frames, or tick expiry.
+	for {
+		h.drainNetwork(ctx)
+		delay, err := h.MainLoop(ctx)
+		if err != nil {
+			return err
+		}
+		if haltDetector.Halted() {
+			return nil
+		}
+		wait := max(time.Duration(delay*float64(time.Millisecond)), 0)
+		timer.Reset(wait)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-readErr:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		case data := <-inputCh:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			if err := h.WriteSerialInput(ctx, data); err != nil {
+				return err
+			}
+		case <-h.netWakeCh():
+			// A host-origin frame arrived; cut the idle wait short so the next
+			// tick drains it instead of stalling on the emulator's clock.
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
+	}
+}
+
+// guestHaltDetectingWriter forwards serial output and records whether the
+type guestHaltDetectingWriter struct {
+	dst    io.Writer
+	tail   []byte
+	halted bool
+}
+
+// Write scans appended output for guest-halt markers and forwards to dst.
+func (w *guestHaltDetectingWriter) Write(p []byte) (int, error) {
+	if len(p) != 0 && !w.halted {
+		buf := append(append([]byte(nil), w.tail...), p...)
+		for _, marker := range guestHaltSerialMarkers {
+			if bytes.Contains(buf, marker) {
+				w.halted = true
+				break
+			}
+		}
+		w.tail = serialMarkerTail(buf)
+	}
+	if w.dst == nil {
+		return len(p), nil
+	}
+	return w.dst.Write(p)
+}
+
+// Halted reports whether a guest-halt marker was observed in the stream.
+func (w *guestHaltDetectingWriter) Halted() bool {
+	return w.halted
+}
+
+// serialMarkerTail returns the trailing bytes of buf that a marker could
+func serialMarkerTail(buf []byte) []byte {
+	keep := 0
+	for _, marker := range guestHaltSerialMarkers {
+		if n := len(marker) - 1; n > keep {
+			keep = n
+		}
+	}
+	if keep <= 0 || len(buf) <= keep {
+		return append([]byte(nil), buf...)
+	}
+	return append([]byte(nil), buf[len(buf)-keep:]...)
+}

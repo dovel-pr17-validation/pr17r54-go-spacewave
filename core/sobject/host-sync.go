@@ -1,0 +1,169 @@
+package sobject
+
+import (
+	"bytes"
+	"context"
+	"slices"
+
+	"github.com/pkg/errors"
+)
+
+// MaxConfigSuffixEntries bounds one peer catch-up transaction.
+const MaxConfigSuffixEntries = 4096
+
+// MaxConfigSuffixBytes bounds serialized configuration history held during catch-up.
+const MaxConfigSuffixBytes = 8 * 1024 * 1024
+
+// ErrConfigHistoryUnavailable requires a trusted recovery source instead of peer catch-up.
+var ErrConfigHistoryUnavailable = errors.New("shared object configuration history requires recovery")
+
+// ErrParticipantRevoked reports a committed removal of local readable participation.
+var ErrParticipantRevoked = errors.New("shared object participant access revoked")
+
+// SOHostSyncFuncs supplies provider persistence for authenticated peer import.
+// Configure these callbacks when constructing the host, before publishing it.
+type SOHostSyncFuncs struct {
+	// Lock imports accepted peer state without publishing a local root to a server.
+	// When nil, the host uses its ordinary local persistence lock.
+	Lock SOStateLockFunc
+	// CheckpointLock atomically installs an externally authenticated invitation
+	// checkpoint. The changes written with it are the verified lineage of the
+	// state's config, oldest first; the first produced the new history base.
+	// It is never used for peer synchronization or an unauthenticated recovery candidate.
+	CheckpointLock SOStateLockFunc
+	// History returns a bounded oldest-first suffix between two exact head hashes.
+	// It returns ErrConfigHistoryUnavailable for missing or divergent history.
+	History func(context.Context, string, []byte, []byte) ([]*SOConfigChange, error)
+	// Entry returns the retained configuration change addressed by its hash, or
+	// nil when it is not retained.
+	Entry func(context.Context, string, []byte) (*SOConfigChange, error)
+	// WaitDurable waits, without forcing a flush, until every state write
+	// completed before the call is durable. When nil, state writes are durable
+	// when they return.
+	WaitDurable func(context.Context) error
+}
+
+// ReadConfigSuffix follows retained hash-addressed entries from target to base.
+// When a merge on the way absorbs base, the suffix continues to that merge's
+// fork instead, which ConfigSuffixBase recovers from the suffix.
+// The caller provides one consistent read scope. Missing history fails closed;
+// returned entries remain untrusted until VerifyConfigChainSuffix accepts them.
+func ReadConfigSuffix(ctx context.Context, base, target []byte, read func(context.Context, []byte) (*SOConfigChange, error)) ([]*SOConfigChange, error) {
+	// An empty receiver head cannot supply a trust anchor.
+	if len(base) == 0 || len(target) == 0 {
+		return nil, ErrConfigHistoryUnavailable
+	}
+
+	// Bound both traversal work and retained bytes, including cyclic corrupt history.
+	var entries []*SOConfigChange
+	var size int
+	for !bytes.Equal(base, target) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if len(entries) == MaxConfigSuffixEntries || len(target) == 0 {
+			return nil, ErrConfigHistoryUnavailable
+		}
+		entry, err := read(ctx, target)
+		if err != nil {
+			return nil, err
+		}
+		if entry == nil {
+			return nil, ErrConfigHistoryUnavailable
+		}
+		data, err := entry.MarshalVT()
+		if err != nil {
+			return nil, err
+		}
+		size += len(data)
+		if size > MaxConfigSuffixBytes {
+			return nil, ErrConfigHistoryUnavailable
+		}
+		hash, err := HashSOConfigChange(entry)
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(hash, target) {
+			return nil, ErrConfigHistoryUnavailable
+		}
+		if fork := AbsorbedFork(base, entry); fork != nil {
+			if base, err = HashSOConfigChange(fork); err != nil {
+				return nil, err
+			}
+		}
+		entries = append(entries, entry)
+		target = entry.GetPreviousHash()
+	}
+
+	// Verification and transmission consume transitions in causal order.
+	slices.Reverse(entries)
+	return entries, nil
+}
+
+// ReadConfigBranch follows retained hash-addressed entries back from target
+// while their sequence number exceeds floor. It returns the hash before the
+// oldest one, which names the record at floor, and the entries oldest first.
+// Missing history or a branch past the suffix bounds fails closed.
+func ReadConfigBranch(ctx context.Context, target []byte, floor uint64, read func(context.Context, []byte) (*SOConfigChange, error)) ([]byte, []*SOConfigChange, error) {
+	// Walk back from target to the entry after floor.
+	var entries []*SOConfigChange
+	var size int
+	for len(target) != 0 {
+		entry, err := read(ctx, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		if entry == nil {
+			return nil, nil, ErrConfigHistoryUnavailable
+		}
+		if entry.GetConfigSeqno() <= floor {
+			break
+		}
+		size += entry.SizeVT()
+		if len(entries) == MaxConfigSuffixEntries || size > MaxConfigSuffixBytes {
+			return nil, nil, ErrConfigHistoryUnavailable
+		}
+		entries = append(entries, entry)
+		target = entry.GetPreviousHash()
+		if entry.GetConfigSeqno() == floor+1 {
+			break
+		}
+	}
+
+	// Verification and transmission consume transitions in causal order.
+	slices.Reverse(entries)
+	return target, entries, nil
+}
+
+// ReadConfigLineage follows retained hash-addressed entries back from target,
+// through genesis or the oldest entry read holds, and returns them oldest
+// first. A replica sends it so the receiver can resolve the config of every
+// operation it holds. Past the suffix bounds it keeps the newest entries.
+func ReadConfigLineage(ctx context.Context, target []byte, read func(context.Context, []byte) (*SOConfigChange, error)) ([]*SOConfigChange, error) {
+	// Walk back from target while the entries fit the suffix bounds.
+	var entries []*SOConfigChange
+	var size int
+	for len(target) != 0 && len(entries) < MaxConfigSuffixEntries {
+		// Stop at the first entry this replica does not hold.
+		entry, err := read(ctx, target)
+		if errors.Is(err, ErrConfigHistoryUnavailable) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if entry == nil {
+			break
+		}
+		size += entry.SizeVT()
+		if size > MaxConfigSuffixBytes {
+			break
+		}
+		entries = append(entries, entry)
+		target = entry.GetPreviousHash()
+	}
+
+	// Verification and transmission consume transitions in causal order.
+	slices.Reverse(entries)
+	return entries, nil
+}

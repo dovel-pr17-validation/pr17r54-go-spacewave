@@ -1,0 +1,227 @@
+package block_store_writeback
+
+import (
+	"context"
+	"slices"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+// decodedBlockRefInvalidator removes decoded values after storage mutation.
+type decodedBlockRefInvalidator interface {
+	// InvalidateDecodedBlockRef drops the decoded value of a block.
+	InvalidateDecodedBlockRef(context.Context, *block.BlockRef)
+}
+
+// errUnmarkedWrite is returned for a write whose blocks no transaction
+// marked, because the store below cannot mark in its transactions, when the
+// MarkingStore has no mark function to mark them after the write.
+var errUnmarkedWrite = errors.New("store did not mark the written blocks")
+
+// MarkingStore acknowledges writes only after each written block is marked.
+//
+// It marks in one of two ways. NewTxMarkingStore asks the transaction that
+// stores a block to mark it, so the block and its marker commit or discard
+// together. NewMarkingStore calls a function after the write, so a write that
+// fails to mark returns the error with the block stored, and repeating the
+// write repairs the marker. A store below that holds roots can still be unable
+// to mark in its transactions, such as an RPC proxy whose transactions run in
+// another process; NewTxMarkingStore then marks its writes after them.
+type MarkingStore struct {
+	// store owns the block writes.
+	store block.StoreOps
+	// mark records every written block after its write, when marker is nil
+	// or no transaction applied the marker.
+	mark MarkFunc
+	// marker records every written block in the transaction that stores it,
+	// when not nil.
+	marker kvtx.BlockMarker
+}
+
+// NewMarkingStore wraps store, calling mark after each successful write.
+func NewMarkingStore(store block.StoreOps, mark MarkFunc) *MarkingStore {
+	return &MarkingStore{store: store, mark: mark}
+}
+
+// NewTxMarkingStore wraps store, which marks every written block with marker
+// in the transaction that stores it. A write no transaction marked is marked
+// by calling mark after it, or fails when mark is nil.
+func NewTxMarkingStore(store block.StoreOps, marker kvtx.BlockMarker, mark MarkFunc) *MarkingStore {
+	return &MarkingStore{store: store, marker: marker, mark: mark}
+}
+
+// GetStoreParts returns the wrapped store.
+func (m *MarkingStore) GetStoreParts() []block.StorePart {
+	return []block.StorePart{{Label: "inner", Store: m.store}}
+}
+
+// GetHashType returns the inner store hash type.
+func (m *MarkingStore) GetHashType() hash.HashType {
+	return m.store.GetHashType()
+}
+
+// GetSupportedFeatures returns the inner store native feature bitset.
+func (m *MarkingStore) GetSupportedFeatures() block.StoreFeature {
+	return m.store.GetSupportedFeatures()
+}
+
+// BeginReadOperation opens a read scope on the inner store.
+func (m *MarkingStore) BeginReadOperation(ctx context.Context) (block.StoreOps, func(), error) {
+	store, release, err := m.store.BeginReadOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &MarkingStore{store: store, mark: m.mark, marker: m.marker}, release, nil
+}
+
+// PutBlock stores a block and marks it, even when it already existed.
+func (m *MarkingStore) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (*block.BlockRef, bool, error) {
+	// Mark in the storing transaction.
+	if m.marker != nil {
+		ctx, req := kvtx.WithBlockMarker(ctx, m.marker)
+		ref, existed, err := m.store.PutBlock(ctx, data, opts)
+		if err == nil && !ref.GetEmpty() && !req.Applied() {
+			err = m.markUnapplied(ctx, []Mark{{Hash: ref.GetHash(), Size: int64(len(data)), At: time.Now()}})
+		}
+		return ref, existed, err
+	}
+
+	// Store the block, then mark it when the write landed.
+	ref, existed, err := m.store.PutBlock(ctx, data, opts)
+	if err == nil && !ref.GetEmpty() {
+		err = m.mark(ctx, []Mark{{Hash: ref.GetHash(), Size: int64(len(data)), At: time.Now()}})
+	}
+	return ref, existed, err
+}
+
+// PutBlockBatch marks every successful non-tombstone write.
+func (m *MarkingStore) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	// Mark in the storing transaction.
+	if m.marker != nil {
+		ctx, req := kvtx.WithBlockMarker(ctx, m.marker)
+		existed, err := m.store.PutBlockBatch(ctx, entries)
+		if err != nil {
+			return nil, err
+		}
+		if !req.Applied() && slices.ContainsFunc(entries, isMarked) {
+			return existed, m.markEntriesUnapplied(ctx, entries)
+		}
+		m.invalidateTombstones(ctx, entries)
+		return existed, nil
+	}
+
+	// Store the batch, then mark it. A failed marker returns an error;
+	// repeating the batch repairs the markers.
+	existed, err := m.store.PutBlockBatch(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	return existed, m.markEntries(ctx, entries)
+}
+
+// markUnapplied marks blocks a transaction-marked write stored without
+// marking, through mark, or fails when there is none.
+func (m *MarkingStore) markUnapplied(ctx context.Context, marks []Mark) error {
+	if m.mark == nil {
+		return errUnmarkedWrite
+	}
+	return m.mark(ctx, marks)
+}
+
+// markEntriesUnapplied marks a batch a transaction-marked write stored without
+// marking, through mark, or fails when there is none.
+func (m *MarkingStore) markEntriesUnapplied(ctx context.Context, entries []*block.PutBatchEntry) error {
+	if m.mark == nil {
+		return errUnmarkedWrite
+	}
+	return m.markEntries(ctx, entries)
+}
+
+// isMarked reports whether a batch entry stores a block that needs a marker.
+func isMarked(entry *block.PutBatchEntry) bool {
+	return entry != nil && !entry.Tombstone && !entry.Ref.GetEmpty()
+}
+
+// invalidateTombstones invalidates the decoded values of the tombstones of a
+// written batch.
+func (m *MarkingStore) invalidateTombstones(ctx context.Context, entries []*block.PutBatchEntry) {
+	for _, entry := range entries {
+		if entry != nil && entry.Tombstone {
+			m.invalidate(ctx, entry.Ref)
+		}
+	}
+}
+
+// markEntries marks every non-tombstone entry of a written batch in one call
+// and invalidates the decoded values of its tombstones.
+func (m *MarkingStore) markEntries(ctx context.Context, entries []*block.PutBatchEntry) error {
+	// Collect the written blocks under one write time.
+	m.invalidateTombstones(ctx, entries)
+	marks := make([]Mark, 0, len(entries))
+	now := time.Now()
+	for _, entry := range entries {
+		if isMarked(entry) {
+			marks = append(marks, Mark{Hash: entry.Ref.GetHash(), Size: int64(len(entry.Data)), At: now})
+		}
+	}
+	if len(marks) == 0 {
+		return nil
+	}
+	return m.mark(ctx, marks)
+}
+
+// GetBlock gets a block by reference.
+func (m *MarkingStore) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	return m.store.GetBlock(ctx, ref)
+}
+
+// GetStoredBlock forwards to the inner store.
+func (m *MarkingStore) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	return m.store.GetStoredBlock(ctx, ref)
+}
+
+// GetBlockExists checks if a block exists.
+func (m *MarkingStore) GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error) {
+	return m.store.GetBlockExists(ctx, ref)
+}
+
+// GetBlockExistsBatch forwards batched existence probes to the inner store.
+func (m *MarkingStore) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	return m.store.GetBlockExistsBatch(ctx, refs)
+}
+
+// RmBlock removes a block.
+func (m *MarkingStore) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	if err := m.store.RmBlock(ctx, ref); err != nil {
+		return err
+	}
+	m.invalidate(ctx, ref)
+	return nil
+}
+
+// StatBlock returns block metadata.
+func (m *MarkingStore) StatBlock(ctx context.Context, ref *block.BlockRef) (*block.BlockStat, error) {
+	return m.store.StatBlock(ctx, ref)
+}
+
+// Sync forwards the durability barrier to the inner store.
+func (m *MarkingStore) Sync(ctx context.Context) (bool, error) {
+	return m.store.Sync(ctx)
+}
+
+// invalidate drops decoded values for a removed block when the store caches them.
+func (m *MarkingStore) invalidate(ctx context.Context, ref *block.BlockRef) {
+	if invalidator, ok := m.store.(decodedBlockRefInvalidator); ok {
+		invalidator.InvalidateDecodedBlockRef(ctx, ref)
+	}
+}
+
+// _ is a type assertion
+var (
+	_ block.StoreOps   = (*MarkingStore)(nil)
+	_ block.StoreParts = (*MarkingStore)(nil)
+)

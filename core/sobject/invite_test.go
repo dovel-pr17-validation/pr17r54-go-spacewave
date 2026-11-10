@@ -1,0 +1,378 @@
+package sobject
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/util/ccontainer"
+)
+
+// newTestSOHost creates a SOHost for testing with a mutable state pointer.
+// The returned statePtr can be read to observe writes.
+func newTestSOHost(ctx context.Context, state *SOState) (*SOHost, **SOState) {
+	statePtr := &state
+	ctr := ccontainer.NewCContainer[*SOState](state)
+	host := NewSOHost(ctx,
+		func(_ context.Context, _ string, released func()) (ccontainer.Watchable[*SOState], func(), error) {
+			return ctr, func() {}, nil
+		},
+		func(_ context.Context, _ string) (SOStateLock, error) {
+			return NewSOStateLock(*statePtr, func(_ context.Context, s *SOState, _ ...*SOConfigChange) error {
+				*statePtr = s
+				ctr.SetValue(s)
+				return nil
+			}, func() {}), nil
+		},
+		mockSharedObjectID,
+	)
+	return host, statePtr
+}
+
+// TestCreateSOInviteOp signs an invite message and stores only its token hash.
+func TestCreateSOInviteOp(t *testing.T) {
+	// Host a shared object owned by one peer.
+	ctx := context.Background()
+	peers := createMockPeers(t, 1)
+	owner := peers[0]
+	ownerPriv, err := owner.GetPrivKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerIDStr := owner.GetPeerID().String()
+	host, statePtr := newTestSOHost(ctx, &SOState{
+		Config: &SharedObjectConfig{
+			Participants: []*SOParticipantConfig{{
+				PeerId: ownerIDStr,
+				Role:   SOParticipantRole_SOParticipantRole_OWNER,
+			}},
+		},
+	})
+
+	// Create an invite with five uses.
+	msg, err := host.CreateSOInviteOp(ctx, ownerPriv, "test-provider", &SOInvite{
+		Role:    SOParticipantRole_SOParticipantRole_WRITER,
+		MaxUses: 5,
+	})
+	if err != nil {
+		t.Fatalf("CreateSOInviteOp: %v", err)
+	}
+
+	// Verify the returned message.
+	if msg.GetInviteId() == "" {
+		t.Fatal("invite_id should not be empty")
+	}
+	if msg.GetOwnerPeerId() != ownerIDStr {
+		t.Fatalf("owner_peer_id mismatch: got %s, want %s", msg.GetOwnerPeerId(), ownerIDStr)
+	}
+	if msg.GetProviderId() != "test-provider" {
+		t.Fatal("provider_id mismatch")
+	}
+	if len(msg.GetToken()) != 32 {
+		t.Fatalf("expected 32-byte token, got %d", len(msg.GetToken()))
+	}
+	if msg.GetRole() != SOParticipantRole_SOParticipantRole_WRITER {
+		t.Fatal("role mismatch")
+	}
+	if msg.GetMaxUses() != 5 {
+		t.Fatal("max_uses mismatch")
+	}
+	if msg.GetSignature() == nil {
+		t.Fatal("signature should not be nil")
+	}
+
+	// Verify the on-chain invite.
+	written := *statePtr
+	if len(written.GetInvites()) != 1 {
+		t.Fatalf("expected 1 invite, got %d", len(written.GetInvites()))
+	}
+	inv := written.GetInvites()[0]
+	if inv.GetInviteId() != msg.GetInviteId() {
+		t.Fatal("on-chain invite_id should match message invite_id")
+	}
+	if len(inv.GetTokenHash()) != 32 {
+		t.Fatalf("expected 32-byte token_hash, got %d", len(inv.GetTokenHash()))
+	}
+	if string(inv.GetTokenHash()) == string(msg.GetToken()) {
+		t.Fatal("token_hash should be a hash, not the raw token")
+	}
+}
+
+// TestCreateInvite stores an invite and rejects a duplicate ID.
+func TestCreateInvite(t *testing.T) {
+	ctx := context.Background()
+	peers := createMockPeers(t, 1)
+	owner := peers[0]
+	ownerPriv, err := owner.GetPrivKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerIDStr := owner.GetPeerID().String()
+
+	state := &SOState{
+		Config: &SharedObjectConfig{
+			Participants: []*SOParticipantConfig{{
+				PeerId: ownerIDStr,
+				Role:   SOParticipantRole_SOParticipantRole_OWNER,
+			}},
+		},
+	}
+
+	host, statePtr := newTestSOHost(ctx, state)
+
+	invite := &SOInvite{
+		InviteId:  "inv-1",
+		TokenHash: []byte("hash-1"),
+		Role:      SOParticipantRole_SOParticipantRole_WRITER,
+		MaxUses:   5,
+	}
+
+	if err := host.CreateInvite(ctx, ownerPriv, invite); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	written := *statePtr
+	if len(written.GetInvites()) != 1 {
+		t.Fatalf("expected 1 invite, got %d", len(written.GetInvites()))
+	}
+	if written.GetInvites()[0].GetInviteId() != "inv-1" {
+		t.Fatal("invite_id mismatch")
+	}
+
+	// Duplicate should fail.
+	err = host.CreateInvite(ctx, ownerPriv, invite)
+	if err == nil {
+		t.Fatal("expected error for duplicate invite_id")
+	}
+}
+
+// TestRevokeInvite marks an invite revoked.
+func TestRevokeInvite(t *testing.T) {
+	ctx := context.Background()
+	peers := createMockPeers(t, 1)
+	owner := peers[0]
+	ownerPriv, err := owner.GetPrivKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerIDStr := owner.GetPeerID().String()
+
+	state := &SOState{
+		Config: &SharedObjectConfig{
+			Participants: []*SOParticipantConfig{{
+				PeerId: ownerIDStr,
+				Role:   SOParticipantRole_SOParticipantRole_OWNER,
+			}},
+		},
+		Invites: []*SOInvite{{
+			InviteId:  "inv-1",
+			TokenHash: []byte("hash-1"),
+			Role:      SOParticipantRole_SOParticipantRole_WRITER,
+		}},
+	}
+
+	host, statePtr := newTestSOHost(ctx, state)
+
+	if err := host.RevokeInvite(ctx, ownerPriv, "inv-1"); err != nil {
+		t.Fatalf("RevokeInvite: %v", err)
+	}
+	written := *statePtr
+	if !written.GetInvites()[0].GetRevoked() {
+		t.Fatal("invite should be revoked")
+	}
+
+	// Revoking again should fail.
+	err = host.RevokeInvite(ctx, ownerPriv, "inv-1")
+	if err == nil {
+		t.Fatal("expected error for already-revoked invite")
+	}
+
+	// Revoking nonexistent should fail.
+	err = host.RevokeInvite(ctx, ownerPriv, "inv-999")
+	if err == nil {
+		t.Fatal("expected error for nonexistent invite")
+	}
+}
+
+// TestIncrementInviteUses counts uses up to max_uses.
+func TestIncrementInviteUses(t *testing.T) {
+	ctx := context.Background()
+	peers := createMockPeers(t, 1)
+	owner := peers[0]
+	ownerPriv, err := owner.GetPrivKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerIDStr := owner.GetPeerID().String()
+
+	state := &SOState{
+		Config: &SharedObjectConfig{
+			Participants: []*SOParticipantConfig{{
+				PeerId: ownerIDStr,
+				Role:   SOParticipantRole_SOParticipantRole_OWNER,
+			}},
+		},
+		Invites: []*SOInvite{{
+			InviteId:  "inv-1",
+			TokenHash: []byte("hash-1"),
+			Role:      SOParticipantRole_SOParticipantRole_WRITER,
+			MaxUses:   2,
+		}},
+	}
+
+	host, statePtr := newTestSOHost(ctx, state)
+
+	// First use.
+	if err := host.IncrementInviteUses(ctx, ownerPriv, "inv-1"); err != nil {
+		t.Fatalf("IncrementInviteUses: %v", err)
+	}
+	if (*statePtr).GetInvites()[0].GetUses() != 1 {
+		t.Fatalf("expected uses=1, got %d", (*statePtr).GetInvites()[0].GetUses())
+	}
+
+	// Second use (hits max_uses).
+	if err := host.IncrementInviteUses(ctx, ownerPriv, "inv-1"); err != nil {
+		t.Fatalf("IncrementInviteUses: %v", err)
+	}
+	if (*statePtr).GetInvites()[0].GetUses() != 2 {
+		t.Fatalf("expected uses=2, got %d", (*statePtr).GetInvites()[0].GetUses())
+	}
+
+	// Third use should fail (max_uses reached).
+	err = host.IncrementInviteUses(ctx, ownerPriv, "inv-1")
+	if err == nil {
+		t.Fatal("expected error for max_uses reached")
+	}
+}
+
+// TestIncrementInviteUsesExpired rejects a use of an expired invite.
+func TestIncrementInviteUsesExpired(t *testing.T) {
+	ctx := context.Background()
+	peers := createMockPeers(t, 1)
+	owner := peers[0]
+	ownerPriv, err := owner.GetPrivKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerIDStr := owner.GetPeerID().String()
+
+	state := &SOState{
+		Config: &SharedObjectConfig{
+			Participants: []*SOParticipantConfig{{
+				PeerId: ownerIDStr,
+				Role:   SOParticipantRole_SOParticipantRole_OWNER,
+			}},
+		},
+		Invites: []*SOInvite{{
+			InviteId:  "inv-expired",
+			TokenHash: []byte("hash"),
+			Role:      SOParticipantRole_SOParticipantRole_WRITER,
+			ExpiresAt: timestamppb.New(time.Now().Add(-60 * time.Second)),
+		}},
+	}
+
+	host, _ := newTestSOHost(ctx, state)
+
+	err = host.IncrementInviteUses(ctx, ownerPriv, "inv-expired")
+	if err == nil {
+		t.Fatal("expected error for expired invite")
+	}
+}
+
+// TestValidateInviteRedeemable limits repeat redemption to a targeted invite's named peer.
+func TestValidateInviteRedeemable(t *testing.T) {
+	past := timestamppb.New(time.Now().Add(-time.Hour))
+	tests := []struct {
+		name    string
+		invite  *SOInvite
+		peerID  string
+		wantErr bool
+	}{
+		{
+			name:   "targeted peer redeems an unused invite",
+			invite: &SOInvite{TargetPeerId: "named", MaxUses: 1},
+			peerID: "named",
+		},
+		{
+			name:   "targeted peer redeems a used invite again",
+			invite: &SOInvite{TargetPeerId: "named", MaxUses: 1, Uses: 1},
+			peerID: "named",
+		},
+		{
+			name:    "other peer is refused a targeted invite",
+			invite:  &SOInvite{TargetPeerId: "named", MaxUses: 1},
+			peerID:  "other",
+			wantErr: true,
+		},
+		{
+			name:    "other peer is refused a used targeted invite",
+			invite:  &SOInvite{TargetPeerId: "named", MaxUses: 1, Uses: 1},
+			peerID:  "other",
+			wantErr: true,
+		},
+		{
+			name:   "untargeted invite admits anyone while unused",
+			invite: &SOInvite{MaxUses: 1},
+			peerID: "other",
+		},
+		{
+			name:    "untargeted invite is refused after its use",
+			invite:  &SOInvite{MaxUses: 1, Uses: 1},
+			peerID:  "other",
+			wantErr: true,
+		},
+		{
+			name:    "revoked targeted invite is refused to its peer",
+			invite:  &SOInvite{TargetPeerId: "named", Revoked: true},
+			peerID:  "named",
+			wantErr: true,
+		},
+		{
+			name:    "expired targeted invite is refused to its peer",
+			invite:  &SOInvite{TargetPeerId: "named", ExpiresAt: past},
+			peerID:  "named",
+			wantErr: true,
+		},
+		{
+			name:    "revoked untargeted invite is refused",
+			invite:  &SOInvite{Revoked: true},
+			peerID:  "other",
+			wantErr: true,
+		},
+		{
+			name:    "expired untargeted invite is refused",
+			invite:  &SOInvite{ExpiresAt: past},
+			peerID:  "other",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateInviteRedeemable(tt.invite, tt.peerID)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateInviteRedeemable() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateInviteUsableTargetedUsed keeps a used targeted invite closed to new peers.
+func TestValidateInviteUsableTargetedUsed(t *testing.T) {
+	inv := &SOInvite{TargetPeerId: "named", MaxUses: 1, Uses: 1}
+	if err := ValidateInviteUsable(inv); err == nil {
+		t.Fatal("expected a used targeted invite to be unusable")
+	}
+}
+
+// TestInviteCountsUse counts a targeted invite's first redemption only.
+func TestInviteCountsUse(t *testing.T) {
+	if !InviteCountsUse(&SOInvite{TargetPeerId: "named"}) {
+		t.Fatal("expected the first targeted redemption to count")
+	}
+	if InviteCountsUse(&SOInvite{TargetPeerId: "named", Uses: 1}) {
+		t.Fatal("expected a repeat targeted redemption not to count")
+	}
+	if !InviteCountsUse(&SOInvite{Uses: 1}) {
+		t.Fatal("expected every untargeted redemption to count")
+	}
+}

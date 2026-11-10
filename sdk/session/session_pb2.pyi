@@ -1,0 +1,1151 @@
+import datetime
+
+from core.account.settings import settings_pb2 as _settings_pb2
+from core.pairing import pairing_pb2 as _pairing_pb2
+from core.provider.transfer import transfer_pb2 as _transfer_pb2
+from core.session import session_pb2 as _session_pb2
+from core.sobject import sobject_pb2 as _sobject_pb2
+from core.space import space_pb2 as _space_pb2
+from db.block.store.s3 import s3_pb2 as _s3_pb2
+from net.hash import hash_pb2 as _hash_pb2
+from google.protobuf import timestamp_pb2 as _timestamp_pb2
+from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
+
+DESCRIPTOR: _descriptor.FileDescriptor
+
+class SyncStatusState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SyncStatusState_SYNCED: _ClassVar[SyncStatusState]
+    SyncStatusState_ACTIVE: _ClassVar[SyncStatusState]
+    SyncStatusState_ERROR: _ClassVar[SyncStatusState]
+
+class SyncActivityDirection(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SyncActivityDirection_NONE: _ClassVar[SyncActivityDirection]
+    SyncActivityDirection_UPLOAD: _ClassVar[SyncActivityDirection]
+    SyncActivityDirection_DOWNLOAD: _ClassVar[SyncActivityDirection]
+    SyncActivityDirection_UPLOAD_DOWNLOAD: _ClassVar[SyncActivityDirection]
+
+class SyncTransportState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SyncTransportState_UNKNOWN: _ClassVar[SyncTransportState]
+    SyncTransportState_UNAVAILABLE: _ClassVar[SyncTransportState]
+    SyncTransportState_CONNECTING: _ClassVar[SyncTransportState]
+    SyncTransportState_ONLINE: _ClassVar[SyncTransportState]
+    SyncTransportState_ERROR: _ClassVar[SyncTransportState]
+
+class SyncP2PState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SyncP2PState_UNKNOWN: _ClassVar[SyncP2PState]
+    SyncP2PState_NO_PEERS: _ClassVar[SyncP2PState]
+    SyncP2PState_IDLE: _ClassVar[SyncP2PState]
+    SyncP2PState_ACTIVE: _ClassVar[SyncP2PState]
+    SyncP2PState_ERROR: _ClassVar[SyncP2PState]
+    SyncP2PState_DISABLED: _ClassVar[SyncP2PState]
+    SyncP2PState_STARTING: _ClassVar[SyncP2PState]
+    SyncP2PState_FALLBACK_NO_PEER: _ClassVar[SyncP2PState]
+
+class SyncBlockSource(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SyncBlockSource_UNKNOWN: _ClassVar[SyncBlockSource]
+    SyncBlockSource_CACHE: _ClassVar[SyncBlockSource]
+    SyncBlockSource_DIRECT: _ClassVar[SyncBlockSource]
+    SyncBlockSource_CLOUD: _ClassVar[SyncBlockSource]
+
+class PairingStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    PairingStatus_IDLE: _ClassVar[PairingStatus]
+    PairingStatus_CODE_GENERATED: _ClassVar[PairingStatus]
+    PairingStatus_WAITING_FOR_PEER: _ClassVar[PairingStatus]
+    PairingStatus_PEER_CONNECTED: _ClassVar[PairingStatus]
+    PairingStatus_VERIFYING_EMOJI: _ClassVar[PairingStatus]
+    PairingStatus_VERIFIED: _ClassVar[PairingStatus]
+    PairingStatus_FAILED: _ClassVar[PairingStatus]
+    PairingStatus_SIGNALING_FAILED: _ClassVar[PairingStatus]
+    PairingStatus_CONNECTION_TIMEOUT: _ClassVar[PairingStatus]
+    PairingStatus_WAITING_FOR_REMOTE_CONFIRM: _ClassVar[PairingStatus]
+    PairingStatus_BOTH_CONFIRMED: _ClassVar[PairingStatus]
+    PairingStatus_PAIRING_REJECTED: _ClassVar[PairingStatus]
+    PairingStatus_CONFIRMATION_TIMEOUT: _ClassVar[PairingStatus]
+    PairingStatus_ENROLLING: _ClassVar[PairingStatus]
+    PairingStatus_SELECTING_ACCOUNT: _ClassVar[PairingStatus]
+
+class JoinSpaceViaInviteResult(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    JoinSpaceViaInviteResult_UNSPECIFIED: _ClassVar[JoinSpaceViaInviteResult]
+    JoinSpaceViaInviteResult_ACCEPTED: _ClassVar[JoinSpaceViaInviteResult]
+    JoinSpaceViaInviteResult_PENDING_OWNER_APPROVAL: _ClassVar[JoinSpaceViaInviteResult]
+    JoinSpaceViaInviteResult_REJECTED: _ClassVar[JoinSpaceViaInviteResult]
+    JoinSpaceViaInviteResult_OWNER_MUST_BE_ONLINE: _ClassVar[JoinSpaceViaInviteResult]
+
+class MoveSpaceStoragePhase(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MoveSpaceStoragePhase_UNKNOWN: _ClassVar[MoveSpaceStoragePhase]
+    MoveSpaceStoragePhase_FETCH: _ClassVar[MoveSpaceStoragePhase]
+    MoveSpaceStoragePhase_UPLOAD: _ClassVar[MoveSpaceStoragePhase]
+    MoveSpaceStoragePhase_DONE: _ClassVar[MoveSpaceStoragePhase]
+SyncStatusState_SYNCED: SyncStatusState
+SyncStatusState_ACTIVE: SyncStatusState
+SyncStatusState_ERROR: SyncStatusState
+SyncActivityDirection_NONE: SyncActivityDirection
+SyncActivityDirection_UPLOAD: SyncActivityDirection
+SyncActivityDirection_DOWNLOAD: SyncActivityDirection
+SyncActivityDirection_UPLOAD_DOWNLOAD: SyncActivityDirection
+SyncTransportState_UNKNOWN: SyncTransportState
+SyncTransportState_UNAVAILABLE: SyncTransportState
+SyncTransportState_CONNECTING: SyncTransportState
+SyncTransportState_ONLINE: SyncTransportState
+SyncTransportState_ERROR: SyncTransportState
+SyncP2PState_UNKNOWN: SyncP2PState
+SyncP2PState_NO_PEERS: SyncP2PState
+SyncP2PState_IDLE: SyncP2PState
+SyncP2PState_ACTIVE: SyncP2PState
+SyncP2PState_ERROR: SyncP2PState
+SyncP2PState_DISABLED: SyncP2PState
+SyncP2PState_STARTING: SyncP2PState
+SyncP2PState_FALLBACK_NO_PEER: SyncP2PState
+SyncBlockSource_UNKNOWN: SyncBlockSource
+SyncBlockSource_CACHE: SyncBlockSource
+SyncBlockSource_DIRECT: SyncBlockSource
+SyncBlockSource_CLOUD: SyncBlockSource
+PairingStatus_IDLE: PairingStatus
+PairingStatus_CODE_GENERATED: PairingStatus
+PairingStatus_WAITING_FOR_PEER: PairingStatus
+PairingStatus_PEER_CONNECTED: PairingStatus
+PairingStatus_VERIFYING_EMOJI: PairingStatus
+PairingStatus_VERIFIED: PairingStatus
+PairingStatus_FAILED: PairingStatus
+PairingStatus_SIGNALING_FAILED: PairingStatus
+PairingStatus_CONNECTION_TIMEOUT: PairingStatus
+PairingStatus_WAITING_FOR_REMOTE_CONFIRM: PairingStatus
+PairingStatus_BOTH_CONFIRMED: PairingStatus
+PairingStatus_PAIRING_REJECTED: PairingStatus
+PairingStatus_CONFIRMATION_TIMEOUT: PairingStatus
+PairingStatus_ENROLLING: PairingStatus
+PairingStatus_SELECTING_ACCOUNT: PairingStatus
+JoinSpaceViaInviteResult_UNSPECIFIED: JoinSpaceViaInviteResult
+JoinSpaceViaInviteResult_ACCEPTED: JoinSpaceViaInviteResult
+JoinSpaceViaInviteResult_PENDING_OWNER_APPROVAL: JoinSpaceViaInviteResult
+JoinSpaceViaInviteResult_REJECTED: JoinSpaceViaInviteResult
+JoinSpaceViaInviteResult_OWNER_MUST_BE_ONLINE: JoinSpaceViaInviteResult
+MoveSpaceStoragePhase_UNKNOWN: MoveSpaceStoragePhase
+MoveSpaceStoragePhase_FETCH: MoveSpaceStoragePhase
+MoveSpaceStoragePhase_UPLOAD: MoveSpaceStoragePhase
+MoveSpaceStoragePhase_DONE: MoveSpaceStoragePhase
+
+class GetSessionInfoRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GetSessionInfoResponse(_message.Message):
+    __slots__ = ("session_ref", "peer_id", "crypto_info", "username", "signing_peer_id")
+    SESSION_REF_FIELD_NUMBER: _ClassVar[int]
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    CRYPTO_INFO_FIELD_NUMBER: _ClassVar[int]
+    USERNAME_FIELD_NUMBER: _ClassVar[int]
+    SIGNING_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    session_ref: _session_pb2.SessionRef
+    peer_id: str
+    crypto_info: SessionCryptoInfo
+    username: str
+    signing_peer_id: str
+    def __init__(self, session_ref: _Optional[_Union[_session_pb2.SessionRef, _Mapping]] = ..., peer_id: _Optional[str] = ..., crypto_info: _Optional[_Union[SessionCryptoInfo, _Mapping]] = ..., username: _Optional[str] = ..., signing_peer_id: _Optional[str] = ...) -> None: ...
+
+class SessionCryptoInfo(_message.Message):
+    __slots__ = ("key_type", "public_key_base58", "space_count", "total_storage_bytes", "public_key_pem")
+    KEY_TYPE_FIELD_NUMBER: _ClassVar[int]
+    PUBLIC_KEY_BASE58_FIELD_NUMBER: _ClassVar[int]
+    SPACE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_STORAGE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PUBLIC_KEY_PEM_FIELD_NUMBER: _ClassVar[int]
+    key_type: str
+    public_key_base58: str
+    space_count: int
+    total_storage_bytes: int
+    public_key_pem: str
+    def __init__(self, key_type: _Optional[str] = ..., public_key_base58: _Optional[str] = ..., space_count: _Optional[int] = ..., total_storage_bytes: _Optional[int] = ..., public_key_pem: _Optional[str] = ...) -> None: ...
+
+class WatchResourcesListRequest(_message.Message):
+    __slots__ = ("include_index_object_types",)
+    INCLUDE_INDEX_OBJECT_TYPES_FIELD_NUMBER: _ClassVar[int]
+    include_index_object_types: bool
+    def __init__(self, include_index_object_types: _Optional[bool] = ...) -> None: ...
+
+class WatchResourcesListResponse(_message.Message):
+    __slots__ = ("spaces_list",)
+    SPACES_LIST_FIELD_NUMBER: _ClassVar[int]
+    spaces_list: _containers.RepeatedCompositeFieldContainer[_space_pb2.SpaceSoListEntry]
+    def __init__(self, spaces_list: _Optional[_Iterable[_Union[_space_pb2.SpaceSoListEntry, _Mapping]]] = ...) -> None: ...
+
+class CreateSpaceRequest(_message.Message):
+    __slots__ = ("space_name", "owner_type", "owner_id", "storage_backend_id", "account_storage")
+    SPACE_NAME_FIELD_NUMBER: _ClassVar[int]
+    OWNER_TYPE_FIELD_NUMBER: _ClassVar[int]
+    OWNER_ID_FIELD_NUMBER: _ClassVar[int]
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    ACCOUNT_STORAGE_FIELD_NUMBER: _ClassVar[int]
+    space_name: str
+    owner_type: str
+    owner_id: str
+    storage_backend_id: str
+    account_storage: bool
+    def __init__(self, space_name: _Optional[str] = ..., owner_type: _Optional[str] = ..., owner_id: _Optional[str] = ..., storage_backend_id: _Optional[str] = ..., account_storage: _Optional[bool] = ...) -> None: ...
+
+class CreateSpaceResponse(_message.Message):
+    __slots__ = ("shared_object_ref", "shared_object_meta", "mounted_shared_object", "shared_object_body_resource_id", "space_world_resource_id")
+    SHARED_OBJECT_REF_FIELD_NUMBER: _ClassVar[int]
+    SHARED_OBJECT_META_FIELD_NUMBER: _ClassVar[int]
+    MOUNTED_SHARED_OBJECT_FIELD_NUMBER: _ClassVar[int]
+    SHARED_OBJECT_BODY_RESOURCE_ID_FIELD_NUMBER: _ClassVar[int]
+    SPACE_WORLD_RESOURCE_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_ref: _sobject_pb2.SharedObjectRef
+    shared_object_meta: _sobject_pb2.SharedObjectMeta
+    mounted_shared_object: MountSharedObjectResponse
+    shared_object_body_resource_id: int
+    space_world_resource_id: int
+    def __init__(self, shared_object_ref: _Optional[_Union[_sobject_pb2.SharedObjectRef, _Mapping]] = ..., shared_object_meta: _Optional[_Union[_sobject_pb2.SharedObjectMeta, _Mapping]] = ..., mounted_shared_object: _Optional[_Union[MountSharedObjectResponse, _Mapping]] = ..., shared_object_body_resource_id: _Optional[int] = ..., space_world_resource_id: _Optional[int] = ...) -> None: ...
+
+class DeleteSpaceRequest(_message.Message):
+    __slots__ = ("shared_object_id",)
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    def __init__(self, shared_object_id: _Optional[str] = ...) -> None: ...
+
+class DeleteSpaceResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class LeaveSpaceRequest(_message.Message):
+    __slots__ = ("shared_object_id", "successor_peer_id")
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    SUCCESSOR_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    successor_peer_id: str
+    def __init__(self, shared_object_id: _Optional[str] = ..., successor_peer_id: _Optional[str] = ...) -> None: ...
+
+class LeaveSpaceResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class RenameSpaceRequest(_message.Message):
+    __slots__ = ("shared_object_id", "display_name")
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    DISPLAY_NAME_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    display_name: str
+    def __init__(self, shared_object_id: _Optional[str] = ..., display_name: _Optional[str] = ...) -> None: ...
+
+class RenameSpaceResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class MountSharedObjectRequest(_message.Message):
+    __slots__ = ("shared_object_id",)
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    def __init__(self, shared_object_id: _Optional[str] = ...) -> None: ...
+
+class MountSharedObjectResponse(_message.Message):
+    __slots__ = ("health", "resource_id", "shared_object_meta", "peer_id", "shared_object_id", "block_store_id", "hash_type")
+    HEALTH_FIELD_NUMBER: _ClassVar[int]
+    RESOURCE_ID_FIELD_NUMBER: _ClassVar[int]
+    SHARED_OBJECT_META_FIELD_NUMBER: _ClassVar[int]
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_STORE_ID_FIELD_NUMBER: _ClassVar[int]
+    HASH_TYPE_FIELD_NUMBER: _ClassVar[int]
+    health: _sobject_pb2.SharedObjectHealth
+    resource_id: int
+    shared_object_meta: _sobject_pb2.SharedObjectMeta
+    peer_id: str
+    shared_object_id: str
+    block_store_id: str
+    hash_type: _hash_pb2.HashType
+    def __init__(self, health: _Optional[_Union[_sobject_pb2.SharedObjectHealth, _Mapping]] = ..., resource_id: _Optional[int] = ..., shared_object_meta: _Optional[_Union[_sobject_pb2.SharedObjectMeta, _Mapping]] = ..., peer_id: _Optional[str] = ..., shared_object_id: _Optional[str] = ..., block_store_id: _Optional[str] = ..., hash_type: _Optional[_Union[_hash_pb2.HashType, str]] = ...) -> None: ...
+
+class WatchSharedObjectHealthRequest(_message.Message):
+    __slots__ = ("shared_object_id",)
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    def __init__(self, shared_object_id: _Optional[str] = ...) -> None: ...
+
+class WatchSharedObjectHealthResponse(_message.Message):
+    __slots__ = ("health",)
+    HEALTH_FIELD_NUMBER: _ClassVar[int]
+    health: _sobject_pb2.SharedObjectHealth
+    def __init__(self, health: _Optional[_Union[_sobject_pb2.SharedObjectHealth, _Mapping]] = ...) -> None: ...
+
+class WatchSyncStatusRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchStorageStatsRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SyncBlockStoreStatus(_message.Message):
+    __slots__ = ("block_store_id", "direct_hit_count", "cloud_hit_count", "cache_hit_count", "last_source", "accepted_checkpoint_height", "cloud_remote_sequence", "shared_object_id")
+    BLOCK_STORE_ID_FIELD_NUMBER: _ClassVar[int]
+    DIRECT_HIT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    CLOUD_HIT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    CACHE_HIT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    LAST_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    ACCEPTED_CHECKPOINT_HEIGHT_FIELD_NUMBER: _ClassVar[int]
+    CLOUD_REMOTE_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    block_store_id: str
+    direct_hit_count: int
+    cloud_hit_count: int
+    cache_hit_count: int
+    last_source: SyncBlockSource
+    accepted_checkpoint_height: int
+    cloud_remote_sequence: int
+    shared_object_id: str
+    def __init__(self, block_store_id: _Optional[str] = ..., direct_hit_count: _Optional[int] = ..., cloud_hit_count: _Optional[int] = ..., cache_hit_count: _Optional[int] = ..., last_source: _Optional[_Union[SyncBlockSource, str]] = ..., accepted_checkpoint_height: _Optional[int] = ..., cloud_remote_sequence: _Optional[int] = ..., shared_object_id: _Optional[str] = ...) -> None: ...
+
+class WatchSyncStatusResponse(_message.Message):
+    __slots__ = ("state", "direction", "transport_state", "p2p_state", "pending_upload_bytes", "pending_download_bytes", "pending_upload_count", "pending_download_count", "upload_bytes_per_second", "download_bytes_per_second", "active_upload_bytes", "active_upload_transferred_bytes", "in_flight_upload_count", "active_store_count", "active_peer_count", "last_error", "last_activity_at", "pack_range_request_count", "pack_range_response_bytes", "pack_full_response_fallback_count", "pack_full_response_fallback_bytes", "pack_last_full_response_fallback_bytes", "pack_manifest_entries", "pack_block_count_total", "pack_block_count_min", "pack_block_count_max", "pack_size_bytes_total", "pack_size_bytes_min", "pack_size_bytes_max", "pack_bloom_filter_count", "pack_bloom_missing_count", "pack_bloom_invalid_count", "pack_bloom_max_false_positive_rate", "pack_bloom_risk_pack_count", "pack_lookup_count", "pack_candidate_packs", "pack_opened_packs", "pack_negative_packs", "pack_target_hits", "pack_last_candidate_packs", "pack_last_opened_packs", "pack_last_negative_packs", "pack_last_target_hit", "pack_index_cache_hits", "pack_index_cache_misses", "pack_index_cache_read_errors", "pack_index_cache_write_errors", "pack_remote_index_loads", "pack_remote_index_bytes", "pack_last_remote_index_bytes", "pack_index_tail_fetch_count", "pack_index_tail_fetch_bytes", "pack_index_tail_response_bytes", "direct_p2p_disabled", "block_stores", "local_account", "local_copies", "peer_upload_bytes", "peer_download_bytes", "peers", "upload_error")
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    DIRECTION_FIELD_NUMBER: _ClassVar[int]
+    TRANSPORT_STATE_FIELD_NUMBER: _ClassVar[int]
+    P2P_STATE_FIELD_NUMBER: _ClassVar[int]
+    PENDING_UPLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PENDING_DOWNLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PENDING_UPLOAD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PENDING_DOWNLOAD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    UPLOAD_BYTES_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOAD_BYTES_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_UPLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_UPLOAD_TRANSFERRED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    IN_FLIGHT_UPLOAD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_STORE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_PEER_COUNT_FIELD_NUMBER: _ClassVar[int]
+    LAST_ERROR_FIELD_NUMBER: _ClassVar[int]
+    LAST_ACTIVITY_AT_FIELD_NUMBER: _ClassVar[int]
+    PACK_RANGE_REQUEST_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_RANGE_RESPONSE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PACK_FULL_RESPONSE_FALLBACK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_FULL_RESPONSE_FALLBACK_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PACK_LAST_FULL_RESPONSE_FALLBACK_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PACK_MANIFEST_ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOCK_COUNT_TOTAL_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOCK_COUNT_MIN_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOCK_COUNT_MAX_FIELD_NUMBER: _ClassVar[int]
+    PACK_SIZE_BYTES_TOTAL_FIELD_NUMBER: _ClassVar[int]
+    PACK_SIZE_BYTES_MIN_FIELD_NUMBER: _ClassVar[int]
+    PACK_SIZE_BYTES_MAX_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOOM_FILTER_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOOM_MISSING_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOOM_INVALID_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOOM_MAX_FALSE_POSITIVE_RATE_FIELD_NUMBER: _ClassVar[int]
+    PACK_BLOOM_RISK_PACK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_LOOKUP_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_CANDIDATE_PACKS_FIELD_NUMBER: _ClassVar[int]
+    PACK_OPENED_PACKS_FIELD_NUMBER: _ClassVar[int]
+    PACK_NEGATIVE_PACKS_FIELD_NUMBER: _ClassVar[int]
+    PACK_TARGET_HITS_FIELD_NUMBER: _ClassVar[int]
+    PACK_LAST_CANDIDATE_PACKS_FIELD_NUMBER: _ClassVar[int]
+    PACK_LAST_OPENED_PACKS_FIELD_NUMBER: _ClassVar[int]
+    PACK_LAST_NEGATIVE_PACKS_FIELD_NUMBER: _ClassVar[int]
+    PACK_LAST_TARGET_HIT_FIELD_NUMBER: _ClassVar[int]
+    PACK_INDEX_CACHE_HITS_FIELD_NUMBER: _ClassVar[int]
+    PACK_INDEX_CACHE_MISSES_FIELD_NUMBER: _ClassVar[int]
+    PACK_INDEX_CACHE_READ_ERRORS_FIELD_NUMBER: _ClassVar[int]
+    PACK_INDEX_CACHE_WRITE_ERRORS_FIELD_NUMBER: _ClassVar[int]
+    PACK_REMOTE_INDEX_LOADS_FIELD_NUMBER: _ClassVar[int]
+    PACK_REMOTE_INDEX_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PACK_LAST_REMOTE_INDEX_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PACK_INDEX_TAIL_FETCH_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PACK_INDEX_TAIL_FETCH_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PACK_INDEX_TAIL_RESPONSE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    DIRECT_P2P_DISABLED_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_STORES_FIELD_NUMBER: _ClassVar[int]
+    LOCAL_ACCOUNT_FIELD_NUMBER: _ClassVar[int]
+    LOCAL_COPIES_FIELD_NUMBER: _ClassVar[int]
+    PEER_UPLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PEER_DOWNLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PEERS_FIELD_NUMBER: _ClassVar[int]
+    UPLOAD_ERROR_FIELD_NUMBER: _ClassVar[int]
+    state: SyncStatusState
+    direction: SyncActivityDirection
+    transport_state: SyncTransportState
+    p2p_state: SyncP2PState
+    pending_upload_bytes: int
+    pending_download_bytes: int
+    pending_upload_count: int
+    pending_download_count: int
+    upload_bytes_per_second: int
+    download_bytes_per_second: int
+    active_upload_bytes: int
+    active_upload_transferred_bytes: int
+    in_flight_upload_count: int
+    active_store_count: int
+    active_peer_count: int
+    last_error: str
+    last_activity_at: _timestamp_pb2.Timestamp
+    pack_range_request_count: int
+    pack_range_response_bytes: int
+    pack_full_response_fallback_count: int
+    pack_full_response_fallback_bytes: int
+    pack_last_full_response_fallback_bytes: int
+    pack_manifest_entries: int
+    pack_block_count_total: int
+    pack_block_count_min: int
+    pack_block_count_max: int
+    pack_size_bytes_total: int
+    pack_size_bytes_min: int
+    pack_size_bytes_max: int
+    pack_bloom_filter_count: int
+    pack_bloom_missing_count: int
+    pack_bloom_invalid_count: int
+    pack_bloom_max_false_positive_rate: float
+    pack_bloom_risk_pack_count: int
+    pack_lookup_count: int
+    pack_candidate_packs: int
+    pack_opened_packs: int
+    pack_negative_packs: int
+    pack_target_hits: int
+    pack_last_candidate_packs: int
+    pack_last_opened_packs: int
+    pack_last_negative_packs: int
+    pack_last_target_hit: bool
+    pack_index_cache_hits: int
+    pack_index_cache_misses: int
+    pack_index_cache_read_errors: int
+    pack_index_cache_write_errors: int
+    pack_remote_index_loads: int
+    pack_remote_index_bytes: int
+    pack_last_remote_index_bytes: int
+    pack_index_tail_fetch_count: int
+    pack_index_tail_fetch_bytes: int
+    pack_index_tail_response_bytes: int
+    direct_p2p_disabled: bool
+    block_stores: _containers.RepeatedCompositeFieldContainer[SyncBlockStoreStatus]
+    local_account: bool
+    local_copies: _containers.RepeatedCompositeFieldContainer[SyncLocalCopyStatus]
+    peer_upload_bytes: int
+    peer_download_bytes: int
+    peers: _containers.RepeatedCompositeFieldContainer[SyncPeerTransferStatus]
+    upload_error: str
+    def __init__(self, state: _Optional[_Union[SyncStatusState, str]] = ..., direction: _Optional[_Union[SyncActivityDirection, str]] = ..., transport_state: _Optional[_Union[SyncTransportState, str]] = ..., p2p_state: _Optional[_Union[SyncP2PState, str]] = ..., pending_upload_bytes: _Optional[int] = ..., pending_download_bytes: _Optional[int] = ..., pending_upload_count: _Optional[int] = ..., pending_download_count: _Optional[int] = ..., upload_bytes_per_second: _Optional[int] = ..., download_bytes_per_second: _Optional[int] = ..., active_upload_bytes: _Optional[int] = ..., active_upload_transferred_bytes: _Optional[int] = ..., in_flight_upload_count: _Optional[int] = ..., active_store_count: _Optional[int] = ..., active_peer_count: _Optional[int] = ..., last_error: _Optional[str] = ..., last_activity_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pack_range_request_count: _Optional[int] = ..., pack_range_response_bytes: _Optional[int] = ..., pack_full_response_fallback_count: _Optional[int] = ..., pack_full_response_fallback_bytes: _Optional[int] = ..., pack_last_full_response_fallback_bytes: _Optional[int] = ..., pack_manifest_entries: _Optional[int] = ..., pack_block_count_total: _Optional[int] = ..., pack_block_count_min: _Optional[int] = ..., pack_block_count_max: _Optional[int] = ..., pack_size_bytes_total: _Optional[int] = ..., pack_size_bytes_min: _Optional[int] = ..., pack_size_bytes_max: _Optional[int] = ..., pack_bloom_filter_count: _Optional[int] = ..., pack_bloom_missing_count: _Optional[int] = ..., pack_bloom_invalid_count: _Optional[int] = ..., pack_bloom_max_false_positive_rate: _Optional[float] = ..., pack_bloom_risk_pack_count: _Optional[int] = ..., pack_lookup_count: _Optional[int] = ..., pack_candidate_packs: _Optional[int] = ..., pack_opened_packs: _Optional[int] = ..., pack_negative_packs: _Optional[int] = ..., pack_target_hits: _Optional[int] = ..., pack_last_candidate_packs: _Optional[int] = ..., pack_last_opened_packs: _Optional[int] = ..., pack_last_negative_packs: _Optional[int] = ..., pack_last_target_hit: _Optional[bool] = ..., pack_index_cache_hits: _Optional[int] = ..., pack_index_cache_misses: _Optional[int] = ..., pack_index_cache_read_errors: _Optional[int] = ..., pack_index_cache_write_errors: _Optional[int] = ..., pack_remote_index_loads: _Optional[int] = ..., pack_remote_index_bytes: _Optional[int] = ..., pack_last_remote_index_bytes: _Optional[int] = ..., pack_index_tail_fetch_count: _Optional[int] = ..., pack_index_tail_fetch_bytes: _Optional[int] = ..., pack_index_tail_response_bytes: _Optional[int] = ..., direct_p2p_disabled: _Optional[bool] = ..., block_stores: _Optional[_Iterable[_Union[SyncBlockStoreStatus, _Mapping]]] = ..., local_account: _Optional[bool] = ..., local_copies: _Optional[_Iterable[_Union[SyncLocalCopyStatus, _Mapping]]] = ..., peer_upload_bytes: _Optional[int] = ..., peer_download_bytes: _Optional[int] = ..., peers: _Optional[_Iterable[_Union[SyncPeerTransferStatus, _Mapping]]] = ..., upload_error: _Optional[str] = ...) -> None: ...
+
+class SyncPeerTransferStatus(_message.Message):
+    __slots__ = ("peer_id", "uploaded_bytes", "downloaded_bytes", "connected")
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    UPLOADED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    DOWNLOADED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CONNECTED_FIELD_NUMBER: _ClassVar[int]
+    peer_id: str
+    uploaded_bytes: int
+    downloaded_bytes: int
+    connected: bool
+    def __init__(self, peer_id: _Optional[str] = ..., uploaded_bytes: _Optional[int] = ..., downloaded_bytes: _Optional[int] = ..., connected: _Optional[bool] = ...) -> None: ...
+
+class SyncLocalCopyStatus(_message.Message):
+    __slots__ = ("shared_object_id", "display_name", "blocks", "bytes", "complete", "error")
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    DISPLAY_NAME_FIELD_NUMBER: _ClassVar[int]
+    BLOCKS_FIELD_NUMBER: _ClassVar[int]
+    BYTES_FIELD_NUMBER: _ClassVar[int]
+    COMPLETE_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    display_name: str
+    blocks: int
+    bytes: int
+    complete: bool
+    error: str
+    def __init__(self, shared_object_id: _Optional[str] = ..., display_name: _Optional[str] = ..., blocks: _Optional[int] = ..., bytes: _Optional[int] = ..., complete: _Optional[bool] = ..., error: _Optional[str] = ...) -> None: ...
+
+class WatchStorageStatsResponse(_message.Message):
+    __slots__ = ("supported", "total_bytes", "block_count")
+    SUPPORTED_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    supported: bool
+    total_bytes: int
+    block_count: int
+    def __init__(self, supported: _Optional[bool] = ..., total_bytes: _Optional[int] = ..., block_count: _Optional[int] = ...) -> None: ...
+
+class WatchLockStateRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchLockStateResponse(_message.Message):
+    __slots__ = ("mode", "locked")
+    MODE_FIELD_NUMBER: _ClassVar[int]
+    LOCKED_FIELD_NUMBER: _ClassVar[int]
+    mode: _session_pb2.SessionLockMode
+    locked: bool
+    def __init__(self, mode: _Optional[_Union[_session_pb2.SessionLockMode, str]] = ..., locked: _Optional[bool] = ...) -> None: ...
+
+class SetLockModeRequest(_message.Message):
+    __slots__ = ("mode", "pin")
+    MODE_FIELD_NUMBER: _ClassVar[int]
+    PIN_FIELD_NUMBER: _ClassVar[int]
+    mode: _session_pb2.SessionLockMode
+    pin: bytes
+    def __init__(self, mode: _Optional[_Union[_session_pb2.SessionLockMode, str]] = ..., pin: _Optional[bytes] = ...) -> None: ...
+
+class SetLockModeResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SetDirectP2PEnabledRequest(_message.Message):
+    __slots__ = ("enabled",)
+    ENABLED_FIELD_NUMBER: _ClassVar[int]
+    enabled: bool
+    def __init__(self, enabled: _Optional[bool] = ...) -> None: ...
+
+class SetDirectP2PEnabledResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SetBackgroundPluginRequest(_message.Message):
+    __slots__ = ("space_id", "plugin_id", "enabled", "suspended")
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    PLUGIN_ID_FIELD_NUMBER: _ClassVar[int]
+    ENABLED_FIELD_NUMBER: _ClassVar[int]
+    SUSPENDED_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    plugin_id: str
+    enabled: bool
+    suspended: bool
+    def __init__(self, space_id: _Optional[str] = ..., plugin_id: _Optional[str] = ..., enabled: _Optional[bool] = ..., suspended: _Optional[bool] = ...) -> None: ...
+
+class SetBackgroundPluginResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class UnlockSessionRequest(_message.Message):
+    __slots__ = ("pin",)
+    PIN_FIELD_NUMBER: _ClassVar[int]
+    pin: bytes
+    def __init__(self, pin: _Optional[bytes] = ...) -> None: ...
+
+class UnlockSessionResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class LockSessionRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class LockSessionResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GeneratePairingCodeRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GeneratePairingCodeResponse(_message.Message):
+    __slots__ = ("code",)
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    code: str
+    def __init__(self, code: _Optional[str] = ...) -> None: ...
+
+class CompletePairingRequest(_message.Message):
+    __slots__ = ("code", "offer_current_account", "remote_peer_id", "label")
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    OFFER_CURRENT_ACCOUNT_FIELD_NUMBER: _ClassVar[int]
+    REMOTE_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    LABEL_FIELD_NUMBER: _ClassVar[int]
+    code: str
+    offer_current_account: bool
+    remote_peer_id: str
+    label: str
+    def __init__(self, code: _Optional[str] = ..., offer_current_account: _Optional[bool] = ..., remote_peer_id: _Optional[str] = ..., label: _Optional[str] = ...) -> None: ...
+
+class SelectPairingAccountRequest(_message.Message):
+    __slots__ = ("outcome",)
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    outcome: _pairing_pb2.AccountOutcome
+    def __init__(self, outcome: _Optional[_Union[_pairing_pb2.AccountOutcome, str]] = ...) -> None: ...
+
+class SelectPairingAccountResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class CompletePairingResponse(_message.Message):
+    __slots__ = ("remote_peer_id",)
+    REMOTE_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    remote_peer_id: str
+    def __init__(self, remote_peer_id: _Optional[str] = ...) -> None: ...
+
+class GetSASEmojiRequest(_message.Message):
+    __slots__ = ("remote_peer_id",)
+    REMOTE_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    remote_peer_id: str
+    def __init__(self, remote_peer_id: _Optional[str] = ...) -> None: ...
+
+class GetSASEmojiResponse(_message.Message):
+    __slots__ = ("emoji",)
+    EMOJI_FIELD_NUMBER: _ClassVar[int]
+    emoji: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, emoji: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class ConfirmSASMatchRequest(_message.Message):
+    __slots__ = ("confirmed",)
+    CONFIRMED_FIELD_NUMBER: _ClassVar[int]
+    confirmed: bool
+    def __init__(self, confirmed: _Optional[bool] = ...) -> None: ...
+
+class ConfirmSASMatchResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class ConfirmPairingRequest(_message.Message):
+    __slots__ = ("remote_peer_id", "display_name")
+    REMOTE_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    DISPLAY_NAME_FIELD_NUMBER: _ClassVar[int]
+    remote_peer_id: str
+    display_name: str
+    def __init__(self, remote_peer_id: _Optional[str] = ..., display_name: _Optional[str] = ...) -> None: ...
+
+class ConfirmPairingResponse(_message.Message):
+    __slots__ = ("session_list_entry",)
+    SESSION_LIST_ENTRY_FIELD_NUMBER: _ClassVar[int]
+    session_list_entry: _session_pb2.SessionListEntry
+    def __init__(self, session_list_entry: _Optional[_Union[_session_pb2.SessionListEntry, _Mapping]] = ...) -> None: ...
+
+class DeleteAccountRequest(_message.Message):
+    __slots__ = ("session_idx",)
+    SESSION_IDX_FIELD_NUMBER: _ClassVar[int]
+    session_idx: int
+    def __init__(self, session_idx: _Optional[int] = ...) -> None: ...
+
+class DeleteAccountResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class AccessSessionStateAtomRequest(_message.Message):
+    __slots__ = ("store_id",)
+    STORE_ID_FIELD_NUMBER: _ClassVar[int]
+    store_id: str
+    def __init__(self, store_id: _Optional[str] = ...) -> None: ...
+
+class AccessSessionStateAtomResponse(_message.Message):
+    __slots__ = ("resource_id",)
+    RESOURCE_ID_FIELD_NUMBER: _ClassVar[int]
+    resource_id: int
+    def __init__(self, resource_id: _Optional[int] = ...) -> None: ...
+
+class AccessPeerTransportRequest(_message.Message):
+    __slots__ = ("udp_listen_addr", "udp_peer_addrs", "serve_resources")
+    class UdpPeerAddrsEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    UDP_LISTEN_ADDR_FIELD_NUMBER: _ClassVar[int]
+    UDP_PEER_ADDRS_FIELD_NUMBER: _ClassVar[int]
+    SERVE_RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    udp_listen_addr: str
+    udp_peer_addrs: _containers.ScalarMap[str, str]
+    serve_resources: bool
+    def __init__(self, udp_listen_addr: _Optional[str] = ..., udp_peer_addrs: _Optional[_Mapping[str, str]] = ..., serve_resources: _Optional[bool] = ...) -> None: ...
+
+class AccessPeerTransportResponse(_message.Message):
+    __slots__ = ("resource_id", "peer_id", "udp_addr")
+    RESOURCE_ID_FIELD_NUMBER: _ClassVar[int]
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    UDP_ADDR_FIELD_NUMBER: _ClassVar[int]
+    resource_id: int
+    peer_id: str
+    udp_addr: str
+    def __init__(self, resource_id: _Optional[int] = ..., peer_id: _Optional[str] = ..., udp_addr: _Optional[str] = ...) -> None: ...
+
+class WatchSessionStateAtomsRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchSessionStateAtomsResponse(_message.Message):
+    __slots__ = ("store_ids", "store_count")
+    STORE_IDS_FIELD_NUMBER: _ClassVar[int]
+    STORE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    store_ids: _containers.RepeatedScalarFieldContainer[str]
+    store_count: int
+    def __init__(self, store_ids: _Optional[_Iterable[str]] = ..., store_count: _Optional[int] = ...) -> None: ...
+
+class GetTransferInventoryRequest(_message.Message):
+    __slots__ = ("session_index",)
+    SESSION_INDEX_FIELD_NUMBER: _ClassVar[int]
+    session_index: int
+    def __init__(self, session_index: _Optional[int] = ...) -> None: ...
+
+class GetTransferInventoryResponse(_message.Message):
+    __slots__ = ("spaces",)
+    SPACES_FIELD_NUMBER: _ClassVar[int]
+    spaces: _containers.RepeatedCompositeFieldContainer[_space_pb2.SpaceSoListEntry]
+    def __init__(self, spaces: _Optional[_Iterable[_Union[_space_pb2.SpaceSoListEntry, _Mapping]]] = ...) -> None: ...
+
+class StartTransferRequest(_message.Message):
+    __slots__ = ("source_session_index", "target_session_index", "mode", "space_ids")
+    SOURCE_SESSION_INDEX_FIELD_NUMBER: _ClassVar[int]
+    TARGET_SESSION_INDEX_FIELD_NUMBER: _ClassVar[int]
+    MODE_FIELD_NUMBER: _ClassVar[int]
+    SPACE_IDS_FIELD_NUMBER: _ClassVar[int]
+    source_session_index: int
+    target_session_index: int
+    mode: _transfer_pb2.TransferMode
+    space_ids: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, source_session_index: _Optional[int] = ..., target_session_index: _Optional[int] = ..., mode: _Optional[_Union[_transfer_pb2.TransferMode, str]] = ..., space_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class StartTransferResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchTransferProgressRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchTransferProgressResponse(_message.Message):
+    __slots__ = ("state",)
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    state: _transfer_pb2.TransferState
+    def __init__(self, state: _Optional[_Union[_transfer_pb2.TransferState, _Mapping]] = ...) -> None: ...
+
+class CancelTransferRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class CancelTransferResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchPairedDevicesRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchPairedDevicesResponse(_message.Message):
+    __slots__ = ("paired_devices", "online_peer_ids")
+    PAIRED_DEVICES_FIELD_NUMBER: _ClassVar[int]
+    ONLINE_PEER_IDS_FIELD_NUMBER: _ClassVar[int]
+    paired_devices: _containers.RepeatedCompositeFieldContainer[_settings_pb2.PairedDevice]
+    online_peer_ids: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, paired_devices: _Optional[_Iterable[_Union[_settings_pb2.PairedDevice, _Mapping]]] = ..., online_peer_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class UnlinkDeviceRequest(_message.Message):
+    __slots__ = ("peer_id",)
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    peer_id: str
+    def __init__(self, peer_id: _Optional[str] = ...) -> None: ...
+
+class UnlinkDeviceResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchPairingStatusRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchPairingStatusResponse(_message.Message):
+    __slots__ = ("status", "remote_peer_id", "code", "emoji", "error_message", "account_id", "receiving", "account_name", "choice", "remote_label", "session_peer_id")
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    REMOTE_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    EMOJI_FIELD_NUMBER: _ClassVar[int]
+    ERROR_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    ACCOUNT_ID_FIELD_NUMBER: _ClassVar[int]
+    RECEIVING_FIELD_NUMBER: _ClassVar[int]
+    ACCOUNT_NAME_FIELD_NUMBER: _ClassVar[int]
+    CHOICE_FIELD_NUMBER: _ClassVar[int]
+    REMOTE_LABEL_FIELD_NUMBER: _ClassVar[int]
+    SESSION_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    status: PairingStatus
+    remote_peer_id: str
+    code: str
+    emoji: _containers.RepeatedScalarFieldContainer[str]
+    error_message: str
+    account_id: str
+    receiving: bool
+    account_name: str
+    choice: _pairing_pb2.AccountChoice
+    remote_label: str
+    session_peer_id: str
+    def __init__(self, status: _Optional[_Union[PairingStatus, str]] = ..., remote_peer_id: _Optional[str] = ..., code: _Optional[str] = ..., emoji: _Optional[_Iterable[str]] = ..., error_message: _Optional[str] = ..., account_id: _Optional[str] = ..., receiving: _Optional[bool] = ..., account_name: _Optional[str] = ..., choice: _Optional[_Union[_pairing_pb2.AccountChoice, _Mapping]] = ..., remote_label: _Optional[str] = ..., session_peer_id: _Optional[str] = ...) -> None: ...
+
+class CreateSpaceInviteRequest(_message.Message):
+    __slots__ = ("space_id", "role", "target_peer_id", "max_uses", "expires_at", "approval_required", "participant_of")
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    ROLE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    MAX_USES_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_FIELD_NUMBER: _ClassVar[int]
+    APPROVAL_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    PARTICIPANT_OF_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    role: _sobject_pb2.SOParticipantRole
+    target_peer_id: str
+    max_uses: int
+    expires_at: _timestamp_pb2.Timestamp
+    approval_required: bool
+    participant_of: _sobject_pb2.SOInviteParticipation
+    def __init__(self, space_id: _Optional[str] = ..., role: _Optional[_Union[_sobject_pb2.SOParticipantRole, str]] = ..., target_peer_id: _Optional[str] = ..., max_uses: _Optional[int] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., approval_required: _Optional[bool] = ..., participant_of: _Optional[_Union[_sobject_pb2.SOInviteParticipation, _Mapping]] = ...) -> None: ...
+
+class CreateSpaceInviteResponse(_message.Message):
+    __slots__ = ("invite_message", "short_code")
+    INVITE_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    SHORT_CODE_FIELD_NUMBER: _ClassVar[int]
+    invite_message: _sobject_pb2.SOInviteMessage
+    short_code: str
+    def __init__(self, invite_message: _Optional[_Union[_sobject_pb2.SOInviteMessage, _Mapping]] = ..., short_code: _Optional[str] = ...) -> None: ...
+
+class ListSpaceInvitesRequest(_message.Message):
+    __slots__ = ("space_id",)
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    def __init__(self, space_id: _Optional[str] = ...) -> None: ...
+
+class ListSpaceInvitesResponse(_message.Message):
+    __slots__ = ("invites",)
+    INVITES_FIELD_NUMBER: _ClassVar[int]
+    invites: _containers.RepeatedCompositeFieldContainer[_sobject_pb2.SOInvite]
+    def __init__(self, invites: _Optional[_Iterable[_Union[_sobject_pb2.SOInvite, _Mapping]]] = ...) -> None: ...
+
+class ListSpaceParticipantsRequest(_message.Message):
+    __slots__ = ("space_id",)
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    def __init__(self, space_id: _Optional[str] = ...) -> None: ...
+
+class ListSpaceParticipantsResponse(_message.Message):
+    __slots__ = ("participants",)
+    PARTICIPANTS_FIELD_NUMBER: _ClassVar[int]
+    participants: _containers.RepeatedCompositeFieldContainer[_sobject_pb2.SOParticipantConfig]
+    def __init__(self, participants: _Optional[_Iterable[_Union[_sobject_pb2.SOParticipantConfig, _Mapping]]] = ...) -> None: ...
+
+class RemoveSpaceParticipantsRequest(_message.Message):
+    __slots__ = ("space_id", "peer_ids", "admit_through", "dry_run")
+    class AdmitThroughEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: int
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[int] = ...) -> None: ...
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    PEER_IDS_FIELD_NUMBER: _ClassVar[int]
+    ADMIT_THROUGH_FIELD_NUMBER: _ClassVar[int]
+    DRY_RUN_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    peer_ids: _containers.RepeatedScalarFieldContainer[str]
+    admit_through: _containers.ScalarMap[str, int]
+    dry_run: bool
+    def __init__(self, space_id: _Optional[str] = ..., peer_ids: _Optional[_Iterable[str]] = ..., admit_through: _Optional[_Mapping[str, int]] = ..., dry_run: _Optional[bool] = ...) -> None: ...
+
+class RemoveSpaceParticipantsResponse(_message.Message):
+    __slots__ = ("removed_peer_ids", "awaiting_group", "cuts")
+    REMOVED_PEER_IDS_FIELD_NUMBER: _ClassVar[int]
+    AWAITING_GROUP_FIELD_NUMBER: _ClassVar[int]
+    CUTS_FIELD_NUMBER: _ClassVar[int]
+    removed_peer_ids: _containers.RepeatedScalarFieldContainer[str]
+    awaiting_group: bool
+    cuts: _containers.RepeatedCompositeFieldContainer[SpaceParticipantCut]
+    def __init__(self, removed_peer_ids: _Optional[_Iterable[str]] = ..., awaiting_group: _Optional[bool] = ..., cuts: _Optional[_Iterable[_Union[SpaceParticipantCut, _Mapping]]] = ...) -> None: ...
+
+class SpaceParticipantCut(_message.Message):
+    __slots__ = ("peer_id", "admit_through", "head_nonce", "checkpoint_nonce", "cut_operations")
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    ADMIT_THROUGH_FIELD_NUMBER: _ClassVar[int]
+    HEAD_NONCE_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_NONCE_FIELD_NUMBER: _ClassVar[int]
+    CUT_OPERATIONS_FIELD_NUMBER: _ClassVar[int]
+    peer_id: str
+    admit_through: int
+    head_nonce: int
+    checkpoint_nonce: int
+    cut_operations: int
+    def __init__(self, peer_id: _Optional[str] = ..., admit_through: _Optional[int] = ..., head_nonce: _Optional[int] = ..., checkpoint_nonce: _Optional[int] = ..., cut_operations: _Optional[int] = ...) -> None: ...
+
+class RevokeSpaceInviteRequest(_message.Message):
+    __slots__ = ("space_id", "invite_id")
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    INVITE_ID_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    invite_id: str
+    def __init__(self, space_id: _Optional[str] = ..., invite_id: _Optional[str] = ...) -> None: ...
+
+class RevokeSpaceInviteResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class ResolveSpaceJoinRequestRequest(_message.Message):
+    __slots__ = ("space_id", "peer_id", "grant")
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    GRANT_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    peer_id: str
+    grant: bool
+    def __init__(self, space_id: _Optional[str] = ..., peer_id: _Optional[str] = ..., grant: _Optional[bool] = ...) -> None: ...
+
+class ResolveSpaceJoinRequestResponse(_message.Message):
+    __slots__ = ("invite_message",)
+    INVITE_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    invite_message: _sobject_pb2.SOInviteMessage
+    def __init__(self, invite_message: _Optional[_Union[_sobject_pb2.SOInviteMessage, _Mapping]] = ...) -> None: ...
+
+class WithdrawSpaceJoinRequestRequest(_message.Message):
+    __slots__ = ("invite_message",)
+    INVITE_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    invite_message: _sobject_pb2.SOInviteMessage
+    def __init__(self, invite_message: _Optional[_Union[_sobject_pb2.SOInviteMessage, _Mapping]] = ...) -> None: ...
+
+class WithdrawSpaceJoinRequestResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class JoinSpaceViaInviteRequest(_message.Message):
+    __slots__ = ("invite_message", "targeted_invitation_envelope", "owner_udp_addr")
+    INVITE_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    TARGETED_INVITATION_ENVELOPE_FIELD_NUMBER: _ClassVar[int]
+    OWNER_UDP_ADDR_FIELD_NUMBER: _ClassVar[int]
+    invite_message: _sobject_pb2.SOInviteMessage
+    targeted_invitation_envelope: bytes
+    owner_udp_addr: str
+    def __init__(self, invite_message: _Optional[_Union[_sobject_pb2.SOInviteMessage, _Mapping]] = ..., targeted_invitation_envelope: _Optional[bytes] = ..., owner_udp_addr: _Optional[str] = ...) -> None: ...
+
+class JoinSpaceViaInviteResponse(_message.Message):
+    __slots__ = ("shared_object_id", "result")
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    RESULT_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    result: JoinSpaceViaInviteResult
+    def __init__(self, shared_object_id: _Optional[str] = ..., result: _Optional[_Union[JoinSpaceViaInviteResult, str]] = ...) -> None: ...
+
+class GetTransferStatusRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GetTransferStatusResponse(_message.Message):
+    __slots__ = ("active", "has_checkpoint", "state")
+    ACTIVE_FIELD_NUMBER: _ClassVar[int]
+    HAS_CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    active: bool
+    has_checkpoint: bool
+    state: _transfer_pb2.TransferState
+    def __init__(self, active: _Optional[bool] = ..., has_checkpoint: _Optional[bool] = ..., state: _Optional[_Union[_transfer_pb2.TransferState, _Mapping]] = ...) -> None: ...
+
+class LocalPairingOffer(_message.Message):
+    __slots__ = ("sdp", "peer_id")
+    SDP_FIELD_NUMBER: _ClassVar[int]
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    sdp: str
+    peer_id: str
+    def __init__(self, sdp: _Optional[str] = ..., peer_id: _Optional[str] = ...) -> None: ...
+
+class LocalPairingAnswer(_message.Message):
+    __slots__ = ("sdp", "peer_id")
+    SDP_FIELD_NUMBER: _ClassVar[int]
+    PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    sdp: str
+    peer_id: str
+    def __init__(self, sdp: _Optional[str] = ..., peer_id: _Optional[str] = ...) -> None: ...
+
+class CreateLocalPairingOfferRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class CreateLocalPairingOfferResponse(_message.Message):
+    __slots__ = ("offer_payload",)
+    OFFER_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    offer_payload: str
+    def __init__(self, offer_payload: _Optional[str] = ...) -> None: ...
+
+class AcceptLocalPairingOfferRequest(_message.Message):
+    __slots__ = ("offer_payload", "offer_current_account")
+    OFFER_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    OFFER_CURRENT_ACCOUNT_FIELD_NUMBER: _ClassVar[int]
+    offer_payload: str
+    offer_current_account: bool
+    def __init__(self, offer_payload: _Optional[str] = ..., offer_current_account: _Optional[bool] = ...) -> None: ...
+
+class AcceptLocalPairingOfferResponse(_message.Message):
+    __slots__ = ("answer_payload",)
+    ANSWER_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    answer_payload: str
+    def __init__(self, answer_payload: _Optional[str] = ...) -> None: ...
+
+class AcceptLocalPairingAnswerRequest(_message.Message):
+    __slots__ = ("answer_payload",)
+    ANSWER_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    answer_payload: str
+    def __init__(self, answer_payload: _Optional[str] = ...) -> None: ...
+
+class AcceptLocalPairingAnswerResponse(_message.Message):
+    __slots__ = ("remote_peer_id",)
+    REMOTE_PEER_ID_FIELD_NUMBER: _ClassVar[int]
+    remote_peer_id: str
+    def __init__(self, remote_peer_id: _Optional[str] = ...) -> None: ...
+
+class EnsureDeveloperSpaceRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class EnsureDeveloperSpaceResponse(_message.Message):
+    __slots__ = ("shared_object_id",)
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    def __init__(self, shared_object_id: _Optional[str] = ...) -> None: ...
+
+class SetAccountPluginRequest(_message.Message):
+    __slots__ = ("plugin_id", "enabled")
+    PLUGIN_ID_FIELD_NUMBER: _ClassVar[int]
+    ENABLED_FIELD_NUMBER: _ClassVar[int]
+    plugin_id: str
+    enabled: bool
+    def __init__(self, plugin_id: _Optional[str] = ..., enabled: _Optional[bool] = ...) -> None: ...
+
+class SetAccountPluginResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchStorageBackendsRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchStorageBackendsResponse(_message.Message):
+    __slots__ = ("storage_backends", "default_storage_backend_id")
+    STORAGE_BACKENDS_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    storage_backends: _containers.RepeatedCompositeFieldContainer[StorageBackendInfo]
+    default_storage_backend_id: str
+    def __init__(self, storage_backends: _Optional[_Iterable[_Union[StorageBackendInfo, _Mapping]]] = ..., default_storage_backend_id: _Optional[str] = ...) -> None: ...
+
+class StorageBackendInfo(_message.Message):
+    __slots__ = ("backend", "placed_spaces")
+    BACKEND_FIELD_NUMBER: _ClassVar[int]
+    PLACED_SPACES_FIELD_NUMBER: _ClassVar[int]
+    backend: _settings_pb2.StorageBackend
+    placed_spaces: _containers.RepeatedCompositeFieldContainer[PlacedSpace]
+    def __init__(self, backend: _Optional[_Union[_settings_pb2.StorageBackend, _Mapping]] = ..., placed_spaces: _Optional[_Iterable[_Union[PlacedSpace, _Mapping]]] = ...) -> None: ...
+
+class PlacedSpace(_message.Message):
+    __slots__ = ("space_id", "name")
+    SPACE_ID_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    space_id: str
+    name: str
+    def __init__(self, space_id: _Optional[str] = ..., name: _Optional[str] = ...) -> None: ...
+
+class CheckStorageBackendRequest(_message.Message):
+    __slots__ = ("storage_backend_id", "s3", "credentials")
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    S3_FIELD_NUMBER: _ClassVar[int]
+    CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
+    storage_backend_id: str
+    s3: _settings_pb2.S3Location
+    credentials: _s3_pb2.Credentials
+    def __init__(self, storage_backend_id: _Optional[str] = ..., s3: _Optional[_Union[_settings_pb2.S3Location, _Mapping]] = ..., credentials: _Optional[_Union[_s3_pb2.Credentials, _Mapping]] = ...) -> None: ...
+
+class CheckStorageBackendResponse(_message.Message):
+    __slots__ = ("result",)
+    RESULT_FIELD_NUMBER: _ClassVar[int]
+    result: _s3_pb2.CheckResult
+    def __init__(self, result: _Optional[_Union[_s3_pb2.CheckResult, _Mapping]] = ...) -> None: ...
+
+class AddStorageBackendRequest(_message.Message):
+    __slots__ = ("display_name", "s3", "credentials", "set_default")
+    DISPLAY_NAME_FIELD_NUMBER: _ClassVar[int]
+    S3_FIELD_NUMBER: _ClassVar[int]
+    CREDENTIALS_FIELD_NUMBER: _ClassVar[int]
+    SET_DEFAULT_FIELD_NUMBER: _ClassVar[int]
+    display_name: str
+    s3: _settings_pb2.S3Location
+    credentials: _s3_pb2.Credentials
+    set_default: bool
+    def __init__(self, display_name: _Optional[str] = ..., s3: _Optional[_Union[_settings_pb2.S3Location, _Mapping]] = ..., credentials: _Optional[_Union[_s3_pb2.Credentials, _Mapping]] = ..., set_default: _Optional[bool] = ...) -> None: ...
+
+class AddStorageBackendResponse(_message.Message):
+    __slots__ = ("storage_backend_id", "check")
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    CHECK_FIELD_NUMBER: _ClassVar[int]
+    storage_backend_id: str
+    check: _s3_pb2.CheckResult
+    def __init__(self, storage_backend_id: _Optional[str] = ..., check: _Optional[_Union[_s3_pb2.CheckResult, _Mapping]] = ...) -> None: ...
+
+class RemoveStorageBackendRequest(_message.Message):
+    __slots__ = ("storage_backend_id",)
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    storage_backend_id: str
+    def __init__(self, storage_backend_id: _Optional[str] = ...) -> None: ...
+
+class RemoveStorageBackendResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SetDefaultStorageBackendRequest(_message.Message):
+    __slots__ = ("storage_backend_id",)
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    storage_backend_id: str
+    def __init__(self, storage_backend_id: _Optional[str] = ...) -> None: ...
+
+class SetDefaultStorageBackendResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SetStorageBackendPricingRequest(_message.Message):
+    __slots__ = ("storage_backend_id", "pricing")
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    PRICING_FIELD_NUMBER: _ClassVar[int]
+    storage_backend_id: str
+    pricing: _s3_pb2.Pricing
+    def __init__(self, storage_backend_id: _Optional[str] = ..., pricing: _Optional[_Union[_s3_pb2.Pricing, _Mapping]] = ...) -> None: ...
+
+class SetStorageBackendPricingResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WatchSpaceStorageRequest(_message.Message):
+    __slots__ = ("shared_object_id",)
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    def __init__(self, shared_object_id: _Optional[str] = ...) -> None: ...
+
+class WatchSpaceStorageResponse(_message.Message):
+    __slots__ = ("storage_backend_id", "storage_backend_name", "pending_blocks", "pending_bytes", "upload_error")
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    STORAGE_BACKEND_NAME_FIELD_NUMBER: _ClassVar[int]
+    PENDING_BLOCKS_FIELD_NUMBER: _ClassVar[int]
+    PENDING_BYTES_FIELD_NUMBER: _ClassVar[int]
+    UPLOAD_ERROR_FIELD_NUMBER: _ClassVar[int]
+    storage_backend_id: str
+    storage_backend_name: str
+    pending_blocks: int
+    pending_bytes: int
+    upload_error: str
+    def __init__(self, storage_backend_id: _Optional[str] = ..., storage_backend_name: _Optional[str] = ..., pending_blocks: _Optional[int] = ..., pending_bytes: _Optional[int] = ..., upload_error: _Optional[str] = ...) -> None: ...
+
+class MoveSpaceStorageRequest(_message.Message):
+    __slots__ = ("shared_object_id", "storage_backend_id")
+    SHARED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    STORAGE_BACKEND_ID_FIELD_NUMBER: _ClassVar[int]
+    shared_object_id: str
+    storage_backend_id: str
+    def __init__(self, shared_object_id: _Optional[str] = ..., storage_backend_id: _Optional[str] = ...) -> None: ...
+
+class MoveSpaceStorageResponse(_message.Message):
+    __slots__ = ("phase", "blocks_fetched", "blocks_total", "pending_blocks", "pending_bytes", "upload_error")
+    PHASE_FIELD_NUMBER: _ClassVar[int]
+    BLOCKS_FETCHED_FIELD_NUMBER: _ClassVar[int]
+    BLOCKS_TOTAL_FIELD_NUMBER: _ClassVar[int]
+    PENDING_BLOCKS_FIELD_NUMBER: _ClassVar[int]
+    PENDING_BYTES_FIELD_NUMBER: _ClassVar[int]
+    UPLOAD_ERROR_FIELD_NUMBER: _ClassVar[int]
+    phase: MoveSpaceStoragePhase
+    blocks_fetched: int
+    blocks_total: int
+    pending_blocks: int
+    pending_bytes: int
+    upload_error: str
+    def __init__(self, phase: _Optional[_Union[MoveSpaceStoragePhase, str]] = ..., blocks_fetched: _Optional[int] = ..., blocks_total: _Optional[int] = ..., pending_blocks: _Optional[int] = ..., pending_bytes: _Optional[int] = ..., upload_error: _Optional[str] = ...) -> None: ...

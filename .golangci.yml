@@ -1,0 +1,192 @@
+# Config file version V2 has been introduced, read more in lintersdb.
+# Visit https://golangci-lint.run/usage/configuration/#config-file
+version: '2'
+
+run:
+  concurrency: 4
+  modules-download-mode: vendor
+  # Agents lint concurrently on one machine. Wait for the shared lock instead
+  # of failing the run, such as a commit hook, when another lint holds it.
+  allow-serial-runners: true
+
+linters:
+  enable:
+    - depguard
+    - gosec
+    - importas
+    - lostresource
+    - misspell
+    - nonavigate
+    - quadscan
+    - revive
+    - unconvert
+  disable:
+    - errcheck
+    - govet
+  settings:
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: io/ioutil
+              desc: The io/ioutil package has been deprecated, see https://go.dev/doc/go1.16#ioutil
+            - pkg: 'github.com/stretchr/testify/assert'
+              desc: Use "gotest.tools/v3/assert" instead
+            - pkg: 'github.com/stretchr/testify/require'
+              desc: Use "gotest.tools/v3/assert" instead
+            - pkg: 'github.com/stretchr/testify/suite'
+              desc: Do not use
+        no-encoding-json:
+          deny:
+            - pkg: encoding/json
+              desc: >-
+                Use protobuf-go-lite/json for proto types or
+                aperturerobotics/fastjson for non-proto JSON.
+                encoding/json uses reflection.
+        net-layering:
+          list-mode: lax
+          files:
+            - '**/net/**'
+          allow:
+            - github.com/s4wave/spacewave/net
+          deny:
+            - pkg: github.com/s4wave/spacewave
+              desc: net imports only its own packages inside the Spacewave module.
+        runtimeenv-layering:
+          list-mode: strict
+          files:
+            - '**/runtimeenv/**'
+          allow:
+            - $gostd
+        sobject-layering:
+          list-mode: lax
+          files:
+            - '**/core/sobject/**'
+            - '!$test'
+          deny:
+            - pkg: github.com/s4wave/spacewave/db/world
+              desc: >-
+                The SharedObject agrees on an opaque body through sobject.Body;
+                World code lives with the Space adapter in core/space/world.
+            - pkg: github.com/s4wave/spacewave/sdk
+              desc: The consensus packages build on core and db primitives, never the SDK.
+        db-layering:
+          list-mode: lax
+          files:
+            - '**/db/**'
+            - '!$test'
+          allow:
+            - github.com/s4wave/spacewave/db
+            - github.com/s4wave/spacewave/net
+            - github.com/s4wave/spacewave/runtimeenv
+          deny:
+            - pkg: github.com/s4wave/spacewave
+              desc: db imports only db, lower-layer net packages, and the standard-library-only runtimeenv policy inside the Spacewave module.
+    gosec:
+      excludes:
+        - G306
+    importas:
+      no-unaliased: true
+    custom:
+      lostresource:
+        type: 'module'
+        description: Checks discarded handles and missing resource releases.
+        settings:
+          check-paths: true
+          resources:
+            - type: github.com/s4wave/spacewave/db/world.ObjectState
+              nil-on-false-functions:
+                - github.com/s4wave/spacewave/db/world.WorldStateObject.GetObject
+                - github.com/s4wave/spacewave/db/world/block.WorldState.GetObject
+              consumers:
+                - github.com/s4wave/spacewave/db/world.ReleaseObjectState:0
+                - github.com/s4wave/spacewave/sdk/git/repofs.newRepoFSCursor:1
+                - github.com/s4wave/spacewave/db/world/block.NewTxObjectState:2
+                - github.com/s4wave/spacewave/db/world/block.newEngineTxObjectState:2
+                - github.com/s4wave/spacewave/db/world/block/tx.NewObjectState:2
+                - github.com/s4wave/spacewave/db/world/vlogger.NewObjectState:1
+              success-consumers:
+                - github.com/s4wave/spacewave/bldr/resource/server.ResourceClientContext.AddResource:1
+            - type: github.com/s4wave/spacewave/bldr/resource/client.ResourceRef
+              release-methods: [Release]
+              success-consumers:
+                - github.com/s4wave/spacewave/sdk/root.NewRoot:1
+                - github.com/s4wave/spacewave/sdk/session.NewSession:1
+                - github.com/s4wave/spacewave/sdk/world.NewEngine:1
+                - github.com/s4wave/spacewave/sdk/world.NewWorldState:1
+                - github.com/s4wave/spacewave/sdk/world.NewObjectState:1
+                - github.com/s4wave/spacewave/sdk/world.NewTx:1
+                - github.com/s4wave/spacewave/sdk/world/engine.NewSDKEngine:1
+                - github.com/s4wave/spacewave/sdk/world/engine.NewSDKWorldState:1
+                - github.com/s4wave/spacewave/sdk/world/engine.NewSDKObjectState:1
+                - github.com/s4wave/spacewave/sdk/world/engine.NewSDKTx:1
+                - github.com/s4wave/spacewave/sdk/world/engine.NewSDKObjectIterator:1
+                - github.com/s4wave/spacewave/sdk/viewer/registry.NewViewerRegistry:1
+                - github.com/s4wave/spacewave/sdk/provider/local.NewLocalProvider:1
+                - github.com/s4wave/spacewave/sdk/provider/spacewave.NewSpacewaveProvider:1
+                - github.com/s4wave/spacewave/sdk/bucket/lookup.NewCursor:1
+              borrowed:
+                # The returned engine and cleanup own this view of their reference.
+                - github.com/s4wave/spacewave/cmd/spacewave/cli.sdkClient.accessWorldEngineWithRef
+                - github.com/s4wave/spacewave/sdk/root.Root.GetResourceRef
+                - github.com/s4wave/spacewave/sdk/session.Session.GetResourceRef
+                - github.com/s4wave/spacewave/sdk/world.Engine.GetResourceRef
+                - github.com/s4wave/spacewave/sdk/world.WorldState.GetResourceRef
+                - github.com/s4wave/spacewave/sdk/world.ObjectState.GetResourceRef
+                - github.com/s4wave/spacewave/sdk/viewer/registry.ViewerRegistry.GetResourceRef
+                - github.com/s4wave/spacewave/sdk/provider/local.LocalProvider.GetResourceRef
+                - github.com/s4wave/spacewave/sdk/provider/spacewave.SpacewaveProvider.GetResourceRef
+      nonavigate:
+        type: 'module'
+        description: Forbids Harness.Navigate calls in e2e/wasm tests (destroys WASM process).
+      quadscan:
+        type: 'module'
+        description: Flags graph quads that fix only the predicate, which scan every quad with it.
+    revive:
+      rules:
+        - name: package-comments
+          disabled: true
+    staticcheck:
+      checks:
+        - all
+        - '-SA1012'
+        - '-ST1003'
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters: [nonavigate]
+        path-except: 'e2e/wasm/'
+      - linters: [gosec]
+        path: '_test\.go$'
+      # The WasiVM kernel converts between the guest's 32-bit Linux ABI and
+      # Go integers; truncation there is the system call semantics.
+      - linters: [gosec]
+        path: '^plugin/wasivm/kernel/'
+        text: G115
+    paths:
+      - '(^|/)node_modules($|/)'
+      - '(^|/)prototypes($|/)'
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - '(^|/)node_modules($|/)'
+      - '(^|/)prototypes($|/)'
+      - third_party$
+      - builtin$
+      - examples$

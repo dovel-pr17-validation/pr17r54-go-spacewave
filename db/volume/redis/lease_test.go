@@ -1,0 +1,172 @@
+package volume_redis
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gomodule/redigo/redis"
+)
+
+func TestRedisLeaseRenewalLossSignalsDone(t *testing.T) {
+	// Prepare a Redis lease and a controlled renewal failure.
+	lease := &lease{
+		cancel:        func() {},
+		done:          make(chan struct{}),
+		keepaliveDone: make(chan struct{}),
+		releaseDone:   make(chan struct{}),
+	}
+	renewCh := make(chan time.Time, 1)
+	renewErr := errors.New("renewal failed")
+
+	// Trigger renewal against the failing command callback.
+	go lease.keepaliveWith(context.Background(), renewCh, func() error {
+		return renewErr
+	})
+	renewCh <- time.Time{}
+
+	// Verify renewal loss closes the lease and preserves its error.
+	select {
+	case <-lease.Done():
+	case <-time.After(time.Second):
+		t.Fatal("lease loss did not close Done")
+	}
+	if !errors.Is(lease.Err(), renewErr) {
+		t.Fatalf("lease error = %v, want %v", lease.Err(), renewErr)
+	}
+}
+
+type timeoutRedisConn struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+	timeoutCh chan time.Duration
+}
+
+func (c *timeoutRedisConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (*timeoutRedisConn) Err() error {
+	return nil
+}
+
+func (c *timeoutRedisConn) Do(command string, _ ...any) (any, error) {
+	if command == "" {
+		return nil, nil
+	}
+	<-c.closed
+	return nil, errors.New("redis connection closed")
+}
+
+func (c *timeoutRedisConn) DoWithTimeout(
+	timeout time.Duration,
+	_ string,
+	_ ...any,
+) (any, error) {
+	c.timeoutCh <- timeout
+	return nil, context.DeadlineExceeded
+}
+
+func (*timeoutRedisConn) Send(string, ...any) error {
+	return nil
+}
+
+func (*timeoutRedisConn) Flush() error {
+	return nil
+}
+
+func (*timeoutRedisConn) Receive() (any, error) {
+	return nil, nil
+}
+
+func (*timeoutRedisConn) ReceiveWithTimeout(time.Duration) (any, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func newTimeoutRedisLease(t *testing.T) (
+	*lease,
+	*timeoutRedisConn,
+	*redis.Pool,
+) {
+	// Build a bounded-command Redis fixture and close its connection and pool after the test.
+	t.Helper()
+	conn := &timeoutRedisConn{
+		closed:    make(chan struct{}),
+		timeoutCh: make(chan time.Duration, 2),
+	}
+	pool := &redis.Pool{
+		Dial: func() (redis.Conn, error) {
+			return conn, nil
+		},
+	}
+	l := &lease{
+		pool:          pool,
+		key:           "lease-key",
+		value:         []byte("lease-value"),
+		cancel:        func() {},
+		done:          make(chan struct{}),
+		keepaliveDone: make(chan struct{}),
+		releaseDone:   make(chan struct{}),
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+		pool.Close()
+	})
+	return l, conn, pool
+}
+
+func TestRedisLeaseHangingRenewalSignalsLoss(t *testing.T) {
+	// Prepare a Redis lease with controlled renewal notifications.
+	lease, conn, _ := newTimeoutRedisLease(t)
+	renewCh := make(chan time.Time, 1)
+
+	// Trigger renewal through the bounded Redis command.
+	go lease.keepaliveWith(context.Background(), renewCh, lease.renew)
+	renewCh <- time.Now()
+
+	// Verify a timed-out renewal closes the lease and uses a bounded command timeout.
+	select {
+	case <-lease.Done():
+	case <-time.After(time.Second):
+		t.Fatal("hanging lease renewal did not close Done")
+	}
+	if !errors.Is(lease.Err(), context.DeadlineExceeded) {
+		t.Fatalf("lease error = %v, want context deadline exceeded", lease.Err())
+	}
+	select {
+	case timeout := <-conn.timeoutCh:
+		if timeout <= 0 || timeout >= redisLeaseTTL {
+			t.Fatalf("renewal timeout = %s, want between zero and lease TTL", timeout)
+		}
+	default:
+		t.Fatal("renewal did not use a bounded Redis command timeout")
+	}
+}
+
+func TestRedisLeaseReleaseTimeoutClosesDone(t *testing.T) {
+	// Prepare a Redis lease whose keepalive has already finished.
+	lease, conn, _ := newTimeoutRedisLease(t)
+	close(lease.keepaliveDone)
+
+	// Release the lease and verify the timeout still closes it with a bounded command.
+	err := lease.Release(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("release error = %v, want context deadline exceeded", err)
+	}
+	select {
+	case <-lease.Done():
+	default:
+		t.Fatal("timed-out release did not close Done")
+	}
+	select {
+	case timeout := <-conn.timeoutCh:
+		if timeout <= 0 || timeout >= redisLeaseTTL {
+			t.Fatalf("release timeout = %s, want between zero and lease TTL", timeout)
+		}
+	default:
+		t.Fatal("release did not use a bounded Redis command timeout")
+	}
+}

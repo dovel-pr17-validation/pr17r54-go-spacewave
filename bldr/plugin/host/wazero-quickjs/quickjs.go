@@ -1,0 +1,567 @@
+//go:build !goscript
+
+package plugin_host_wazero_quickjs
+
+import (
+	"context"
+	"encoding/base64"
+	"io"
+	"io/fs"
+	"path"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	quickjs "github.com/aperturerobotics/go-quickjs-wasi-reactor/wazero-quickjs"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/refcount"
+	"github.com/pkg/errors"
+	bldr_platform "github.com/s4wave/spacewave/bldr/platform"
+	plugin "github.com/s4wave/spacewave/bldr/plugin"
+	plugin_host "github.com/s4wave/spacewave/bldr/plugin/host"
+	host_controller "github.com/s4wave/spacewave/bldr/plugin/host/controller"
+	"github.com/s4wave/spacewave/bldr/util/wazerofs"
+	"github.com/s4wave/spacewave/db/unixfs"
+	unixfs_iofs "github.com/s4wave/spacewave/db/unixfs/iofs"
+	bifrost_rpc "github.com/s4wave/spacewave/net/rpc"
+	"github.com/s4wave/spacewave/net/util/randstring"
+	bifrost_rwc "github.com/s4wave/spacewave/net/util/rwc"
+	"github.com/sirupsen/logrus"
+	"github.com/tetratelabs/wazero"
+	wazero_exp_sysfs "github.com/tetratelabs/wazero/experimental/sysfs"
+	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+)
+
+// ControllerID is the wazero-quickjs host controller ID.
+const ControllerID = "bldr/plugin/host/wazero-quickjs"
+
+// Controller is the plugin host controller type.
+type Controller = host_controller.Controller
+
+// Version is the version of this controller.
+var Version = controller.MustParseVersion("0.0.1")
+
+var (
+	// BootScriptPath is the file name of the quickjs vm entrypoint.
+	BootScriptPath = "/boot/plugin-quickjs.esm.js"
+
+	// DistFsMount is the path we mount the dist fs within the vm.
+	DistFsMount = "/dist"
+
+	// AssetsFsMount is the path we mount the assets fs within the vm.
+	AssetsFsMount = "/assets"
+
+	// DevFsMount is the path we mount the system device files within the vm.
+	DevFsMount = "/dev"
+
+	// BDirMount is the path we mount the /b/ tree within the vm.
+	BDirMount = "/b"
+
+	// BDirWebPkgsMount is the path within BDir we mount the web pkgs within the vm.
+	BDirWebPkgsMount = "pkg"
+)
+
+// WazeroQuickJsHost implements the plugin host with QuickJS running as WASI in Wazero.
+type WazeroQuickJsHost struct {
+	// b is the bus
+	b bus.Bus
+	// le is the logger
+	le *logrus.Entry
+	// pluginPlatformID is the plugin platform to use
+	pluginPlatformID string
+	// quickjsVmRc is a routine to compile quickjs wasi
+	// this is released after a timeout to free up memory if no plugins are running.
+	// shared between plugin instances to save memory and speed up startup time.
+	quickjsVmRc *refcount.RefCount[*quickjsVm]
+	// wazeroCacheDir holds the native code wazero compiles from the QuickJS
+	// module, empty to keep it in memory.
+	wazeroCacheDir string
+	// bytecode caches compiled plugin modules, nil when disabled.
+	bytecode *bytecodeCache
+}
+
+// quickjsVm contains the shared compilation cache for quickjs instances.
+// Each plugin instance gets its own wazero.Runtime to avoid module name
+// collisions, but they share compiled native code via the cache.
+type quickjsVm struct {
+	cache wazero.CompilationCache
+}
+
+// NewWazeroQuickJsHost constructs a new WazeroQuickJsHost.
+// cacheDir caches compiled code across restarts, and empty disables the cache.
+func NewWazeroQuickJsHost(b bus.Bus, le *logrus.Entry, cacheDir string) (*WazeroQuickJsHost, error) {
+	// determine the platform id for the host
+	platformID := bldr_platform.NewJsPlatform().GetPlatformID()
+	h := &WazeroQuickJsHost{
+		b:                b,
+		le:               le,
+		pluginPlatformID: platformID,
+	}
+	if cacheDir != "" {
+		h.wazeroCacheDir = filepath.Join(cacheDir, "wazero")
+		h.bytecode = newBytecodeCache(filepath.Join(cacheDir, "bytecode"))
+	}
+	h.quickjsVmRc = refcount.NewRefCount(nil, false, nil, nil, h.resolveQuickjsVm)
+	return h, nil
+}
+
+// resolveQuickjsVm resolves the shared compilation cache for quickjs plugins.
+func (h *WazeroQuickJsHost) resolveQuickjsVm(ctx context.Context, released func()) (*quickjsVm, func(), error) {
+	// Create the compilation cache and its release func.
+	cache, err := h.newCompilationCache()
+	if err != nil {
+		return nil, nil, err
+	}
+	rel := func() { _ = cache.Close(ctx) }
+
+	// Pre-warm the cache by compiling once, or by reading the disk cache.
+	runtimeConfig := wazero.NewRuntimeConfig().
+		WithCompilationCache(cache).
+		WithCloseOnContextDone(true)
+	r := wazero.NewRuntimeWithConfig(ctx, runtimeConfig)
+	_, err = wasi_snapshot_preview1.Instantiate(ctx, r)
+	if err != nil {
+		_ = r.Close(ctx)
+		rel()
+		return nil, nil, err
+	}
+	_, err = quickjs.CompileQuickJS(ctx, r)
+	_ = r.Close(ctx)
+	if err != nil {
+		rel()
+		return nil, nil, err
+	}
+
+	// Return the vm sharing the warmed cache.
+	return &quickjsVm{cache: cache}, rel, nil
+}
+
+// newCompilationCache creates the compilation cache, on disk when the host
+// has a cache directory.
+func (h *WazeroQuickJsHost) newCompilationCache() (wazero.CompilationCache, error) {
+	if h.wazeroCacheDir == "" {
+		return wazero.NewCompilationCache(), nil
+	}
+	return wazero.NewCompilationCacheWithDir(h.wazeroCacheDir)
+}
+
+// newPluginRuntime creates a per-plugin wazero.Runtime with the shared compilation cache.
+func (h *WazeroQuickJsHost) newPluginRuntime(ctx context.Context, cache wazero.CompilationCache) (wazero.Runtime, wazero.CompiledModule, error) {
+	// Build the runtime config with the shared cache.
+	runtimeConfig := wazero.NewRuntimeConfig().
+		WithCompilationCache(cache).
+		WithCloseOnContextDone(true)
+	r := wazero.NewRuntimeWithConfig(ctx, runtimeConfig)
+
+	// Instantiate WASI and compile the QuickJS module.
+	_, err := wasi_snapshot_preview1.Instantiate(ctx, r)
+	if err != nil {
+		_ = r.Close(ctx)
+		return nil, nil, err
+	}
+	mod, err := quickjs.CompileQuickJS(ctx, r)
+	if err != nil {
+		_ = r.Close(ctx)
+		return nil, nil, err
+	}
+	return r, mod, nil
+}
+
+// NewWazeroQuickJsHostController constructs the WazeroQuickJsHost and PluginHost controller.
+func NewWazeroQuickJsHostController(
+	le *logrus.Entry,
+	b bus.Bus,
+	c *Config,
+) (*host_controller.Controller, *WazeroQuickJsHost, error) {
+	// Validate the config and construct the host.
+	if err := c.Validate(); err != nil {
+		return nil, nil, err
+	}
+	pluginHost, err := NewWazeroQuickJsHost(b, le, c.GetCacheDir())
+	if err != nil {
+		return nil, nil, err
+	}
+	hctrl := host_controller.NewController(
+		le,
+		b,
+		controller.NewInfo(ControllerID, Version, "plugin host with QuickJS running as WASI in Wazero"),
+		pluginHost,
+	)
+	return hctrl, pluginHost, nil
+}
+
+// Execute is a stub as the wazero host does not need a global management goroutine.
+func (h *WazeroQuickJsHost) Execute(ctx context.Context) error {
+	_ = h.quickjsVmRc.SetContext(ctx)
+	return nil
+}
+
+// GetPlatformId returns the plugin platform ID for this host.
+func (h *WazeroQuickJsHost) GetPlatformId() string {
+	return h.pluginPlatformID
+}
+
+// ListPlugins lists the set of initialized plugins.
+func (h *WazeroQuickJsHost) ListPlugins(ctx context.Context) ([]string, error) {
+	// TODO list stored plugins or temporary storage
+	// the plugin host will call Delete for any unrecognized
+	return nil, nil
+}
+
+// ExecutePlugin executes the plugin with the given ID.
+// If the plugin was already initialized, existing state can be reused.
+// The plugin should be stopped if/when the function exits.
+// Return ErrPluginUninitialized if the plugin was not ready.
+// Should expect to be called only once (at a time) for a plugin ID.
+// pluginDist contains the plugin distribution files (binaries and assets).
+func (h *WazeroQuickJsHost) ExecutePlugin(
+	ctx context.Context,
+	pluginID, instanceKey, _, manifestRoot, entrypoint string,
+	pluginDist, pluginAssets *unixfs.FSHandle,
+	hostMux srpc.Mux,
+	rpcInit plugin_host.PluginRpcInitCb,
+) error {
+	// restrict to .mjs and .js only
+	if !strings.HasSuffix(entrypoint, ".mjs") && !strings.HasSuffix(entrypoint, ".js") {
+		return errors.Errorf("entrypoint must have a .mjs or .js extension: %q", entrypoint)
+	}
+	le := h.le.WithFields(logrus.Fields{
+		"plugin-id": pluginID,
+	})
+
+	// double-check the entrypoint exists and is executable
+	entrypoint = filepath.Clean(entrypoint)
+	le.
+		WithField("entrypoint", entrypoint).
+		Debug("looking up quickjs plugin entrypoint")
+	entrypointHandle, _, err := pluginDist.LookupPath(ctx, entrypoint)
+	if err != nil {
+		return errors.Wrapf(err, "entrypoint at %s", entrypoint)
+	}
+	le.
+		WithField("entrypoint", entrypoint).
+		Debug("quickjs plugin entrypoint lookup complete")
+
+	// Read the entrypoint file info and release the handle.
+	le.
+		WithField("entrypoint", entrypoint).
+		Debug("reading quickjs plugin entrypoint file info")
+	entrypointFi, err := entrypointHandle.GetFileInfo(ctx)
+	entrypointHandle.Release()
+	if err != nil {
+		return errors.Wrap(err, "entrypoint")
+	}
+	le.
+		WithField("entrypoint", entrypoint).
+		WithField("mode", entrypointFi.Mode().String()).
+		Debug("quickjs plugin entrypoint file info ready")
+
+	// The entrypoint must be a regular file.
+	entrypointFiMode := entrypointFi.Mode()
+	if !entrypointFiMode.IsRegular() {
+		return errors.Errorf("entrypoint must be an executable regular file: %s", entrypointFiMode.String())
+	}
+
+	// start loading the quickjs wasm module (kick it off)
+	loadVmRef := h.quickjsVmRc.AddRef(nil)
+	defer loadVmRef.Release()
+
+	// create unique plugin instance id
+	pluginInstanceID := randstring.RandomIdentifier(4)
+	pluginStartInfo := plugin.NewPluginStartInfo(pluginInstanceID, pluginID, instanceKey, manifestRoot)
+	pluginStartInfoJson, err := pluginStartInfo.MarshalJSON()
+	if err != nil {
+		return err
+	}
+	pluginStartInfoB64 := base64.StdEncoding.EncodeToString(pluginStartInfoJson)
+
+	// Encode the start info for the plugin environment.
+
+	// Mount the RPC handler to the bus.
+	baseControllerID := ControllerID + "/" + pluginID
+	rpcServiceControllerID := baseControllerID + "/rpc-host"
+
+	// Build the RPC service controller for the plugin instance.
+	var hostInvoker srpc.Invoker = hostMux
+	rpcServiceCtrl := bifrost_rpc.NewRpcServiceController(
+		controller.NewInfo(rpcServiceControllerID, Version, "rpc host for plugin"),
+		func(ctx context.Context, released func()) (srpc.Invoker, func(), error) {
+			return hostInvoker, nil, nil
+		},
+		nil,
+		false,
+		nil,
+		nil,
+		regexp.MustCompile("^"+regexp.QuoteMeta("wazero-quickjs/"+pluginInstanceID)+"$"),
+	)
+	relRpcServiceCtrl, err := h.b.AddController(ctx, rpcServiceCtrl, nil)
+	if err != nil {
+		return err
+	}
+	defer relRpcServiceCtrl()
+
+	// Add the instance id to the logger.
+	le = h.le.WithFields(logrus.Fields{
+		"plugin-instance-id": pluginInstanceID,
+		"plugin-id":          pluginID,
+	})
+	le.Debug("starting wazero quickjs plugin instance")
+
+	// this restarts if the quickjs vm is reloaded or unloaded
+	return h.quickjsVmRc.Access(ctx, func(ctx context.Context, val *quickjsVm) error {
+		// Scope cancellation to this run. Canceling the Access context would make
+		// Access report context.Canceled and discard the run's own error.
+		ctx, cancelRun := context.WithCancel(ctx)
+		defer cancelRun()
+
+		// Log the runtime creation.
+		le.Debug("creating quickjs plugin runtime")
+
+		// Create a per-plugin runtime with the shared compilation cache.
+		// Each plugin gets its own runtime to avoid wazero module name collisions
+		// (the QuickJS library forces the module name to "qjs-wasi.wasm").
+		r, compiled, err := h.newPluginRuntime(ctx, val.cache)
+		if err != nil {
+			return errors.Wrap(err, "create plugin runtime")
+		}
+		defer r.Close(ctx)
+		le.Debug("quickjs plugin runtime ready")
+
+		// construct a filesystem with the plugin dist fs at /dist
+		// this makes /dist read-only which is what we want.
+		pluginDistIofs := unixfs_iofs.NewFS(ctx, pluginDist)
+		pluginAssetsIoFs := unixfs_iofs.NewFS(ctx, pluginAssets)
+
+		// construct the fs config
+		fsConfig := wazero.NewFSConfig().
+			WithFSMount(pluginDistIofs, DistFsMount).
+			WithFSMount(pluginAssetsIoFs, AssetsFsMount)
+
+		// Mount the web packages subdirectory when the plugin has one.
+		webPkgsInfo, err := fs.Stat(pluginAssetsIoFs, plugin.PluginAssetsWebPkgsDir)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return errors.Wrap(err, "stat project plugin web packages")
+		}
+		if err == nil {
+			if !webPkgsInfo.IsDir() {
+				return errors.Errorf("project plugin web packages %q is not a directory", plugin.PluginAssetsWebPkgsDir)
+			}
+			pluginWebPkgsIoFs, err := fs.Sub(pluginAssetsIoFs, plugin.PluginAssetsWebPkgsDir)
+			if err != nil {
+				return errors.Wrap(err, "project plugin web packages")
+			}
+			fsConfig = fsConfig.WithFSMount(pluginWebPkgsIoFs, path.Join(BDirMount, BDirWebPkgsMount))
+		}
+
+		// script is within dist
+		scriptPath := path.Join(DistFsMount, entrypoint)
+
+		// Create the stdin buffer.
+		stdinBuf := &wazerofs.StdinBuffer{}
+		defer stdinBuf.Close()
+
+		// Create the output pipe + buffer.
+		localRead, remoteWrite := io.Pipe()
+
+		// create read/write/closer for local I/O
+		// we will read from the localRead end of the pipe, and write to the stdinBuf.
+		localRwc := bifrost_rwc.NewReadWriteCloser(localRead, stdinBuf)
+
+		// initialize the yamux client for talking to the plugin.
+		yamuxConf := srpc.NewYamuxConfig()
+		yamuxConf.EnableKeepAlive = false
+		yamuxConf.MaxMessageSize = 32 * 1024 // use a 32kb buffer for stdin
+
+		// NOTE: we could probably also disable rtt measurement.
+		muxedConn, err := srpc.NewMuxedConnWithRwc(ctx, localRwc, true, yamuxConf)
+		if err != nil {
+			return err
+		}
+		defer muxedConn.Close()
+
+		// Mount the device filesystem for async output and secure randomness.
+
+		// NOTE stdin is currently the only fd which implements Poll.
+		// all other fds will call and block on read() (blocking I/O only).
+		// https://github.com/tetratelabs/wazero/issues/1500#issuecomment-3041125375
+		// we therefore must use stdin for our async i/o input, and a file at /dev/out for output
+		// force WR_ONLY on that file.
+		//
+		// See prototype under prototypes/js-wazero-quickjs/nonblock/
+		devFS := newDevFS(remoteWrite)
+		fsConfig = fsConfig.(wazero_exp_sysfs.FSConfig).WithSysFSMount(devFS, DevFsMount)
+
+		// Initialize the rpc client for calling the plugin.
+		openStreamFn := srpc.NewOpenStreamWithMuxedConn(muxedConn)
+		pluginRpcClient := srpc.NewClient(openStreamFn)
+		le.Debug("publishing quickjs plugin rpc client")
+		if err := rpcInit(pluginRpcClient); err != nil {
+			return err
+		}
+		le.Debug("quickjs plugin rpc client published")
+
+		// Execute the muxed conn on the server side (accept incoming streams).
+		var acceptStreamErr atomic.Pointer[error]
+		srv := srpc.NewServer(hostMux)
+		go func() {
+			err := srv.AcceptMuxedConn(ctx, muxedConn)
+			if err != nil && ctx.Err() == nil {
+				acceptStreamErr.Store(&err)
+				cancelRun()
+			}
+		}()
+
+		// Log to the logger instead of directly to stderr.
+		debugWriter := le.WriterLevel(logrus.DebugLevel)
+		moduleConfig := wazero.NewModuleConfig().
+			WithStdin(stdinBuf).
+			WithStdout(debugWriter).
+			WithStderr(debugWriter).
+			WithFS(pluginDistIofs).
+			WithFSConfig(fsConfig).
+			WithSysNanosleep().
+			WithSysNanotime().
+			WithSysWalltime().
+			WithEnv("BLDR_SCRIPT_PATH", scriptPath).
+			WithEnv("BLDR_PLUGIN_START_INFO", pluginStartInfoB64)
+
+		// Create a QuickJS instance using the pre-compiled module.
+		// This uses the reactor model which doesn't block in _start().
+		le.Debug("creating quickjs instance")
+		qjs, err := quickjs.NewQuickJSWithModule(ctx, r, compiled, moduleConfig)
+		if err != nil {
+			return errors.Wrap(err, "create quickjs instance")
+		}
+		defer qjs.Close(ctx)
+		le.Debug("quickjs instance created")
+
+		// Initialize QuickJS with the std globals the boot harness uses.
+		le.WithField("script-path", scriptPath).Debug("initializing quickjs plugin")
+		if err := qjs.Init(ctx, []string{"qjs", "--std"}); err != nil {
+			return errors.Wrap(err, "init quickjs")
+		}
+
+		// Register the dist modules from cached bytecode before the plugin
+		// imports them.
+		if h.bytecode != nil {
+			if err := h.bytecode.loadModules(ctx, le, qjs, pluginID, pluginDistIofs); err != nil {
+				return errors.Wrap(err, "load module bytecode")
+			}
+		}
+
+		// Run the boot harness, which reads BLDR_SCRIPT_PATH and
+		// BLDR_PLUGIN_START_INFO from env and imports the plugin.
+		if err := qjs.EvalWithFilename(ctx, pluginQuickjsBoot, BootScriptPath, true); err != nil {
+			return errors.Wrap(err, "run quickjs boot harness")
+		}
+		le.Debug("quickjs plugin initialized")
+
+		// Run the event loop with stdin polling.
+		// Unlike RunLoop which exits on idle, we need to wait for stdin data
+		// when idle since the plugin is waiting for RPC messages.
+		err = runLoopWithStdin(ctx, qjs, stdinBuf)
+		_ = remoteWrite.Close()
+
+		// Report the accept stream error before the loop error.
+		if errPtr := acceptStreamErr.Load(); errPtr != nil {
+			return *errPtr
+		}
+		if ctx.Err() != nil {
+			return context.Canceled
+		}
+		if err != nil {
+			return errors.Wrap(err, "quickjs event loop")
+		}
+
+		return nil
+	})
+}
+
+// runLoopWithStdin runs the QuickJS event loop with stdin polling.
+// When the event loop becomes idle or waiting for a timer, it also monitors stdin.
+// This keeps the plugin alive waiting for RPC messages.
+//
+// The reactor model's qjs_loop_once() only handles timers and microtasks - it does
+// NOT poll for I/O. We use qjs_poll_io() to invoke os.setReadHandler callbacks when
+// stdin has data available. This is more efficient than the command model because
+// the host knows exactly when I/O is ready, avoiding unnecessary poll() syscalls.
+func runLoopWithStdin(ctx context.Context, qjs *quickjs.QuickJS, stdinBuf *wazerofs.StdinBuffer) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		result, err := qjs.LoopOnce(ctx)
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case result == quickjs.LoopError:
+			return errors.New("JavaScript error occurred")
+		case result == 0:
+			// More microtasks pending, continue immediately
+			continue
+		case result > 0:
+			// Timer pending - wait for timer, stdin data, or context cancellation
+			ready, waitCh := stdinBuf.CheckReady()
+			if ready {
+				// Data available - poll I/O to invoke read handlers
+				if _, err := qjs.PollIO(ctx, 0); err != nil {
+					return err
+				}
+				continue
+			}
+			timerDur := time.Duration(result.NextTimerMs()) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-waitCh:
+				// Stdin data available - poll I/O to invoke read handlers
+				if _, err := qjs.PollIO(ctx, 0); err != nil {
+					return err
+				}
+				continue
+			case <-time.After(timerDur):
+				continue
+			}
+		case result == quickjs.LoopIdle:
+			// Idle - wait for stdin data or context cancellation
+			ready, waitCh := stdinBuf.CheckReady()
+			if ready {
+				// Data available - poll I/O to invoke read handlers
+				if _, err := qjs.PollIO(ctx, 0); err != nil {
+					return err
+				}
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-waitCh:
+				// Stdin data available - poll I/O to invoke read handlers
+				if _, err := qjs.PollIO(ctx, 0); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+	}
+}
+
+// DeletePlugin clears cached plugin data for the given plugin ID.
+func (h *WazeroQuickJsHost) DeletePlugin(ctx context.Context, pluginID string) error {
+	if h.bytecode == nil {
+		return nil
+	}
+	return h.bytecode.deletePlugin(pluginID)
+}
+
+// _ is a type assertion
+var _ plugin_host.PluginHost = (*WazeroQuickJsHost)(nil)

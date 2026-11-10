@@ -1,0 +1,369 @@
+package block_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/s4wave/spacewave/db/block"
+	block_store_inmem "github.com/s4wave/spacewave/db/block/store/inmem"
+	store_kvkey "github.com/s4wave/spacewave/db/store/kvkey"
+	store_kvtx_inmem "github.com/s4wave/spacewave/db/store/kvtx/inmem"
+	hash "github.com/s4wave/spacewave/net/hash"
+)
+
+type overlayBatchTestStore struct {
+	block.StoreOps
+
+	// leaves serves stored blocks as leaves from GetStoredBlock.
+	leaves bool
+
+	mu               sync.Mutex
+	putCalls         int
+	rmCalls          int
+	batchCalls       int
+	existsBatchCalls int
+	putNotify        chan struct{}
+}
+
+type overlayNilOptsTestStore struct {
+	block.StoreOps
+
+	putOpts []*block.PutOpts
+}
+
+func newOverlayBatchTestStore() *overlayBatchTestStore {
+	return &overlayBatchTestStore{
+		StoreOps:  newOverlayMemoryStore(),
+		putNotify: make(chan struct{}, 1),
+	}
+}
+
+func newOverlayNilOptsTestStore() *overlayNilOptsTestStore {
+	return &overlayNilOptsTestStore{StoreOps: newOverlayMemoryStore()}
+}
+
+func newOverlayMemoryStore() block.StoreOps {
+	return block_store_inmem.NewInmemBlock(
+		store_kvkey.NewDefaultKVKey(),
+		store_kvtx_inmem.NewStore(),
+		hash.HashType_HashType_BLAKE3,
+		false,
+	)
+}
+
+func (s *overlayBatchTestStore) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (*block.BlockRef, bool, error) {
+	// Count the overlay write and notify waiting tests.
+	s.mu.Lock()
+	s.putCalls++
+	s.mu.Unlock()
+	select {
+	case s.putNotify <- struct{}{}:
+	default:
+	}
+	return s.StoreOps.PutBlock(ctx, data, opts)
+}
+
+func (s *overlayBatchTestStore) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	stored, err := s.StoreOps.GetStoredBlock(ctx, ref)
+	if stored != nil && s.leaves {
+		stored.RefsKnown = true
+	}
+	return stored, err
+}
+
+func (s *overlayBatchTestStore) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	s.mu.Lock()
+	s.rmCalls++
+	s.mu.Unlock()
+	return s.StoreOps.RmBlock(ctx, ref)
+}
+
+func (s *overlayBatchTestStore) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	s.batchCalls++
+	return s.StoreOps.PutBlockBatch(ctx, entries)
+}
+
+func (s *overlayBatchTestStore) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	s.existsBatchCalls++
+	return s.StoreOps.GetBlockExistsBatch(ctx, refs)
+}
+
+func (s *overlayNilOptsTestStore) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (*block.BlockRef, bool, error) {
+	s.putOpts = append(s.putOpts, opts)
+	return s.StoreOps.PutBlock(ctx, data, opts)
+}
+
+func TestStoreOverlayPutBlockBatchForwards(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name      string
+		mode      block.OverlayMode
+		wantUpper int
+	}{
+		{name: "upper-cache", mode: block.OverlayMode_UPPER_CACHE, wantUpper: 1},
+		{name: "upper-read-cache", mode: block.OverlayMode_UPPER_READ_CACHE},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create two backing stores and an overlay for batch forwarding.
+			lower := newOverlayBatchTestStore()
+			upper := newOverlayBatchTestStore()
+			overlay := block.NewOverlay(ctx, nil, lower, upper, tt.mode, 0, nil)
+			data := []byte("hello")
+			ref := mustBuildBlockRef(t, data)
+			entries := []*block.PutBatchEntry{{Ref: ref, Data: data, RefsKnown: true}}
+
+			// Write the block batch through the overlay.
+			if _, err := overlay.PutBlockBatch(ctx, entries); err != nil {
+				t.Fatal(err.Error())
+			}
+
+			// Verify each written store used its batch API, and a read cache
+			// wrote only the lower store.
+			if lower.batchCalls != 1 || upper.batchCalls != tt.wantUpper {
+				t.Fatalf("unexpected batch calls: lower=%d upper=%d", lower.batchCalls, upper.batchCalls)
+			}
+			if lower.putCalls != 0 || upper.putCalls != 0 {
+				t.Fatalf("expected no per-entry PutBlock fallback, got lower=%d upper=%d", lower.putCalls, upper.putCalls)
+			}
+		})
+	}
+}
+
+func TestStoreOverlayCachePutHandlesNilOpts(t *testing.T) {
+	// Create a caching overlay that records incoming put options.
+	ctx := context.Background()
+	lower := newOverlayNilOptsTestStore()
+	upper := newOverlayNilOptsTestStore()
+	overlay := block.NewOverlay(ctx, nil, lower, upper, block.OverlayMode_UPPER_CACHE, 0, nil)
+
+	// Verify nil primary options become forced-reference cache options.
+	ref, _, err := overlay.PutBlock(ctx, []byte("hello"), nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(lower.putOpts) != 1 || lower.putOpts[0] != nil {
+		t.Fatalf("expected primary put to receive original nil opts")
+	}
+	if len(upper.putOpts) != 1 {
+		t.Fatalf("expected secondary put to receive forced-ref opts")
+	}
+	if !upper.putOpts[0].GetForceBlockRef().EqualsRef(ref) {
+		t.Fatalf("expected secondary put force ref to match primary ref")
+	}
+}
+
+func TestStoreOverlayPutBlockForwards(t *testing.T) {
+	// Create an upper-only overlay and its block payload.
+	ctx := context.Background()
+	lower := newOverlayBatchTestStore()
+	upper := newOverlayBatchTestStore()
+	overlay := block.NewOverlay(ctx, nil, lower, upper, block.OverlayMode_UPPER_ONLY, 0, nil)
+	data := []byte("hello")
+	ref := mustBuildBlockRef(t, data)
+
+	// Write the block through the upper-only overlay.
+	if _, _, err := overlay.PutBlock(ctx, data, &block.PutOpts{ForceBlockRef: ref}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Verify only one upper-store write occurred.
+	if upper.putCalls != 1 {
+		t.Fatalf("expected one upper put call, got %d", upper.putCalls)
+	}
+}
+
+func TestStoreOverlayUpperReadbackCache(t *testing.T) {
+	// Store a lower-layer block for upper readback caching.
+	ctx := context.Background()
+	lower := newOverlayBatchTestStore()
+	lower.leaves = true
+	upper := newOverlayBatchTestStore()
+	overlay := block.NewOverlay(ctx, nil, lower, upper, block.OverlayMode_UPPER_READBACK_CACHE, 0, nil)
+	data := []byte("from-lower")
+	ref, _, err := lower.StoreOps.PutBlock(ctx, data, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Read the lower-layer block through the overlay.
+	data, found, err := overlay.GetBlock(ctx, ref)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !found || string(data) != "from-lower" {
+		t.Fatalf("expected lower data, got found=%v data=%q", found, string(data))
+	}
+
+	// Wait for the upper cache write and snapshot both store counters.
+	select {
+	case <-upper.putNotify:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for writeback to upper")
+	}
+	upper.mu.Lock()
+	upperPuts := upper.putCalls
+	upper.mu.Unlock()
+	lower.mu.Lock()
+	lowerPuts := lower.putCalls
+	lower.mu.Unlock()
+
+	// Verify readback cached the block only in the upper store.
+	if upperPuts != 1 {
+		t.Fatalf("expected one writeback to upper, got %d", upperPuts)
+	}
+	if lowerPuts != 0 {
+		t.Fatalf("expected no writes to lower, got %d", lowerPuts)
+	}
+
+	// Write the block through the readback-cache overlay.
+	if _, _, err := overlay.PutBlock(ctx, data, &block.PutOpts{ForceBlockRef: ref}); err != nil {
+		t.Fatal(err.Error())
+	}
+	upper.mu.Lock()
+	upperPuts = upper.putCalls
+	upper.mu.Unlock()
+	lower.mu.Lock()
+	lowerPuts = lower.putCalls
+	lower.mu.Unlock()
+
+	// Verify the explicit write affects only the upper store.
+	if upperPuts != 2 {
+		t.Fatalf("expected upper put to bring total to 2, got %d", upperPuts)
+	}
+	if lowerPuts != 0 {
+		t.Fatalf("expected no writes to lower, got %d", lowerPuts)
+	}
+
+	// Remove the block through the readback-cache overlay.
+	if err := overlay.RmBlock(ctx, ref); err != nil {
+		t.Fatal(err.Error())
+	}
+	upper.mu.Lock()
+	upperRms := upper.rmCalls
+	upper.mu.Unlock()
+	lower.mu.Lock()
+	lowerRms := lower.rmCalls
+	lower.mu.Unlock()
+
+	// Verify removal affects only the upper store.
+	if upperRms != 1 {
+		t.Fatalf("expected one rm on upper, got %d", upperRms)
+	}
+	if lowerRms != 0 {
+		t.Fatalf("expected no rms on lower, got %d", lowerRms)
+	}
+}
+
+func TestStoreOverlayWriteCacheRemoveUsesWriteStore(t *testing.T) {
+	ctx := context.Background()
+	ref := mustBuildBlockRef(t, []byte("remove"))
+
+	for _, tt := range []struct {
+		name      string
+		mode      block.OverlayMode
+		wantLower int
+		wantUpper int
+	}{
+		{name: "upper", mode: block.OverlayMode_UPPER_WRITE_CACHE, wantUpper: 1},
+		{name: "lower", mode: block.OverlayMode_LOWER_WRITE_CACHE, wantLower: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create the backing stores for this write-cache mode.
+			lower := newOverlayBatchTestStore()
+			upper := newOverlayBatchTestStore()
+			overlay := block.NewOverlay(ctx, nil, lower, upper, tt.mode, 0, nil)
+
+			// Remove the block and verify the configured write store receives it.
+			if err := overlay.RmBlock(ctx, ref); err != nil {
+				t.Fatal(err.Error())
+			}
+			if lower.rmCalls != tt.wantLower || upper.rmCalls != tt.wantUpper {
+				t.Fatalf("unexpected rm calls: lower=%d upper=%d", lower.rmCalls, upper.rmCalls)
+			}
+		})
+	}
+}
+
+func TestStoreOverlayGetBlockExistsBatchForwards(t *testing.T) {
+	// Create a read-cache overlay for batched existence probes.
+	ctx := context.Background()
+	lower := newOverlayBatchTestStore()
+	upper := newOverlayBatchTestStore()
+	overlay := block.NewOverlay(ctx, nil, lower, upper, block.OverlayMode_UPPER_READ_CACHE, 0, nil)
+	ref := mustBuildBlockRef(t, []byte("missing"))
+
+	// Verify both cache and fallback stores receive the batch probe.
+	if _, err := overlay.GetBlockExistsBatch(ctx, []*block.BlockRef{ref}); err != nil {
+		t.Fatal(err.Error())
+	}
+	if upper.existsBatchCalls != 1 {
+		t.Fatalf("expected upper batch exists call, got %d", upper.existsBatchCalls)
+	}
+	if lower.existsBatchCalls != 1 {
+		t.Fatalf("expected lower batch exists call for cache miss fallback, got %d", lower.existsBatchCalls)
+	}
+}
+
+func mustBuildBlockRef(t *testing.T, data []byte) *block.BlockRef {
+	t.Helper()
+	ref, err := block.BuildBlockRef(data, &block.PutOpts{HashType: hash.HashType_HashType_BLAKE3})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	return ref
+}
+
+// overlayGatedPutStore records the data passed to PutBlock after a gate opens.
+type overlayGatedPutStore struct {
+	block.StoreOps
+
+	gate chan struct{}
+	got  chan []byte
+}
+
+func (s *overlayGatedPutStore) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (*block.BlockRef, bool, error) {
+	<-s.gate
+	s.got <- append([]byte(nil), data...)
+	return s.StoreOps.PutBlock(ctx, data, opts)
+}
+
+// TestStoreOverlayReadbackCopiesData checks the background writeback does not
+// share the data slice returned to the caller.
+func TestStoreOverlayReadbackCopiesData(t *testing.T) {
+	// Store a lower-layer block behind a gated upper writeback.
+	ctx := context.Background()
+	lower := newOverlayBatchTestStore()
+	lower.leaves = true
+	upper := &overlayGatedPutStore{
+		StoreOps: newOverlayMemoryStore(),
+		gate:     make(chan struct{}),
+		got:      make(chan []byte, 1),
+	}
+	overlay := block.NewOverlay(ctx, nil, lower, upper, block.OverlayMode_UPPER_READBACK_CACHE, 0, nil)
+	ref, _, err := lower.StoreOps.PutBlock(ctx, []byte("from-lower"), nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Read the lower block before releasing upper writeback.
+	data, found, err := overlay.GetBlock(ctx, ref)
+	if err != nil || !found {
+		t.Fatalf("GetBlock: found=%v err=%v", found, err)
+	}
+
+	// The caller owns the returned slice and may reuse it.
+	copy(data, "XXXXXXXXXX")
+	close(upper.gate)
+
+	// Verify the upper writeback retained the original block bytes.
+	select {
+	case written := <-upper.got:
+		if string(written) != "from-lower" {
+			t.Fatalf("writeback wrote %q, want %q", written, "from-lower")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for writeback to upper")
+	}
+}

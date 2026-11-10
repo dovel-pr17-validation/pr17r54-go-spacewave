@@ -1,0 +1,552 @@
+#!/usr/bin/env bun
+/* eslint-disable react-doctor/async-await-in-loop */
+
+// Generates Go and JS license data, merges into unified licenses.json.
+//
+// Usage: bun scripts/license-gen.ts [--go] [--js] [--merge]
+// No flags = generate both + merge.
+
+import { spawn } from 'child_process'
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  rmSync,
+} from 'fs'
+import { dirname, join, resolve } from 'path'
+import { fileURLToPath } from 'url'
+import { build } from 'vite'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const rootDir = join(__dirname, '..')
+const outDir = join(rootDir, 'app', 'licenses')
+const tmpDir = join(rootDir, '.tmp', 'license-build')
+
+const args = process.argv.slice(2)
+const explicit = args.some((a) => a.startsWith('--'))
+const doGo = !explicit || args.includes('--go')
+const doJs = !explicit || args.includes('--js')
+const doMerge = !explicit || args.includes('--merge')
+
+const canonicalSpdxIdentifiers = new Map(
+  [
+    '0BSD',
+    'Apache-2.0',
+    'Apache-2.0 OR MIT',
+    'BSD-2-Clause',
+    'BSD-3-Clause',
+    'CC0-1.0',
+    'ISC',
+    'LGPL-2.1',
+    'LGPL-2.1-only',
+    'LGPL-3.0',
+    'LGPL-3.0-only',
+    'MIT',
+    'MIT-0',
+    'MPL-2.0',
+    'Unlicense',
+    'BlueOak-1.0.0',
+    'Unknown',
+  ].map((spdx) => [spdx.toLowerCase(), spdx]),
+)
+
+interface GoLicenseEntry {
+  name: string
+  version: string
+  licenseName: string
+  licenseText: string
+}
+
+interface JsLicenseEntry {
+  name: string
+  version: string
+  identifier: string
+  text: string
+}
+
+interface LicenseEntry {
+  name: string
+  version: string
+  spdx: string
+  source: 'go' | 'js' | 'both'
+  repo?: string
+  isDev?: boolean
+  // SPDX dedup: if the license body matches the canonical SPDX base,
+  // only copyrightNotice is stored. Otherwise, fullText has the complete text.
+  copyrightNotice?: string
+  fullText?: string
+}
+
+interface LicensesJson {
+  bases: Record<string, string>
+  entries: LicenseEntry[]
+}
+
+// Map aperturerobotics fork module paths to upstream repos.
+const forkToUpstream: Record<string, string> = {
+  'github.com/aperturerobotics/bbolt': 'https://github.com/etcd-io/bbolt',
+  'github.com/aperturerobotics/json-iterator-lite':
+    'https://github.com/nicholasgasior/gojsoniter',
+  'github.com/aperturerobotics/go-multiaddr':
+    'https://github.com/multiformats/go-multiaddr',
+  'github.com/aperturerobotics/go-multicodec':
+    'https://github.com/multiformats/go-multicodec',
+  'github.com/aperturerobotics/go-multihash':
+    'https://github.com/multiformats/go-multihash',
+  'github.com/aperturerobotics/go-multistream':
+    'https://github.com/multiformats/go-multistream',
+  'github.com/aperturerobotics/go-websocket':
+    'https://github.com/nhooyr/websocket',
+  'github.com/aperturerobotics/go-varint':
+    'https://github.com/multiformats/go-varint',
+  'github.com/aperturerobotics/go-libp2p-channel':
+    'https://github.com/libp2p/go-libp2p-channel',
+}
+
+interface RunResult {
+  code: number | null
+  stdout: string
+  stderr: string
+}
+
+function run(
+  command: string,
+  cmdArgs: string[],
+  cwd?: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<RunResult> {
+  return new Promise((res) => {
+    const proc = spawn(command, cmdArgs, {
+      cwd: cwd || rootDir,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      env: env ? { ...process.env, ...env } : process.env,
+    })
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', (data: Buffer) => {
+      stdout += data.toString()
+    })
+    proc.stderr.on('data', (data: Buffer) => {
+      stderr += data.toString()
+    })
+    proc.on('close', (code) => {
+      res({ code, stdout, stderr })
+    })
+  })
+}
+
+// Builds the license reporter from its isolated module on each generation.
+async function buildGoLicenses(): Promise<string> {
+  const binPath = join(rootDir, '.tools', 'license-report')
+  mkdirSync(dirname(binPath), { recursive: true })
+  const result = await run(
+    'go',
+    ['-C', 'scripts/licenses', 'build', '-o', binPath, '.'],
+    rootDir,
+  )
+  if (result.code !== 0) {
+    console.error('failed to build go-licenses:', result.stderr)
+    process.exit(1)
+  }
+  return binPath
+}
+
+// Go license generation: runs the reporter, deduplicates
+// sub-packages to module level, enriches versions from vendor/modules.txt.
+async function generateGoLicenses(): Promise<GoLicenseEntry[]> {
+  console.log('Generating Go licenses...')
+  const binPath = await buildGoLicenses()
+
+  // Run go-licenses once per supported (GOOS, GOARCH) pair and union the
+  // results. Without iterating over platforms, packages behind build
+  // constraints (e.g. bazil.org/fuse on linux/darwin, syscall/js on
+  // js/wasm, windows-only registry packages) are missed depending on the
+  // host. The module-level dedup loop below merges duplicates across runs.
+  //
+  // CGO_ENABLED is pinned per platform so the package set is host-
+  // independent. On macOS, GOOS=linux defaults to CGO_ENABLED=0 (cross
+  // compile) which silently drops cgo-only packages like
+  // github.com/mattn/go-sqlite3; CI's native Linux defaults to 1 and
+  // includes them. js/wasm does not support cgo.
+  const platforms: Array<{ goos: string; goarch: string; cgo: '0' | '1' }> = [
+    { goos: 'linux', goarch: 'amd64', cgo: '1' },
+    { goos: 'darwin', goarch: 'amd64', cgo: '1' },
+    { goos: 'windows', goarch: 'amd64', cgo: '1' },
+    { goos: 'js', goarch: 'wasm', cgo: '0' },
+  ]
+
+  const raw: GoLicenseEntry[] = []
+  for (const { goos, goarch, cgo } of platforms) {
+    const result = await run(
+      binPath,
+      ['./...'],
+      rootDir,
+      { GOOS: goos, GOARCH: goarch, CGO_ENABLED: cgo },
+    )
+
+    if (result.code !== 0) {
+      console.error(`go-licenses failed for ${goos}/${goarch}:`, result.stderr)
+      process.exit(1)
+    }
+
+    let entries: GoLicenseEntry[]
+    try {
+      entries = JSON.parse(result.stdout)
+    } catch {
+      console.error(`Failed to parse go-licenses JSON output for ${goos}/${goarch}`)
+      console.error('stdout (first 500 chars):', result.stdout.slice(0, 500))
+      process.exit(1)
+    }
+
+    console.log(`  ${goos}/${goarch}: ${entries.length} packages`)
+    raw.push(...entries)
+  }
+
+  // Sort raw entries by package name in byte order so the dedup loop's
+  // "first non-empty wins" choice for licenseText is deterministic across
+  // machines and unaffected by per-platform output ordering.
+  raw.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+
+  // Parse vendor/modules.txt for version mapping
+  const versions: Record<string, string> = {}
+  const modulesTxt = readFileSync(join(rootDir, 'vendor', 'modules.txt'), 'utf-8')
+  for (const line of modulesTxt.split('\n')) {
+    const m = line.match(/^# (\S+) (\S+)/)
+    if (m) versions[m[1]] = m[2]
+  }
+
+  function findModule(pkg: string): string {
+    const parts = pkg.split('/')
+    for (let i = parts.length; i > 0; i--) {
+      const candidate = parts.slice(0, i).join('/')
+      if (versions[candidate]) return candidate
+    }
+    return parts.length >= 3 ? parts.slice(0, 3).join('/') : pkg
+  }
+
+  // Deduplicate to module level
+  const modules: Record<string, GoLicenseEntry> = {}
+  for (const entry of raw) {
+    const mod = findModule(entry.name)
+    if (!modules[mod]) {
+      modules[mod] = {
+        name: mod,
+        version: versions[mod] || entry.version || 'Unknown',
+        licenseName: entry.licenseName,
+        licenseText: entry.licenseText || '',
+      }
+    } else {
+      const existing = modules[mod]
+      if (!existing.licenseText && entry.licenseText) {
+        existing.licenseText = entry.licenseText
+      }
+      if (existing.licenseName === 'Unknown' && entry.licenseName !== 'Unknown') {
+        existing.licenseName = entry.licenseName
+      }
+    }
+  }
+
+  const goLicenses = Object.values(modules).sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  )
+
+  mkdirSync(outDir, { recursive: true })
+  writeFileSync(join(outDir, 'go-licenses.json'), JSON.stringify(goLicenses, null, 2) + '\n')
+
+  const withText = goLicenses.filter((e) => e.licenseText).length
+  console.log(`Go: ${goLicenses.length} modules, ${withText} with license text`)
+  return goLicenses
+}
+
+// JS license generation: runs a Vite build with build.license enabled.
+async function generateJsLicenses(): Promise<JsLicenseEntry[]> {
+  console.log('Generating JS licenses...')
+
+  mkdirSync(tmpDir, { recursive: true })
+
+  await build({
+    root: rootDir,
+    configFile: resolve(rootDir, 'vite.config.ts'),
+    build: {
+      license: { fileName: 'licenses.json' },
+      outDir: tmpDir,
+      emptyOutDir: true,
+    },
+    logLevel: 'warn',
+  })
+
+  const licensePath = join(tmpDir, 'licenses.json')
+  let jsLicenses: JsLicenseEntry[]
+  try {
+    jsLicenses = JSON.parse(readFileSync(licensePath, 'utf-8'))
+  } catch {
+    console.error('Failed to read Vite license output at', licensePath)
+    process.exit(1)
+  }
+
+  rmSync(tmpDir, { recursive: true, force: true })
+
+  // Sort by name in byte order so downstream merge sees deterministic input.
+  jsLicenses.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+
+  mkdirSync(outDir, { recursive: true })
+  writeFileSync(join(outDir, 'js-licenses.json'), JSON.stringify(jsLicenses, null, 2) + '\n')
+
+  const withText = jsLicenses.filter((e) => e.text).length
+  console.log(`JS: ${jsLicenses.length} packages, ${withText} with license text`)
+  return jsLicenses
+}
+
+// Derive upstream repo URL from a Go module path.
+function goModuleRepo(name: string): string | undefined {
+  if (forkToUpstream[name]) return forkToUpstream[name]
+  const parts = name.split('/')
+  if (parts[0] === 'github.com' && parts.length >= 3) {
+    return `https://github.com/${parts[1]}/${parts[2]}`
+  }
+  if (parts[0] === 'golang.org' && parts[1] === 'x' && parts.length >= 3) {
+    return `https://github.com/golang/${parts[2]}`
+  }
+  if (parts[0].endsWith('.io') || parts[0].endsWith('.dev')) {
+    return `https://${parts.slice(0, Math.min(parts.length, 3)).join('/')}`
+  }
+  return undefined
+}
+
+// Derive npm repo URL from a JS package name.
+function jsPackageRepo(name: string): string | undefined {
+  if (name.startsWith('@aptre/')) {
+    return `https://github.com/aperturerobotics/${name.replace('@aptre/', '')}`
+  }
+  if (name.startsWith('@radix-ui/')) {
+    return 'https://github.com/radix-ui/primitives'
+  }
+  if (name.startsWith('@lexical/') || name === 'lexical') {
+    return 'https://github.com/facebook/lexical'
+  }
+  return undefined
+}
+
+// Normalize whitespace for license body comparison.
+// Collapses all whitespace (including line breaks within paragraphs) to single
+// spaces, preserving paragraph breaks (double newlines).
+function normalize(text: string): string {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\n\n+/g, '\x00')       // preserve paragraph breaks
+    .replace(/\s+/g, ' ')             // collapse all whitespace
+    .replace(/\x00/g, '\n\n')         // restore paragraph breaks
+    .trim()
+}
+
+function canonicalizeSpdxIdentifier(spdx: string): string {
+  return canonicalSpdxIdentifiers.get(spdx.toLowerCase()) ?? spdx
+}
+
+// Extract copyright notice lines and the license body from a license text.
+function splitLicense(text: string): { copyright: string; body: string } {
+  const lines = text.trim().split('\n')
+  const copyrightLines: string[] = []
+  let bodyStart = 0
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim().toLowerCase()
+    if (
+      line === '' ||
+      line === 'mit license' ||
+      line === 'the mit license' ||
+      line === 'the mit license (mit)' ||
+      line === 'isc license' ||
+      line === 'bsd 2-clause license' ||
+      line === 'bsd 3-clause license' ||
+      line.startsWith('copyright')
+    ) {
+      if (line.startsWith('copyright')) {
+        copyrightLines.push(lines[i].trim())
+      }
+      continue
+    }
+    bodyStart = i
+    break
+  }
+
+  return {
+    copyright: copyrightLines.join('\n'),
+    body: lines.slice(bodyStart).join('\n').trim(),
+  }
+}
+
+// Extract SPDX base texts from the actual license data by finding the most
+// common body for each SPDX identifier.
+function extractBases(
+  entries: Array<{ spdx: string; text: string }>,
+): Record<string, string> {
+  const bodyGroups: Record<string, Map<string, number>> = {}
+
+  for (const entry of entries) {
+    if (!entry.text || entry.spdx === 'Unknown') continue
+    const { body } = splitLicense(entry.text)
+    const normalized = normalize(body)
+    if (!normalized) continue
+
+    const spdx = entry.spdx
+    if (!bodyGroups[spdx]) bodyGroups[spdx] = new Map()
+    const counts = bodyGroups[spdx]
+    counts.set(normalized, (counts.get(normalized) || 0) + 1)
+  }
+
+  const bases: Record<string, string> = {}
+  // Iterate SPDX keys in sorted order so insertion order in the result
+  // object is stable.
+  for (const spdx of Object.keys(bodyGroups).sort()) {
+    const counts = bodyGroups[spdx]
+    // Pick the most common body as the canonical base. Ties broken by
+    // lexicographically smallest body for determinism across runs.
+    let best = ''
+    let bestCount = 0
+    for (const [body, count] of counts) {
+      if (count > bestCount || (count === bestCount && body < best)) {
+        best = body
+        bestCount = count
+      }
+    }
+    if (bestCount >= 2) {
+      bases[spdx] = best
+    }
+  }
+
+  return bases
+}
+
+// Merge Go and JS licenses into unified schema with SPDX base text dedup.
+function mergeLicenses(goData: GoLicenseEntry[], jsData: JsLicenseEntry[]): LicensesJson {
+  console.log('Merging licenses...')
+
+  // Read package.json devDependencies for isDev marking.
+  const pkgJson = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf-8'))
+  const devDeps = new Set(Object.keys(pkgJson.devDependencies || {}))
+
+  // First pass: collect all entries with their raw text
+  const rawEntries: Array<{
+    name: string
+    version: string
+    spdx: string
+    text: string
+    source: 'go' | 'js' | 'both'
+    repo?: string
+    isDev?: boolean
+  }> = []
+
+  const seen = new Map<string, number>()
+
+  for (const entry of goData) {
+    seen.set(entry.name, rawEntries.length)
+    rawEntries.push({
+      name: entry.name,
+      version: entry.version,
+      spdx: canonicalizeSpdxIdentifier(entry.licenseName),
+      text: entry.licenseText,
+      source: 'go',
+      repo: goModuleRepo(entry.name),
+    })
+  }
+
+  for (const entry of jsData) {
+    const idx = seen.get(entry.name)
+    if (idx !== undefined) {
+      rawEntries[idx].source = 'both'
+      if (!rawEntries[idx].text && entry.text) rawEntries[idx].text = entry.text
+    } else {
+      rawEntries.push({
+        name: entry.name,
+        version: entry.version,
+        spdx: canonicalizeSpdxIdentifier(entry.identifier),
+        text: entry.text || '',
+        source: 'js',
+        repo: jsPackageRepo(entry.name),
+        isDev: devDeps.has(entry.name) || undefined,
+      })
+    }
+  }
+
+  // Extract SPDX base texts from the collected data
+  const bases = extractBases(rawEntries)
+
+  // Second pass: dedup against bases
+  let deduped = 0
+  const entries: LicenseEntry[] = rawEntries
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    .map((raw) => {
+      const entry: LicenseEntry = {
+        name: raw.name,
+        version: raw.version,
+        spdx: raw.spdx,
+        source: raw.source,
+        repo: raw.repo,
+        isDev: raw.isDev,
+      }
+
+      if (!raw.text) return entry
+
+      const base = bases[raw.spdx]
+      if (base) {
+        const { copyright, body } = splitLicense(raw.text)
+        if (normalize(body) === base) {
+          // Body matches base, store only the copyright notice
+          entry.copyrightNotice = copyright || undefined
+          deduped++
+          return entry
+        }
+      }
+
+      // No base match, store full text
+      entry.fullText = raw.text
+      return entry
+    })
+
+  const result: LicensesJson = { bases, entries }
+
+  writeFileSync(join(outDir, 'licenses.json'), JSON.stringify(result, null, 2) + '\n')
+
+  const spdxSet = new Set(entries.map((e) => e.spdx))
+  console.log(
+    `Merged: ${entries.length} entries (${goData.length} Go + ${jsData.length} JS), ${spdxSet.size} license types`,
+  )
+  console.log(
+    `SPDX dedup: ${deduped} entries use base text (${Object.keys(bases).length} bases), ${entries.length - deduped} have full text`,
+  )
+  return result
+}
+
+async function main() {
+  mkdirSync(outDir, { recursive: true })
+
+  let goData: GoLicenseEntry[] | undefined
+  let jsData: JsLicenseEntry[] | undefined
+  const tasks: Promise<void>[] = []
+  if (doGo) tasks.push(generateGoLicenses().then((d) => { goData = d }))
+  if (doJs) tasks.push(generateJsLicenses().then((d) => { jsData = d }))
+  await Promise.all(tasks)
+
+  if (doMerge) {
+    if (!goData) {
+      const p = join(outDir, 'go-licenses.json')
+      goData = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : []
+    }
+    if (!jsData) {
+      const p = join(outDir, 'js-licenses.json')
+      jsData = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : []
+    }
+    const result = mergeLicenses(goData!, jsData!)
+    const bytes = Buffer.byteLength(JSON.stringify(result))
+    const fullBytes = Buffer.byteLength(JSON.stringify(
+      result.entries.map((e) => ({ ...e, text: e.fullText || '' })),
+    ))
+    console.log(`Size: ${(bytes / 1024).toFixed(0)} KB (vs ${(fullBytes / 1024).toFixed(0)} KB without dedup)`)
+  }
+
+  console.log('Done. Output: app/licenses/')
+}
+
+main()

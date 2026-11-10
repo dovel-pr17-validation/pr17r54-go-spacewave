@@ -1,0 +1,417 @@
+package web_fetch
+
+import (
+	"bytes"
+	context "context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+)
+
+func TestFetch(t *testing.T) {
+	// Prepare the fetch test context and diagnostic logger.
+	ctx := context.Background()
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	le := logrus.NewEntry(log)
+
+	// this is a valid hello-world.wasm.br file
+	testWasmBrData := []byte{0xa1, 0xb0, 0x1, 0xc0, 0x2f, 0xf0, 0xef, 0xb6, 0xde, 0xdf, 0xd0, 0xa1, 0x16, 0x43, 0x34, 0x47, 0x5, 0x93, 0x70, 0xe9, 0xe8, 0x4b, 0x4d, 0x70, 0x21, 0xa9, 0xc, 0x48, 0x65, 0xe1, 0xfc, 0x9f, 0x0, 0x85, 0xb6, 0x65, 0x2a, 0xdd, 0x44, 0x71, 0x41, 0x4c, 0xf3, 0x73, 0x2f, 0xd4, 0x8a, 0xd1, 0x9b, 0x82, 0x85, 0xde, 0x0}
+	testWasmFilename := "hello-world.wasm.br"
+
+	// Serve the compressed WebAssembly fixture through the fetch RPC service.
+	streamDone := make(chan error, 1)
+	fetchServer := NewFetchServer(func(rw http.ResponseWriter, req *http.Request) {
+		// Stream one event, flush, and hold the response open like a watch
+		// until the caller goes away.
+		if req.URL.Path == "/watch" {
+			_, _ = rw.Write([]byte("event\n"))
+			rw.(http.Flusher).Flush()
+			<-req.Context().Done()
+			streamDone <- req.Context().Err()
+			return
+		}
+
+		// Echo a posted body back to the caller.
+		if req.Method == http.MethodPost {
+			_, _ = io.Copy(rw, req.Body)
+			return
+		}
+
+		// Answer a matching revalidation with a bodiless 304.
+		if req.Header.Get("If-None-Match") == `"v1"` {
+			rw.Header().Set("Etag", `"v1"`)
+			rw.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		// Reject paths that do not select the WebAssembly fixture.
+		if strings.TrimPrefix(req.URL.Path, "/") != testWasmFilename {
+			rw.WriteHeader(404)
+			return
+		}
+
+		// Send the compressed fixture with its MIME type and encoding headers.
+		rw.Header().Add("Content-Type", "application/wasm")
+		rw.Header().Add("Content-Encoding", "br")
+		rw.WriteHeader(200)
+		_, err := io.Copy(rw, bytes.NewReader(testWasmBrData))
+		if err != nil {
+			le.Fatal(err.Error())
+		}
+	})
+
+	// create the srpc bus for the server
+	serverMux := srpc.NewMux()
+	_ = SRPCRegisterFetchService(serverMux, fetchServer)
+
+	// create the srpc server
+	srpcServer := srpc.NewServer(serverMux)
+
+	// create the srpc client
+	openStream := srpc.NewServerPipe(srpcServer)
+	client := srpc.NewClient(openStream)
+	fetchClient := NewSRPCFetchServiceClient(client)
+
+	// test the mime type of a .wasm.br file
+	req, err := http.NewRequest("GET", testWasmFilename, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Fetch the WebAssembly response into an HTTP recorder.
+	rw := httptest.NewRecorder()
+	if err := Fetch(ctx, fetchClient.Fetch, req, rw); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Verify the response preserves fixture bytes and HTTP metadata.
+	res := rw.Result()
+	if res.StatusCode != 200 {
+		t.Fatalf("status code: %d", res.StatusCode)
+	}
+	readData, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !bytes.Equal(readData, testWasmBrData) {
+		t.Fatalf("read data does not match test data: %#v", string(readData))
+	}
+	if contentType := res.Header.Get("content-type"); contentType != "application/wasm" {
+		t.Fatalf("incorrect content type: %s", contentType)
+	}
+	if contentEnc := res.Header.Get("content-encoding"); contentEnc != "br" {
+		t.Fatalf("incorrect content encoding: %s", contentEnc)
+	}
+
+	// Fetch the fixture through an http.Client over the Transport.
+	hc := &http.Client{Transport: NewTransport(fetchClient.Fetch)}
+	res, err = hc.Get("http://plugin/" + testWasmFilename)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	readData, err = io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if err != nil || res.StatusCode != 200 || !bytes.Equal(readData, testWasmBrData) {
+		t.Fatalf("transport get: status %d, err %v, data %#v", res.StatusCode, err, string(readData))
+	}
+	if contentType := res.Header.Get("content-type"); contentType != "application/wasm" {
+		t.Fatalf("transport get: incorrect content type: %s", contentType)
+	}
+
+	// Revalidate: the 304 carries no Content-Type an HTTP cache would merge.
+	req, err = http.NewRequest("GET", "http://plugin/"+testWasmFilename, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	req.Header.Set("If-None-Match", `"v1"`)
+	res, err = hc.Do(req)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusNotModified || res.Header.Get("Content-Type") != "" {
+		t.Fatalf("transport 304: status %d, content type %q", res.StatusCode, res.Header.Get("Content-Type"))
+	}
+
+	// Read the first event of a held-open stream, then close it: the handler
+	// sees its request context end.
+	res, err = hc.Get("http://plugin/watch")
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	event := make([]byte, len("event\n"))
+	if _, err := io.ReadFull(res.Body, event); err != nil || string(event) != "event\n" {
+		t.Fatalf("transport watch: event %q, err %v", event, err)
+	}
+	_ = res.Body.Close()
+	select {
+	case err := <-streamDone:
+		if err == nil {
+			t.Fatal("transport watch: handler context not canceled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("transport watch: handler still running after close")
+	}
+
+	// Post a body larger than one data packet and read its echo.
+	posted := bytes.Repeat([]byte("spacewave"), 4096)
+	res, err = hc.Post("http://plugin/echo", "application/octet-stream", bytes.NewReader(posted))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	readData, err = io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if err != nil || !bytes.Equal(readData, posted) {
+		t.Fatalf("transport post: err %v, got %d bytes, want %d", err, len(readData), len(posted))
+	}
+}
+
+// newFetchTestClient builds a SRPC pipe client over the given fetch server.
+func newFetchTestClient(server SRPCFetchServiceServer) SRPCFetchServiceClient {
+	// Connect a fetch client directly to the supplied RPC service.
+	serverMux := srpc.NewMux()
+	_ = SRPCRegisterFetchService(serverMux, server)
+	srpcServer := srpc.NewServer(serverMux)
+	openStream := srpc.NewServerPipe(srpcServer)
+	return NewSRPCFetchServiceClient(srpc.NewClient(openStream))
+}
+
+// truncatingFetchServer sends response headers and a partial body packet,
+// then ends the stream without the final done packet.
+type truncatingFetchServer struct{}
+
+func (s *truncatingFetchServer) Fetch(strm SRPCFetchService_FetchStream) error {
+	// Send a partial JavaScript response without a final completion packet.
+	if _, err := strm.Recv(); err != nil {
+		return err
+	}
+	hdr := http.Header{}
+	hdr.Set("Content-Type", "text/javascript")
+	if err := strm.Send(BuildFetchResponse_Info(hdr, 200)); err != nil {
+		return err
+	}
+	return strm.Send(BuildFetchResponse_Data([]byte("partial"), false))
+}
+
+func TestFetchStreamEOFBeforeDoneIsError(t *testing.T) {
+	// Prepare a fetch service that truncates its response stream.
+	ctx := context.Background()
+	fetchClient := newFetchTestClient(&truncatingFetchServer{})
+
+	// Fetch the truncated response and verify it reports unexpected EOF.
+	req, err := http.NewRequest("GET", "/module.mjs", nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	rw := httptest.NewRecorder()
+	err = Fetch(ctx, fetchClient.Fetch, req, rw)
+	if err == nil {
+		t.Fatal("expected error for stream EOF before the final done packet")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected unexpected EOF, got: %v", err)
+	}
+}
+
+func TestHandleFetchContentLengthMismatchIsError(t *testing.T) {
+	// Prepare a response whose body is shorter than its declared length.
+	ctx := context.Background()
+	fetchClient := newFetchTestClient(NewFetchServer(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Length", "100")
+		rw.WriteHeader(200)
+		_, _ = rw.Write([]byte("short body"))
+	}))
+
+	// Fetch the short response and verify the length mismatch fails.
+	req, err := http.NewRequest("GET", "/module.mjs", nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	rw := httptest.NewRecorder()
+	err = Fetch(ctx, fetchClient.Fetch, req, rw)
+	if err == nil {
+		t.Fatal("expected error for body shorter than declared Content-Length")
+	}
+}
+
+func TestHandleFetchHeadIgnoresContentLength(t *testing.T) {
+	// Prepare a HEAD response with a declared content length.
+	ctx := context.Background()
+	fetchClient := newFetchTestClient(NewFetchServer(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Length", "100")
+		rw.WriteHeader(200)
+	}))
+
+	// Verify HEAD succeeds without requiring response body bytes.
+	req, err := http.NewRequest("HEAD", "/module.mjs", nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	rw := httptest.NewRecorder()
+	if err := Fetch(ctx, fetchClient.Fetch, req, rw); err != nil {
+		t.Fatalf("expected HEAD with Content-Length to succeed: %v", err)
+	}
+}
+
+func TestHandleFetchAbortedBodyIsError(t *testing.T) {
+	// Prepare a fetch handler that aborts after a partial response.
+	ctx := context.Background()
+	fetchClient := newFetchTestClient(NewFetchServer(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(200)
+		_, _ = rw.Write([]byte("partial"))
+		rw.(BodyAborter).Abort(errors.New("upstream body failed"))
+	}))
+
+	// Verify fetching the aborted body reports failure.
+	req, err := http.NewRequest("GET", "/module.mjs", nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	rw := httptest.NewRecorder()
+	err = Fetch(ctx, fetchClient.Fetch, req, rw)
+	if err == nil {
+		t.Fatal("expected error for aborted response body")
+	}
+}
+
+func TestHandleFetchHandlerPanicIsError(t *testing.T) {
+	// Prepare a fetch handler that panics before completion.
+	ctx := context.Background()
+	fetchClient := newFetchTestClient(NewFetchServer(func(rw http.ResponseWriter, req *http.Request) {
+		panic("handler exploded")
+	}))
+
+	// Verify the fetch error preserves the handler panic message.
+	req, err := http.NewRequest("GET", "/module.mjs", nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	rw := httptest.NewRecorder()
+	err = Fetch(ctx, fetchClient.Fetch, req, rw)
+	if err == nil {
+		t.Fatal("expected error for handler panic")
+	}
+	if !strings.Contains(err.Error(), "handler exploded") {
+		t.Fatalf("expected panic message in error, got: %v", err)
+	}
+}
+
+func TestFetchResponseWriterSplitsLargeDataPackets(t *testing.T) {
+	// Prepare a recording stream and response writer.
+	strm := &recordingFetchStream{ctx: context.Background()}
+	rw := NewFetchResponseWriter(strm)
+
+	// Write a large body and verify the writer accepts its complete length.
+	body := append(bytes.Repeat([]byte{'x'}, 32*1024), bytes.Repeat([]byte{'/'}, 105)...)
+	rw.Header().Set("Content-Length", "32873")
+	n, err := rw.Write(body)
+	if err != nil {
+		t.Fatalf("write large response body: %v", err)
+	}
+	if n != len(body) {
+		t.Fatalf("wrote %d bytes, want %d", n, len(body))
+	}
+	if err := rw.BodyError(http.MethodGet); err != nil {
+		t.Fatalf("body error after complete write: %v", err)
+	}
+
+	// Verify response packets stay bounded and reconstruct the complete body.
+	var got []byte
+	var dataPacketCount int
+	for _, pkt := range strm.sent {
+		data := pkt.GetResponseData()
+		if data == nil || len(data.GetData()) == 0 {
+			continue
+		}
+		dataPacketCount++
+		if len(data.GetData()) > maxFetchResponseDataPacketBytes {
+			t.Fatalf("response data packet length %d exceeds max %d", len(data.GetData()), maxFetchResponseDataPacketBytes)
+		}
+		got = append(got, data.GetData()...)
+	}
+	if dataPacketCount < 2 {
+		t.Fatalf("expected response body to be split across packets, got %d data packets", dataPacketCount)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("response packet data mismatch: got %d bytes, want %d", len(got), len(body))
+	}
+}
+
+func TestFetchDataPacketsOwnPayloadBytes(t *testing.T) {
+	// Verify request packets retain their payload after the source bytes change.
+	reqData := []byte("request-payload")
+	reqPkt := NewFetchRequestWithData(reqData, false)
+	reqData[0] = 'X'
+	if got, want := reqPkt.GetRequestData().GetData(), []byte("request-payload"); !bytes.Equal(got, want) {
+		t.Fatalf("request packet data mutated: got %q, want %q", got, want)
+	}
+
+	// Verify response packets retain their payload after the source bytes change.
+	respData := []byte("response-payload")
+	respPkt := BuildFetchResponse_Data(respData, false)
+	respData[0] = 'X'
+	if got, want := respPkt.GetResponseData().GetData(), []byte("response-payload"); !bytes.Equal(got, want) {
+		t.Fatalf("response packet data mutated: got %q, want %q", got, want)
+	}
+}
+
+type recordingFetchStream struct {
+	ctx  context.Context
+	sent []*FetchResponse
+}
+
+func (s *recordingFetchStream) Context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+func (s *recordingFetchStream) MsgSend(msg srpc.Message) error {
+	if resp, ok := msg.(*FetchResponse); ok {
+		return s.Send(resp)
+	}
+	return nil
+}
+
+func (s *recordingFetchStream) MsgRecv(srpc.Message) error {
+	return io.EOF
+}
+
+func (s *recordingFetchStream) CloseSend() error {
+	return nil
+}
+
+func (s *recordingFetchStream) Close() error {
+	return nil
+}
+
+func (s *recordingFetchStream) Send(resp *FetchResponse) error {
+	s.sent = append(s.sent, resp)
+	return nil
+}
+
+func (s *recordingFetchStream) SendAndClose(resp *FetchResponse) error {
+	if resp != nil {
+		if err := s.Send(resp); err != nil {
+			return err
+		}
+	}
+	return s.CloseSend()
+}
+
+func (s *recordingFetchStream) Recv() (*FetchRequest, error) {
+	return nil, io.EOF
+}
+
+func (s *recordingFetchStream) RecvTo(*FetchRequest) error {
+	return io.EOF
+}

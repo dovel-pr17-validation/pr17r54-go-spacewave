@@ -1,0 +1,266 @@
+#!/bin/bash
+set -euo pipefail
+
+PLATFORM="${1:?usage: build-helper.sh darwin|linux|windows}"
+ARCH="${2:-amd64}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+OUT="$REPO_ROOT/dist/helper"
+VERBOSE="${VERBOSE:-0}"
+mkdir -p "$OUT"
+
+# Keep build scratch directories outside the source tree under
+# .tmp/<tool>/<platform> so they survive source-tree relocations and stay
+# per-platform isolated. The in-source .build / build dirs are brittle:
+# Swift bakes absolute paths into its PCH module cache, and CMake caches
+# the source path too, so a repo move (e.g. native/macos -> desktop/macos)
+# invalidates them. Using a stable out-of-tree path avoids that class of
+# breakage entirely.
+SCRATCH_ROOT="$REPO_ROOT/.tmp"
+
+# build_via_docker runs the CMake + Ninja cross-build inside the
+# spacewave-builder image via the docker cp pattern so it works on hosts
+# without 9p / bind-mount support (e.g. Lima). Source tree is copied into
+# a transient container, built there, and the artifact is copied back out.
+#
+# Phases are printed explicitly so the first-time Zig target-cache extraction
+# (glibc / mingw-w64 stub unpack) shows up as its own step instead of hiding
+# inside cmake's ABI probe. Under qemu emulation that extraction dominates
+# wall time on the first run per target.
+#
+#   build_via_docker <label> <triple> <toolchain> <artifact-in> <artifact-out>
+build_via_docker() {
+  local label="$1"
+  local triple="$2"
+  local toolchain="$3"
+  local artifact_in="$4"
+  local artifact_out="$5"
+  local image="spacewave-builder"
+
+  echo "=== [$label] ensure image ==="
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    docker build --platform linux/amd64 -t "$image" "$REPO_ROOT/desktop/"
+  fi
+
+  echo "=== [$label] start container ==="
+  # Persistent cache for Zig's per-target stub extraction so only the first
+  # build per target pays the cost; every subsequent build reuses
+  # /root/.cache/zig. Defaults to a docker named volume for local iteration.
+  # CI sets BLDR_BUILDER_ZIG_CACHE_DIR to a host path so GitHub Actions cache
+  # can persist it across workflow runs.
+  local zig_cache_mount="type=volume,source=spacewave-builder-zig-cache,target=/root/.cache/zig"
+  if [ -n "${BLDR_BUILDER_ZIG_CACHE_DIR:-}" ]; then
+    mkdir -p "$BLDR_BUILDER_ZIG_CACHE_DIR"
+    zig_cache_mount="type=bind,source=$BLDR_BUILDER_ZIG_CACHE_DIR,target=/root/.cache/zig"
+  fi
+  local cid
+  cid="$(docker create --platform linux/amd64 --rm \
+      --mount "$zig_cache_mount" \
+      "$image" tail -f /dev/null)"
+  # Double-quoted trap expands $cid at setup so cleanup still works after the
+  # function returns and the local goes out of scope.
+  trap "docker rm -f '$cid' >/dev/null 2>&1 || true" EXIT
+  docker start "$cid" >/dev/null
+
+  echo "=== [$label] copy source ==="
+  docker exec "$cid" mkdir -p /src /build /probe
+  docker cp "$REPO_ROOT/desktop/cross/." "$cid":/src/
+
+  echo "=== [$label] warm zig target cache ($triple) ==="
+  # Compile AND link a trivial C++ program so Zig extracts libc, libc++, and
+  # (on windows) mingw-w64 import libs for the target now, with a visible
+  # phase marker. cmake's ABI probe does a full compile+link too, so doing it
+  # here means cmake reuses the warm cache instead of hiding the extraction.
+  local zig_verbose=""
+  if [ "$VERBOSE" != "0" ]; then
+    # zig cc / zig c++ forward -v to the underlying clang driver which prints
+    # every sub-invocation (compile, assembler, linker) with full arg list.
+    zig_verbose="-v"
+  fi
+  docker exec "$cid" sh -c 'printf "int main(){return 0;}\n" > /probe/probe.cc'
+  docker exec "$cid" zig c++ --target="$triple" $zig_verbose /probe/probe.cc -o /probe/probe
+
+  echo "=== [$label] cmake configure ==="
+  local cmake_configure_extra=""
+  if [ "$VERBOSE" != "0" ]; then
+    cmake_configure_extra="-DCMAKE_VERBOSE_MAKEFILE=ON"
+  fi
+  docker exec "$cid" cmake -S /src -B /build \
+      --toolchain "/src/toolchains/$toolchain" \
+      -G Ninja -DCMAKE_BUILD_TYPE=Release $cmake_configure_extra
+
+  echo "=== [$label] cmake build ==="
+  local ninja_flags=""
+  if [ "$VERBOSE" != "0" ]; then
+    ninja_flags="-v"
+  fi
+  docker exec "$cid" cmake --build /build -- $ninja_flags
+
+  echo "=== [$label] copy artifact ==="
+  docker cp "$cid:$artifact_in" "$artifact_out"
+
+  docker rm -f "$cid" >/dev/null
+  trap - EXIT
+}
+
+windows_cmake_generator() {
+  if [ -n "${BLDR_WINDOWS_CMAKE_GENERATOR:-}" ]; then
+    echo "$BLDR_WINDOWS_CMAKE_GENERATOR"
+    return
+  fi
+
+  local vswhere=""
+  local version=""
+  if command -v vswhere.exe >/dev/null 2>&1; then
+    vswhere="vswhere.exe"
+  elif [ -x "/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" ]; then
+    vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+  fi
+
+  if [ -n "$vswhere" ]; then
+    version="$("$vswhere" -latest -products '*' -requires Microsoft.Component.MSBuild -property installationVersion | tr -d '\r' | head -n1)"
+  fi
+
+  case "$version" in
+    18.*) echo "Visual Studio 18 2026" ;;
+    17.*) echo "Visual Studio 17 2022" ;;
+    *) echo "Visual Studio 18 2026" ;;
+  esac
+}
+
+build_windows_native() {
+  local arch="$1"
+  local scratch="$SCRATCH_ROOT/cmake/windows-${arch}"
+  local cmake_configure_extra=""
+  local build_flags=""
+  local vs_arch=""
+
+  if [ "$VERBOSE" != "0" ]; then
+    cmake_configure_extra="-DCMAKE_VERBOSE_MAKEFILE=ON"
+    build_flags="--verbose"
+  fi
+
+  case "$arch" in
+    amd64) vs_arch="x64" ;;
+    arm64) vs_arch="ARM64" ;;
+    *) echo "ERROR: unsupported windows helper ARCH: $arch" >&2; exit 1 ;;
+  esac
+
+  cmake -S "$REPO_ROOT/desktop/cross" -B "$scratch" \
+    -G "$(windows_cmake_generator)" -A "$vs_arch" \
+    -DCMAKE_BUILD_TYPE=Release $cmake_configure_extra
+  cmake --build "$scratch" --config Release $build_flags
+  cp "$scratch/Release/spacewave-helper.exe" "$OUT/windows-${arch}/spacewave-helper.exe"
+}
+
+# sign_windows_helper signs the extracted Windows helper .exe via Azure
+# Trusted Signing. Mirrors the bldr Windows signing hook so one env export
+# covers the bldr-signed launcher and the C++ helper .exe. Unset profile =
+# warn and skip (local iteration only; release runs must set it).
+sign_windows_helper() {
+  local exe="$1"
+  local profile="${BLDR_WINDOWS_SIGN_PROFILE:-}"
+  if [ -z "$profile" ]; then
+    echo "WARN: BLDR_WINDOWS_SIGN_PROFILE unset; Windows helper is unsigned." >&2
+    return 0
+  fi
+  local account="${BLDR_WINDOWS_SIGN_ACCOUNT:-}"
+  if [ -z "$account" ]; then
+    echo "ERROR: BLDR_WINDOWS_SIGN_PROFILE is set but BLDR_WINDOWS_SIGN_ACCOUNT is not." >&2
+    exit 1
+  fi
+  local publisher="${BLDR_WINDOWS_SIGN_PUBLISHER:-Aperture Robotics, LLC.}"
+  local endpoint="${BLDR_WINDOWS_SIGN_ENDPOINT:-https://wus.codesigning.azure.net/}"
+
+  echo "=== [sign] $exe ==="
+  BLDR_SIGN_ENDPOINT="$endpoint" \
+    BLDR_SIGN_ACCOUNT="$account" \
+    BLDR_SIGN_PROFILE="$profile" \
+    BLDR_SIGN_FILE="$exe" \
+    BLDR_SIGN_DESCRIPTION="Spacewave Helper" \
+    pwsh -NoProfile -NonInteractive -Command \
+      "Invoke-TrustedSigning -Endpoint \$env:BLDR_SIGN_ENDPOINT -CodeSigningAccountName \$env:BLDR_SIGN_ACCOUNT -CertificateProfileName \$env:BLDR_SIGN_PROFILE -Files \$env:BLDR_SIGN_FILE -Description \$env:BLDR_SIGN_DESCRIPTION -FileDigest SHA256 -TimestampRfc3161 'http://timestamp.acs.microsoft.com' -TimestampDigest SHA256 -ExcludeManagedIdentityCredential -ExcludeSharedTokenCacheCredential -ExcludeVisualStudioCredential -ExcludeVisualStudioCodeCredential -ExcludeAzurePowerShellCredential -ExcludeAzureDeveloperCliCredential -ExcludeInteractiveBrowserCredential"
+}
+
+# Per-platform output is namespaced under <goos>-<goarch>/ so darwin, linux,
+# and windows helpers never collide at the same filename (previous layout
+# wrote all three to dist/helper/spacewave-helper-<arch> which let the linux
+# ELF overwrite the darwin Mach-O on multi-platform release runs, producing
+# a .app bundle whose helper was an unlaunchable Linux binary).
+build_darwin_helper() {
+  local swift_arch="$1"
+  local out_arch="$2"
+  local scratch="$SCRATCH_ROOT/swift/darwin-$out_arch"
+  mkdir -p "$scratch"
+  (cd "$REPO_ROOT/desktop/macos" && \
+    swift build -c release --arch "$swift_arch" --scratch-path "$scratch")
+  # SwiftPM's scratch layout changed across toolchain versions; ask it where
+  # the built products are instead of assuming the <triple>/release path.
+  local bin_dir
+  bin_dir=$(cd "$REPO_ROOT/desktop/macos" && \
+    swift build -c release --arch "$swift_arch" --scratch-path "$scratch" --show-bin-path)
+  if [ -z "$bin_dir" ]; then
+    echo "ERROR: swift build --show-bin-path returned no product directory for darwin-$out_arch" >&2
+    exit 1
+  fi
+  if [ ! -f "$bin_dir/SpacewaveHelper" ]; then
+    echo "ERROR: no SpacewaveHelper in swift product directory $bin_dir for darwin-$out_arch" >&2
+    exit 1
+  fi
+  mkdir -p "$OUT/darwin-$out_arch"
+  cp "$bin_dir/SpacewaveHelper" \
+    "$OUT/darwin-$out_arch/spacewave-helper"
+}
+
+# The requested ARCH selects exactly one Swift target. A universal release
+# requests darwin-arm64 and darwin-amd64 separately (see handoff buildHelpers),
+# so no invocation silently builds the other architecture.
+case "$PLATFORM" in
+  darwin)
+    case "$ARCH" in
+      arm64) build_darwin_helper arm64 arm64 ;;
+      amd64) build_darwin_helper x86_64 amd64 ;;
+      *) echo "ERROR: unsupported darwin helper ARCH: $ARCH" >&2; exit 1 ;;
+    esac
+    echo "Built macOS helper ($ARCH) in $OUT/darwin-$ARCH/"
+    ;;
+  linux)
+    case "$ARCH" in
+      amd64) TRIPLE="x86_64-linux-gnu" ;;
+      arm64) TRIPLE="aarch64-linux-gnu" ;;
+      *) echo "ERROR: unsupported linux helper ARCH: $ARCH" >&2; exit 1 ;;
+    esac
+    mkdir -p "$OUT/linux-${ARCH}"
+    build_via_docker "linux/$ARCH" "$TRIPLE" "linux-${ARCH}.cmake" \
+        "/build/spacewave-helper" \
+        "$OUT/linux-${ARCH}/spacewave-helper"
+    echo "Built Linux helper ($ARCH) in $OUT/linux-${ARCH}/"
+    ;;
+  windows)
+    case "$ARCH" in
+      amd64) TRIPLE="x86_64-windows-gnu" ;;
+      arm64) TRIPLE="aarch64-windows-gnu" ;;
+      *) echo "ERROR: unsupported windows helper ARCH: $ARCH" >&2; exit 1 ;;
+    esac
+    mkdir -p "$OUT/windows-${ARCH}"
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*)
+        build_windows_native "$ARCH"
+        ;;
+      *)
+        build_via_docker "windows/$ARCH" "$TRIPLE" "windows-${ARCH}.cmake" \
+            "/build/spacewave-helper.exe" \
+            "$OUT/windows-${ARCH}/spacewave-helper.exe"
+        ;;
+    esac
+    sign_windows_helper "$OUT/windows-${ARCH}/spacewave-helper.exe"
+    # The Windows desktop launcher embeds the signed helper to install itself.
+    cp "$OUT/windows-${ARCH}/spacewave-helper.exe" \
+        "$REPO_ROOT/core/launcher/install/helper/windows-${ARCH}/spacewave-helper.exe"
+    echo "Built Windows helper ($ARCH) in $OUT/windows-${ARCH}/"
+    ;;
+  *)
+    echo "error: unknown platform $PLATFORM"
+    exit 1
+    ;;
+esac

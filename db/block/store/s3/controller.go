@@ -1,0 +1,47 @@
+//go:build !tinygo
+
+package block_store_s3
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	block_store "github.com/s4wave/spacewave/db/block/store"
+	block_store_controller "github.com/s4wave/spacewave/db/block/store/controller"
+	"github.com/sirupsen/logrus"
+)
+
+// ControllerID identifies the s3 block store controller.
+const ControllerID = ConfigID
+
+// Version is the version of the block store implementation.
+var Version = controller.MustParseVersion("0.0.1")
+
+// Controller implements the s3 block store controller.
+type Controller = block_store_controller.Controller
+
+// NewController builds a new s3 block store controller.
+func NewController(le *logrus.Entry, conf *Config) *Controller {
+	return block_store_controller.NewController(
+		le,
+		controller.NewInfo(ControllerID, Version, "s3 block store"),
+		NewBlockStoreBuilder(le, conf),
+		[]string{conf.GetBlockStoreId()},
+		true,
+		conf.GetBucketIds(),
+		conf.GetSkipNotFound(),
+		conf.GetVerbose(),
+	)
+}
+
+// NewBlockStoreBuilder constructs a new block store builder from config.
+func NewBlockStoreBuilder(le *logrus.Entry, conf *Config) block_store_controller.BlockStoreBuilder {
+	return func(ctx context.Context, released func()) (block_store.Store, func(), error) {
+		client, err := BuildClient(conf.GetClient())
+		if err != nil {
+			return nil, nil, err
+		}
+		packs := NewPackStore(le, client, conf.GetBucketName(), conf.GetObjectPrefix(), nil)
+		return block_store.NewStore(conf.GetBlockStoreId(), packs), packs.Close, nil
+	}
+}

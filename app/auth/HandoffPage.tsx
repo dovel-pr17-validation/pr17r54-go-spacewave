@@ -1,0 +1,261 @@
+/* eslint-disable react-doctor/rerender-state-only-in-handlers */
+import { useCallback, useMemo, useState } from 'react'
+import { LuMonitor, LuTerminal } from 'react-icons/lu'
+
+import { Spinner } from '@s4wave/web/ui/loading/Spinner.js'
+import AnimatedLogo from '@s4wave/app/landing/AnimatedLogo.js'
+import { useNavigate, useParams } from '@s4wave/web/router/router.js'
+import { LoginForm, type LoginResult } from '@s4wave/web/ui/login-form.js'
+import { useRootResource } from '@s4wave/web/hooks/useRootResource.js'
+import { useResourceValue } from '@aptre/bldr-sdk/hooks/useResource.js'
+import { SpacewaveProvider } from '@s4wave/sdk/provider/spacewave/spacewave.js'
+import { AuthScreenLayout } from '@s4wave/app/auth/AuthScreenLayout.js'
+import { useCloudProviderConfig } from '@s4wave/app/provider/spacewave/useSpacewaveAuth.js'
+import { setSSOStartIntent } from '@s4wave/app/provider/spacewave/sso-start-intent.js'
+import { HandoffComplete, HandoffDetails } from './HandoffComplete.js'
+import {
+  clearStoredHandoffPayload,
+  clientTypeLabel,
+  decodeHandoffRequest,
+  enrollHandoffSession,
+  setStoredHandoffPayload,
+} from './handoff-state.js'
+
+interface HandoffRouteHints {
+  authIntent: string
+  username: string
+}
+
+function parseHandoffRouteHints(): HandoffRouteHints {
+  const hash = window.location.hash
+  const idx = hash.indexOf('?')
+  if (idx === -1) {
+    return { authIntent: '', username: '' }
+  }
+  const params = new URLSearchParams(hash.slice(idx + 1))
+  return {
+    authIntent: params.get('intent') ?? '',
+    username: (params.get('username') ?? '').toLowerCase(),
+  }
+}
+
+// HandoffState tracks the handoff page lifecycle.
+type HandoffState =
+  | { step: 'auth' }
+  | { step: 'completing' }
+  | { step: 'complete'; sessionIndex: number }
+
+// ClientTypeIcon renders the icon for the client type.
+function ClientTypeIcon({ clientType }: { clientType: string }) {
+  if (clientType === 'cli') {
+    return <LuTerminal className="text-brand size-6" />
+  }
+  return <LuMonitor className="text-brand size-6" />
+}
+
+// HandoffPage handles browser-delegated auth for desktop/CLI clients.
+// Route: #/auth/link/{base64url payload}
+export function HandoffPage() {
+  const params = useParams()
+  const navigate = useNavigate()
+  const rootResource = useRootResource()
+  const root = useResourceValue(rootResource)
+  const cloudProviderConfig = useCloudProviderConfig()
+  const [state, setState] = useState<HandoffState>({ step: 'auth' })
+
+  const handoffPayload = params.payload ?? ''
+  const request = useMemo(
+    () => decodeHandoffRequest(handoffPayload),
+    [handoffPayload],
+  )
+  const routeHints = useMemo(() => parseHandoffRouteHints(), [])
+
+  const label = useMemo(
+    () => clientTypeLabel(request?.clientType ?? ''),
+    [request?.clientType],
+  )
+
+  const handleLoginWithPassword = useCallback(
+    async (
+      username: string,
+      password: string,
+      turnstileToken: string,
+    ): Promise<LoginResult> => {
+      if (!root) {
+        throw new Error('Not connected')
+      }
+      if (!request) {
+        throw new Error('Invalid handoff request')
+      }
+      using provider = await root.lookupProvider('spacewave')
+      const sw = new SpacewaveProvider(provider.resourceRef)
+      const resp = await sw.loginAccount({
+        entityId: username,
+        turnstileToken,
+        credential: {
+          value: { password },
+          case: 'password' as const,
+        },
+      })
+      switch (resp.result?.case) {
+        case 'session': {
+          const idx = resp.result.value?.sessionIndex ?? 0
+          setState({ step: 'completing' })
+          await enrollHandoffSession(root, idx, request)
+          clearStoredHandoffPayload()
+          setState({ step: 'complete', sessionIndex: idx })
+          return { type: 'session', sessionIndex: idx }
+        }
+        case 'isNewAccount':
+          return { type: 'new_account' }
+        case 'errorCode':
+          return { type: 'error', errorCode: resp.result.value }
+        default:
+          return { type: 'error', errorCode: 'unknown' }
+      }
+    },
+    [root, request],
+  )
+
+  const handleCreateAccountWithPassword = useCallback(
+    async (
+      username: string,
+      password: string,
+      turnstileToken: string,
+    ): Promise<{ sessionIndex: number }> => {
+      if (!root) {
+        throw new Error('Not connected')
+      }
+      if (!request) {
+        throw new Error('Invalid handoff request')
+      }
+      using provider = await root.lookupProvider('spacewave')
+      const sw = new SpacewaveProvider(provider.resourceRef)
+      const resp = await sw.createAccount({
+        entityId: username,
+        turnstileToken,
+        credential: {
+          value: { password },
+          case: 'password' as const,
+        },
+      })
+      const sessionIndex = resp.sessionListEntry?.sessionIndex ?? 0
+
+      setState({ step: 'completing' })
+      await enrollHandoffSession(root, sessionIndex, request)
+      clearStoredHandoffPayload()
+      setState({ step: 'complete', sessionIndex })
+
+      return { sessionIndex }
+    },
+    [root, request],
+  )
+
+  const handleNavigateToSession = useCallback(() => {
+    // In handoff mode, do not navigate to session.
+    // The completion message is shown instead.
+  }, [])
+
+  const handleContinueWithPasskey = useCallback(() => {
+    if (!handoffPayload) {
+      throw new Error('Invalid handoff request')
+    }
+    setStoredHandoffPayload(handoffPayload)
+    const usernameQuery =
+      routeHints.username !== ''
+        ? `?username=${encodeURIComponent(routeHints.username)}`
+        : ''
+    navigate({ path: `/auth/passkey${usernameQuery}` })
+  }, [handoffPayload, navigate, routeHints.username])
+
+  const handleLoginWithPem = useCallback(
+    async (pemPrivateKey: Uint8Array): Promise<{ sessionIndex: number }> => {
+      if (!root || !request) throw new Error('Invalid handoff request')
+      using provider = await root.lookupProvider('spacewave')
+      const sw = new SpacewaveProvider(provider.resourceRef)
+      const resp = await sw.loginWithEntityKey(pemPrivateKey)
+      const sessionIndex = resp.sessionListEntry?.sessionIndex ?? 0
+      setState({ step: 'completing' })
+      await enrollHandoffSession(root, sessionIndex, request)
+      clearStoredHandoffPayload()
+      setState({ step: 'complete', sessionIndex })
+      return { sessionIndex }
+    },
+    [request, root],
+  )
+
+  const handleSignInWithSSO = useCallback(
+    (provider: 'google' | 'github') => {
+      if (!handoffPayload) throw new Error('Invalid handoff request')
+      setStoredHandoffPayload(handoffPayload)
+      setSSOStartIntent(provider, `/auth/link/${handoffPayload}`)
+      navigate({ path: `/auth/sso/${provider}` })
+    },
+    [handoffPayload, navigate],
+  )
+
+  if (!request) {
+    return (
+      <div className="bg-background-landing flex flex-1 flex-col items-center justify-center p-6">
+        <p className="text-destructive text-sm">Invalid handoff link.</p>
+      </div>
+    )
+  }
+
+  if (state.step === 'completing') {
+    return (
+      <div className="bg-background-landing relative flex flex-1 flex-col items-center justify-center gap-6 p-6">
+        <div className="relative z-10 flex flex-col items-center gap-4">
+          <Spinner size="xl" variant="brand" />
+          <h1 className="text-xl font-semibold tracking-wide">
+            Completing sign-in…
+          </h1>
+          <p className="text-foreground-alt text-sm">
+            Sending credentials to Spacewave {label}.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  if (state.step === 'complete') {
+    return (
+      <HandoffComplete request={request} sessionIndex={state.sessionIndex} />
+    )
+  }
+
+  return (
+    <AuthScreenLayout
+      intro={
+        <>
+          <AnimatedLogo followMouse={false} />
+          <div className="flex items-center gap-2">
+            <ClientTypeIcon clientType={request.clientType ?? ''} />
+            <h1 className="text-xl font-semibold tracking-wide">
+              {routeHints.authIntent === 'signup'
+                ? `Creating a Spacewave ${label} account`
+                : `Signing in to Spacewave ${label}`}
+            </h1>
+          </div>
+          <HandoffDetails
+            username={
+              routeHints.authIntent === 'signup' ? routeHints.username : ''
+            }
+            deviceName={request.deviceName ?? ''}
+          />
+        </>
+      }
+    >
+      <LoginForm
+        initialUsername={routeHints.username}
+        cloudProviderConfig={cloudProviderConfig}
+        onLoginWithPassword={handleLoginWithPassword}
+        onCreateAccountWithPassword={handleCreateAccountWithPassword}
+        onNavigateToSession={handleNavigateToSession}
+        onContinueWithPasskey={handleContinueWithPasskey}
+        onLoginWithPem={handleLoginWithPem}
+        onSignInWithSSO={handleSignInWithSSO}
+      />
+    </AuthScreenLayout>
+  )
+}

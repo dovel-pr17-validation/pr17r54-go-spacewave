@@ -1,0 +1,809 @@
+package resource_space
+
+import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	timestamppb "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	forge_dashboard "github.com/s4wave/spacewave/core/forge/dashboard"
+	forge_job_ops "github.com/s4wave/spacewave/core/forge/job"
+	forge_task_ops "github.com/s4wave/spacewave/core/forge/task"
+	plugin_space "github.com/s4wave/spacewave/core/plugin/space"
+	plugin_space_runtime "github.com/s4wave/spacewave/core/plugin/space/runtime"
+	"github.com/s4wave/spacewave/db/world"
+	forge_cluster "github.com/s4wave/spacewave/forge/cluster"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	forge_job "github.com/s4wave/spacewave/forge/job"
+	forge_pass "github.com/s4wave/spacewave/forge/pass"
+	forge_task "github.com/s4wave/spacewave/forge/task"
+	forge_worker "github.com/s4wave/spacewave/forge/worker"
+	identity_world "github.com/s4wave/spacewave/identity/world"
+	"github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_space "github.com/s4wave/spacewave/sdk/space"
+	s4wave_wizard "github.com/s4wave/spacewave/sdk/world/wizard"
+	"github.com/s4wave/spacewave/testbed"
+	"github.com/sirupsen/logrus"
+)
+
+// spaceContentsTestTimeout bounds each contents test.
+const spaceContentsTestTimeout = 2 * time.Minute
+
+// testWatchSpaceContentsStateStream records WatchState snapshots.
+type testWatchSpaceContentsStateStream struct {
+	// Stream supplies default stream methods for the test double.
+	srpc.Stream
+	// ctx is returned to WatchState.
+	ctx context.Context
+	// msgs receives each sent snapshot.
+	msgs chan *s4wave_space.SpaceContentsState
+}
+
+// newTestWatchSpaceContentsStateStream creates a watch stream that ends with ctx.
+func newTestWatchSpaceContentsStateStream(ctx context.Context) *testWatchSpaceContentsStateStream {
+	return &testWatchSpaceContentsStateStream{
+		ctx:  ctx,
+		msgs: make(chan *s4wave_space.SpaceContentsState, 4),
+	}
+}
+
+// Context returns the watch stream context.
+func (m *testWatchSpaceContentsStateStream) Context() context.Context {
+	return m.ctx
+}
+
+// Send records one snapshot.
+func (m *testWatchSpaceContentsStateStream) Send(resp *s4wave_space.SpaceContentsState) error {
+	select {
+	case m.msgs <- resp:
+		return nil
+	case <-m.ctx.Done():
+		return m.ctx.Err()
+	}
+}
+
+// SendAndClose records one snapshot.
+func (m *testWatchSpaceContentsStateStream) SendAndClose(resp *s4wave_space.SpaceContentsState) error {
+	return m.Send(resp)
+}
+
+// MsgRecv implements srpc.Stream.
+func (m *testWatchSpaceContentsStateStream) MsgRecv(_ srpc.Message) error {
+	return nil
+}
+
+// MsgSend implements srpc.Stream.
+func (m *testWatchSpaceContentsStateStream) MsgSend(_ srpc.Message) error {
+	return nil
+}
+
+// CloseSend implements srpc.Stream.
+func (m *testWatchSpaceContentsStateStream) CloseSend() error {
+	return nil
+}
+
+// Close implements srpc.Stream.
+func (m *testWatchSpaceContentsStateStream) Close() error {
+	return nil
+}
+
+// newTestSpaceContentsResource mounts the contents of the Space in conf on b
+// with its shared plugin runtime. The mount is released when the test ends.
+func newTestSpaceContentsResource(
+	t *testing.T,
+	le *logrus.Entry,
+	b bus.Bus,
+	engine world.Engine,
+	conf *plugin_space.Config,
+) *SpaceContentsResource {
+	// Start the shared Space runtime and retain its contents mount until test cleanup.
+	t.Helper()
+	runtime, runtimeRef, err := plugin_space_runtime.StartControllerWithConfig(
+		t.Context(),
+		b,
+		&plugin_space_runtime.Config{Space: conf},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewSpaceContentsResource(le, b, engine, conf.GetSpaceId(), conf.GetEngineId(), runtime, runtimeRef)
+	t.Cleanup(r.Release)
+	return r
+}
+
+// waitSpaceRuntimeGeneration waits for runtime to run a generation other than
+// prev.
+func waitSpaceRuntimeGeneration(
+	t *testing.T,
+	runtime *plugin_space_runtime.Controller,
+	prev *plugin_space_runtime.Generation,
+) *plugin_space_runtime.Generation {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	for {
+		gen, waitCh, err := runtime.GetGeneration()
+		if gen != nil && gen != prev {
+			return gen
+		}
+		select {
+		case <-waitCh:
+		case <-timeout:
+			t.Fatalf("timed out waiting for a Space runtime generation, last error: %v", err)
+		}
+	}
+}
+
+func TestWaitSpaceContentsSourcesWaitsForEverySource(t *testing.T) {
+	t.Parallel()
+
+	for sourceIdx := range 5 {
+		t.Run(fmt.Sprintf("source-%d", sourceIdx), func(t *testing.T) {
+			// Run each independent Space contents wake source concurrently.
+			t.Parallel()
+
+			// Watch the selected contents source without waking it yet.
+			waitChs, closeSource := testWaitChannels(5, sourceIdx)
+			done := make(chan error, 1)
+			go func() {
+				done <- waitSpaceContentsSources(t.Context(), func(ctx context.Context) error {
+					<-ctx.Done()
+					return ctx.Err()
+				}, waitChs)
+			}()
+
+			// Verify the contents wait remains blocked until a source changes.
+			select {
+			case err := <-done:
+				t.Fatalf("waitSpaceContentsSources returned before source %d woke: %v", sourceIdx, err)
+			case <-time.After(10 * time.Millisecond):
+			}
+
+			// Wake the selected contents source.
+			closeSource()
+
+			// Verify the contents wait completes after the selected source changes.
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("waitSpaceContentsSources returned %v after source %d woke", err, sourceIdx)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("waitSpaceContentsSources ignored source %d", sourceIdx)
+			}
+		})
+	}
+}
+
+func TestWaitSpaceContentsSourcesContextCancellation(t *testing.T) {
+	// Run the contents cancellation check independently.
+	t.Parallel()
+
+	// Start a contents wait with a cancellable context.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- waitSpaceContentsSources(ctx, func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}, nil)
+	}()
+
+	// Verify the contents wait remains blocked before cancellation.
+	select {
+	case err := <-done:
+		t.Fatalf("waitSpaceContentsSources returned before cancellation: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	// Cancel the pending contents wait.
+	cancel()
+
+	// Verify the contents wait returns its context cancellation.
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitSpaceContentsSources did not return after cancellation")
+	}
+}
+
+func TestWaitSpaceContentsSourcesWorldWake(t *testing.T) {
+	t.Parallel()
+
+	if err := waitSpaceContentsSources(t.Context(), func(context.Context) error {
+		return nil
+	}, nil); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+}
+
+func TestBuildSpacePluginStatusProjectsLifecycle(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		loaded            bool
+		controllerStarted bool
+		schedulerStatus   *bldr_plugin.PluginStatus
+		wantLoaded        bool
+		wantState         s4wave_space.SpacePluginLifecycleState
+		wantDetail        string
+	}{
+		{
+			name:      "configured",
+			wantState: s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_CONFIGURED,
+		},
+		{
+			name:              "controller requested",
+			controllerStarted: true,
+			wantState:         s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_LOADING,
+			wantDetail:        "Plugin runtime requested",
+		},
+		{
+			name:   "legacy loaded",
+			loaded: true,
+			schedulerStatus: &bldr_plugin.PluginStatus{
+				State: bldr_plugin.PluginState_PluginState_REQUESTED,
+			},
+			wantLoaded: true,
+			wantState:  s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_LOADED,
+		},
+		{
+			name: "scheduler running",
+			schedulerStatus: &bldr_plugin.PluginStatus{
+				State:   bldr_plugin.PluginState_PluginState_RUNNING,
+				Running: true,
+			},
+			wantLoaded: true,
+			wantState:  s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_LOADED,
+		},
+		{
+			name: "scheduler failed",
+			schedulerStatus: &bldr_plugin.PluginStatus{
+				LastErrorMessage: "execute plugin: boom",
+			},
+			wantState:  s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_FAILED,
+			wantDetail: "execute plugin: boom",
+		},
+		{
+			name: "scheduler retrying",
+			schedulerStatus: &bldr_plugin.PluginStatus{
+				State:            bldr_plugin.PluginState_PluginState_REQUESTED,
+				LastErrorMessage: "fetch plugin manifest: missing",
+			},
+			wantState:  s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_RETRYING,
+			wantDetail: "fetch plugin manifest: missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Project the configured plugin lifecycle for the selected test case.
+			got := buildSpacePluginStatus(
+				"plugin-"+tt.name,
+				"description",
+				tt.loaded,
+				tt.controllerStarted,
+				tt.schedulerStatus,
+			)
+
+			// Verify the projected plugin lifecycle and description match the case.
+			if got.GetLoaded() != tt.wantLoaded {
+				t.Fatalf("loaded = %v, want %v", got.GetLoaded(), tt.wantLoaded)
+			}
+			if got.GetState() != tt.wantState {
+				t.Fatalf("state = %v, want %v", got.GetState(), tt.wantState)
+			}
+			if got.GetDetail() != tt.wantDetail {
+				t.Fatalf("detail = %q, want %q", got.GetDetail(), tt.wantDetail)
+			}
+			if got.GetDescription() != "description" {
+				t.Fatalf("description = %q, want description", got.GetDescription())
+			}
+		})
+	}
+}
+
+// testWaitChannels returns count open channels framed by nil channels and a
+// func that closes the channel at sourceIdx.
+func testWaitChannels(count int, sourceIdx int) ([]<-chan struct{}, func()) {
+	// Prepare the contents wake channels with inactive entries at both ends.
+	chans := make([]chan struct{}, count)
+	waitChs := make([]<-chan struct{}, 0, count+2)
+	waitChs = append(waitChs, nil)
+	for i := range chans {
+		chans[i] = make(chan struct{})
+		waitChs = append(waitChs, chans[i])
+	}
+	waitChs = append(waitChs, nil)
+	return waitChs, func() {
+		close(chans[sourceIdx])
+	}
+}
+
+// generateSpaceContentsTestPeerID returns a random Ed25519 peer ID.
+func generateSpaceContentsTestPeerID(t *testing.T) peer.ID {
+	// Generate an Ed25519 identity for the Space contents test.
+	t.Helper()
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+// applyWizardFinalizeOp creates a wizard object, then applies op as sender and
+// deletes the wizard in a second transaction, as the wizard UI does.
+func applyWizardFinalizeOp(
+	ctx context.Context,
+	t testing.TB,
+	engine world.Engine,
+	wizardKey string,
+	wizardTypeID string,
+	targetTypeID string,
+	targetKeyPrefix string,
+	name string,
+	op world.Operation,
+	sender peer.ID,
+) {
+	// Create and commit the wizard object before finalization.
+	t.Helper()
+	wizardOp := s4wave_wizard.NewCreateWizardObjectOp(
+		wizardKey,
+		wizardTypeID,
+		targetTypeID,
+		targetKeyPrefix,
+		name,
+		time.Now(),
+	)
+	tx, err := engine.NewTransaction(ctx, true)
+	if err != nil {
+		t.Fatalf("NewTransaction(%s wizard create): %v", wizardTypeID, err)
+	}
+	defer tx.Discard()
+	_, _, err = tx.ApplyWorldOp(ctx, wizardOp, "")
+	if err != nil {
+		t.Fatalf("ApplyWorldOp(%s wizard): %v", wizardTypeID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit(%s wizard create): %v", wizardTypeID, err)
+	}
+
+	// Finalize the target object and remove its wizard in a second transaction.
+	tx, err = engine.NewTransaction(ctx, true)
+	if err != nil {
+		t.Fatalf("NewTransaction(%s finalize): %v", wizardTypeID, err)
+	}
+	defer tx.Discard()
+	_, _, err = tx.ApplyWorldOp(ctx, op, sender)
+	if err != nil {
+		t.Fatalf("ApplyWorldOp(%s finalize): %v", wizardTypeID, err)
+	}
+	_, err = tx.DeleteObject(ctx, wizardKey)
+	if err != nil {
+		t.Fatalf("DeleteObject(%s wizard): %v", wizardTypeID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit(%s finalize): %v", wizardTypeID, err)
+	}
+}
+
+// waitForForgeExecutionState waits for a completed Pass of jobKey with a
+// completed Execution that recorded log entries.
+func waitForForgeExecutionState(
+	ctx context.Context,
+	t testing.TB,
+	engine world.Engine,
+	ws world.WorldState,
+	jobKey string,
+) (*forge_pass.Pass, *forge_execution.Execution) {
+	t.Helper()
+
+	seqno, err := engine.GetSeqno(ctx)
+	if err != nil {
+		t.Fatalf("GetSeqno: %v", err)
+	}
+
+	for {
+		taskKeys, err := forge_job.ListJobTasks(ctx, ws, jobKey)
+		if err != nil {
+			t.Fatalf("ListJobTasks: %v", err)
+		}
+		for _, taskKey := range taskKeys {
+			passKeys, err := forge_task.ListTaskPasses(ctx, ws, taskKey)
+			if err != nil {
+				t.Fatalf("ListTaskPasses(%s): %v", taskKey, err)
+			}
+			for _, passKey := range passKeys {
+				passState, _, err := forge_pass.LookupPass(ctx, ws, passKey)
+				if err != nil {
+					t.Fatalf("LookupPass(%s): %v", passKey, err)
+				}
+				execKeys, err := forge_pass.ListPassExecutions(ctx, ws, passKey)
+				if err != nil {
+					t.Fatalf("ListPassExecutions(%s): %v", passKey, err)
+				}
+				for _, execKey := range execKeys {
+					execState, objectState, err := forge_execution.LookupExecution(ctx, ws, execKey)
+					world.ReleaseObjectState(objectState)
+					if err != nil {
+						t.Fatalf("LookupExecution(%s): %v", execKey, err)
+					}
+					if passState.IsComplete() && execState.IsComplete() && len(execState.GetLogEntries()) != 0 {
+						return passState, execState
+					}
+				}
+			}
+		}
+
+		seqno, err = engine.WaitSeqno(ctx, seqno+1)
+		if err != nil {
+			t.Fatalf("WaitSeqno: %v", err)
+		}
+	}
+}
+
+func TestSpaceContentsResource_ForgeWizardChainStartsApprovedWorker(t *testing.T) {
+	// Bound the test by the package timeout.
+	ctx, cancel := context.WithTimeout(t.Context(), spaceContentsTestTimeout)
+	defer cancel()
+
+	// Initialize the testbed.
+	tb, err := testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Name the session signer.
+	pid := generateSpaceContentsTestPeerID(t)
+	sender := pid.String()
+	ts := timestamppb.Now()
+
+	// Name the Forge objects and their wizards.
+	clusterKey := "forge/cluster/wizard-test"
+	jobKey := "forge/job/wizard-test"
+	taskKey := "forge/task/wizard-extra"
+	workerKey := "forge/worker/wizard-session"
+	clusterWizardKey := "wizard/forge/cluster/wizard-test"
+	jobWizardKey := "wizard/forge/job/wizard-test"
+	taskWizardKey := "wizard/forge/task/wizard-test"
+
+	// Finalize the cluster wizard.
+	clusterOp := &forge_cluster.ClusterCreateOp{
+		ClusterKey: clusterKey,
+		Name:       "wizard-cluster",
+	}
+	applyWizardFinalizeOp(
+		ctx,
+		t,
+		tb.Engine,
+		clusterWizardKey,
+		"wizard/forge/cluster",
+		forge_cluster.ClusterTypeID,
+		"forge/cluster/",
+		"wizard-cluster",
+		clusterOp,
+		pid,
+	)
+
+	// Finalize the job wizard with one task.
+	jobOp := &forge_job_ops.ForgeJobCreateOp{
+		JobKey:     jobKey,
+		ClusterKey: clusterKey,
+		TaskDefs: []*forge_job_ops.ForgeJobTaskDef{
+			{Name: "build"},
+		},
+		Timestamp: ts,
+	}
+	applyWizardFinalizeOp(
+		ctx,
+		t,
+		tb.Engine,
+		jobWizardKey,
+		"wizard/forge/job",
+		forge_job.JobTypeID,
+		"forge/job/",
+		"wizard-job",
+		jobOp,
+		pid,
+	)
+
+	// Finalize a task wizard that adds a second task to the job.
+	taskOp := &forge_task_ops.ForgeTaskCreateOp{
+		TaskKey:   taskKey,
+		Name:      "verify",
+		JobKey:    jobKey,
+		Timestamp: ts,
+	}
+	applyWizardFinalizeOp(
+		ctx,
+		t,
+		tb.Engine,
+		taskWizardKey,
+		"wizard/forge/task",
+		forge_task.TaskTypeID,
+		"forge/task/",
+		"wizard-task",
+		taskOp,
+		pid,
+	)
+
+	// Create the session Worker, bind it to the signer keypair, and assign it to the cluster.
+	workerOp := forge_worker.NewWorkerCreateOp(workerKey, "session-worker", nil)
+	if _, _, err := tb.WorldState.ApplyWorldOp(ctx, workerOp, pid); err != nil {
+		t.Fatalf("ApplyWorldOp(worker create): %v", err)
+	}
+	if err := tb.WorldState.SetGraphQuad(ctx, identity_world.NewObjectToKeypairQuad(
+		workerKey,
+		identity_world.NewKeypairKey(sender),
+	)); err != nil {
+		t.Fatalf("SetGraphQuad(worker keypair): %v", err)
+	}
+	assignWorkerOp := forge_cluster.NewClusterAssignWorkerOp(clusterKey, workerKey)
+	if _, _, err := tb.WorldState.ApplyWorldOp(ctx, assignWorkerOp, pid); err != nil {
+		t.Fatalf("ApplyWorldOp(assign worker): %v", err)
+	}
+
+	// Verify the job links both tasks.
+	taskKeys, err := forge_job.ListJobTasks(ctx, tb.WorldState, jobKey)
+	if err != nil {
+		t.Fatalf("ListJobTasks: %v", err)
+	}
+	if len(taskKeys) != 2 {
+		t.Fatalf("expected 2 tasks linked to job, got %v", taskKeys)
+	}
+	for _, linkedTaskKey := range taskKeys {
+		if err := forge_job.EnsureJobHasTask(ctx, tb.WorldState, jobKey, linkedTaskKey); err != nil {
+			t.Fatalf("EnsureJobHasTask(%s): %v", linkedTaskKey, err)
+		}
+	}
+
+	// Verify finalization deleted every wizard object.
+	readTx, err := tb.Engine.NewTransaction(ctx, false)
+	if err != nil {
+		t.Fatalf("NewTransaction(verify wizard cleanup): %v", err)
+	}
+	defer readTx.Discard()
+	for _, wizardKey := range []string{clusterWizardKey, jobWizardKey, taskWizardKey} {
+		objectState, found, err := readTx.GetObject(ctx, wizardKey)
+		world.ReleaseObjectState(objectState)
+		if err != nil {
+			t.Fatalf("GetObject(%s): %v", wizardKey, err)
+		}
+		if found {
+			t.Fatalf("wizard object %s should be deleted", wizardKey)
+		}
+	}
+
+	// Open the Space contents resource with a Worker policy host.
+	resource := newTestSpaceContentsResource(t, tb.Logger, tb.Bus, tb.Engine, &plugin_space.Config{
+		SpaceId:       "space-test",
+		VolumeId:      tb.EngineVolumeID,
+		ObjectStoreId: "platform-account",
+		EngineId:      tb.EngineID,
+		SessionPeerId: sender,
+	})
+	resource.volumeID = tb.EngineVolumeID
+	resource.storeID = "platform-account"
+	addBindingTestForgeWorkerHost(t, ctx, tb, workerKey)
+
+	// Verify no task has a pass before approval.
+	for _, linkedTaskKey := range taskKeys {
+		passKeys, err := forge_task.ListTaskPasses(ctx, tb.WorldState, linkedTaskKey)
+		if err != nil {
+			t.Fatalf("ListTaskPasses(%s): %v", linkedTaskKey, err)
+		}
+		if len(passKeys) != 0 {
+			t.Fatalf("expected no passes before approval for %s, got %v", linkedTaskKey, passKeys)
+		}
+	}
+
+	// Approve the process binding of the Worker.
+	_, err = resource.SetProcessBinding(ctx, &s4wave_space.SetProcessBindingRequest{
+		ObjectKey: workerKey,
+		TypeId:    forge_worker.WorkerTypeID,
+		Approved:  true,
+	})
+	if err != nil {
+		t.Fatalf("SetProcessBinding: %v", err)
+	}
+
+	// Wait for the job to complete.
+	jobState, err := forge_job.WaitJobComplete(
+		ctx,
+		logrus.NewEntry(logrus.StandardLogger()),
+		tb.WorldState,
+		jobKey,
+	)
+	if err != nil {
+		t.Fatalf("WaitJobComplete: %v", err)
+	}
+	if !jobState.IsComplete() {
+		t.Fatalf("expected complete job, got %s", jobState.GetJobState().String())
+	}
+
+	// Verify each task completed a pass and its execution.
+	for _, linkedTaskKey := range taskKeys {
+		passKeys, err := forge_task.ListTaskPasses(ctx, tb.WorldState, linkedTaskKey)
+		if err != nil {
+			t.Fatalf("ListTaskPasses(%s): %v", linkedTaskKey, err)
+		}
+		if len(passKeys) == 0 {
+			t.Fatalf("expected passes after approval for %s", linkedTaskKey)
+		}
+		passState, _, err := forge_pass.LookupPass(ctx, tb.WorldState, passKeys[0])
+		if err != nil {
+			t.Fatalf("LookupPass(%s): %v", passKeys[0], err)
+		}
+		if !passState.IsComplete() {
+			t.Fatalf("expected complete pass for %s, got %s", linkedTaskKey, passState.GetPassState().String())
+		}
+		execKeys, err := forge_pass.ListPassExecutions(ctx, tb.WorldState, passKeys[0])
+		if err != nil {
+			t.Fatalf("ListPassExecutions(%s): %v", passKeys[0], err)
+		}
+		if len(execKeys) == 0 {
+			t.Fatalf("expected execution for pass %s", passKeys[0])
+		}
+		execState, objectState2, err := forge_execution.LookupExecution(ctx, tb.WorldState, execKeys[0])
+		world.ReleaseObjectState(objectState2)
+		if err != nil {
+			t.Fatalf("LookupExecution(%s): %v", execKeys[0], err)
+		}
+		if !execState.IsComplete() {
+			t.Fatalf("expected complete execution for %s, got %s", linkedTaskKey, execState.GetExecutionState().String())
+		}
+	}
+}
+
+// TestSpaceContentsResource_SetProcessBindingStartsForgeWorker checks that
+// approving a Worker binding runs the Worker with daemon policy and completes
+// its sample Job after the submitting mount releases.
+func TestSpaceContentsResource_SetProcessBindingStartsForgeWorker(t *testing.T) {
+	// Start the Space runtime testbed.
+	ctx, tb := newSpaceRuntimeTestbed(t, time.Minute)
+
+	// Create the Worker and sample Job that its binding will execute.
+	pid := generateSpaceContentsTestPeerID(t)
+	op := &forge_dashboard.InitForgeQuickstartOp{
+		LayoutKey:     "forge",
+		DashboardKey:  "dashboard",
+		ClusterKey:    "cluster",
+		ClusterName:   "default",
+		WorkerKey:     "session-worker",
+		SessionPeerId: pid.String(),
+		Timestamp:     timestamppb.Now(),
+	}
+	if _, _, err := tb.WorldState.ApplyWorldOp(ctx, op, pid); err != nil {
+		t.Fatalf("ApplyWorldOp: %v", err)
+	}
+
+	// Make a plugin desired without a manifest for the Linux host.
+	addSpaceRuntimePluginHost(t, tb.Bus, "desktop/linux/amd64")
+	manifestSource := newEmptyManifestSource(spaceRuntimeManifestID)
+	addSpaceRuntimeController(t, tb.Bus, manifestSource)
+	approveSpaceRuntimePlugin(t, ctx, tb)
+
+	// Mount the Space contents and publish the daemon policy host.
+	conf := &plugin_space.Config{
+		SpaceId:       "space-test",
+		VolumeId:      tb.EngineVolumeID,
+		ObjectStoreId: "platform-account",
+		EngineId:      tb.EngineID,
+		SessionPeerId: pid.String(),
+	}
+	resource := newTestSpaceContentsResource(t, tb.Logger, tb.Bus, tb.Engine, conf)
+	resource.volumeID = tb.EngineVolumeID
+	resource.storeID = "platform-account"
+	addBindingTestForgeWorkerHost(t, ctx, tb, "session-worker")
+
+	// Wait for the desired plugin to request its missing manifest.
+	select {
+	case <-manifestSource.started:
+	case <-ctx.Done():
+		t.Fatal("desired plugin did not request its missing manifest")
+	}
+
+	// Confirm no Pass runs before the binding is approved.
+	taskKeys, err := forge_job.ListJobTasks(ctx, tb.WorldState, "sample-job")
+	if err != nil {
+		t.Fatalf("ListJobTasks: %v", err)
+	}
+	for _, taskKey := range taskKeys {
+		passKeys, err := forge_task.ListTaskPasses(ctx, tb.WorldState, taskKey)
+		if err != nil {
+			t.Fatalf("ListTaskPasses(%s): %v", taskKey, err)
+		}
+		if len(passKeys) != 0 {
+			t.Fatalf("expected no passes before approval, got %v", passKeys)
+		}
+	}
+
+	// Approve the Worker binding.
+	_, err = resource.SetProcessBinding(ctx, &s4wave_space.SetProcessBindingRequest{
+		ObjectKey: "session-worker",
+		TypeId:    "forge/worker",
+		Approved:  true,
+	})
+	if err != nil {
+		t.Fatalf("SetProcessBinding: %v", err)
+	}
+
+	// Read one contents state from a watch.
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	stream := newTestWatchSpaceContentsStateStream(watchCtx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- resource.WatchState(&s4wave_space.WatchSpaceContentsStateRequest{}, stream)
+	}()
+
+	// Wait for the state, then stop the watch.
+	var resp *s4wave_space.SpaceContentsState
+	select {
+	case resp = <-stream.msgs:
+	case <-time.After(time.Second):
+		watchCancel()
+		t.Fatal("timed out waiting for space contents state")
+	}
+	watchCancel()
+
+	// Confirm the watch stopped cleanly and reported the approved binding.
+	select {
+	case err := <-errCh:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("WatchState: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WatchState to stop")
+	}
+	if len(resp.GetProcessBindings()) != 1 || !resp.GetProcessBindings()[0].GetApproved() {
+		t.Fatalf("expected one approved binding, got %+v", resp.GetProcessBindings())
+	}
+
+	// Release the submitting mount while another mount retains the runtime.
+	keeper := newTestSpaceContentsResource(t, tb.Logger, tb.Bus, tb.Engine, conf.CloneVT())
+	if keeper.runtime != resource.runtime {
+		t.Fatal("keeper acquired a different Space runtime")
+	}
+	resource.Release()
+
+	// Observe the bound Worker's published capacity after the release.
+	capacity := waitBindingWorkerCapacity(t, ctx, tb.WorldState, "session-worker")
+	if capacity.MilliCPUTotal != 1000 || capacity.MemoryBytesTotal != 1<<30 ||
+		capacity.OwnerDeviceObjectKey != "devices/self" || !capacity.SupportsBackend("docker") {
+		t.Fatalf("observed Worker capacity = %#v", capacity)
+	}
+
+	// Confirm the Worker completed the sample Job.
+	passState, execState := waitForForgeExecutionState(
+		ctx,
+		t,
+		tb.Engine,
+		tb.WorldState,
+		"sample-job",
+	)
+	if !passState.IsComplete() {
+		t.Fatalf("expected complete pass, got %s", passState.GetPassState().String())
+	}
+	if !execState.IsComplete() {
+		t.Fatalf("expected complete execution, got %s", execState.GetExecutionState().String())
+	}
+	if !execState.GetResult().IsSuccessful() {
+		t.Fatalf("expected successful execution, got %q", execState.GetResult().GetFailError())
+	}
+	if got := execState.GetLogEntries()[0].GetMessage(); got != "noop execution complete" {
+		t.Fatalf("expected noop execution log, got %q", got)
+	}
+}

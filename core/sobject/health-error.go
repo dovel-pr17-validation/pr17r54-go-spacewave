@@ -1,0 +1,98 @@
+package sobject
+
+import (
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+)
+
+// sharedObjectHealthError attaches a SharedObjectHealth snapshot to an error.
+type sharedObjectHealthError struct {
+	health *SharedObjectHealth
+	cause  error
+}
+
+// Error returns the wrapped error string.
+func (e *sharedObjectHealthError) Error() string {
+	if e.cause != nil {
+		return e.cause.Error()
+	}
+	if e.health != nil {
+		return e.health.GetError()
+	}
+	return ""
+}
+
+// Unwrap returns the wrapped cause.
+func (e *sharedObjectHealthError) Unwrap() error {
+	return e.cause
+}
+
+// BuildSharedObjectHealthFromError maps a known error into a SharedObjectHealth snapshot.
+func BuildSharedObjectHealthFromError(
+	layer SharedObjectHealthLayer,
+	err error,
+) *SharedObjectHealth {
+	if err == nil {
+		return NewSharedObjectLoadingHealth(layer)
+	}
+
+	if health, ok := GetSharedObjectHealthFromError(err); ok {
+		return health
+	}
+
+	hint := SharedObjectHealthRemediationHint_SHARED_OBJECT_HEALTH_REMEDIATION_HINT_NONE
+	reason := SharedObjectHealthCommonReason_SHARED_OBJECT_HEALTH_COMMON_REASON_UNKNOWN
+	msg := err.Error()
+
+	switch {
+	case errors.Is(err, ErrSharedObjectNotFound):
+		reason = SharedObjectHealthCommonReason_SHARED_OBJECT_HEALTH_COMMON_REASON_NOT_FOUND
+		hint = SharedObjectHealthRemediationHint_SHARED_OBJECT_HEALTH_REMEDIATION_HINT_CONTACT_OWNER
+	case errors.Is(err, ErrResourceBlocked):
+		reason = SharedObjectHealthCommonReason_SHARED_OBJECT_HEALTH_COMMON_REASON_RESOURCE_BLOCKED
+		hint = SharedObjectHealthRemediationHint_SHARED_OBJECT_HEALTH_REMEDIATION_HINT_RETRY
+	case errors.Is(err, ErrNotParticipant) || errors.Is(err, ErrCannotDecode):
+		reason = SharedObjectHealthCommonReason_SHARED_OBJECT_HEALTH_COMMON_REASON_ACCESS_REVOKED
+		hint = SharedObjectHealthRemediationHint_SHARED_OBJECT_HEALTH_REMEDIATION_HINT_REQUEST_ACCESS
+	case errors.Is(err, ErrEmptyTransformConfig):
+		reason = SharedObjectHealthCommonReason_SHARED_OBJECT_HEALTH_COMMON_REASON_TRANSFORM_CONFIG_DECODE_FAILED
+		hint = SharedObjectHealthRemediationHint_SHARED_OBJECT_HEALTH_REMEDIATION_HINT_REPAIR_SOURCE_DATA
+	case errors.Is(err, ErrEmptyBodyType) || errors.Is(err, ErrUnsupportedBodyType):
+		reason = SharedObjectHealthCommonReason_SHARED_OBJECT_HEALTH_COMMON_REASON_BODY_CONFIG_DECODE_FAILED
+		hint = SharedObjectHealthRemediationHint_SHARED_OBJECT_HEALTH_REMEDIATION_HINT_REPAIR_SOURCE_DATA
+	case errors.Is(err, block.ErrNotFound):
+		reason = SharedObjectHealthCommonReason_SHARED_OBJECT_HEALTH_COMMON_REASON_BLOCK_NOT_FOUND
+		hint = SharedObjectHealthRemediationHint_SHARED_OBJECT_HEALTH_REMEDIATION_HINT_REPAIR_SOURCE_DATA
+	}
+
+	return NewSharedObjectClosedHealth(layer, reason, hint, msg)
+}
+
+// GetSharedObjectHealthFromError returns an attached SharedObjectHealth snapshot when available.
+func GetSharedObjectHealthFromError(err error) (*SharedObjectHealth, bool) {
+	var healthErr *sharedObjectHealthError
+	if !errors.As(err, &healthErr) {
+		return nil, false
+	}
+	return healthErr.health, true
+}
+
+// NewSharedObjectHealthError wraps an explicit SharedObjectHealth snapshot in an error.
+func NewSharedObjectHealthError(health *SharedObjectHealth, cause error) error {
+	if health == nil && cause == nil {
+		return nil
+	}
+	return &sharedObjectHealthError{
+		health: health,
+		cause:  cause,
+	}
+}
+
+// WrapSharedObjectHealthError wraps err with the SharedObjectHealth snapshot
+// it carries, or the one BuildSharedObjectHealthFromError maps it to.
+func WrapSharedObjectHealthError(layer SharedObjectHealthLayer, err error) error {
+	if err == nil {
+		return nil
+	}
+	return NewSharedObjectHealthError(BuildSharedObjectHealthFromError(layer, err), err)
+}

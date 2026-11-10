@@ -1,0 +1,453 @@
+syntax = "proto3";
+package volume.rpc;
+
+import "github.com/s4wave/spacewave/db/volume/volume.proto";
+import "github.com/s4wave/spacewave/db/bucket/bucket.proto";
+import "github.com/aperturerobotics/starpc/rpcstream/rpcstream.proto";
+import "github.com/s4wave/spacewave/db/block/block.proto";
+import "github.com/s4wave/spacewave/db/block/rpc/block.proto";
+
+// AccessVolumes is a service to access available volumes over RPC.
+service AccessVolumes {
+  // WatchVolumeInfo watches information about a volume.
+  // The most recent message contains the most recently known state.
+  // If the volume was not found (directive is idle) returns empty.
+  rpc WatchVolumeInfo(WatchVolumeInfoRequest) returns (stream WatchVolumeInfoResponse);
+  // VolumeRpc uses the LookupVolume directive access a Volume handle.
+  // Exposes the ProxyVolume service.
+  // Id: volume id
+  rpc VolumeRpc(stream .rpcstream.RpcStreamPacket) returns (stream .rpcstream.RpcStreamPacket);
+}
+
+// WatchVolumeInfoRequest is a request to watch volume information.
+message WatchVolumeInfoRequest {
+  // VolumeId is the volume id to watch.
+  string volume_id = 1;
+}
+
+// WatchVolumeInfoResponse is a state snapshot of the volume info.
+message WatchVolumeInfoResponse {
+  // NotFound is set of the volume info is empty (not found).
+  bool not_found = 1;
+  // VolumeInfo contains the located volume information.
+  .volume.VolumeInfo volume_info = 2;
+}
+
+// ProxyVolume is a service exposing a Volume handle via RPC.
+//
+// Other available services:
+//  - rpc.block.BlockStore
+//  - rpc.bucket.BucketStore
+//  - rpc.object.ObjectStore
+service ProxyVolume {
+  // GetVolumeInfo returns the basic volume information.
+  rpc GetVolumeInfo(GetVolumeInfoRequest) returns (GetVolumeInfoResponse);
+
+  // GetCoordinatorCapability reports direct coordination support for a scoped ObjectStore.
+  rpc GetCoordinatorCapability(GetCoordinatorCapabilityRequest) returns (GetCoordinatorCapabilityResponse);
+
+  // WatchCoordinatorEvents streams coordination events for a scoped ObjectStore.
+  rpc WatchCoordinatorEvents(WatchCoordinatorEventsRequest) returns (stream WatchCoordinatorEventsResponse);
+
+  // GetCoordinatorSnapshot returns the current remote coordinator snapshot.
+  rpc GetCoordinatorSnapshot(GetCoordinatorSnapshotRequest) returns (GetCoordinatorSnapshotResponse);
+
+  // TryAcquireCoordinatorWriteLease attempts to acquire the remote write lease.
+  rpc TryAcquireCoordinatorWriteLease(TryAcquireCoordinatorWriteLeaseRequest) returns (stream AcquireCoordinatorWriteLeaseResponse);
+
+  // WaitAcquireCoordinatorWriteLease waits for the remote write lease.
+  rpc WaitAcquireCoordinatorWriteLease(WaitAcquireCoordinatorWriteLeaseRequest) returns (stream AcquireCoordinatorWriteLeaseResponse);
+
+  // RefreshCoordinatorWriteLease refreshes a remote write lease.
+  rpc RefreshCoordinatorWriteLease(CoordinatorWriteLeaseRequest) returns (CoordinatorWriteLeaseSnapshotResponse);
+
+  // PublishCoordinatorWriteLease publishes a remote write lease event.
+  rpc PublishCoordinatorWriteLease(PublishCoordinatorWriteLeaseRequest) returns (CoordinatorWriteLeaseSnapshotResponse);
+
+  // ReleaseCoordinatorWriteLease releases a remote write lease.
+  rpc ReleaseCoordinatorWriteLease(CoordinatorWriteLeaseRequest) returns (ReleaseCoordinatorWriteLeaseResponse);
+
+  // GetPeerPriv returns the volume peer private key.
+  // Returns ErrPrivKeyUnavailable if the private key is unavailable.
+  rpc GetPeerPriv(GetPeerPrivRequest) returns (GetPeerPrivResponse);
+
+  // GetStorageStats returns storage usage statistics for the volume.
+  rpc GetStorageStats(GetStorageStatsRequest) returns (GetStorageStatsResponse);
+
+  // GetBucketRoot returns the block a named root of a bucket holds.
+  rpc GetBucketRoot(GetBucketRootRequest) returns (GetBucketRootResponse);
+
+  // ListBucketRoots streams the named roots of a bucket under a prefix.
+  rpc ListBucketRoots(ListBucketRootsRequest) returns (stream ListBucketRootsResponse);
+
+  // SetBucketRoots stores blocks and moves named roots of a bucket in one
+  // transaction of the volume.
+  rpc SetBucketRoots(SetBucketRootsRequest) returns (SetBucketRootsResponse);
+
+  // GetHoldsRoots reports whether the volume holds roots, pins and stages.
+  rpc GetHoldsRoots(GetHoldsRootsRequest) returns (GetHoldsRootsResponse);
+
+  // HoldPin pins a reader's root, sends one message once pinned, and holds
+  // the pin until the client ends the stream.
+  rpc HoldPin(HoldPinRequest) returns (stream HoldPinResponse);
+
+  // HoldStage opens a stage, sends its name, and holds it until the client
+  // ends the stream.
+  rpc HoldStage(HoldStageRequest) returns (stream HoldStageResponse);
+
+  // PrepareStagedBlock writes a block a stage this connection holds keeps.
+  rpc PrepareStagedBlock(PrepareStagedBlockRequest) returns (PrepareStagedBlockResponse);
+
+  // PrepareStagedBlockBatch writes a batch a stage this connection holds keeps.
+  rpc PrepareStagedBlockBatch(PrepareStagedBlockBatchRequest) returns (PrepareStagedBlockBatchResponse);
+
+  // ReleaseStageRoots drops a stage's holds on blocks.
+  rpc ReleaseStageRoots(StageRefsRequest) returns (ReleaseStageRootsResponse);
+
+  // HoldStageCompleteRoots makes a stage hold each proved root, and reports
+  // which roots have a completion proof.
+  rpc HoldStageCompleteRoots(StageRefsRequest) returns (RootsCompleteResponse);
+
+  // MarkRootsComplete records completion proofs for stored roots.
+  rpc MarkRootsComplete(RefsRequest) returns (MarkRootsCompleteResponse);
+
+  // RootsComplete reports which roots have a completion proof.
+  rpc RootsComplete(RefsRequest) returns (RootsCompleteResponse);
+}
+
+// GetVolumeInfoRequest is a request to get volume information.
+message GetVolumeInfoRequest {}
+
+// GetVolumeInfoResponse is the response to the request for volume info.
+message GetVolumeInfoResponse {
+  // VolumeInfo is the volume information object.
+  .volume.VolumeInfo volume_info = 1;
+}
+
+// CoordinatorScope identifies a coordinated ObjectStore or exclusion subject inside a Volume.
+message CoordinatorScope {
+  // VolumeId is the owning Volume id.
+  string volume_id = 1;
+  // ObjectStoreId is the ObjectStore id inside the Volume.
+  string object_store_id = 2;
+  // ParticipantId identifies the process or handle performing the operation.
+  string participant_id = 3;
+  // Key names a caller-chosen exclusion subject inside the Volume.
+  string key = 4;
+}
+
+// CoordinatorCapability describes direct coordination support for a scoped ObjectStore.
+message CoordinatorCapability {
+  // Supported is true when direct coordination is available.
+  bool supported = 1;
+  // Backend identifies the backend that would coordinate the scope.
+  string backend = 2;
+  // VolumeId is the owning Volume id.
+  string volume_id = 3;
+  // ObjectStoreId is the ObjectStore id inside the Volume.
+  string object_store_id = 4;
+  // Generation is the latest durable generation observed by the coordinator.
+  uint64 generation = 5;
+  // FallbackReason explains why Supported is false.
+  string fallback_reason = 6;
+  // Generations is true when the scope carries durable generation fencing.
+  bool generations = 7;
+  // DetectsLoss is true when involuntary lease loss is reported.
+  bool detects_loss = 8;
+}
+
+// CoordinatorEvent reports a coordination state change for a scoped ObjectStore.
+message CoordinatorEvent {
+  // ProcessId identifies the process that produced or requested the event.
+  string process_id = 1;
+  // VolumeId is the owning Volume id.
+  string volume_id = 2;
+  // ObjectStoreId is the ObjectStore id inside the Volume.
+  string object_store_id = 3;
+  // Generation is the durable generation associated with this event.
+  uint64 generation = 4;
+  // WantLock is true when another participant is waiting for the write lease.
+  bool want_lock = 5;
+  // Unlocked is true when a participant released the write lease.
+  bool unlocked = 6;
+  // RootChanged carries the accepted root after a commit.
+  .bucket.ObjectRef root_changed = 7;
+  // KeyPrefixChanged carries a key prefix invalidated by a commit.
+  bytes key_prefix_changed = 8;
+  // FallbackReason carries a visible fallback reason when direct coordination fails.
+  string fallback_reason = 9;
+}
+
+// CoordinatorSnapshot captures the current durable coordination state.
+message CoordinatorSnapshot {
+  // VolumeId is the owning Volume id.
+  string volume_id = 1;
+  // ObjectStoreId is the ObjectStore id inside the Volume.
+  string object_store_id = 2;
+  // Generation is the latest durable generation.
+  uint64 generation = 3;
+  // Root is the latest durable ObjectStore root.
+  .bucket.ObjectRef root = 4;
+}
+
+// GetCoordinatorCapabilityRequest is a request to get direct coordination support.
+message GetCoordinatorCapabilityRequest {
+  // Scope identifies the coordinated ObjectStore.
+  CoordinatorScope scope = 1;
+}
+
+// GetCoordinatorCapabilityResponse is the response to coordinator capability negotiation.
+message GetCoordinatorCapabilityResponse {
+  // Capability contains the direct coordination support report.
+  CoordinatorCapability capability = 1;
+}
+
+// WatchCoordinatorEventsRequest is a request to stream coordination events.
+message WatchCoordinatorEventsRequest {
+  // Scope identifies the coordinated ObjectStore.
+  CoordinatorScope scope = 1;
+  // AfterGeneration skips events at or before this generation.
+  uint64 after_generation = 2;
+}
+
+// WatchCoordinatorEventsResponse is a streamed coordination event response.
+message WatchCoordinatorEventsResponse {
+  // Event contains the coordination event.
+  CoordinatorEvent event = 1;
+}
+
+// GetCoordinatorSnapshotRequest is a request to get a coordinator snapshot.
+message GetCoordinatorSnapshotRequest {
+  // Scope identifies the coordinated ObjectStore.
+  CoordinatorScope scope = 1;
+}
+
+// GetCoordinatorSnapshotResponse is a coordinator snapshot response.
+message GetCoordinatorSnapshotResponse {
+  // Snapshot is the current durable coordinator state.
+  CoordinatorSnapshot snapshot = 1;
+}
+
+// TryAcquireCoordinatorWriteLeaseRequest is a non-blocking lease request.
+message TryAcquireCoordinatorWriteLeaseRequest {
+  // Scope identifies the coordinated ObjectStore.
+  CoordinatorScope scope = 1;
+}
+
+// WaitAcquireCoordinatorWriteLeaseRequest is a blocking lease request.
+message WaitAcquireCoordinatorWriteLeaseRequest {
+  // Scope identifies the coordinated ObjectStore.
+  CoordinatorScope scope = 1;
+}
+
+// Reserved removed top-level message names; do not reuse:
+// TryAcquireWorldEngineLeaseRequest, AcquireWorldEngineLeaseResponse,
+// ReleaseWorldEngineLeaseRequest, ReleaseWorldEngineLeaseResponse.
+
+// AcquireCoordinatorWriteLeaseResponse is returned by lease acquisition.
+message AcquireCoordinatorWriteLeaseResponse {
+  // LeaseId identifies the remote lease for later lease operations.
+  string lease_id = 1;
+  // Acquired is false when a try-acquire request found the lease busy.
+  bool acquired = 2;
+}
+
+// CoordinatorWriteLeaseRequest identifies a held remote write lease.
+message CoordinatorWriteLeaseRequest {
+  // LeaseId identifies the remote lease.
+  string lease_id = 1;
+}
+
+// CoordinatorWriteLeaseSnapshotResponse returns a lease operation snapshot.
+message CoordinatorWriteLeaseSnapshotResponse {
+  // Snapshot is the current durable coordinator state.
+  CoordinatorSnapshot snapshot = 1;
+}
+
+// PublishCoordinatorWriteLeaseRequest publishes through a held remote lease.
+message PublishCoordinatorWriteLeaseRequest {
+  // LeaseId identifies the remote lease.
+  string lease_id = 1;
+  // Event is the accepted coordination event.
+  CoordinatorEvent event = 2;
+}
+
+// ReleaseCoordinatorWriteLeaseResponse is returned after releasing a lease.
+message ReleaseCoordinatorWriteLeaseResponse {}
+
+// GetPeerPrivRequest is a request to get the volume peer privkey.
+message GetPeerPrivRequest {}
+
+// GetPeerPrivResponse is the response to looking up the volume peer privkey.
+message GetPeerPrivResponse {
+  // PrivKey is the private key.
+  string priv_key = 1;
+}
+
+// GetStorageStatsRequest is a request to get storage usage statistics.
+message GetStorageStatsRequest {}
+
+// GetStorageStatsResponse is the response with storage usage statistics.
+message GetStorageStatsResponse {
+  // StorageStats contains the storage usage statistics.
+  .volume.StorageStats storage_stats = 1;
+}
+
+// GetBucketRootRequest reads a named root of a bucket.
+message GetBucketRootRequest {
+  // BucketId is the bucket.
+  string bucket_id = 1;
+  // Name is the root name.
+  string name = 2;
+}
+
+// GetBucketRootResponse is the block a named root holds.
+message GetBucketRootResponse {
+  // Ref is the block the root holds, empty when the name is free.
+  .block.BlockRef ref = 1;
+}
+
+// ListBucketRootsRequest lists the named roots of a bucket under a prefix.
+message ListBucketRootsRequest {
+  // BucketId is the bucket.
+  string bucket_id = 1;
+  // Prefix filters the root names.
+  string prefix = 2;
+}
+
+// ListBucketRootsResponse is one named root of the listing.
+message ListBucketRootsResponse {
+  // Root is the named root.
+  NamedRoot root = 1;
+}
+
+// NamedRoot is a named root, or a move of one.
+message NamedRoot {
+  // Name is the root name.
+  string name = 1;
+  // Ref is the block the name holds, or after the move, empty to release.
+  .block.BlockRef ref = 2;
+  // Previous is the block the name must hold before the move, empty when it
+  // must be free.
+  .block.BlockRef previous = 3;
+  // ExpiresUnixMilli is when the volume releases a leased root, zero for one
+  // held until released.
+  int64 expires_unix_milli = 4;
+}
+
+// SetBucketRootsRequest stores blocks and moves named roots of a bucket.
+message SetBucketRootsRequest {
+  // BucketId is the bucket.
+  string bucket_id = 1;
+  // Entries are the blocks to store with the moves.
+  repeated .block.rpc.PutBlockBatchEntry entries = 2;
+  // Roots are the moves.
+  repeated NamedRoot roots = 3;
+}
+
+// SetBucketRootsResult is the outcome of a SetBucketRoots call that reached
+// the volume.
+enum SetBucketRootsResult {
+  // SET_BUCKET_ROOTS_RESULT_OK means the blocks are stored and the roots moved.
+  SET_BUCKET_ROOTS_RESULT_OK = 0;
+  // SET_BUCKET_ROOTS_RESULT_ROOT_MOVED means a root did not hold its
+  // Previous, and nothing was written.
+  SET_BUCKET_ROOTS_RESULT_ROOT_MOVED = 1;
+  // SET_BUCKET_ROOTS_RESULT_UNHELD means the volume holds no roots and
+  // refused a root that would hold a block.
+  SET_BUCKET_ROOTS_RESULT_UNHELD = 2;
+}
+
+// SetBucketRootsResponse is the outcome of a SetBucketRoots call.
+message SetBucketRootsResponse {
+  // Result is the outcome.
+  SetBucketRootsResult result = 1;
+  // Name is the root a refusal names.
+  string name = 2;
+}
+
+// GetHoldsRootsRequest asks whether the volume holds roots.
+message GetHoldsRootsRequest {}
+
+// GetHoldsRootsResponse reports whether the volume holds roots.
+message GetHoldsRootsResponse {
+  // HoldsRoots reports that the volume holds roots, pins and stages.
+  bool holds_roots = 1;
+}
+
+// HoldPinRequest pins a reader's root.
+message HoldPinRequest {
+  // Ref is the root to pin.
+  .block.BlockRef ref = 1;
+}
+
+// HoldPinResponse reports that the pin is held.
+message HoldPinResponse {}
+
+// HoldStageRequest opens a stage.
+message HoldStageRequest {}
+
+// HoldStageResponse names the stage the stream holds.
+message HoldStageResponse {
+  // Stage is the stage's name.
+  string stage = 1;
+}
+
+// PrepareStagedBlockRequest writes one block a stage holds.
+message PrepareStagedBlockRequest {
+  // Stage is a stage this connection holds.
+  string stage = 1;
+  // Data is the encoded block.
+  bytes data = 2;
+  // Opts are the put options.
+  .block.PutOpts opts = 3;
+}
+
+// PrepareStagedBlockResponse is the stored block.
+message PrepareStagedBlockResponse {
+  // Ref is the block's reference.
+  .block.BlockRef ref = 1;
+  // Existed reports that the block was stored before.
+  bool existed = 2;
+}
+
+// PrepareStagedBlockBatchRequest writes a batch a stage holds.
+message PrepareStagedBlockBatchRequest {
+  // Stage is a stage this connection holds.
+  string stage = 1;
+  // Entries are the blocks.
+  repeated .block.rpc.PutBlockBatchEntry entries = 2;
+}
+
+// PrepareStagedBlockBatchResponse reports which blocks were stored before.
+message PrepareStagedBlockBatchResponse {
+  // Existed reports, for each entry in order, that its block was stored
+  // before.
+  repeated bool existed = 1;
+}
+
+// StageRefsRequest names blocks of a stage.
+message StageRefsRequest {
+  // Stage is a stage this connection holds.
+  string stage = 1;
+  // Refs are the blocks.
+  repeated .block.BlockRef refs = 2;
+}
+
+// ReleaseStageRootsResponse reports that the holds are dropped.
+message ReleaseStageRootsResponse {}
+
+// RefsRequest names blocks.
+message RefsRequest {
+  // Refs are the blocks.
+  repeated .block.BlockRef refs = 1;
+}
+
+// MarkRootsCompleteResponse reports that the proofs are recorded.
+message MarkRootsCompleteResponse {}
+
+// RootsCompleteResponse reports a completion proof per block.
+message RootsCompleteResponse {
+  // Complete reports, for each block in order, whether it has a proof.
+  repeated bool complete = 1;
+}

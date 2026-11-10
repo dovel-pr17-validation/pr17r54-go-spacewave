@@ -1,0 +1,142 @@
+package psecho
+
+import (
+	"context"
+	"testing"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+)
+
+func TestFilterLocalExistingBlocksUsesBatchWithoutPayloadReads(t *testing.T) {
+	// Prepare a lookup with two locally available block references.
+	refs := []*block.BlockRef{
+		mustTestBlockRef(t, "first"),
+		mustTestBlockRef(t, "second"),
+		mustTestBlockRef(t, "third"),
+	}
+	lk := &queueTestLookup{found: []bool{true, false, true}}
+
+	// Filter the requested references through the batch existence API.
+	queued, err := filterLocalExistingBlocks(context.Background(), lk, refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the batch selects local blocks without reading their payloads.
+	if lk.existsBatchCalls != 1 {
+		t.Fatalf("exists batch calls = %d, want 1", lk.existsBatchCalls)
+	}
+	if lk.lookupBlockCalls != 0 {
+		t.Fatalf("payload lookup calls = %d, want 0", lk.lookupBlockCalls)
+	}
+	if !lk.localOnly {
+		t.Fatal("existence batch did not use local-only lookup")
+	}
+	if len(queued) != 2 || queued[0] != refs[0] || queued[1] != refs[2] {
+		t.Fatalf("queued refs = %#v, want first and third refs", queued)
+	}
+}
+
+func TestFilterLocalExistingBlocksFallsBackOnBatchError(t *testing.T) {
+	// Prepare a lookup whose batch request fails before individual checks.
+	refs := []*block.BlockRef{
+		mustTestBlockRef(t, "first"),
+		mustTestBlockRef(t, "second"),
+	}
+	lk := &queueTestLookup{
+		batchErr:    errors.New("batch failed"),
+		lookupFound: []bool{false, true},
+	}
+
+	// Filter the requested references through the failed batch and fallback.
+	queued, err := filterLocalExistingBlocks(context.Background(), lk, refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the fallback selects only the individually available block.
+	if lk.existsBatchCalls != 1 {
+		t.Fatalf("exists batch calls = %d, want 1", lk.existsBatchCalls)
+	}
+	if lk.lookupBlockCalls != 2 {
+		t.Fatalf("payload lookup calls = %d, want 2 fallback calls", lk.lookupBlockCalls)
+	}
+	if len(queued) != 1 || queued[0] != refs[1] {
+		t.Fatalf("queued refs = %#v, want second ref", queued)
+	}
+}
+
+func mustTestBlockRef(t *testing.T, data string) *block.BlockRef {
+	t.Helper()
+	ref, err := block.BuildBlockRef([]byte(data), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
+}
+
+type queueTestLookup struct {
+	found            []bool
+	lookupFound      []bool
+	batchErr         error
+	localOnly        bool
+	lookupBlockCalls int
+	existsBatchCalls int
+}
+
+// BeginReadOperation retains the fixture lookup for a bounded read.
+func (l *queueTestLookup) BeginReadOperation(context.Context) (bucket_lookup.Lookup, func(), error) {
+	return l, func() {}, nil
+}
+
+func (l *queueTestLookup) LookupBlock(
+	context.Context,
+	*block.BlockRef,
+	...bucket_lookup.LookupBlockOption,
+) ([]byte, bool, error) {
+	call := l.lookupBlockCalls
+	l.lookupBlockCalls++
+	if call < len(l.lookupFound) {
+		return nil, l.lookupFound[call], nil
+	}
+	return nil, false, nil
+}
+
+// LookupStoredBlock reads the block without refs because this test lookup
+// keeps no ref graph.
+func (l *queueTestLookup) LookupStoredBlock(ctx context.Context, ref *block.BlockRef, opts ...bucket_lookup.LookupBlockOption) (*block.StoredBlock, error) {
+	data, found, err := l.LookupBlock(ctx, ref, opts...)
+	if err != nil || !found {
+		return nil, err
+	}
+	return &block.StoredBlock{Data: data}, nil
+}
+
+func (l *queueTestLookup) LookupBlockExistsBatch(
+	_ context.Context,
+	refs []*block.BlockRef,
+	opts ...bucket_lookup.LookupBlockOption,
+) ([]bool, error) {
+	// Record the batch lookup options and return its configured failure.
+	l.existsBatchCalls++
+	l.localOnly = bucket_lookup.NewLookupBlockOpts(opts...).LocalOnly
+	if l.batchErr != nil {
+		return nil, l.batchErr
+	}
+
+	// Return the configured existence results for the requested references.
+	out := make([]bool, len(refs))
+	copy(out, l.found)
+	return out, nil
+}
+
+func (l *queueTestLookup) PutBlock(
+	context.Context,
+	[]byte,
+	*block.PutOpts,
+) ([]*bucket.ObjectRef, bool, error) {
+	return nil, false, nil
+}

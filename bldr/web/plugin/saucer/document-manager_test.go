@@ -1,0 +1,437 @@
+package saucer
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/pkg/errors"
+	web_runtime "github.com/s4wave/spacewave/bldr/web/runtime"
+	"github.com/sirupsen/logrus"
+)
+
+func TestDocumentManagerDefaultDocumentWaitsForMuxRead(t *testing.T) {
+	// Create a document manager with a bounded default-document wait.
+	dm := newTestDocumentManager()
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), time.Second)
+	defer waitCancel()
+
+	// Wait for the default document before its HTTP mux connects.
+	ready := make(chan struct {
+		docID string
+		err   error
+	}, 1)
+	go func() {
+		docID, err := dm.WaitDefaultDoc(waitCtx)
+		ready <- struct {
+			docID string
+			err   error
+		}{docID: docID, err: err}
+	}()
+
+	// Connect the document HTTP mux and close it when the test finishes.
+	readCtx, readCancel := context.WithCancel(t.Context())
+	readDone := startTestMuxRead(dm, readCtx, "doc-a")
+	defer func() {
+		readCancel()
+		waitForDone(t, readDone, "mux read")
+	}()
+
+	// Verify that mux readiness selects the connected document as default.
+	select {
+	case result := <-ready:
+		if result.err != nil {
+			t.Fatalf("WaitDefaultDoc returned error after mux read connected: %v", result.err)
+		}
+		if result.docID != "doc-a" {
+			t.Fatalf("WaitDefaultDoc returned doc id %q, want doc-a", result.docID)
+		}
+	case <-waitCtx.Done():
+		t.Fatalf("WaitDefaultDoc did not observe mux read readiness: %v", waitCtx.Err())
+	}
+}
+
+func TestDocumentManagerMuxWriteWaitsForMuxRead(t *testing.T) {
+	// Create the document manager for pre-connection POST requests.
+	dm := newTestDocumentManager()
+
+	// Cancel a document POST while its mux connection is unavailable.
+	cancelCtx, cancel := context.WithCancel(t.Context())
+	cancelBody := &countingReader{data: []byte{9}}
+	cancelDone := make(chan struct{}, 1)
+	go func() {
+		req := httptest.NewRequest("POST", "/b/saucer/doc-a/mux", cancelBody).
+			WithContext(cancelCtx)
+		dm.ServeSaucerHTTP(httptest.NewRecorder(), req)
+		cancelDone <- struct{}{}
+	}()
+
+	// Verify cancellation leaves the document POST body unread.
+	cancel()
+	waitForDone(t, cancelDone, "pre-mux canceled POST")
+	if reads := cancelBody.reads.Load(); reads != 0 {
+		t.Fatalf("POST body was read %d times before mux connection", reads)
+	}
+
+	// Observe when the document POST begins waiting for mux readiness.
+	postWaiting := make(chan struct{}, 1)
+	dm.sessions.muxWriteWaitHook = func(docID string) {
+		if docID != "doc-a" {
+			return
+		}
+		select {
+		case postWaiting <- struct{}{}:
+		default:
+		}
+	}
+
+	// Prepare the document POST payload and its cancellation scope.
+	postCtx, postCancel := context.WithCancel(t.Context())
+	defer postCancel()
+	body := []byte{1, 2, 3, 4}
+
+	// Submit the document POST before establishing the mux connection.
+	postDone := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest("POST", "/b/saucer/doc-a/mux", bytes.NewReader(body)).
+			WithContext(postCtx)
+		rw := httptest.NewRecorder()
+		dm.ServeSaucerHTTP(rw, req)
+		postDone <- rw.Code
+	}()
+
+	// Require the document POST to reach its mux readiness wait.
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), time.Second)
+	defer waitCancel()
+	select {
+	case <-postWaiting:
+	case <-waitCtx.Done():
+		t.Fatalf("POST did not reach mux readiness wait: %v", waitCtx.Err())
+	}
+
+	// Connect the document POST transport and wake its readiness waiter.
+	muxCtx, muxCancel := context.WithCancel(t.Context())
+	defer muxCancel()
+	mc := &muxConn{
+		ctx:     muxCtx,
+		cancel:  muxCancel,
+		writeCh: make(chan []byte, 1),
+		flushCh: make(chan []byte, 1),
+	}
+	dm.sessions.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		dm.sessions.docs["doc-a"] = &documentState{
+			id:        "doc-a",
+			connected: true,
+			mc:        mc,
+		}
+		broadcast()
+	})
+
+	// Verify the connected document mux receives the original POST payload.
+	select {
+	case queued := <-mc.writeCh:
+		if !bytes.Equal(queued, body) {
+			t.Fatalf("queued body = %v, want %v", queued, body)
+		}
+	case <-waitCtx.Done():
+		t.Fatalf("POST body did not reach mux writer after connection: %v", waitCtx.Err())
+	}
+
+	// Verify the document POST completes after mux readiness.
+	select {
+	case code := <-postDone:
+		if code != 204 {
+			t.Fatalf("POST status = %d, want 204", code)
+		}
+	case <-waitCtx.Done():
+		t.Fatalf("POST did not complete after mux read connected: %v", waitCtx.Err())
+	}
+}
+
+func TestDocumentManagerDefaultDocAndStatusWatchFollowMuxLifecycle(t *testing.T) {
+	// Watch runtime status from a document manager with no connected muxes.
+	dm := newTestDocumentManager()
+	statusStream := newTestRuntimeStatusStream(t.Context())
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- dm.WatchWebRuntimeStatus(web_runtime.NewWatchWebRuntimeStatusRequest(), statusStream)
+	}()
+
+	// Verify the initial runtime snapshot contains no documents.
+	initial := statusStream.recv(t)
+	if !initial.GetSnapshot() {
+		t.Fatal("initial status is not a snapshot")
+	}
+	if got := len(initial.GetWebDocuments()); got != 0 {
+		t.Fatalf("initial status document count = %d, want 0", got)
+	}
+
+	// Connect the document HTTP mux.
+	readCtx, readCancel := context.WithCancel(t.Context())
+	readDone := startTestMuxRead(dm, readCtx, "doc-a")
+
+	// Verify the connected document becomes the default RPC destination.
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), time.Second)
+	defer waitCancel()
+	docID, err := dm.WaitDefaultDoc(waitCtx)
+	if err != nil {
+		t.Fatalf("wait default doc: %v", err)
+	}
+	if docID != "doc-a" {
+		t.Fatalf("default doc = %q, want doc-a", docID)
+	}
+
+	// Verify the runtime snapshot describes the connected permanent document.
+	connected := statusStream.recvWithDocCount(t, 1)
+	docs := connected.GetWebDocuments()
+	if got := docs[0].GetId(); got != "doc-a" {
+		t.Fatalf("connected status doc id = %q, want doc-a", got)
+	}
+	if !docs[0].GetPermanent() {
+		t.Fatal("connected status doc is not marked permanent")
+	}
+
+	// Disconnect the document mux and wait for its HTTP handler to finish.
+	readCancel()
+	waitForDone(t, readDone, "mux read")
+
+	// Verify the runtime snapshot removes the disconnected document.
+	statusStream.recvWithDocCount(t, 0)
+
+	// Verify cancellation terminates the runtime status watcher.
+	statusStream.cancel()
+	select {
+	case err := <-watchDone:
+		if err == nil {
+			t.Fatal("status watch returned nil after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("status watch did not exit after cancellation")
+	}
+}
+
+func TestDocumentSessionOwnerIgnoresStaleDisconnect(t *testing.T) {
+	// Prepare a document manager and two successive mux connections.
+	dm := newTestDocumentManager()
+	owner := &dm.sessions
+	firstMux := &testMuxedConn{}
+	secondMux := &testMuxedConn{}
+
+	// Connect the first document session without a previous mux.
+	firstGeneration, oldMux := owner.beginMuxReconnect("doc-a")
+	if oldMux != nil {
+		t.Fatal("first reconnect returned old mux")
+	}
+	if !owner.connectMux("doc-a", firstGeneration, firstMux, newTestMuxConn(t.Context())) {
+		t.Fatal("first mux did not connect")
+	}
+
+	// Replace the document session and retain its previous mux for cleanup.
+	secondGeneration, oldMux := owner.beginMuxReconnect("doc-a")
+	if oldMux != firstMux {
+		t.Fatalf("old mux = %#v, want first mux", oldMux)
+	}
+	if !owner.connectMux("doc-a", secondGeneration, secondMux, newTestMuxConn(t.Context())) {
+		t.Fatal("second mux did not connect")
+	}
+
+	// Verify the stale disconnect preserves both muxes and the connected document.
+	owner.disconnectMux(documentSession{docID: "doc-a", generation: firstGeneration})
+	if firstMux.closed.Load() {
+		t.Fatal("stale disconnect closed the old mux returned to the reconnect owner")
+	}
+	if secondMux.closed.Load() {
+		t.Fatal("stale disconnect closed the current mux")
+	}
+	ids := owner.documentIDs()
+	if len(ids) != 1 || ids[0] != "doc-a" {
+		t.Fatalf("connected document ids = %v, want [doc-a]", ids)
+	}
+
+	// Verify the current disconnect closes its mux and removes the document.
+	owner.disconnectMux(documentSession{docID: "doc-a", generation: secondGeneration})
+	if !secondMux.closed.Load() {
+		t.Fatal("current disconnect did not close the current mux")
+	}
+	if ids := owner.documentIDs(); len(ids) != 0 {
+		t.Fatalf("connected document ids after current disconnect = %v, want none", ids)
+	}
+}
+
+func newTestDocumentManager() *DocumentManager {
+	log := logrus.New()
+	log.SetLevel(logrus.PanicLevel)
+	return NewDocumentManager(logrus.NewEntry(log))
+}
+
+func newTestMuxConn(ctx context.Context) *muxConn {
+	muxCtx, muxCancel := context.WithCancel(ctx)
+	return &muxConn{
+		ctx:     muxCtx,
+		cancel:  muxCancel,
+		writeCh: make(chan []byte, 1),
+		flushCh: make(chan []byte, 1),
+	}
+}
+
+func startTestMuxRead(dm *DocumentManager, ctx context.Context, docID string) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest("GET", "/b/saucer/"+docID+"/mux", nil).
+			WithContext(ctx)
+		dm.ServeSaucerHTTP(httptest.NewRecorder(), req)
+	}()
+	return done
+}
+
+func waitForDone(t *testing.T, done <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("%s did not finish", name)
+	}
+}
+
+type testRuntimeStatusStream struct {
+	ctx      context.Context
+	cancelFn context.CancelFunc
+	statuses chan *web_runtime.WebRuntimeStatus
+}
+
+func newTestRuntimeStatusStream(ctx context.Context) *testRuntimeStatusStream {
+	streamCtx, cancel := context.WithCancel(ctx)
+	return &testRuntimeStatusStream{
+		ctx:      streamCtx,
+		cancelFn: cancel,
+		statuses: make(chan *web_runtime.WebRuntimeStatus, 8),
+	}
+}
+
+func (s *testRuntimeStatusStream) recv(t *testing.T) *web_runtime.WebRuntimeStatus {
+	t.Helper()
+	select {
+	case status := <-s.statuses:
+		return status
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for runtime status")
+		return nil
+	}
+}
+
+func (s *testRuntimeStatusStream) recvWithDocCount(t *testing.T, docCount int) *web_runtime.WebRuntimeStatus {
+	// Bound the runtime snapshot wait and retain the last observed status.
+	t.Helper()
+	deadline := time.After(time.Second)
+	var last *web_runtime.WebRuntimeStatus
+
+	// Receive runtime snapshots until the requested document count appears.
+	for {
+		select {
+		case status := <-s.statuses:
+			last = status
+			if len(status.GetWebDocuments()) == docCount {
+				return status
+			}
+		case <-deadline:
+			if last == nil {
+				t.Fatalf("timed out waiting for runtime status with %d docs; no status received", docCount)
+			}
+			t.Fatalf(
+				"timed out waiting for runtime status with %d docs; last had %d docs",
+				docCount,
+				len(last.GetWebDocuments()),
+			)
+		}
+	}
+}
+
+func (s *testRuntimeStatusStream) cancel() {
+	s.cancelFn()
+}
+
+func (s *testRuntimeStatusStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *testRuntimeStatusStream) MsgSend(_ srpc.Message) error {
+	return nil
+}
+
+func (s *testRuntimeStatusStream) MsgRecv(_ srpc.Message) error {
+	return context.Canceled
+}
+
+func (s *testRuntimeStatusStream) CloseSend() error {
+	return nil
+}
+
+func (s *testRuntimeStatusStream) Close() error {
+	s.cancel()
+	return nil
+}
+
+func (s *testRuntimeStatusStream) Send(status *web_runtime.WebRuntimeStatus) error {
+	select {
+	case s.statuses <- status:
+		return nil
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+}
+
+func (s *testRuntimeStatusStream) SendAndClose(status *web_runtime.WebRuntimeStatus) error {
+	if status != nil {
+		if err := s.Send(status); err != nil {
+			return err
+		}
+	}
+	return s.CloseSend()
+}
+
+var _ web_runtime.SRPCWebRuntime_WatchWebRuntimeStatusStream = (*testRuntimeStatusStream)(nil)
+
+type countingReader struct {
+	data  []byte
+	reads atomic.Int32
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	// Record each document POST body read and report exhaustion.
+	r.reads.Add(1)
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+
+	// Copy document POST bytes and retain the unread body.
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+type testMuxedConn struct {
+	closed atomic.Bool
+}
+
+func (c *testMuxedConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func (c *testMuxedConn) IsClosed() bool {
+	return c.closed.Load()
+}
+
+func (c *testMuxedConn) OpenStream(context.Context) (srpc.MuxedStream, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *testMuxedConn) AcceptStream() (srpc.MuxedStream, error) {
+	return nil, errors.New("not implemented")
+}

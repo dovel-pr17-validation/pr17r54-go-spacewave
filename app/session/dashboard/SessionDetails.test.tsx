@@ -1,0 +1,586 @@
+import React, { Suspense } from 'react'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { render, cleanup, fireEvent, screen } from '@testing-library/react'
+
+import {
+  SessionContext,
+  SessionIndexContext,
+  SessionRouteContext,
+} from '@s4wave/web/contexts/contexts.js'
+import type { Session } from '@s4wave/sdk/session/session.js'
+
+import { SessionDetails } from './SessionDetails.js'
+
+const mockNavigate = vi.hoisted(() => vi.fn())
+
+// Mock the promise hook
+vi.mock('@s4wave/web/hooks/usePromise.js', () => ({
+  usePromise: vi.fn(),
+}))
+
+vi.mock('@s4wave/web/command/index.js', () => ({
+  useInvokeCommand: () => vi.fn(),
+}))
+
+// Mock tooltip components to simplify testing
+vi.mock('@s4wave/web/ui/tooltip.js', () => ({
+  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  TooltipContent: () => null,
+}))
+
+// Mock router hooks
+vi.mock('@s4wave/web/router/router.js', async () => {
+  const React = await import('react')
+
+  interface RouterState {
+    path: string
+    onNavigate?: (to: { path: string; replace?: boolean }) => void
+  }
+
+  const RouterContext = React.createContext<RouterState>({ path: '/' })
+
+  const resolvePath = (
+    current: string,
+    to: { path: string; replace?: boolean },
+  ) => {
+    if (to.path.startsWith('/')) return to.path
+    if (!to.path || to.path === '.') return current
+    const parts = current.split('/').filter(Boolean)
+    for (const part of to.path.split('/')) {
+      if (!part || part === '.') continue
+      if (part === '..') {
+        parts.pop()
+        continue
+      }
+      parts.push(part)
+    }
+    return '/' + parts.join('/')
+  }
+
+  return {
+    resolvePath,
+    Router: ({
+      children,
+      path,
+      onNavigate,
+    }: {
+      children?: React.ReactNode
+      path: string
+      onNavigate: (to: { path: string; replace?: boolean }) => void
+    }) => (
+      <RouterContext.Provider value={{ path, onNavigate }}>
+        {children}
+      </RouterContext.Provider>
+    ),
+    Routes: ({
+      children,
+    }: {
+      children?: React.ReactNode
+      fullPath?: boolean
+    }) => {
+      const ctx = React.use(RouterContext)
+      const routes = React.Children.toArray(children).filter(
+        (
+          child,
+        ): child is React.ReactElement<{
+          path: string
+          children?: React.ReactNode
+        }> => React.isValidElement(child),
+      )
+      const match = routes.find((child) => child.props.path === ctx.path)
+      return match?.props.children ?? null
+    },
+    Route: ({ children }: { children?: React.ReactNode; path: string }) => (
+      <>{children}</>
+    ),
+    useNavigate: () => mockNavigate,
+    useParams: () => ({ sessionIndex: '1' }),
+  }
+})
+
+vi.mock('../setup/LinkDeviceWizard.js', () => ({
+  LinkDeviceWizard: ({
+    topLeft,
+  }: {
+    topLeft?: React.ReactNode
+    exitPath?: string
+  }) => (
+    <div>
+      {topLeft}
+      <div>Link Device Wizard</div>
+    </div>
+  ),
+}))
+
+vi.mock('./DeleteSpaceEscapeHatchDialog.js', () => ({
+  DeleteSpaceEscapeHatchDialog: ({
+    open,
+  }: {
+    open: boolean
+    onOpenChange: (open: boolean) => void
+    session: unknown
+  }) => (open ? <div>Delete Space Dialog</div> : null),
+}))
+
+vi.mock('./SessionsSection.js', () => ({
+  SessionsSection: ({
+    onLinkDeviceClick,
+  }: {
+    account: unknown
+    isLocal: boolean
+    open?: boolean
+    onOpenChange?: (open: boolean) => void
+    onLinkDeviceClick?: () => void
+  }) => (
+    <div>
+      <div>Sessions</div>
+      <div
+        role="button"
+        tabIndex={0}
+        data-testid="link-devices-trigger"
+        onClick={onLinkDeviceClick}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            onLinkDeviceClick?.()
+          }
+        }}
+      />
+    </div>
+  ),
+}))
+
+// Mock session list hook
+vi.mock('@s4wave/app/hooks/useSessionList.js', () => ({
+  useSessionList: () => ({
+    value: { sessions: [{ sessionIndex: 1 }, { sessionIndex: 2 }] },
+    loading: false,
+    error: null,
+    retry: vi.fn(),
+  }),
+}))
+
+vi.mock('@s4wave/app/billing/BillingStateProvider.js', () => ({
+  useBillingStateContext: () => ({
+    billingAccountId: undefined,
+    selfServiceAllowed: true,
+    response: null,
+    loading: false,
+  }),
+  useBillingStateContextSafe: () => ({
+    billingAccountId: undefined,
+    selfServiceAllowed: true,
+    response: null,
+    loading: false,
+  }),
+}))
+
+vi.mock('@s4wave/app/billing/BillingSection.js', () => ({
+  BillingSection: ({
+    onNavigateToPath,
+  }: {
+    isLocal: boolean
+    open?: boolean
+    onOpenChange?: (open: boolean) => void
+    onNavigateToPath?: (path: string) => void
+  }) => (
+    <div
+      role="button"
+      tabIndex={0}
+      data-testid="billing-section-manage"
+      onClick={() => onNavigateToPath?.('billing/ba_test')}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          onNavigateToPath?.('billing/ba_test')
+        }
+      }}
+    />
+  ),
+}))
+
+vi.mock('@s4wave/web/hooks/useMountAccount.js', () => ({
+  useMountAccount: () => ({
+    value: { revokeSession: vi.fn(), selfRevokeSession: vi.fn() },
+    loading: false,
+    error: null,
+    retry: vi.fn(),
+  }),
+}))
+
+vi.mock('@s4wave/web/state/persist.js', async (importOriginal) => {
+  const React = await import('react')
+  return {
+    ...(await importOriginal()),
+    useStateNamespace: () => ['session-settings'],
+    useStateAtom: <T,>(_ns: unknown, _key: string, init: T) =>
+      React.useState(init),
+  }
+})
+
+import { usePromise } from '@s4wave/web/hooks/usePromise.js'
+
+const mockUsePromise = usePromise as ReturnType<typeof vi.fn>
+
+describe('SessionDetails', () => {
+  const mockSessionInfo = {
+    peerId: 'test-peer-id-123456',
+    sessionRef: {
+      providerResourceRef: {
+        providerId: 'spacewave',
+        id: 'test-session-id',
+        providerAccountId: 'test-account-id',
+      },
+    },
+  }
+
+  const mockLocalSessionInfo = {
+    ...mockSessionInfo,
+    sessionRef: {
+      providerResourceRef: {
+        providerId: 'local',
+        id: 'test-local-session-id',
+        providerAccountId: 'test-local-account-id',
+      },
+    },
+  }
+
+  const mockSession = {
+    getSessionInfo: vi.fn().mockResolvedValue(mockSessionInfo),
+    resourceRef: {
+      resourceId: 1,
+      released: false,
+    },
+    id: 1,
+    client: {},
+    service: {},
+    createSpace: vi.fn(),
+    watchResourcesList: vi.fn(),
+    mountSharedObject: vi.fn(),
+    localProvider: {
+      watchDisplayName: vi.fn(() => null),
+    },
+  } as unknown as Session
+
+  const mockClipboard = {
+    writeText: vi.fn().mockResolvedValue(undefined),
+  }
+
+  const mockRetry = vi.fn()
+
+  beforeEach(() => {
+    mockNavigate.mockClear()
+    Object.defineProperty(navigator, 'clipboard', {
+      value: mockClipboard,
+      writable: true,
+      configurable: true,
+    })
+    mockClipboard.writeText.mockClear()
+    mockRetry.mockClear()
+    mockUsePromise.mockReturnValue({
+      data: mockSessionInfo,
+      loading: false,
+      error: null,
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  function renderWithContext(
+    component: React.ReactElement,
+    sessionValue: Session = mockSession,
+  ) {
+    return render(
+      <SessionRouteContext.Provider
+        value={{
+          basePath: '/u/1',
+          navigate: mockNavigate,
+        }}
+      >
+        <SessionContext.Provider
+          resource={{
+            value: sessionValue,
+            loading: false,
+            error: null,
+            retry: mockRetry,
+          }}
+        >
+          <SessionIndexContext.Provider value={1}>
+            <Suspense fallback={null}>{component}</Suspense>
+          </SessionIndexContext.Provider>
+        </SessionContext.Provider>
+      </SessionRouteContext.Provider>,
+    )
+  }
+
+  describe('Loading State', () => {
+    it('displays loading state when data is loading', () => {
+      mockUsePromise.mockReturnValue({
+        data: null,
+        loading: true,
+        error: null,
+      })
+      renderWithContext(<SessionDetails />)
+      expect(screen.getByText('Loading session info…')).toBeDefined()
+    })
+  })
+
+  describe('Error State', () => {
+    it('displays error state when there is an error', () => {
+      mockUsePromise.mockReturnValue({
+        data: null,
+        loading: false,
+        error: new Error('Failed to load session'),
+      })
+      renderWithContext(<SessionDetails />)
+      expect(screen.getByText(/Error: Failed to load session/)).toBeDefined()
+    })
+  })
+
+  describe('Rendering', () => {
+    it('renders a human account fallback header with a copyable peer ID affordance', () => {
+      renderWithContext(<SessionDetails />)
+
+      expect(screen.getByText('Account settings')).toBeDefined()
+      expect(screen.getByText('Cloud account')).toBeDefined()
+      expect(screen.queryByText('er-id-123456')).toBeNull()
+
+      const peerIdAffordance = screen
+        .getByText('test-p…d-123456')
+        .closest('span[title]')
+      expect(peerIdAffordance?.getAttribute('title')).toBe(
+        mockSessionInfo.peerId,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Copy session ID' }))
+      expect(mockClipboard.writeText).toHaveBeenCalledWith(
+        mockSessionInfo.peerId,
+      )
+    })
+
+    it('renders the session sync status summary near the top', () => {
+      renderWithContext(<SessionDetails />)
+      expect(screen.getByTestId('session-sync-status-summary')).toBeDefined()
+      expect(screen.getByText('Checking sync status')).toBeDefined()
+    })
+
+    it('handles missing session info gracefully', () => {
+      mockUsePromise.mockReturnValue({
+        data: null,
+        loading: false,
+        error: null,
+      })
+      renderWithContext(<SessionDetails />)
+      expect(screen.getByText('Account settings')).toBeDefined()
+      expect(screen.getByText('Session')).toBeDefined()
+      expect(
+        screen.queryByRole('button', { name: 'Copy session ID' }),
+      ).toBeNull()
+    })
+
+    it('scrolls overflowing settings and hides the cue at the end', () => {
+      const scrollBy = vi.fn()
+      const { container } = renderWithContext(<SessionDetails />)
+      const viewport = container.querySelector<HTMLDivElement>('.overflow-auto')
+      if (!viewport) {
+        throw new Error('settings scroll viewport not found')
+      }
+      Object.defineProperties(viewport, {
+        clientHeight: { value: 400, configurable: true },
+        scrollHeight: { value: 1_000, configurable: true },
+        scrollTop: { value: 0, writable: true, configurable: true },
+        scrollBy: { value: scrollBy, configurable: true },
+      })
+
+      fireEvent.scroll(viewport)
+      fireEvent.click(
+        screen.getByRole('button', {
+          name: 'Scroll down for more settings',
+        }),
+      )
+      expect(scrollBy).toHaveBeenCalledWith({
+        top: 160,
+        behavior: 'smooth',
+      })
+
+      viewport.scrollTop = 600
+      fireEvent.scroll(viewport)
+      expect(
+        screen.queryByRole('button', {
+          name: 'Scroll down for more settings',
+        }),
+      ).toBeNull()
+    })
+  })
+
+  describe('Close Button', () => {
+    it('renders close button when onCloseClick is provided', () => {
+      renderWithContext(<SessionDetails onCloseClick={() => {}} />)
+      const withClose = screen.getAllByRole('button').length
+
+      cleanup()
+
+      renderWithContext(<SessionDetails />)
+      const withoutClose = screen.getAllByRole('button').length
+
+      expect(withClose).toBe(withoutClose + 1)
+    })
+
+    it('calls onCloseClick when close button is clicked', () => {
+      const onCloseClick = vi.fn()
+      renderWithContext(<SessionDetails onCloseClick={onCloseClick} />)
+      const closeButton = screen.getAllByRole('button', { name: '' })[0]
+      expect(closeButton).toBeDefined()
+      fireEvent.click(closeButton)
+      expect(onCloseClick).toHaveBeenCalledTimes(1)
+    })
+
+    it('renders Transfer Sessions inside the Actions section', () => {
+      renderWithContext(<SessionDetails />)
+      const actionsSection = screen.getByText('Actions').closest('section')
+      expect(actionsSection).toBeTruthy()
+      expect(
+        actionsSection?.contains(screen.getByText('Transfer Sessions')),
+      ).toBe(true)
+    })
+  })
+
+  describe('Action Buttons', () => {
+    it('renders all action buttons', () => {
+      renderWithContext(<SessionDetails />)
+      expect(screen.getByText('Change Account')).toBeDefined()
+      expect(screen.getByText('Lock')).toBeDefined()
+      expect(screen.getByText('Logout')).toBeDefined()
+      expect(screen.getByText('Danger Zone')).toBeDefined()
+      expect(screen.queryByText('Delete a Space')).toBeNull()
+    })
+
+    it('keeps the account Command Line action singular', () => {
+      renderWithContext(<SessionDetails />)
+      expect(screen.getAllByText('Command Line')).toHaveLength(1)
+      expect(screen.queryByText('Command Line Setup')).toBeNull()
+      expect(screen.queryByText('Open CLI Terminal')).toBeNull()
+    })
+
+    it('calls onChangeAccountClick when Change Account button is clicked', () => {
+      const onChangeAccountClick = vi.fn()
+      renderWithContext(
+        <SessionDetails onChangeAccountClick={onChangeAccountClick} />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: 'Change Account' }))
+      expect(onChangeAccountClick).toHaveBeenCalledTimes(1)
+    })
+
+    it('confirms before logging out from the header action', () => {
+      renderWithContext(<SessionDetails />)
+
+      const headerLogout = screen
+        .getAllByText('Logout')
+        .find((el) => el.className && el.className.includes('hidden'))
+        ?.closest('button')
+      expect(headerLogout).toBeTruthy()
+      fireEvent.click(headerLogout!)
+
+      expect(screen.getByText('Log out of session?')).toBeDefined()
+      expect(mockNavigate).not.toHaveBeenCalledWith({ path: '/sessions' })
+    })
+
+    it('confirms before logging out from the actions list', () => {
+      renderWithContext(<SessionDetails />)
+
+      fireEvent.click(screen.getByText('Log Out'))
+
+      expect(screen.getByText('Log out of session?')).toBeDefined()
+      expect(mockNavigate).not.toHaveBeenCalledWith({ path: '/sessions' })
+    })
+
+    it('opens the delete-space escape hatch dialog from Actions', () => {
+      renderWithContext(<SessionDetails />)
+
+      fireEvent.click(screen.getByText('Danger Zone'))
+      fireEvent.click(screen.getByText('Delete a Space'))
+
+      expect(screen.getByText('Delete Space Dialog')).toBeDefined()
+    })
+
+    it('closes the overlay before navigating to cloud upgrade', () => {
+      const onCloseClick = vi.fn()
+      mockUsePromise.mockReturnValue({
+        data: mockLocalSessionInfo,
+        loading: false,
+        error: null,
+      })
+      renderWithContext(<SessionDetails onCloseClick={onCloseClick} />)
+
+      fireEvent.click(screen.getByText('Upgrade to Cloud'))
+
+      expect(onCloseClick).toHaveBeenCalledTimes(1)
+      expect(mockNavigate).toHaveBeenCalledWith({ path: 'plan' })
+    })
+
+    it('reveals destructive actions when the danger zone expands', () => {
+      renderWithContext(<SessionDetails />)
+
+      fireEvent.click(screen.getByText('Danger Zone'))
+
+      expect(screen.getByText('Delete a Space')).toBeDefined()
+      expect(screen.getByText('Delete Account')).toBeDefined()
+    })
+  })
+
+  describe('Sections', () => {
+    it('renders Security section', () => {
+      renderWithContext(<SessionDetails />)
+      expect(screen.getByText('Security')).toBeDefined()
+    })
+
+    it('routes linked-device actions inside the panel', async () => {
+      renderWithContext(<SessionDetails />)
+      fireEvent.click(screen.getByTestId('link-devices-trigger'))
+      expect(await screen.findByText('Link Device Wizard')).toBeDefined()
+      expect(screen.queryByText('Identifiers')).toBeNull()
+    })
+
+    it('closes the overlay before navigating to a billing account page', () => {
+      const onCloseClick = vi.fn()
+      renderWithContext(<SessionDetails onCloseClick={onCloseClick} />)
+
+      fireEvent.click(screen.getByTestId('billing-section-manage'))
+
+      expect(onCloseClick).toHaveBeenCalledTimes(1)
+      expect(mockNavigate).toHaveBeenCalledWith({ path: 'billing/ba_test' })
+    })
+  })
+
+  it('does not update state after details unmounts', async () => {
+    // Close the panel before its queued display-name reset runs.
+    renderWithContext(<SessionDetails />)
+    cleanup()
+
+    // React reads window.event when a stale state update requests a lane.
+    const windowValue = window
+    const windowDescriptor = Object.getOwnPropertyDescriptor(
+      globalThis,
+      'window',
+    )!
+    const windowReadStacks: string[] = []
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      get: () => {
+        windowReadStacks.push(new Error().stack ?? '')
+        return windowValue
+      },
+    })
+
+    try {
+      // Let the display-name microtask run after unmount.
+      await Promise.resolve()
+      expect(windowReadStacks).toEqual([])
+    } finally {
+      Object.defineProperty(globalThis, 'window', windowDescriptor)
+    }
+  })
+})

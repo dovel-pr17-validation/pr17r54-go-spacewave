@@ -1,0 +1,286 @@
+package world_block
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	kvtx_block_okra "github.com/s4wave/spacewave/db/kvtx/block/okra"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// ObjectState implements the ObjectState interface attached to block cursor.
+type ObjectState struct {
+	// w owns this object's transaction and change records.
+	w *WorldState
+	// bcs points to the object's metadata in the World index.
+	bcs *block.Cursor
+	// key identifies the object within the World.
+	key string
+}
+
+// NewObjectState constructs a new ObjectState from a block cursor and world state.
+func NewObjectState(ctx context.Context, w *WorldState, bcs *block.Cursor) (*ObjectState, error) {
+	// Unmarshal the object and require a key.
+	s := &ObjectState{w: w, bcs: bcs}
+	obj, err := UnmarshalObject(ctx, bcs)
+	if err != nil {
+		return nil, err
+	}
+	s.key = obj.GetKey()
+	if s.key == "" {
+		return nil, world.ErrEmptyObjectKey
+	}
+	return s, nil
+}
+
+// GetKey returns the key this state object is for.
+func (o *ObjectState) GetKey() string {
+	return o.key
+}
+
+// GetRootRef returns the root reference of the object.
+func (o *ObjectState) GetRootRef(ctx context.Context) (*bucket.ObjectRef, uint64, error) {
+	root, err := o.GetRoot(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	return o.w.externalObjectRef(root.GetRootRef()), root.GetRev(), nil
+}
+
+// AccessWorldState builds a bucket lookup cursor with an optional ref.
+// If the ref is empty, will default to the object RootRef.
+// If the ref Bucket ID is empty, uses the same bucket + volume as the world.
+// The lookup cursor will be released after cb returns.
+func (o *ObjectState) AccessWorldState(
+	ctx context.Context,
+	ref *bucket.ObjectRef,
+	cb func(*bucket_lookup.Cursor) error,
+) error {
+	var err error
+	if ref.GetEmpty() {
+		ref, _, err = o.GetRootRef(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return o.w.AccessWorldState(ctx, ref, cb)
+}
+
+// SetRootRef changes the root reference of the object.
+func (o *ObjectState) SetRootRef(ctx context.Context, nref *bucket.ObjectRef) (uint64, error) {
+	// Validate the new root ref and return the current revision when it is unchanged.
+	if err := nref.Validate(); err != nil {
+		return 0, err
+	}
+	nref = o.w.localObjectRef(nref)
+	root, err := o.GetRoot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if root.GetRootRef().EqualsRef(nref) {
+		// no-op
+		return root.GetRev(), nil
+	}
+
+	// Keep the previous root for the changelog.
+	prevBlk := root.Clone()
+
+	// Clone the root, store the new ref, and advance the revision.
+	root = root.Clone()
+	root.RootRef = nref
+	root.Rev++
+	r := root.Rev
+
+	// Store the updated root.
+	if err := o.setRoot(ctx, root); err != nil {
+		return 0, err
+	}
+
+	// Queue the object-set change and link the current and previous roots.
+	changeBcs, err := o.w.queueWorldChange(ctx, &WorldChange{
+		Key:        o.key,
+		ChangeType: WorldChangeType_WorldChange_OBJECT_SET,
+	})
+	if err != nil {
+		return r, err
+	}
+	if changeBcs != nil {
+		nbcs := o.bcs
+		changeBcs.SetRef(5, nbcs)
+		prevBcs := o.bcs.Detach(false) // clone bcs for previous revision
+		prevBcs.SetBlock(prevBlk, true)
+		changeBcs.SetRef(6, prevBcs)
+	}
+
+	return r, nil
+}
+
+// ApplyObjectOp applies a batch operation at the object level.
+// The handling of the operation is operation-type specific.
+// Returns the revision following the operation execution.
+// If nil is returned for the error, implies success.
+func (o *ObjectState) ApplyObjectOp(
+	rctx context.Context,
+	op world.Operation,
+	opSender peer.ID,
+) (uint64, bool, error) {
+	// Reject an empty operation.
+	if op == nil {
+		return 0, false, world.ErrEmptyOp
+	}
+	if err := world.ValidateOp(op); err != nil {
+		return 0, false, err
+	}
+
+	// Cancel the apply context when the operation returns.
+	ctx, subCtxCancel := context.WithCancel(rctx)
+	defer subCtxCancel()
+
+	// Apply the object operation.
+	sysErr, err := world.ApplyWorldObjectOp(ctx, o.w.le, op, o, opSender)
+	if err != nil {
+		return 0, sysErr, err
+	}
+
+	// Read the revision after the operation.
+	_, rev, err := o.GetRootRef(ctx)
+	if err != nil {
+		return rev, true, err
+	}
+
+	return rev, false, nil
+}
+
+// IncrementRev increments the revision of the object.
+// Returns the new latest revision.
+func (o *ObjectState) IncrementRev(ctx context.Context) (uint64, error) {
+	return o.incrementRev(ctx, true)
+}
+
+// incrementRev increments the object rev optionally adding a changelog entry.
+func (o *ObjectState) incrementRev(ctx context.Context, addToChangelog bool) (uint64, error) {
+	return o.incrementRevBy(ctx, 1, addToChangelog)
+}
+
+// incrementRevBy applies a batch's revision delta with one immutable root copy.
+func (o *ObjectState) incrementRevBy(ctx context.Context, count uint64, addToChangelog bool) (uint64, error) {
+	// Read the root and queue a revision change when requested.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	root, err := o.GetRoot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	nrev := root.Rev + count
+	if addToChangelog {
+		_, err = o.w.queueWorldChange(ctx, &WorldChange{
+			Key:        o.key,
+			ChangeType: WorldChangeType_WorldChange_OBJECT_INC_REV,
+			ObjectRev:  nrev,
+		})
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	// Copy the root and store the new revision.
+	root = root.Clone()
+	root.Rev = nrev
+	if err := o.setRoot(ctx, root); err != nil {
+		return 0, err
+	}
+	return nrev, nil
+}
+
+// setRoot updates both the metadata and its content-derived index entry.
+// IAVL follows mutable cursors directly; Okra must rebuild the entry's hash
+// and page boundaries after its value changes.
+func (o *ObjectState) setRoot(ctx context.Context, root *Object) error {
+	// Write the root block and rebuild a packed index entry.
+	cursor, err := o.getCursor(ctx)
+	if err != nil {
+		return err
+	}
+	cursor.SetBlock(root, true)
+	o.bcs = cursor
+	o.w.markObjectWritten(o.key, cursor)
+	if _, packed := o.w.objTree.(*kvtx_block_okra.Tx); packed {
+		return o.w.objTree.SetCursorAtKey(ctx, []byte(objectKeyPrefix+o.key), cursor, false)
+	}
+	return nil
+}
+
+// WaitRev waits until the object rev is >= the specified.
+// Returns ErrObjectNotFound if the object is deleted.
+// If ignoreNotFound is set, waits for the object to exist.
+// Returns the new rev.
+func (o *ObjectState) WaitRev(
+	ctx context.Context,
+	rev uint64,
+	ignoreNotFound bool,
+) (uint64, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		currSeqno, err := o.w.GetSeqno(ctx)
+		if err != nil {
+			return 0, err
+		}
+
+		_, currRev, err := o.GetRootRef(ctx)
+		if err != nil {
+			if err == world.ErrObjectNotFound && ignoreNotFound {
+				_, err = o.w.WaitSeqno(ctx, currSeqno+1)
+				if err != nil {
+					return 0, err
+				}
+				continue
+			}
+			return 0, err
+		}
+
+		if currRev >= rev {
+			return currRev, nil
+		}
+
+		_, err = o.w.WaitSeqno(ctx, currSeqno+1)
+		if err != nil {
+			return 0, err
+		}
+	}
+}
+
+// GetRoot unmarshals the root from the block cursor.
+func (o *ObjectState) GetRoot(ctx context.Context) (*Object, error) {
+	cursor, err := o.getCursor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return UnmarshalObject(ctx, cursor)
+}
+
+// getCursor resolves replaced packed pages without mutating a read handle.
+func (o *ObjectState) getCursor(ctx context.Context) (*block.Cursor, error) {
+	// Packed writes replace pages. Resolve the current entry so retained handles
+	// see this writer's changes; readonly handles keep their immutable cursor.
+	if _, packed := o.w.objTree.(*kvtx_block_okra.Tx); packed && o.w.write {
+		cursor, err := o.w.objTree.GetCursorAtKey(ctx, []byte(objectKeyPrefix+o.key))
+		if err != nil {
+			return nil, err
+		}
+		if cursor == nil {
+			return nil, world.ErrObjectNotFound
+		}
+		return cursor, nil
+	}
+	return o.bcs, nil
+}
+
+// _ is a type assertion.
+var _ world.ObjectState = (*ObjectState)(nil)

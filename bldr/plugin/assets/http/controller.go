@@ -1,0 +1,50 @@
+package plugin_assets_http
+
+import (
+	"path"
+	"strings"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	unixfs_access_http "github.com/s4wave/spacewave/db/unixfs/access/http"
+)
+
+// ControllerID is the controller ID for the plugin assets HTTP fetcher.
+const ControllerID = "plugin/assets/http"
+
+// Version is the controller version.
+var Version = controller.MustParseVersion("0.0.1")
+
+// Controller responds to LookupHTTPHandler with the plugin Assets FS.
+type Controller = unixfs_access_http.Controller
+
+// NewController constructs a new controller resolving LookupHTTPHandler.
+func NewController(b bus.Bus, cc *Config) *Controller {
+	// Describe the plugin assets HTTP controller.
+	info := controller.NewInfo(
+		ControllerID,
+		Version,
+		"plugin assets http handler",
+	)
+
+	// Normalize the asset and request paths for the filesystem handler.
+	unixfsPathPrefix := strings.TrimPrefix(path.Clean(cc.GetFsPath()), ".")
+	servePath := strings.TrimPrefix(path.Clean(cc.GetServePath()), ".")
+	var matchPathPrefixes []string
+	if servePath != "" {
+		matchPathPrefixes = []string{servePath}
+	}
+
+	return unixfs_access_http.NewController(
+		b,
+		info,
+		matchPathPrefixes,
+		true,
+		nil,
+		bldr_plugin.PluginAssetsFsId(cc.GetPluginId()),
+		unixfsPathPrefix,
+		"",
+		false,
+	)
+}

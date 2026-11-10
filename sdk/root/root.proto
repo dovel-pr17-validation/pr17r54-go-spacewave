@@ -1,0 +1,699 @@
+syntax = "proto3";
+package s4wave.root;
+
+import "github.com/aperturerobotics/go-prometheus-client-lite/client_model/go/metrics.proto";
+import "github.com/s4wave/spacewave/core/changelog/changelog.proto";
+import "github.com/s4wave/spacewave/core/provider/provider.proto";
+import "github.com/s4wave/spacewave/core/session/session.proto";
+import "github.com/s4wave/spacewave/core/space/space.proto";
+import "github.com/s4wave/spacewave/net/hash/hash.proto";
+
+service RootResourceService {
+  rpc MountApp(MountAppRequest) returns (MountAppResponse);
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+  rpc LookupProvider(LookupProviderRequest) returns (LookupProviderResponse);
+
+  rpc MountSession(MountSessionRequest) returns (MountSessionResponse);
+  rpc MountSessionByIdx(MountSessionByIdxRequest) returns (MountSessionByIdxResponse);
+
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
+  rpc WatchAllAccountStatuses(WatchAllAccountStatusesRequest) returns (stream WatchAllAccountStatusesResponse);
+  rpc GetSessionMetadata(GetSessionMetadataRequest) returns (GetSessionMetadataResponse);
+  rpc WatchSessionMetadata(WatchSessionMetadataRequest) returns (stream WatchSessionMetadataResponse);
+  rpc UnlockSession(UnlockSessionByIdxRequest) returns (UnlockSessionByIdxResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+  rpc MoveSession(MoveSessionRequest) returns (MoveSessionResponse);
+  rpc ResetSession(ResetSessionByIdxRequest) returns (ResetSessionByIdxResponse);
+
+  rpc AccessStateAtom(AccessStateAtomRequest) returns (AccessStateAtomResponse);
+  rpc WatchStateAtoms(WatchStateAtomsRequest) returns (stream WatchStateAtomsResponse);
+  rpc ListSpaceRootAliases(ListSpaceRootAliasesRequest) returns (ListSpaceRootAliasesResponse);
+  rpc WatchSpaceRootAliases(WatchSpaceRootAliasesRequest) returns (stream WatchSpaceRootAliasesResponse);
+  rpc UpsertSpaceRootAlias(UpsertSpaceRootAliasRequest) returns (UpsertSpaceRootAliasResponse);
+  rpc RemoveSpaceRootAlias(RemoveSpaceRootAliasRequest) returns (RemoveSpaceRootAliasResponse);
+  rpc WatchSpaceRootRuntime(WatchSpaceRootRuntimeRequest) returns (stream WatchSpaceRootRuntimeResponse);
+
+  rpc MarshalHash(MarshalHashRequest) returns (MarshalHashResponse);
+  rpc ParseHash(ParseHashRequest) returns (ParseHashResponse);
+  rpc HashSum(HashSumRequest) returns (HashSumResponse);
+  rpc HashValidate(HashValidateRequest) returns (HashValidateResponse);
+
+  rpc GetChangelog(GetChangelogRequest) returns (GetChangelogResponse);
+
+  rpc GatherMetrics(GatherMetricsRequest) returns (GatherMetricsResponse);
+
+  rpc GetDebugDb(GetDebugDbRequest) returns (GetDebugDbResponse);
+
+  rpc GetCdn(GetCdnRequest) returns (GetCdnResponse);
+
+  rpc AccessWebListener(AccessWebListenerRequest) returns (AccessWebListenerResponse);
+  rpc WatchWebListeners(WatchWebListenersRequest) returns (stream WatchWebListenersResponse);
+  rpc StopWebListener(StopWebListenerRequest) returns (StopWebListenerResponse);
+
+  rpc WatchListenerYieldPrompts(WatchListenerYieldPromptsRequest) returns (stream WatchListenerYieldPromptsResponse);
+  rpc RespondToListenerYieldPrompt(RespondToListenerYieldPromptRequest) returns (RespondToListenerYieldPromptResponse);
+  rpc WatchRuntimeHandoff(WatchRuntimeHandoffRequest) returns (stream WatchRuntimeHandoffResponse);
+  rpc ReclaimRuntime(ReclaimRuntimeRequest) returns (ReclaimRuntimeResponse);
+
+  rpc WatchListenerStatus(WatchListenerStatusRequest) returns (stream WatchListenerStatusResponse);
+}
+
+// MountAppRequest selects exactly one storage source for a nested installation.
+// The caller retains any supplied World resource until the app is released.
+message MountAppRequest {
+  // StorageId selects an explicitly registered Storage on this runtime.
+  string storage_id = 1;
+  // WorldResourceId selects a caller-owned World Engine Resource.
+  uint32 world_resource_id = 2;
+  // ObjectPrefix separates this installation's named Volumes in the World.
+  // Required with world_resource_id.
+  string object_prefix = 3;
+  // Ephemeral creates a private in-memory World owned by this attachment.
+  bool ephemeral = 4;
+}
+
+// MountAppResponse contains an ordinary ResourceService for the nested app.
+message MountAppResponse {
+  // ResourceId serves the nested runtime's ResourceService.
+  uint32 resource_id = 1;
+  // HttpPathPrefix scopes projected files and exports for the attachment lifetime.
+  string http_path_prefix = 2;
+}
+
+// LookupProviderRequest is the request type for LookupProvider.
+message LookupProviderRequest {
+  // ProviderId is the ID of the provider to lookup.
+  string provider_id = 1;
+}
+
+// LookupProviderResponse is the response type for LookupProvider.
+message LookupProviderResponse {
+  // ResourceId is the ID of the provider resource.
+  uint32 resource_id = 1;
+}
+
+// MountSessionRequest is the request type for MountSession.
+message MountSessionRequest {
+  // SessionRef is the reference to the session to mount.
+  .session.SessionRef session_ref = 1;
+}
+
+// MountSessionResponse is the response type for MountSession.
+message MountSessionResponse {
+  // ResourceId is the ID of the mounted session resource.
+  uint32 resource_id = 1;
+}
+
+// MountSessionByIdxRequest is the request type for MountSessionByIdx.
+message MountSessionByIdxRequest {
+  // SessionIdx is the index of the session to mount.
+  uint32 session_idx = 1;
+}
+
+// MountSessionByIdxResponse is the response type for MountSessionByIdx.
+message MountSessionByIdxResponse {
+  // ResourceId is the ID of the mounted session resource.
+  uint32 resource_id = 1;
+  // SessionRef is the reference to the session.
+  .session.SessionRef session_ref = 2;
+  // NotFound is true if the session was not found.
+  bool not_found = 3;
+}
+
+// ListProvidersRequest is the request type for ListProviders.
+message ListProvidersRequest {}
+
+// ListProvidersResponse is the response type for ListProviders.
+message ListProvidersResponse {
+  // Providers is the list of available providers.
+  repeated .provider.ProviderInfo providers = 1;
+}
+
+// ListSessionsRequest is the request type for ListSessions.
+message ListSessionsRequest {}
+
+// ListSessionsResponse is the response type for ListSessions.
+message ListSessionsResponse {
+  // Sessions is the list of configured sessions.
+  repeated .session.SessionListEntry sessions = 1;
+}
+
+// WatchSessionsRequest is the request type for WatchSessions.
+message WatchSessionsRequest {}
+
+// WatchSessionsResponse is the response type for WatchSessions.
+message WatchSessionsResponse {
+  // Sessions is the current list of configured sessions.
+  repeated .session.SessionListEntry sessions = 1;
+}
+
+// WatchAllAccountStatusesRequest is the request type for WatchAllAccountStatuses.
+message WatchAllAccountStatusesRequest {}
+
+// SessionAccountStatus is the current account status for a session index.
+message SessionAccountStatus {
+  // SessionIdx is the session index.
+  uint32 session_idx = 1;
+  // AccountStatus is the provider account status for the session.
+  .provider.ProviderAccountStatus account_status = 2;
+}
+
+// WatchAllAccountStatusesResponse is the streamed account-status snapshot.
+message WatchAllAccountStatusesResponse {
+  // Statuses contains one account status row per session index.
+  repeated SessionAccountStatus statuses = 1;
+}
+
+// GetSessionMetadataRequest is the request type for GetSessionMetadata.
+message GetSessionMetadataRequest {
+  // SessionIdx is the index of the session.
+  uint32 session_idx = 1;
+}
+
+// GetSessionMetadataResponse is the response type for GetSessionMetadata.
+message GetSessionMetadataResponse {
+  // Metadata is the session metadata.
+  .session.SessionMetadata metadata = 1;
+  // NotFound is true if the session was not found.
+  bool not_found = 2;
+}
+
+// WatchSessionMetadataRequest is the request type for WatchSessionMetadata.
+message WatchSessionMetadataRequest {
+  // SessionIdx is the index of the session.
+  uint32 session_idx = 1;
+}
+
+// WatchSessionMetadataResponse is the response type for WatchSessionMetadata.
+message WatchSessionMetadataResponse {
+  // Metadata is the current session metadata.
+  .session.SessionMetadata metadata = 1;
+  // NotFound is true if the session was not found.
+  bool not_found = 2;
+}
+
+// UnlockSessionByIdxRequest is the request type for UnlockSession.
+message UnlockSessionByIdxRequest {
+  // SessionIdx is the index of the session to unlock.
+  uint32 session_idx = 1;
+  // Pin is the PIN to use for unlocking.
+  bytes pin = 2;
+}
+
+// UnlockSessionByIdxResponse is the response type for UnlockSession.
+message UnlockSessionByIdxResponse {}
+
+// DeleteSessionRequest is the request type for DeleteSession.
+message DeleteSessionRequest {
+  // SessionIdx is the index of the session to delete.
+  uint32 session_idx = 1;
+}
+
+// DeleteSessionResponse is the response type for DeleteSession.
+message DeleteSessionResponse {}
+
+// MoveSessionRequest is the request type for MoveSession.
+message MoveSessionRequest {
+  // FromIdx is the index of the session to move.
+  uint32 from_idx = 1;
+  // ToIdx is the free index the session takes.
+  uint32 to_idx = 2;
+}
+
+// MoveSessionResponse is the response type for MoveSession.
+message MoveSessionResponse {
+  // Session is the moved session's entry at its new index.
+  .session.SessionListEntry session = 1;
+}
+
+// ResetSessionByIdxRequest is the request type for ResetSession.
+message ResetSessionByIdxRequest {
+  // SessionIdx is the index of the session to reset.
+  uint32 session_idx = 1;
+  // Credential authenticates the reset via entity key derivation.
+  .session.EntityCredential credential = 2;
+}
+
+// ResetSessionByIdxResponse is the response type for ResetSession.
+message ResetSessionByIdxResponse {}
+
+// MarshalHashRequest is the request type for MarshalHash.
+message MarshalHashRequest {
+  // Hash is the hash to marshal.
+  .hash.Hash hash = 1;
+}
+
+// MarshalHashResponse is the response type for MarshalHash.
+message MarshalHashResponse {
+  // HashStr is the base58-encoded string representation.
+  string hash_str = 1;
+}
+
+// ParseHashRequest is the request type for ParseHash.
+message ParseHashRequest {
+  // HashStr is the base58-encoded string to parse.
+  string hash_str = 1;
+}
+
+// ParseHashResponse is the response type for ParseHash.
+message ParseHashResponse {
+  // Hash is the parsed hash.
+  .hash.Hash hash = 1;
+}
+
+// HashSumRequest is the request type for HashSum.
+message HashSumRequest {
+  // HashType is the hash type to use.
+  .hash.HashType hash_type = 1;
+  // Data is the data to hash.
+  bytes data = 2;
+}
+
+// HashSumResponse is the response type for HashSum.
+message HashSumResponse {
+  // Hash is the computed hash.
+  .hash.Hash hash = 1;
+}
+
+// HashValidateRequest is the request type for HashValidate.
+message HashValidateRequest {
+  // Hash is the hash to validate.
+  .hash.Hash hash = 1;
+}
+
+// HashValidateResponse is the response type for HashValidate.
+message HashValidateResponse {
+  // Valid is true if the hash is valid.
+  bool valid = 1;
+  // Error contains the validation error message if not valid.
+  string error = 2;
+}
+
+// AccessStateAtomRequest is the request for AccessStateAtom.
+message AccessStateAtomRequest {
+  // StoreId is the identifier for the state store.
+  // If empty, uses the default "ui-state" store.
+  string store_id = 1;
+}
+
+// AccessStateAtomResponse is the response for AccessStateAtom.
+message AccessStateAtomResponse {
+  // ResourceId is the ID of the state atom resource.
+  uint32 resource_id = 1;
+}
+
+// WatchStateAtomsRequest is the request for WatchStateAtoms.
+message WatchStateAtomsRequest {}
+
+// WatchStateAtomsResponse is the response for WatchStateAtoms.
+message WatchStateAtomsResponse {
+  // StoreIds is the current list of known root state atom store ids.
+  repeated string store_ids = 1;
+  // StoreCount is the total number of known root state atom stores.
+  uint32 store_count = 2;
+}
+
+// SpaceRootKind is the storage shape selected for a configured root.
+enum SpaceRootKind {
+  // SpaceRootKind_UNSPECIFIED is invalid for persisted records.
+  SpaceRootKind_UNSPECIFIED = 0;
+  // SpaceRootKind_NATIVE_DIRECTORY is a native filesystem state-root directory.
+  SpaceRootKind_NATIVE_DIRECTORY = 1;
+  // SpaceRootKind_S4WAVE_FILE selects an existing native volume in a state root.
+  SpaceRootKind_S4WAVE_FILE = 2;
+}
+
+// SpaceRootOpenMode is the user action used to create the registry entry.
+enum SpaceRootOpenMode {
+  // SpaceRootOpenMode_UNSPECIFIED is invalid for persisted records.
+  SpaceRootOpenMode_UNSPECIFIED = 0;
+  // SpaceRootOpenMode_OPEN_EXISTING opens an existing state root.
+  SpaceRootOpenMode_OPEN_EXISTING = 1;
+  // SpaceRootOpenMode_CREATE is deferred for this registry version.
+  SpaceRootOpenMode_CREATE = 2;
+}
+
+// SpaceRootStatus is the latest local validation status for a configured root.
+enum SpaceRootStatus {
+  // SpaceRootStatus_UNKNOWN means no validation has run in this process.
+  SpaceRootStatus_UNKNOWN = 0;
+  // SpaceRootStatus_READY means the root is supported and currently accessible.
+  SpaceRootStatus_READY = 1;
+  // SpaceRootStatus_MISSING means the native path no longer exists.
+  SpaceRootStatus_MISSING = 2;
+  // SpaceRootStatus_UNSUPPORTED means the record shape is known but unsupported.
+  SpaceRootStatus_UNSUPPORTED = 3;
+  // SpaceRootStatus_INVALID means the record is malformed or not a state root.
+  SpaceRootStatus_INVALID = 4;
+}
+
+// NativeSpaceRootMetadata stores native filesystem fields for a root record.
+message NativeSpaceRootMetadata {
+  // Path is the absolute native filesystem path.
+  string path = 1;
+}
+
+// BrowserSpaceRootMetadata reserves browser-grant fields for future support.
+message BrowserSpaceRootMetadata {
+  // Reserved is an intentionally empty extension point for browser handles.
+  reserved 1 to 15;
+}
+
+// SpaceRootAliasRecord is a durable configured local state-root registry entry.
+message SpaceRootAliasRecord {
+  // AliasId is the stable registry identity.
+  string alias_id = 1;
+  // DisplayName is the user-facing name for the configured root.
+  string display_name = 2;
+  // Kind is the storage shape for this record.
+  SpaceRootKind kind = 3;
+  // OpenMode is the explicit user action that created this record.
+  SpaceRootOpenMode open_mode = 4;
+  // Native stores native filesystem metadata.
+  NativeSpaceRootMetadata native = 5;
+  // Status is the latest validation status.
+  SpaceRootStatus status = 6;
+  // StatusMessage is a user-actionable validation message when not ready.
+  string status_message = 7;
+  // Browser reserves future browser-grant metadata.
+  BrowserSpaceRootMetadata browser = 8;
+  // CreatedAtUnixMs is when the alias was first persisted.
+  int64 created_at_unix_ms = 9;
+  // UpdatedAtUnixMs is when the alias was last updated.
+  int64 updated_at_unix_ms = 10;
+}
+
+// ListSpaceRootAliasesRequest is the request for ListSpaceRootAliases.
+message ListSpaceRootAliasesRequest {}
+
+// ListSpaceRootAliasesResponse is the configured root registry snapshot.
+message ListSpaceRootAliasesResponse {
+  // Records is the sorted configured root alias snapshot.
+  repeated SpaceRootAliasRecord records = 1;
+}
+
+// WatchSpaceRootAliasesRequest is the request for WatchSpaceRootAliases.
+message WatchSpaceRootAliasesRequest {}
+
+// WatchSpaceRootAliasesResponse is the current configured root registry snapshot.
+message WatchSpaceRootAliasesResponse {
+  // Records is the sorted configured root alias snapshot.
+  repeated SpaceRootAliasRecord records = 1;
+}
+
+// UpsertSpaceRootAliasRequest writes or updates a configured root alias.
+message UpsertSpaceRootAliasRequest {
+  // Record is the configured root alias record to validate and persist.
+  SpaceRootAliasRecord record = 1;
+}
+
+// UpsertSpaceRootAliasResponse returns the persisted record.
+message UpsertSpaceRootAliasResponse {
+  // Record is the validated persisted record.
+  SpaceRootAliasRecord record = 1;
+}
+
+// RemoveSpaceRootAliasRequest removes a configured root alias.
+message RemoveSpaceRootAliasRequest {
+  // AliasId is the stable registry identity to remove.
+  string alias_id = 1;
+}
+
+// RemoveSpaceRootAliasResponse is returned after a remove attempt.
+message RemoveSpaceRootAliasResponse {
+  // NotFound is true when AliasId was not present.
+  bool not_found = 1;
+}
+
+// SpaceRootRuntimeStatus is the connection status for a configured root daemon.
+enum SpaceRootRuntimeStatus {
+  // SpaceRootRuntimeStatus_IDLE means no runtime source is selected.
+  SpaceRootRuntimeStatus_IDLE = 0;
+  // SpaceRootRuntimeStatus_CONNECTING means the app is dialing the daemon.
+  SpaceRootRuntimeStatus_CONNECTING = 1;
+  // SpaceRootRuntimeStatus_STARTING means the app is starting the daemon.
+  SpaceRootRuntimeStatus_STARTING = 2;
+  // SpaceRootRuntimeStatus_READY means sessions are served from the root daemon.
+  SpaceRootRuntimeStatus_READY = 3;
+  // SpaceRootRuntimeStatus_ERROR means the runtime source is unavailable.
+  SpaceRootRuntimeStatus_ERROR = 4;
+}
+
+// WatchSpaceRootRuntimeRequest selects a configured root runtime source.
+message WatchSpaceRootRuntimeRequest {
+  // AliasId is the configured root alias to use.
+  string alias_id = 1;
+  // Autostart starts a daemon when no daemon is reachable.
+  bool autostart = 2;
+}
+
+// WatchSpaceRootRuntimeResponse streams the selected root daemon state.
+message WatchSpaceRootRuntimeResponse {
+  // Status is the current selected-root daemon status.
+  SpaceRootRuntimeStatus status = 1;
+  // AliasId is the configured root alias being used.
+  string alias_id = 2;
+  // StatePath is the absolute configured root path.
+  string state_path = 3;
+  // SocketPath is the selected daemon socket path.
+  string socket_path = 4;
+  // Sessions is the session snapshot from the selected root daemon.
+  repeated .session.SessionListEntry sessions = 5;
+  // Error is a user-actionable status message when status is ERROR.
+  string error = 6;
+  // RuntimeSessions are enriched sessions from the selected root daemon.
+  repeated SpaceRootRuntimeSession runtime_sessions = 7;
+}
+
+// SpaceRootRuntimeSession describes one selected-root session and its spaces.
+message SpaceRootRuntimeSession {
+  // Session is the raw session list entry.
+  .session.SessionListEntry session = 1;
+  // Metadata is stored display metadata for the session.
+  .session.SessionMetadata metadata = 2;
+  // Spaces are the first resources-list snapshot for the mounted session.
+  repeated .space.SpaceSoListEntry spaces = 3;
+  // Error is set when this session could not be enriched.
+  string error = 4;
+}
+
+// GetChangelogRequest is the request type for GetChangelog.
+message GetChangelogRequest {}
+
+// GetChangelogResponse is the response type for GetChangelog.
+message GetChangelogResponse {
+  // changelog is the application changelog.
+  .changelog.Changelog changelog = 1;
+}
+
+// GatherMetricsRequest is the request type for GatherMetrics.
+message GatherMetricsRequest {}
+
+// GatherMetricsResponse is the response type for GatherMetrics.
+message GatherMetricsResponse {
+  // MetricFamilies are the families of the core process's metrics registry,
+  // sorted by name.
+  repeated .io.prometheus.client.MetricFamily metric_families = 1;
+}
+
+// GetDebugDbRequest is the request type for GetDebugDb.
+message GetDebugDbRequest {}
+
+// GetDebugDbResponse is the response type for GetDebugDb.
+message GetDebugDbResponse {
+  // ResourceId is the ID of the debug database resource.
+  uint32 resource_id = 1;
+}
+
+// GetCdnRequest is the request type for GetCdn.
+message GetCdnRequest {
+  // CdnId selects the CDN instance. Empty selects the default CDN. Unknown
+  // ids cause GetCdn to fail with an ErrUnknownCdn-wrapped error so callers
+  // can distinguish misconfigured ids from transport errors.
+  string cdn_id = 1;
+}
+
+// GetCdnResponse is the response type for GetCdn.
+message GetCdnResponse {
+  // ResourceId is the client resource id of the mounted CdnResource.
+  uint32 resource_id = 1;
+  // CdnSpaceId is the CDN Space ULID for the selected instance. Returned in
+  // the same round-trip so callers do not need a follow-up RPC.
+  string cdn_space_id = 2;
+}
+
+// AccessWebListenerRequest is the request type for AccessWebListener.
+message AccessWebListenerRequest {
+  // ListenMultiaddr is the requested listener bind address. Empty defaults to
+  // /ip4/127.0.0.1/tcp/0.
+  string listen_multiaddr = 1;
+  // Background keeps the listener in the daemon registry after the CLI exits.
+  bool background = 2;
+  // SpaceId binds the listener to one Space. A bound listener serves a
+  // read-only Resource service at /_spacewave/resource limited to this Space
+  // in session session_idx. Empty serves no Resource service.
+  string space_id = 3;
+  // SessionIdx is the session holding space_id. Required with space_id.
+  uint32 session_idx = 4;
+  // Full serves the native app over the daemon's whole Resource service at
+  // /_spacewave/resource, with the same access as the daemon socket. It
+  // excludes space_id.
+  bool full = 5;
+}
+
+// AccessWebListenerResponse is the response type for AccessWebListener.
+message AccessWebListenerResponse {
+  // ResourceId is the client-owned listener resource id for foreground mode.
+  uint32 resource_id = 1;
+  // ListenerId is the daemon-local identifier for this listener.
+  string listener_id = 2;
+  // ListenMultiaddr is the resolved listener multiaddr including actual port.
+  string listen_multiaddr = 3;
+  // Url is the localhost URL the user should open.
+  string url = 4;
+  // BootstrapSecret is the single-use bootstrap secret for the printed URL.
+  string bootstrap_secret = 5;
+  // Reused is true when a background port-0 listener was reused.
+  bool reused = 6;
+}
+
+// WatchWebListenersRequest is the request type for WatchWebListeners.
+message WatchWebListenersRequest {}
+
+// WebListenerInfo describes a daemon-owned web listener.
+message WebListenerInfo {
+  // ListenerId is the daemon-local identifier for this listener.
+  string listener_id = 1;
+  // ListenMultiaddr is the resolved listener multiaddr including actual port.
+  string listen_multiaddr = 2;
+  // Url is the localhost URL served by the listener.
+  string url = 3;
+  // Background is true when the listener is daemon-owned.
+  bool background = 4;
+  // SpaceId is the Space the listener is bound to, or empty.
+  string space_id = 5;
+  // SessionIdx is the session of the bound Space, or zero.
+  uint32 session_idx = 6;
+  // Full is true when the listener serves the whole Resource service.
+  bool full = 7;
+}
+
+// WatchWebListenersResponse is the response type for WatchWebListeners.
+message WatchWebListenersResponse {
+  // Listeners is the active daemon-owned web listeners.
+  repeated WebListenerInfo listeners = 1;
+}
+
+// StopWebListenerRequest is the request type for StopWebListener.
+message StopWebListenerRequest {
+  // ListenerId is the daemon-local identifier for the listener to stop.
+  string listener_id = 1;
+}
+
+// StopWebListenerResponse is the response type for StopWebListener.
+message StopWebListenerResponse {
+  // NotFound is true when no daemon-owned listener had ListenerId.
+  bool not_found = 1;
+}
+
+// ListenerYieldPrompt describes a pending takeover prompt surfaced to
+// the desktop app's active window so the user can allow or deny a
+// remote runtime's request to take over the shared Unix socket.
+message ListenerYieldPrompt {
+  // PromptId is the broker-assigned identifier used to resolve the
+  // prompt via RespondToListenerYieldPrompt.
+  string prompt_id = 1;
+  // RequesterName is the human-readable name of the requesting
+  // runtime, typically "spacewave serve".
+  string requester_name = 2;
+  // SocketPath is the Unix socket path the requester wants to bind.
+  string socket_path = 3;
+  // DeadlineUnixMs is the auto-deny deadline in unix milliseconds.
+  int64 deadline_unix_ms = 4;
+}
+
+// WatchListenerYieldPromptsRequest is the request type for
+// WatchListenerYieldPrompts.
+message WatchListenerYieldPromptsRequest {}
+
+// WatchListenerYieldPromptsResponse is streamed whenever the pending
+// prompt list changes. Subscribers render whichever prompt is first
+// in the list (there is at most one at a time under current policy).
+message WatchListenerYieldPromptsResponse {
+  // Prompts is the current set of pending prompts awaiting response.
+  repeated ListenerYieldPrompt prompts = 1;
+}
+
+// RespondToListenerYieldPromptRequest carries the user's decision.
+message RespondToListenerYieldPromptRequest {
+  // PromptId identifies the prompt being resolved.
+  string prompt_id = 1;
+  // Allow is true when the user approves the takeover request.
+  bool allow = 2;
+}
+
+// RespondToListenerYieldPromptResponse is the response type for
+// RespondToListenerYieldPrompt.
+message RespondToListenerYieldPromptResponse {
+  // NotFound is true when the prompt id is unknown (e.g. already
+  // resolved or timed out).
+  bool not_found = 1;
+}
+
+// RuntimeHandoffState describes the current runtime-handoff snapshot.
+message RuntimeHandoffState {
+  // Active is true when the desktop listener has yielded the socket
+  // and is waiting for the user to reclaim the runtime.
+  bool active = 1;
+  // RequesterName is the name of the runtime that took over.
+  string requester_name = 2;
+  // SocketPath is the socket path that was yielded.
+  string socket_path = 3;
+  // SinceUnixMs is when the handoff started in unix milliseconds.
+  int64 since_unix_ms = 4;
+}
+
+// WatchRuntimeHandoffRequest is the request type for
+// WatchRuntimeHandoff.
+message WatchRuntimeHandoffRequest {}
+
+// WatchRuntimeHandoffResponse is streamed whenever the handoff state
+// changes.
+message WatchRuntimeHandoffResponse {
+  // State is the current handoff snapshot.
+  RuntimeHandoffState state = 1;
+}
+
+// ReclaimRuntimeRequest is the request type for ReclaimRuntime.
+message ReclaimRuntimeRequest {}
+
+// ReclaimRuntimeResponse is the response type for ReclaimRuntime.
+message ReclaimRuntimeResponse {
+  // Reclaimed is true when the reclaim signal was fired. False when
+  // there was no active handoff to reclaim from.
+  bool reclaimed = 1;
+}
+
+// WatchListenerStatusRequest is the request type for WatchListenerStatus.
+message WatchListenerStatusRequest {}
+
+// WatchListenerStatusResponse streams the effective desktop resource
+// listener socket path, whether the listener is currently bound, and
+// the count of connected resource clients. The UI subscribes via
+// useWatchStateRpc to render a live status chip on the session-local
+// command-line setup page.
+message WatchListenerStatusResponse {
+  // SocketPath is the effective absolute path of the listener socket.
+  // Populated once the listener controller resolves the configured
+  // path, before the first bind attempt.
+  string socket_path = 1;
+  // Listening is true when the listener currently has an open Unix
+  // socket accepting connections. False during startup before the
+  // first bind, during reclaim-wait when the runtime is handed off,
+  // and during teardown.
+  bool listening = 2;
+  // ConnectedClients is the count of clients currently connected to
+  // the listener socket. Updates on accept and on client disconnect.
+  uint32 connected_clients = 3;
+}

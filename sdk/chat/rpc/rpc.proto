@@ -1,0 +1,266 @@
+syntax = "proto3";
+package spacewave.chat.rpc;
+
+import "google/protobuf/timestamp.proto";
+import "github.com/s4wave/spacewave/sdk/chat/content/content.proto";
+import "github.com/s4wave/spacewave/sdk/chat/state/state.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/chat/rpc;spacewave_chat_rpc";
+
+// ChatResourceService serves authorized operations for one chat channel.
+service ChatResourceService {
+  // GetChannelInfo returns channel metadata and its retained history extent.
+  rpc GetChannelInfo(GetChannelInfoRequest) returns (GetChannelInfoResponse);
+  // WatchChannelInfo streams channel metadata, then again after each change.
+  rpc WatchChannelInfo(WatchChannelInfoRequest) returns (stream WatchChannelInfoResponse);
+  // GetState returns the latest retained event for each channel state identity.
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+  // GetMessage returns one message from this channel by object key.
+  rpc GetMessage(GetMessageRequest) returns (GetMessageResponse);
+  // ListMessages returns a bounded page of channel history.
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+  // ListThreads returns activity-ordered native thread summaries.
+  rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
+  // WatchMessages streams channel messages after each shared-state change.
+  rpc WatchMessages(WatchMessagesRequest) returns (stream WatchMessagesResponse);
+  // SendMessage appends one message or resolves an identical retry.
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  // AttachEnvelope gives a message without an envelope its wire form in another
+  // protocol. It never replaces an envelope the message already holds.
+  rpc AttachEnvelope(AttachEnvelopeRequest) returns (AttachEnvelopeResponse);
+  // GetReadPositions returns the channel's shared per-person read positions.
+  rpc GetReadPositions(GetReadPositionsRequest) returns (GetReadPositionsResponse);
+  // UpdateReadPosition advances only the authenticated person's read position.
+  rpc UpdateReadPosition(UpdateReadPositionRequest) returns (UpdateReadPositionResponse);
+}
+
+// GetStateRequest selects current state for the mounted channel.
+message GetStateRequest {
+}
+
+// GetStateResponse contains current state events with their immutable history identities.
+message GetStateResponse {
+  // Messages is ordered by state type and state key.
+  repeated ChatMessageInfo messages = 1;
+}
+
+// ChatMessageInfo contains flattened message info for the client.
+message ChatMessageInfo {
+  // ObjectKey is the message world object key.
+  string object_key = 1;
+  // SenderPeerId is the sender's peer ID.
+  string sender_peer_id = 2;
+  // Text is plaintext content or a readable state-change summary.
+  // Empty for ciphertext messages and annotations.
+  string text = 3;
+  // CreatedAt is the message creation timestamp.
+  .google.protobuf.Timestamp created_at = 4;
+  // ReplyToKey is the key of the message being replied to.
+  string reply_to_key = 5;
+  // Index is the zero-based position in the channel history as this replica
+  // has replayed it. A write from another member that settles earlier in the
+  // history moves later messages to higher indexes, so object_key identifies a
+  // message and an index holds only until the history order changes.
+  uint64 index = 6;
+  // Content is the full typed message content, including ciphertext envelopes.
+  .spacewave.chat.ChatMessageContent content = 7;
+  // PersonId is the accepted entity ID or local-only device ID.
+  string person_id = 8;
+  // RedactedByKey is the redaction message that removed this body, empty while intact.
+  string redacted_by_key = 9;
+  // ReplacesKey is the state message this state change replaced, empty for the first of its identity.
+  string replaces_key = 10;
+  // Author is the agent or tool that sent the message for its person, empty
+  // when the person sent it.
+  string author = 11;
+  // Envelope is the exact wire form of a message another protocol originated.
+  .spacewave.chat.ChatEnvelope envelope = 12;
+}
+
+// GetChannelInfoRequest is a request for channel info.
+message GetChannelInfoRequest {
+}
+
+// GetChannelInfoResponse contains channel metadata.
+message GetChannelInfoResponse {
+  // Name is the channel name.
+  string name = 1;
+  // Topic is the channel topic.
+  string topic = 2;
+  // MessageCount is the number of messages retained in channel history.
+  uint64 message_count = 3;
+  // CreatedAt is the channel creation timestamp.
+  .google.protobuf.Timestamp created_at = 4;
+  // CreatorPeerId is the peer identity that created the channel.
+  string creator_peer_id = 5;
+  // EncryptionAlgorithm reports the channel encryption policy. Empty allows plaintext;
+  // otherwise message bodies require this algorithm. State and annotations remain public.
+  string encryption_algorithm = 6;
+}
+
+// WatchChannelInfoRequest is a request to stream channel info.
+message WatchChannelInfoRequest {
+}
+
+// WatchChannelInfoResponse contains the current channel metadata.
+message WatchChannelInfoResponse {
+  // Info contains the channel metadata as of a shared-state change.
+  GetChannelInfoResponse info = 1;
+}
+
+// GetMessageRequest identifies one channel message to read.
+message GetMessageRequest {
+  // MessageKey is the channel-scoped object key to read.
+  string message_key = 1;
+}
+
+// GetMessageResponse contains the selected channel message.
+message GetMessageResponse {
+  // Message is the selected message projection, unset when the key names no
+  // message.
+  ChatMessageInfo message = 1;
+}
+
+// ListMessagesRequest is a request for paginated messages.
+message ListMessagesRequest {
+  // BeforeKey returns messages before this key (for pagination).
+  string before_key = 1;
+  // Limit is the maximum number of messages to return.
+  uint32 limit = 2;
+  // BeforeIndex selects an exclusive upper bound for backwards pagination.
+  optional uint64 before_index = 3;
+  // FromIndex selects an inclusive lower bound for forwards pagination.
+  optional uint64 from_index = 4;
+}
+
+// ListMessagesResponse contains a page of messages.
+message ListMessagesResponse {
+  // Messages is the list of messages.
+  repeated ChatMessageInfo messages = 1;
+  // HasMore indicates more messages exist in the selected pagination direction.
+  bool has_more = 2;
+}
+
+// ListThreadsRequest selects an activity-ordered thread page.
+message ListThreadsRequest {
+  // BeforeIndex resumes after the thread whose latest reply has this history index.
+  optional uint64 before_index = 1;
+  // Limit is the maximum number of matching threads to return.
+  uint32 limit = 2;
+  // ParticipatedOnly selects threads with a reply by the authenticated person.
+  bool participated_only = 3;
+}
+
+// ChatThreadInfo projects one native thread summary.
+message ChatThreadInfo {
+  // Root is the retained thread-root message.
+  ChatMessageInfo root = 1;
+  // LatestReply is the newest canonical thread reply.
+  ChatMessageInfo latest_reply = 2;
+  // ReplyCount is the number of canonical thread replies.
+  uint64 reply_count = 3;
+  // CurrentUserParticipated reports whether the authenticated person wrote a reply.
+  bool current_user_participated = 4;
+}
+
+// ListThreadsResponse contains one bounded thread page.
+message ListThreadsResponse {
+  // Threads is ordered from most to least recent activity.
+  repeated ChatThreadInfo threads = 1;
+  // NextBeforeIndex resumes after the last summary examined by this page.
+  optional uint64 next_before_index = 2;
+}
+
+// WatchMessagesRequest is a request to stream messages.
+message WatchMessagesRequest {
+}
+
+// WatchMessagesResponse contains a batch of new messages.
+message WatchMessagesResponse {
+  // Messages is the list of new messages since last response.
+  repeated ChatMessageInfo messages = 1;
+}
+
+// SendMessageRequest is a request to send a message.
+message SendMessageRequest {
+  // Text is the message text.
+  string text = 1;
+  // ReplyToKey is the optional key of the message to reply to.
+  string reply_to_key = 2;
+  // TransactionId identifies a retryable send within the authenticated sender
+  // and channel. By default, differing content is rejected; empty always appends.
+  string transaction_id = 3;
+  // Content is the typed message content. When set, it is persisted as given
+  // and the legacy text field is rejected if also supplied.
+  .spacewave.chat.ChatMessageContent content = 4;
+  // ExpectedStateMessageKey requires the current state event to have this key.
+  // An empty value requires absent state; omission makes the write unconditional.
+  // Only state changes accept this condition. Accepted transaction retries retain
+  // their original result even when current state has since changed.
+  optional string expected_state_message_key = 5;
+  // ReuseAcceptedTransaction returns the original message for a valid retry
+  // even when its content or reply differs. The authenticated author must still
+  // match. It has no effect when TransactionId is empty.
+  bool reuse_accepted_transaction = 6;
+  // Author names the agent or tool sending for the authenticated person. It
+  // must be a DNS label or empty, and a retry must repeat it.
+  string author = 7;
+  // Envelope stores a message another protocol originated. Its ID selects the
+  // message key in place of TransactionId, so a repeated envelope returns the
+  // accepted message.
+  .spacewave.chat.ChatEnvelope envelope = 8;
+}
+
+// SendMessageResponse is the response after sending a message.
+message SendMessageResponse {
+  // MessageKey is the object key of the created message. It is empty when
+  // expected_state_message_key no longer names the current state.
+  string message_key = 1;
+}
+
+// AttachEnvelopeRequest attaches an envelope to a message of the channel.
+message AttachEnvelopeRequest {
+  // MessageKey identifies the message.
+  string message_key = 1;
+  // Envelope is the message's wire form. Its ID must not name another message's
+  // envelope key.
+  .spacewave.chat.ChatEnvelope envelope = 2;
+}
+
+// AttachEnvelopeResponse returns the envelope the message holds.
+message AttachEnvelopeResponse {
+  // Envelope is the requested envelope, or the one an earlier attach or send
+  // gave the message. A redacted message holds the redacted data.
+  .spacewave.chat.ChatEnvelope envelope = 1;
+}
+
+// GetReadPositionsRequest selects shared receipt state for the mounted channel.
+message GetReadPositionsRequest {
+}
+
+// GetReadPositionsResponse reports the canonical read positions for this channel.
+message GetReadPositionsResponse {
+  // Positions maps each accepted person, and each author reading for one, to its
+  // monotonic read position. The key is the person ID, followed by "." and the
+  // author when there is one.
+  map<string, .spacewave.chat.ChatReadPosition> positions = 1;
+}
+
+// UpdateReadPositionRequest advances the person already authenticated by the host.
+message UpdateReadPositionRequest {
+  // NextIndex is the first unread index, bounded by the channel's message count.
+  uint64 next_index = 1;
+  // ThreadRootKey limits the position to one timeline when present: a thread
+  // root message key selects that thread, and the empty key the main timeline.
+  optional string thread_root_key = 2;
+  // Author names the agent or tool reading for the authenticated person. It
+  // selects that author's own position, so an author never moves the person's.
+  // It must be a DNS label or empty.
+  string author = 3;
+}
+
+// UpdateReadPositionResponse reports the retained position, including unchanged retries.
+message UpdateReadPositionResponse {
+  // Position is the authenticated person's current shared read position.
+  .spacewave.chat.ChatReadPosition position = 1;
+}

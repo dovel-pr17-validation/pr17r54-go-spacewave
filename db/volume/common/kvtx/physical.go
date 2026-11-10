@@ -1,0 +1,236 @@
+package kvtx
+
+import (
+	"context"
+	"slices"
+	"sync"
+
+	"github.com/s4wave/spacewave/db/block"
+	block_gc "github.com/s4wave/spacewave/db/block/gc"
+	block_store_kvtx "github.com/s4wave/spacewave/db/block/store/kvtx"
+	"github.com/s4wave/spacewave/db/kvtx"
+)
+
+// BlockDomain is a key-value store that keeps blocks beside its records, such
+// as payloads in a log, and serves them through its transactions. Each write
+// transaction implements BlockTx.
+type BlockDomain interface {
+	kvtx.Store
+	// GetBlockStore returns the block store outside any transaction.
+	GetBlockStore() block.StoreOps
+	// Maintenance reclaims space the removed blocks held.
+	Maintenance(ctx context.Context) error
+}
+
+// BlockTx is a write transaction of a BlockDomain. Its block puts and removes
+// commit and discard with its records.
+type BlockTx interface {
+	kvtx.Tx
+	// GetBlockStore returns the transaction's block store.
+	GetBlockStore() block.StoreOps
+	// WroteBlocks reports whether the transaction put or removed a block.
+	WroteBlocks() bool
+}
+
+// physicalTx is one write transaction of the Volume's store with the block
+// store and liveness records that commit and discard with it.
+type physicalTx struct {
+	// tx is the store transaction. Write through store or rec instead: wrote
+	// sees only their writes, so a direct transaction whose only writes went
+	// to tx ends without a commit and loses them.
+	tx kvtx.Tx
+	// store wraps tx and records whether a record changed.
+	store *kvtx.TxStore
+	// blocks serves the blocks in tx and records the blocks tx removes.
+	blocks *txBlocks
+	// rec are the liveness records in tx.
+	rec *block_gc.Records
+}
+
+// openPhysical opens a write transaction of the Volume's store. A BlockDomain
+// serves the blocks through the transaction; any other store keeps them as
+// records. The caller discards tx.
+func (v *Volume) openPhysical(ctx context.Context) (*physicalTx, error) {
+	// Open the transaction and its record view.
+	tx, err := v.kvtxStore.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	p := &physicalTx{tx: tx, store: kvtx.NewTxStore(tx)}
+	recTx, err := p.store.NewTransaction(ctx, true)
+	if err != nil {
+		tx.Discard()
+		return nil, err
+	}
+	p.rec = block_gc.NewRecords(recTx, livenessPrefix)
+
+	// Serve blocks from the domain's transaction, or as records. Either view
+	// reads tx's uncommitted writes, so neither marks reads durable.
+	var blocks block.StoreOps
+	if btx, ok := tx.(BlockTx); ok {
+		blocks = btx.GetBlockStore()
+	} else {
+		blocks = block_store_kvtx.NewKVTxBlock(v.kvKey, p.store, v.GetHashType(), v.atomicHashGet)
+	}
+	p.blocks = &txBlocks{
+		StoreOps: blocks,
+		marks:    &txMarks{store: p.store, kvKey: v.kvKey},
+	}
+	return p, nil
+}
+
+// discard ends the transaction, then reports the blocks it removed to the
+// decoded-block cache. Callers defer it, so a committed transaction reports
+// its removals after the commit; a discarded one reports removals that never
+// happened, which costs only misses.
+func (p *physicalTx) discard() {
+	p.tx.Discard()
+	for _, ref := range p.blocks.take() {
+		block.InvalidateRemovedBlock(ref)
+	}
+}
+
+// txBlocks serves a physical transaction's blocks. It refuses to store a block
+// without its references, as requireRefsKnown describes, marks the blocks of
+// the writes that asked, and records each block the transaction removes: the
+// sweeps, the block passes, the deferred edits and the publication tombstones
+// all remove through it.
+type txBlocks struct {
+	block.StoreOps
+	// marks marks stored blocks in the transaction.
+	marks *txMarks
+	// mtx guards removed.
+	mtx sync.Mutex
+	// removed lists the removed blocks.
+	removed []*block.BlockRef
+}
+
+// RmBlock records and removes the block.
+func (r *txBlocks) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	r.record(ref)
+	return r.StoreOps.RmBlock(ctx, ref)
+}
+
+// PutBlock refuses a block without its child list, writes the block and
+// marks it, also when it existed, for a write that asked for marking.
+func (r *txBlocks) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (*block.BlockRef, bool, error) {
+	// Refuse a block without its child list, then write it.
+	if err := requireRefKnown(data, opts); err != nil {
+		return nil, false, err
+	}
+	ref, existed, err := r.StoreOps.PutBlock(ctx, data, opts)
+	if err != nil || ref.GetEmpty() {
+		return ref, existed, err
+	}
+
+	// Mark the block in this transaction.
+	err = r.marks.mark(ctx, []kvtx.BlockMark{{Hash: ref.GetHash(), Size: int64(len(data))}})
+	return ref, existed, err
+}
+
+// PutBlockBatch refuses a batch holding a block without its child list,
+// then records the batch's tombstones, writes the batch and marks its blocks,
+// also those that existed, for a write that asked for marking.
+func (r *txBlocks) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	// Refuse a block without its child list.
+	if err := requireRefsKnown(entries); err != nil {
+		return nil, err
+	}
+
+	// Record the tombstones and collect the blocks to mark.
+	var marks []kvtx.BlockMark
+	asked := kvtx.GetBlockMarkRequest(ctx) != nil
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		if entry.Tombstone {
+			r.record(entry.Ref)
+			continue
+		}
+		if asked && !entry.Ref.GetEmpty() {
+			marks = append(marks, kvtx.BlockMark{Hash: entry.Ref.GetHash(), Size: int64(len(entry.Data))})
+		}
+	}
+
+	// Write the batch, then mark its blocks in this transaction.
+	existed, err := r.putStored(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	return existed, r.marks.mark(ctx, marks)
+}
+
+// putStored writes the entries whose bytes the Volume stores and reports, for
+// each entry, whether its bytes were stored before. An external entry writes
+// nothing: its bytes stay in the caller's store, and it reports whether the
+// Volume held them anyway.
+func (r *txBlocks) putStored(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	// Split the external entries from the ones the store writes.
+	var stored []*block.PutBatchEntry
+	var external []*block.BlockRef
+	for _, entry := range entries {
+		if entry != nil && entry.External && !entry.Tombstone {
+			external = append(external, entry.Ref)
+			continue
+		}
+		stored = append(stored, entry)
+	}
+	if len(external) == 0 {
+		return r.StoreOps.PutBlockBatch(ctx, entries)
+	}
+
+	// Write the stored entries and read the external ones' presence.
+	storedExisted, err := r.StoreOps.PutBlockBatch(ctx, stored)
+	if err != nil {
+		return nil, err
+	}
+	externalExisted, err := r.GetBlockExistsBatch(ctx, external)
+	if err != nil {
+		return nil, err
+	}
+
+	// Report the results in the entries' order.
+	existed := make([]bool, len(entries))
+	var si, ei int
+	for i, entry := range entries {
+		if entry != nil && entry.External && !entry.Tombstone {
+			existed[i] = externalExisted[ei]
+			ei++
+			continue
+		}
+		existed[i] = storedExisted[si]
+		si++
+	}
+	return existed, nil
+}
+
+// record appends ref to the removed blocks.
+func (r *txBlocks) record(ref *block.BlockRef) {
+	r.mtx.Lock()
+	r.removed = append(r.removed, ref)
+	r.mtx.Unlock()
+}
+
+// removedRefs returns a copy of the removed blocks.
+func (r *txBlocks) removedRefs() []*block.BlockRef {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	return slices.Clone(r.removed)
+}
+
+// take returns and clears the removed blocks.
+func (r *txBlocks) take() []*block.BlockRef {
+	// Swap the list out under the lock.
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	removed := r.removed
+	r.removed = nil
+	return removed
+}
+
+// wrote reports whether the transaction changed a record or a block.
+func (p *physicalTx) wrote() bool {
+	btx, ok := p.tx.(BlockTx)
+	return p.store.Wrote() || (ok && btx.WroteBlocks())
+}

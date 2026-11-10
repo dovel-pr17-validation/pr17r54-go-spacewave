@@ -1,0 +1,56 @@
+package blockenc
+
+import "sync"
+
+// AllocFn allocates a buffer for use.
+// The cap of the slice must be at least n.
+// This can be backed by an in-memory arena.
+type AllocFn func(n int) []byte
+
+// DefaultAllocFn constructs the default allocate func.
+func DefaultAllocFn() AllocFn {
+	return func(n int) []byte {
+		return make([]byte, n)
+	}
+}
+
+// CheckAllocFn wraps an alloc function to check the result.
+// If the result is invalid, allocates a new buf in memory.
+func CheckAllocFn(allocFn AllocFn) AllocFn {
+	return func(n int) []byte {
+		v := allocFn(n)
+		if cap(v) < n {
+			return make([]byte, n)
+		}
+		if len(v) != n {
+			v = v[:n]
+		}
+		return v
+	}
+}
+
+// NewPoolAlloc constructs a new pool alloc fn.
+// call relBuf with the buffer when done.
+// don't read or write to the buffer after calling relBuf.
+func NewPoolAlloc() (allocFn AllocFn, relBuf func(b []byte)) {
+	pool := sync.Pool{}
+	defAlloc := DefaultAllocFn()
+	return func(n int) []byte {
+			if gv := pool.Get(); gv != nil {
+				out := *gv.(*[]byte)
+				if cap(out) >= n {
+					return out[:n]
+				}
+				// Too small for this request: drop it rather than
+				// draining the pool of buffers other callers can use.
+			}
+			return defAlloc(n)
+		}, func(b []byte) {
+			if cap(b) != 0 {
+				// scrub entire buffer before returning it to the pool
+				b = b[:cap(b)]
+				clear(b)
+				pool.Put(&b)
+			}
+		}
+}

@@ -1,0 +1,147 @@
+//go:build !js
+
+package devtool
+
+import (
+	"context"
+	"io"
+	"os"
+	"os/exec"
+	"syscall"
+	"time"
+
+	"github.com/sirupsen/logrus"
+)
+
+const cliSubprocessKillTimeout = 3 * time.Second
+
+// cliSubprocessSupervisor runs the devtool CLI subprocess and owns its
+// lifetime: start, wait, and graceful-then-forced termination.
+type cliSubprocessSupervisor struct {
+	ctx        context.Context
+	le         *logrus.Entry
+	binaryPath string
+	args       []string
+
+	killTimeout time.Duration
+	cmd         *exec.Cmd
+	stderr      io.Closer
+	done        chan error
+}
+
+// newCliSubprocessSupervisor constructs a supervisor for the given binary
+// and args.
+func newCliSubprocessSupervisor(
+	ctx context.Context,
+	le *logrus.Entry,
+	binaryPath string,
+	args []string,
+) *cliSubprocessSupervisor {
+	return &cliSubprocessSupervisor{
+		ctx:         ctx,
+		le:          le,
+		binaryPath:  binaryPath,
+		args:        args,
+		killTimeout: cliSubprocessKillTimeout,
+	}
+}
+
+// start launches the CLI subprocess.
+func (s *cliSubprocessSupervisor) start() error {
+	// Refuse to start after the supervisor context is canceled.
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+
+	// The supervisor launches the devtool-configured CLI binary with its own
+	// configured arguments, not caller-supplied input.
+	cmd := exec.Command(s.binaryPath, s.args...) //nolint:gosec // G204: binary path and args are devtool-owned config
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = s.newStderrWriter()
+	return s.startCommand(cmd)
+}
+
+// startCommand starts the command and records it as the supervised
+// process.
+func (s *cliSubprocessSupervisor) startCommand(cmd *exec.Cmd) error {
+	// Start the process and close the stderr writer if it fails.
+	if err := cmd.Start(); err != nil {
+		s.closeStderr()
+		return err
+	}
+
+	// Record the process and relay its exit through the done channel.
+	s.cmd = cmd
+	s.done = make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		s.closeStderr()
+		s.done <- err
+	}()
+	return nil
+}
+
+// wait returns the channel delivering the subprocess exit error.
+func (s *cliSubprocessSupervisor) wait() <-chan error {
+	return s.done
+}
+
+// terminate stops the subprocess, escalating to kill after the kill
+// timeout.
+func (s *cliSubprocessSupervisor) terminate() error {
+	return s.terminateAfter(s.killTimeout)
+}
+
+// terminateAfter signals the subprocess and escalates to kill once the
+// timeout expires.
+func (s *cliSubprocessSupervisor) terminateAfter(timeout time.Duration) error {
+	// Nothing to terminate when no process is running.
+	if s.cmd == nil || s.cmd.Process == nil {
+		return nil
+	}
+
+	// Signal the process to terminate and bound the wait with a timer.
+	_ = s.cmd.Process.Signal(syscall.SIGTERM)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	// Return the exit error, killing the process when the timer expires.
+	select {
+	case err := <-s.done:
+		return err
+	case <-timer.C:
+		_ = s.cmd.Process.Kill()
+		return <-s.done
+	}
+}
+
+// newStderrWriter returns a logrus-backed writer for the subprocess
+// stderr.
+func (s *cliSubprocessSupervisor) newStderrWriter() io.Writer {
+	stderr := s.le.WriterLevel(logrus.DebugLevel)
+	s.stderr = stderr
+	return stderr
+}
+
+// closeStderr closes the subprocess stderr writer.
+func (s *cliSubprocessSupervisor) closeStderr() {
+	if s.stderr != nil {
+		_ = s.stderr.Close()
+		s.stderr = nil
+	}
+}
+
+// exitWithChildCode propagates a CLI subprocess exit to the devtool process.
+// It returns nil for success and a non-ExitError unchanged, but for an
+// *exec.ExitError it terminates the process via os.Exit with the child's exit
+// code and does not return, so the devtool exit status mirrors the child.
+func exitWithChildCode(err error) error {
+	if err == nil {
+		return nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		os.Exit(exitErr.ExitCode())
+	}
+	return err
+}

@@ -1,0 +1,322 @@
+package release
+
+import (
+	"strings"
+	"testing"
+
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+func TestReleaseMetadataRoundTrip(t *testing.T) {
+	// Seed the release metadata table with one valid content reference.
+	ref := testBlockRef()
+
+	// Exercise every release record type with marshal/unmarshal functions.
+	tests := []struct {
+		name      string
+		marshal   func() ([]byte, error)
+		unmarshal func([]byte) error
+		equal     func() bool
+	}{
+		{
+			name:      "channel directory",
+			marshal:   func() ([]byte, error) { return testChannelDirectory(ref).MarshalVT() },
+			unmarshal: func(data []byte) error { return (&ChannelDirectory{}).UnmarshalVT(data) },
+			equal: func() bool {
+				// Create the channel directory record that the round trip compares.
+				msg := testChannelDirectory(ref)
+				data, err := msg.MarshalVT()
+				if err != nil {
+					t.Fatalf("MarshalVT() error = %v", err)
+				}
+
+				// Decode the serialized channel directory record.
+				got := &ChannelDirectory{}
+				if err := got.UnmarshalVT(data); err != nil {
+					t.Fatalf("UnmarshalVT() error = %v", err)
+				}
+
+				// Compare the decoded channel directory with its source record.
+				return msg.EqualVT(got)
+			},
+		},
+		{
+			name:      "release metadata",
+			marshal:   func() ([]byte, error) { return testReleaseMetadata(ref).MarshalVT() },
+			unmarshal: func(data []byte) error { return (&ReleaseMetadata{}).UnmarshalVT(data) },
+			equal: func() bool {
+				// Create the release metadata record that the round trip compares.
+				msg := testReleaseMetadata(ref)
+				data, err := msg.MarshalVT()
+				if err != nil {
+					t.Fatalf("MarshalVT() error = %v", err)
+				}
+
+				// Decode the serialized release metadata record.
+				got := &ReleaseMetadata{}
+				if err := got.UnmarshalVT(data); err != nil {
+					t.Fatalf("UnmarshalVT() error = %v", err)
+				}
+
+				// Compare the decoded release metadata with its source record.
+				return msg.EqualVT(got)
+			},
+		},
+		{
+			name:      "browser shell metadata",
+			marshal:   func() ([]byte, error) { return testBrowserShellMetadata(ref).MarshalVT() },
+			unmarshal: func(data []byte) error { return (&BrowserShellMetadata{}).UnmarshalVT(data) },
+			equal: func() bool {
+				// Create the browser shell record that the round trip compares.
+				msg := testBrowserShellMetadata(ref)
+				data, err := msg.MarshalVT()
+				if err != nil {
+					t.Fatalf("MarshalVT() error = %v", err)
+				}
+
+				// Decode the serialized browser shell record.
+				got := &BrowserShellMetadata{}
+				if err := got.UnmarshalVT(data); err != nil {
+					t.Fatalf("UnmarshalVT() error = %v", err)
+				}
+
+				// Compare the decoded browser shell with its source record.
+				return msg.EqualVT(got)
+			},
+		},
+		{
+			name:      "browser asset",
+			marshal:   func() ([]byte, error) { return testBrowserAsset(ref).MarshalVT() },
+			unmarshal: func(data []byte) error { return (&BrowserAsset{}).UnmarshalVT(data) },
+			equal: func() bool {
+				// Create the browser asset record that the round trip compares.
+				msg := testBrowserAsset(ref)
+				data, err := msg.MarshalVT()
+				if err != nil {
+					t.Fatalf("MarshalVT() error = %v", err)
+				}
+
+				// Decode the serialized browser asset record.
+				got := &BrowserAsset{}
+				if err := got.UnmarshalVT(data); err != nil {
+					t.Fatalf("UnmarshalVT() error = %v", err)
+				}
+
+				// Compare the decoded browser asset with its source record.
+				return msg.EqualVT(got)
+			},
+		},
+		{
+			name:      "update notification",
+			marshal:   func() ([]byte, error) { return testUpdateNotification().MarshalVT() },
+			unmarshal: func(data []byte) error { return (&UpdateNotification{}).UnmarshalVT(data) },
+			equal: func() bool {
+				// Create the update notification record that the round trip compares.
+				msg := testUpdateNotification()
+				data, err := msg.MarshalVT()
+				if err != nil {
+					t.Fatalf("MarshalVT() error = %v", err)
+				}
+
+				// Decode the serialized update notification record.
+				got := &UpdateNotification{}
+				if err := got.UnmarshalVT(data); err != nil {
+					t.Fatalf("UnmarshalVT() error = %v", err)
+				}
+
+				// Compare the decoded notification with its source record.
+				return msg.EqualVT(got)
+			},
+		},
+	}
+
+	// Run each release record through its protobuf round-trip contract.
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Serialize the current release record.
+			data, err := tt.marshal()
+			if err != nil {
+				t.Fatalf("MarshalVT() error = %v", err)
+			}
+
+			// Decode the serialized release record into its typed message.
+			if err := tt.unmarshal(data); err != nil {
+				t.Fatalf("UnmarshalVT() error = %v", err)
+			}
+
+			// Require the decoded record to equal its source value.
+			if !tt.equal() {
+				t.Fatalf("protobuf round trip changed message")
+			}
+		})
+	}
+}
+
+func TestReleaseMetadataValidation(t *testing.T) {
+	// Seed validation cases with a valid release content reference.
+	ref := testBlockRef()
+
+	// Cover invalid release metadata references and missing records.
+	tests := []struct {
+		name    string
+		err     error
+		wantErr string
+	}{
+		{
+			name:    "channel directory nil ref",
+			err:     (&ChannelDirectory{Channels: []*ChannelEntry{{ChannelKey: "stable"}}}).Validate(),
+			wantErr: "invalid release metadata ref",
+		},
+		{
+			name:    "channel directory empty ref",
+			err:     testChannelDirectory(&block.BlockRef{}).Validate(),
+			wantErr: "invalid release metadata ref",
+		},
+		{
+			name: "missing release metadata",
+			err: testChannelDirectory(ref).ValidateReleaseMetadataRefs(func(*block.BlockRef) bool {
+				return false
+			}),
+			wantErr: "missing release metadata",
+		},
+		{
+			name: "missing bldr manifest refs",
+			err: (&ReleaseMetadata{
+				ProjectId:    "spacewave",
+				ChannelKey:   "stable",
+				Version:      "0.1.0",
+				BrowserShell: testBrowserShellMetadata(ref),
+			}).Validate(),
+			wantErr: "no bldr manifest refs",
+		},
+	}
+
+	// Require every invalid metadata case to return its expected error.
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Confirm the invalid release record is rejected.
+			if tt.err == nil {
+				t.Fatalf("expected error")
+			}
+
+			// Check that validation identifies the expected failure.
+			if !strings.Contains(tt.err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, tt.err)
+			}
+		})
+	}
+
+	// Confirm valid release records and channel references are accepted.
+	valid := []struct {
+		name string
+		err  error
+	}{
+		{name: "channel directory", err: testChannelDirectory(ref).Validate()},
+		{name: "channel refs", err: testChannelDirectory(ref).ValidateReleaseMetadataRefs(func(*block.BlockRef) bool { return true })},
+		{name: "release metadata", err: testReleaseMetadata(ref).Validate()},
+		{name: "browser shell metadata", err: testBrowserShellMetadata(ref).Validate()},
+		{name: "browser shell metadata without wasm", err: testBrowserShellMetadataWithoutWasm(ref).Validate()},
+		{name: "browser asset", err: testBrowserAsset(ref).Validate()},
+		{name: "browser asset without content ref", err: testBrowserAsset(nil).Validate()},
+		{name: "browser asset with empty content ref", err: testBrowserAsset(&block.BlockRef{}).Validate()},
+		{name: "update notification", err: testUpdateNotification().Validate()},
+	}
+
+	// Accept each valid release record and channel reference.
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			// Require the valid release record to pass validation.
+			if tt.err != nil {
+				t.Fatalf("Validate() error = %v", tt.err)
+			}
+		})
+	}
+}
+
+func testChannelDirectory(ref *block.BlockRef) *ChannelDirectory {
+	return &ChannelDirectory{
+		Channels: []*ChannelEntry{{
+			ChannelKey:         "stable",
+			ReleaseMetadataRef: ref,
+		}},
+	}
+}
+
+func testReleaseMetadata(ref *block.BlockRef) *ReleaseMetadata {
+	return &ReleaseMetadata{
+		ProjectId:              "spacewave",
+		Rev:                    1,
+		Version:                "0.1.0",
+		ChannelKey:             "stable",
+		ManifestRefs:           []*bldr_manifest.ManifestRef{testManifestRef(ref)},
+		BrowserShell:           testBrowserShellMetadata(ref),
+		MinimumLauncherVersion: "0.1.0",
+	}
+}
+
+func testManifestRef(ref *block.BlockRef) *bldr_manifest.ManifestRef {
+	return &bldr_manifest.ManifestRef{
+		Meta: &bldr_manifest.ManifestMeta{
+			ManifestId: "spacewave-web",
+			BuildType:  "production",
+			PlatformId: "js",
+			Rev:        1,
+		},
+		ManifestRef: &bucket.ObjectRef{RootRef: ref},
+	}
+}
+
+func testBrowserShellMetadata(ref *block.BlockRef) *BrowserShellMetadata {
+	return &BrowserShellMetadata{
+		Version:           "0.1.0",
+		GenerationId:      "gen-1",
+		EntrypointPath:    "/b/entrypoint/boot.mjs",
+		ServiceWorkerPath: "/b/entrypoint/sw.js",
+		SharedWorkerPath:  "/b/entrypoint/shared-worker.js",
+		WasmPath:          "/b/entrypoint/spacewave.wasm",
+		Assets:            []*BrowserAsset{testBrowserAsset(ref)},
+	}
+}
+
+func testBrowserShellMetadataWithoutWasm(ref *block.BlockRef) *BrowserShellMetadata {
+	msg := testBrowserShellMetadata(ref)
+	msg.WasmPath = ""
+	return msg
+}
+
+func testBrowserAsset(ref *block.BlockRef) *BrowserAsset {
+	return &BrowserAsset{
+		Path:         "/b/entrypoint/boot.mjs",
+		ContentRef:   ref,
+		Size:         1,
+		Sha256:       testSHA256(),
+		ContentType:  "text/javascript",
+		CacheControl: "public, max-age=31536000, immutable",
+	}
+}
+
+func testUpdateNotification() *UpdateNotification {
+	return &UpdateNotification{
+		ChannelKey:       "stable",
+		CheckpointHeight: 1,
+		RootPointerUrl:   "https://example.invalid/root.packedmsg",
+	}
+}
+
+func testBlockRef() *block.BlockRef {
+	return &block.BlockRef{
+		Hash: &hash.Hash{
+			HashType: hash.HashType_HashType_SHA256,
+			Hash:     testSHA256(),
+		},
+	}
+}
+
+func testSHA256() []byte {
+	out := make([]byte, 32)
+	out[0] = 1
+	return out
+}

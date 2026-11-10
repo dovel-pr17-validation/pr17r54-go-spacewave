@@ -1,0 +1,37 @@
+syntax = "proto3";
+package plugin.space;
+
+// Config configures the Space Plugin Controller.
+// Loads plugins and resolves FetchManifest directives by watching the Space
+// world.
+message Config {
+  // SpaceId is the Space identifier.
+  string space_id = 1;
+  reserved 2;
+  // VolumeId is the volume ID for the PlatformAccount object store.
+  // If empty, uses the default bldr plugin volume.
+  string volume_id = 3;
+  // ObjectStoreId is the object store ID within the volume.
+  // If empty, uses "platform-account".
+  string object_store_id = 4;
+  // EngineId is the Hydra engine ID for watching the Space world.
+  // Required for FetchManifest resolution.
+  string engine_id = 5;
+  // ObjectKeys is the list of object keys to collect manifests from.
+  // If empty, manifests are collected from every manifest store.
+  repeated string object_keys = 6;
+  // SessionPeerId is the base58-encoded peer ID of the local session.
+  // Used by ObjectType factories that need session-scoped behavior
+  // (e.g., ForgeWorkerFactory checks if this session should run the worker).
+  string session_peer_id = 7;
+  // WorldBucketId is the bucket ID backing the mounted Space world.
+  // If set, the controller forwards this block store to the plugin host.
+  string world_bucket_id = 8;
+  // HostPluginId is the plugin ID of the host that mounts this Space.
+  // Required when world_bucket_id is set so the forwarded block store
+  // configset registers under the correct plugin service prefix.
+  string host_plugin_id = 9;
+  // HostStorageId selects the parent runtime Storage for every child plugin.
+  // Empty preserves the ordinary platform storage selection.
+  string host_storage_id = 10;
+}

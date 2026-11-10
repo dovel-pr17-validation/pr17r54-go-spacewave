@@ -1,0 +1,207 @@
+package plugin_space
+
+import (
+	"context"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	controllerbus_core "github.com/aperturerobotics/controllerbus/core"
+	"github.com/aperturerobotics/controllerbus/directive"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	"github.com/sirupsen/logrus"
+)
+
+const sourceManifestID = "cold-plugin"
+
+// sourceManifestController serves sourceManifestID and records each start and
+// release of the parent demand. The bus may run the resolver more than once.
+type sourceManifestController struct {
+	started  chan struct{}
+	released chan struct{}
+}
+
+func newSourceManifestController() *sourceManifestController {
+	return &sourceManifestController{
+		started:  make(chan struct{}, 8),
+		released: make(chan struct{}, 8),
+	}
+}
+
+func (c *sourceManifestController) GetControllerInfo() *controller.Info {
+	return controller.NewInfo("test/manifest-source", controller.MustParseVersion("0.0.1"), "serves a cold manifest")
+}
+
+func (c *sourceManifestController) Execute(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (c *sourceManifestController) Close() error { return nil }
+
+func (c *sourceManifestController) HandleDirective(
+	_ context.Context,
+	inst directive.Instance,
+) ([]directive.Resolver, error) {
+	dir, ok := inst.GetDirective().(bldr_manifest.FetchManifest)
+	if !ok || dir.GetManifestId() != sourceManifestID {
+		return nil, nil
+	}
+	return directive.R(directive.NewFuncResolver(func(ctx context.Context, handler directive.ResolverHandler) error {
+		// Signal the test that the source demand started and record release.
+		c.started <- struct{}{}
+		defer func() { c.released <- struct{}{} }()
+
+		// Publish the manifest value until the directive context ends.
+		_, _ = handler.AddValue(&bldr_manifest.FetchManifestValue{ManifestRefs: []*bldr_manifest.ManifestRef{{}}})
+		handler.MarkIdle(true)
+		<-ctx.Done()
+		return ctx.Err()
+	}), nil)
+}
+
+func TestFetchManifestSourceRequiresSpaceApproval(t *testing.T) {
+	// Bound the test and build the parent bus with the source controller.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	parent, _, err := controllerbus_core.NewCoreBus(ctx, logrus.NewEntry(logrus.New()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := newSourceManifestController()
+	parentRef, err := parent.AddController(ctx, source, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parentRef()
+
+	// Start the child Space controller with the parent as manifest source.
+	child, resolver, err := controllerbus_core.NewCoreBus(ctx, logrus.NewEntry(logrus.New()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.AddFactory(NewFactory(child, WithManifestSource(parent)))
+	ctrl, _, ctrlRef, err := StartControllerWithConfig(ctx, child, &Config{EngineId: "test-engine"}, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlRef.Release()
+
+	// The Space World resolver never idles without a World engine, so watch
+	// values as they arrive.
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
+	values := make(chan []*bldr_manifest.ManifestRef, 2)
+	_, release, err := bus.ExecCollectValuesWatch[*bldr_manifest.FetchManifestValue](
+		watchCtx,
+		child,
+		bldr_manifest.NewFetchManifest(sourceManifestID, nil, nil, 0),
+		false,
+		func(_ []error, vals []*bldr_manifest.FetchManifestValue) error {
+			refs := make([]*bldr_manifest.ManifestRef, 0)
+			for _, val := range vals {
+				refs = append(refs, val.GetManifestRefs()...)
+			}
+			select {
+			case values <- refs:
+			default:
+			}
+			return nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	// Assert the unapproved manifest did not demand the parent source.
+	select {
+	case <-source.started:
+		t.Fatal("unapproved manifest fetched from parent")
+	default:
+	}
+
+	// Approve the manifest and wait for it to resolve from the parent.
+	setSourcePluginIDs(ctrl, []string{sourceManifestID})
+	for {
+		select {
+		case refs := <-values:
+			if len(refs) == 1 {
+				goto resolved
+			}
+		case <-ctx.Done():
+			t.Fatal("approved manifest did not resolve from parent")
+		}
+	}
+
+	// After the manifest resolved, assert the parent source demand started.
+resolved:
+	select {
+	case <-source.started:
+	case <-ctx.Done():
+		t.Fatal("approved manifest did not demand the parent source")
+	}
+
+	// Remove the approval and assert the parent demand releases.
+	setSourcePluginIDs(ctrl, nil)
+	select {
+	case <-source.released:
+	case <-ctx.Done():
+		t.Fatal("removing approval did not release parent manifest demand")
+	}
+}
+
+func setSourcePluginIDs(c *Controller, ids []string) {
+	// Publish the SpaceSettings plugin IDs and wake the watchers.
+	c.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		c.pluginIDs = ids
+		broadcast()
+	})
+}
+
+func TestRequestedPluginIDsFollowFetchManifest(t *testing.T) {
+	// Bound the test and start the Space controller.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	b, resolver, err := controllerbus_core.NewCoreBus(ctx, logrus.NewEntry(logrus.New()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.AddFactory(NewFactory(b))
+	ctrl, _, ctrlRef, err := StartControllerWithConfig(ctx, b, &Config{EngineId: "test-engine"}, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlRef.Release()
+
+	// waitRequested follows the controller's wait channel until the requested
+	// IDs match want.
+	waitRequested := func(want ...string) {
+		t.Helper()
+		for {
+			ids, waitCh := ctrl.GetRequestedPluginIDsAndWaitCh()
+			if slices.Equal(ids, want) {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("requested plugin IDs = %v, want %v", ids, want)
+			case <-waitCh:
+			}
+		}
+	}
+
+	// Add a FetchManifest demand and watch the requested IDs track it.
+	_, ref, err := b.AddDirective(ctx, bldr_manifest.NewFetchManifest("unlisted-plugin", nil, nil, 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRequested("unlisted-plugin")
+
+	// Release the demand and assert the requested IDs empty again.
+	ref.Release()
+	waitRequested()
+}

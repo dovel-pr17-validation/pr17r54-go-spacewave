@@ -1,0 +1,84 @@
+package world_block
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/db/world"
+)
+
+// objectIterator implements ObjectIterator for WorldState over the object
+// tree, stripping the object key prefix from each key.
+type objectIterator struct {
+	// prefix is the object key prefix to filter by
+	prefix string
+	// iter iterates the object tree, nil once closed
+	iter kvtx.Iterator
+	// err is any error that closed the iterator
+	err error
+}
+
+// Err returns any error that has closed the iterator.
+func (o *objectIterator) Err() error {
+	if o.err != nil {
+		return o.err
+	}
+	if o.iter != nil {
+		return o.iter.Err()
+	}
+	return context.Canceled
+}
+
+// Valid returns if the iterator points to a valid entry.
+func (o *objectIterator) Valid() bool {
+	return o.err == nil && o.Key() != ""
+}
+
+// Key returns the current entry key, or empty string if not valid.
+func (o *objectIterator) Key() string {
+	if !o.iter.Valid() {
+		return ""
+	}
+	key := string(o.iter.Key())
+	if len(key) < len(objectKeyPrefix)+len(o.prefix) {
+		return ""
+	}
+	return key[len(objectKeyPrefix):]
+}
+
+// Next advances to the next entry and returns Valid.
+func (o *objectIterator) Next() bool {
+	return o.iter.Next() && o.Valid()
+}
+
+// Seek moves the iterator to the first key >= the provided key (or <= in reverse mode).
+func (o *objectIterator) Seek(k string) error {
+	// Stop when the iterator has failed or was not opened.
+	if o.err != nil {
+		return o.err
+	}
+	if o.iter == nil {
+		return context.Canceled
+	}
+
+	// Seek to the object key.
+	err := o.iter.Seek([]byte(objectKeyPrefix + k))
+	if err != nil {
+		o.err = err
+		return err
+	}
+
+	return nil
+}
+
+// Close releases the iterator.
+func (o *objectIterator) Close() {
+	if o.iter != nil {
+		o.iter.Close()
+		o.iter = nil
+	}
+	o.err = context.Canceled
+}
+
+// _ is a type assertion
+var _ world.ObjectIterator = (*objectIterator)(nil)

@@ -1,0 +1,332 @@
+package common
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"strings"
+
+	"github.com/s4wave/spacewave/db/kvtx"
+)
+
+// Iterator iterates over SQLite results using direct SELECTs on the queryer.
+//
+// This intentionally does not hold an explicit read transaction open. Each
+// Seek/Next is a standalone query, which removes BEGIN/ROLLBACK overhead at the
+// cost of allowing iteration to observe concurrent writes.
+type Iterator struct {
+	ctx     context.Context
+	queryer sqliteQueryer
+	active  func() error
+	table   string
+	prefix  []byte
+	reverse bool
+
+	// Current position
+	currentKey   []byte
+	currentValue []byte
+
+	// State
+	err     error
+	valid   bool
+	started bool
+	closed  bool
+
+	// Precomputed queries for advance operation
+	advanceForwardQuery                 string
+	advanceForwardPrefixQuery           string
+	advanceForwardPrefixUnboundedQuery  string
+	advanceBackwardQuery                string
+	advanceBackwardPrefixQuery          string
+	advanceBackwardPrefixUnboundedQuery string
+
+	// Precomputed queries for seek operation
+	seekForwardQuery                    string
+	seekForwardPrefixQuery              string
+	seekForwardPrefixNilQuery           string
+	seekForwardPrefixUnboundedQuery     string
+	seekBackwardQuery                   string
+	seekBackwardPrefixQuery             string
+	seekBackwardPrefixNilQuery          string
+	seekBackwardPrefixUnboundedQuery    string
+	seekBackwardPrefixNilUnboundedQuery string
+	seekAbsoluteStartQuery              string
+	seekAbsoluteEndQuery                string
+}
+
+// NewIterator constructs a new SQLite iterator.
+func NewIterator(ctx context.Context, queryer sqliteQueryer, active func() error, table string, prefix []byte, sort, reverse bool) *Iterator {
+	// Bind the SQLite iterator to its queryer, prefix, and traversal direction.
+	i := &Iterator{
+		ctx:     ctx,
+		queryer: queryer,
+		active:  active,
+		table:   table,
+		prefix:  prefix,
+		reverse: reverse,
+	}
+
+	// Prepare SQLite queries for advancing from the current iterator key.
+	i.advanceForwardQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key > ? ORDER BY key LIMIT 1"}, " ")
+	i.advanceForwardPrefixQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key > ? AND key >= ? AND key < ? ORDER BY key LIMIT 1"}, " ")
+	i.advanceForwardPrefixUnboundedQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key > ? AND key >= ? ORDER BY key LIMIT 1"}, " ")
+	i.advanceBackwardQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key < ? ORDER BY key DESC LIMIT 1"}, " ")
+	i.advanceBackwardPrefixQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? AND key < ? AND key < ? ORDER BY key DESC LIMIT 1"}, " ")
+	i.advanceBackwardPrefixUnboundedQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? AND key < ? ORDER BY key DESC LIMIT 1"}, " ")
+
+	// Prepare SQLite queries for seeking forward within the iterator prefix.
+	i.seekForwardQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? ORDER BY key LIMIT 1"}, " ")
+	i.seekForwardPrefixQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? AND key < ? ORDER BY key LIMIT 1"}, " ")
+	i.seekForwardPrefixNilQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? AND key < ? ORDER BY key LIMIT 1"}, " ")
+	i.seekForwardPrefixUnboundedQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? ORDER BY key LIMIT 1"}, " ")
+
+	// Prepare SQLite queries for seeking backward within the iterator prefix.
+	i.seekBackwardQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key <= ? ORDER BY key DESC LIMIT 1"}, " ")
+	i.seekBackwardPrefixQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? AND key <= ? AND key < ? ORDER BY key DESC LIMIT 1"}, " ")
+	i.seekBackwardPrefixNilQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? AND key < ? ORDER BY key DESC LIMIT 1"}, " ")
+	i.seekBackwardPrefixUnboundedQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? AND key <= ? ORDER BY key DESC LIMIT 1"}, " ")
+	i.seekBackwardPrefixNilUnboundedQuery = strings.Join([]string{"SELECT key, value FROM", table, "WHERE key >= ? ORDER BY key DESC LIMIT 1"}, " ")
+
+	// Prepare SQLite queries for seeking either end of the table.
+	i.seekAbsoluteStartQuery = strings.Join([]string{"SELECT key, value FROM", table, "ORDER BY key LIMIT 1"}, " ")
+	i.seekAbsoluteEndQuery = strings.Join([]string{"SELECT key, value FROM", table, "ORDER BY key DESC LIMIT 1"}, " ")
+
+	return i
+}
+
+// Err returns any error that has closed the iterator.
+func (i *Iterator) Err() error {
+	return i.err
+}
+
+// Valid returns if the iterator points to a valid entry.
+func (i *Iterator) Valid() bool {
+	return !i.closed && i.valid && i.err == nil
+}
+
+// Key returns the current entry key, or nil if not valid.
+func (i *Iterator) Key() []byte {
+	if !i.Valid() {
+		return nil
+	}
+	return i.currentKey
+}
+
+// Value returns the current entry value, or nil if not valid.
+func (i *Iterator) Value() ([]byte, error) {
+	if !i.Valid() {
+		return nil, i.Err()
+	}
+	return i.currentValue, nil
+}
+
+// ValueCopy copies the value to the given byte slice and returns it.
+func (i *Iterator) ValueCopy(bt []byte) ([]byte, error) {
+	if err := i.Err(); err != nil {
+		return nil, err
+	}
+	if !i.Valid() {
+		return nil, nil
+	}
+	return append(bt[:0], i.currentValue...), nil
+}
+
+// Next advances to the next entry and returns Valid.
+func (i *Iterator) Next() bool {
+	if i.active != nil {
+		if err := i.active(); err != nil {
+			i.err = err
+			return false
+		}
+	}
+	if i.closed || i.err != nil {
+		return false
+	}
+
+	if !i.started {
+		if err := i.Seek(nil); err != nil {
+			return false
+		}
+		return i.Valid()
+	}
+
+	return i.advance()
+}
+
+// advance moves to the next key in sequence.
+func (i *Iterator) advance() bool {
+	// Stop advancing the SQLite iterator when it has no current key.
+	if i.currentKey == nil {
+		return false
+	}
+
+	// Select the SQLite advance query for the iterator direction and prefix.
+	var query string
+	var args []any
+	if i.reverse {
+		if len(i.prefix) > 0 {
+			if upperBound, ok := kvtx.PrefixSuccessor(i.prefix); ok {
+				query = i.advanceBackwardPrefixQuery
+				args = []any{i.prefix, i.currentKey, upperBound}
+			} else {
+				query = i.advanceBackwardPrefixUnboundedQuery
+				args = []any{i.prefix, i.currentKey}
+			}
+		} else {
+			query = i.advanceBackwardQuery
+			args = []any{i.currentKey}
+		}
+	} else {
+		if len(i.prefix) > 0 {
+			if upperBound, ok := kvtx.PrefixSuccessor(i.prefix); ok {
+				query = i.advanceForwardPrefixQuery
+				args = []any{i.currentKey, i.prefix, upperBound}
+			} else {
+				query = i.advanceForwardPrefixUnboundedQuery
+				args = []any{i.currentKey, i.prefix}
+			}
+		} else {
+			query = i.advanceForwardQuery
+			args = []any{i.currentKey}
+		}
+	}
+
+	// Read the next SQLite entry and record exhaustion or query failure.
+	var key, value []byte
+	err := i.queryer.QueryRowContext(i.ctx, query, args...).Scan(&key, &value)
+	if err == sql.ErrNoRows {
+		i.valid = false
+		return false
+	}
+	if err != nil {
+		i.err = err
+		return false
+	}
+
+	// Stop the SQLite iterator when the next key leaves its prefix.
+	if len(i.prefix) > 0 && !bytes.HasPrefix(key, i.prefix) {
+		i.valid = false
+		return false
+	}
+
+	// Publish the next SQLite entry as the valid iterator position.
+	i.currentKey = key
+	i.currentValue = value
+	i.valid = true
+	return true
+}
+
+// Seek moves the iterator to the selected key, or the next key after the key.
+func (i *Iterator) Seek(k []byte) error {
+	// Require an active, open SQLite iterator before seeking.
+	if i.active != nil {
+		if err := i.active(); err != nil {
+			i.err = err
+			return err
+		}
+	}
+	if i.closed {
+		return context.Canceled
+	}
+
+	// Begin SQLite iteration with a seek query for the direction, prefix, and key.
+	i.started = true
+	var query string
+	var args []any
+	if i.reverse {
+		if len(i.prefix) > 0 {
+			if upperBound, ok := kvtx.PrefixSuccessor(i.prefix); ok {
+				if k == nil {
+					query = i.seekBackwardPrefixNilQuery
+					args = []any{i.prefix, upperBound}
+				} else {
+					query = i.seekBackwardPrefixQuery
+					args = []any{i.prefix, k, upperBound}
+				}
+			} else if k == nil {
+				query = i.seekBackwardPrefixNilUnboundedQuery
+				args = []any{i.prefix}
+			} else {
+				query = i.seekBackwardPrefixUnboundedQuery
+				args = []any{i.prefix, k}
+			}
+		} else {
+			if k == nil {
+				query = i.seekAbsoluteEndQuery
+			} else {
+				query = i.seekBackwardQuery
+				args = []any{k}
+			}
+		}
+	} else {
+		if len(i.prefix) > 0 {
+			if k == nil {
+				query = i.seekForwardPrefixNilQuery
+				if upperBound, ok := kvtx.PrefixSuccessor(i.prefix); ok {
+					args = []any{i.prefix, upperBound}
+				} else {
+					query = i.seekForwardPrefixUnboundedQuery
+					args = []any{i.prefix}
+				}
+			} else {
+				seekKey := k
+				if bytes.Compare(k, i.prefix) < 0 {
+					seekKey = i.prefix
+				}
+				if upperBound, ok := kvtx.PrefixSuccessor(i.prefix); ok {
+					query = i.seekForwardPrefixQuery
+					args = []any{seekKey, upperBound}
+				} else {
+					query = i.seekForwardPrefixUnboundedQuery
+					args = []any{seekKey}
+				}
+			}
+		} else {
+			if k == nil {
+				query = i.seekAbsoluteStartQuery
+			} else {
+				query = i.seekForwardQuery
+				args = []any{k}
+			}
+		}
+	}
+
+	// Read the selected SQLite entry and record exhaustion or query failure.
+	var key, value []byte
+	err := i.queryer.QueryRowContext(i.ctx, query, args...).Scan(&key, &value)
+	if err == sql.ErrNoRows {
+		i.valid = false
+		return nil
+	}
+	if err != nil {
+		i.err = err
+		return err
+	}
+
+	// Leave the SQLite iterator invalid when the selected key leaves its prefix.
+	if len(i.prefix) > 0 && !bytes.HasPrefix(key, i.prefix) {
+		i.valid = false
+		return nil
+	}
+
+	// Publish the selected SQLite entry as the valid iterator position.
+	i.currentKey = key
+	i.currentValue = value
+	i.valid = true
+	return nil
+}
+
+// Close closes the iterator.
+func (i *Iterator) Close() {
+	// Close the SQLite iterator and discard its current entry.
+	i.closed = true
+	i.valid = false
+	i.currentKey = nil
+	i.currentValue = nil
+	if i.err == nil {
+		i.err = context.Canceled
+	}
+}
+
+// _ is a type assertion
+var _ kvtx.Iterator = (*Iterator)(nil)

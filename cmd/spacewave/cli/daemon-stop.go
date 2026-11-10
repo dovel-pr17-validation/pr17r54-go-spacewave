@@ -1,0 +1,88 @@
+//go:build !js
+
+package spacewave_cli
+
+import (
+	"context"
+	stderrors "errors"
+	"os"
+
+	"github.com/aperturerobotics/cli"
+	"github.com/pkg/errors"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+	listener_control "github.com/s4wave/spacewave/core/resource/listener/control"
+)
+
+// newStopCommand builds the daemon stop command.
+func newStopCommand(_ func() cli_entrypoint.CliBus) *cli.Command {
+	var statePath string
+	return &cli.Command{
+		Name:  "stop",
+		Usage: "stop the daemon",
+		Flags: daemonClientFlags(&statePath),
+		Action: func(c *cli.Context) error {
+			sockPath, err := daemonSocketPath(c, statePath)
+			if err != nil {
+				return err
+			}
+			return runStop(c.Context, sockPath)
+		},
+	}
+}
+
+// runStop asks the daemon listening on sockPath to shut down and confirms its
+// listener is gone. It never starts a daemon.
+func runStop(ctx context.Context, sockPath string) error {
+	// Dial the daemon socket, treating a missing listener as already stopped.
+	conn, err := connectDaemonDial(ctx, sockPath)
+	if err != nil {
+		if handled, handleErr := handleUnavailableDaemonSocket(sockPath, err); handled {
+			return handleErr
+		}
+		return errors.Wrapf(err, "connect to %s", sockPath)
+	}
+	defer conn.Close()
+
+	// Request shutdown and verify the listener no longer accepts connections.
+	if err := requestDaemonShutdown(ctx, conn); err != nil {
+		var denyErr *listener_control.DenyError
+		if stderrors.As(err, &denyErr) || ctx.Err() != nil {
+			return errors.Wrap(err, "stop daemon")
+		}
+
+		_ = conn.Close()
+		probe, probeErr := connectDaemonDial(ctx, sockPath)
+		if probeErr == nil {
+			_ = probe.Close()
+			return errors.Wrap(err, "stop daemon")
+		}
+		if handled, handleErr := handleUnavailableDaemonSocket(sockPath, probeErr); handled {
+			return handleErr
+		}
+		return errors.Wrapf(err, "stop daemon; verify listener exit: %v", probeErr)
+	}
+	os.Stdout.WriteString("Stopped Spacewave daemon.\n")
+	return nil
+}
+
+// handleUnavailableDaemonSocket reports errors that prove no daemon listener
+// remains and removes the stale socket, if any. Other dial errors must remain
+// fatal to the stop command.
+func handleUnavailableDaemonSocket(sockPath string, dialErr error) (bool, error) {
+	// Keep dial errors that leave the socket's owner unknown fatal.
+	if !listener_control.NoListener(dialErr) {
+		return false, nil
+	}
+
+	// Remove the stale socket and report whether there was one.
+	err := os.Remove(sockPath)
+	if os.IsNotExist(err) {
+		os.Stdout.WriteString("No Spacewave daemon is running.\n")
+		return true, nil
+	}
+	if err != nil {
+		return true, errors.Wrap(err, "remove stale daemon socket")
+	}
+	os.Stdout.WriteString("No Spacewave daemon is running; removed a stale daemon socket.\n")
+	return true, nil
+}

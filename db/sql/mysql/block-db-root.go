@@ -1,0 +1,143 @@
+package mysql
+
+import (
+	"context"
+	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	namedsbset "github.com/s4wave/spacewave/db/block/sbset"
+)
+
+// NewDatabaseRootBlock constructs a new db root block.
+func NewDatabaseRootBlock() block.Block {
+	return &DatabaseRoot{}
+}
+
+// LoadDatabaseRoot follows the database root cursor.
+// may return nil
+func LoadDatabaseRoot(ctx context.Context, cursor *block.Cursor) (*DatabaseRoot, error) {
+	// Decode the DatabaseRoot block from the supplied cursor.
+	ni, err := cursor.Unmarshal(ctx, NewDatabaseRootBlock)
+	if err != nil {
+		return nil, err
+	}
+
+	// Require a present DatabaseRoot block before validating its contents.
+	niv, ok := ni.(*DatabaseRoot)
+	if !ok || niv == nil {
+		return nil, nil
+	}
+
+	// Validate the decoded DatabaseRoot block before returning it.
+	if err := niv.Validate(); err != nil {
+		return nil, err
+	}
+	return niv, nil
+}
+
+// IsNil returns if the object is nil.
+func (r *DatabaseRoot) IsNil() bool {
+	return r == nil
+}
+
+// Validate validates the database root block.
+func (r *DatabaseRoot) Validate() error {
+	var prevName string
+	for i, table := range r.GetTables() {
+		if err := table.Validate(); err != nil {
+			return errors.Wrapf(err, "tables[%s]", table.GetName())
+		}
+		// enforce i[n] < i[n+1]
+		if i > 0 {
+			if dbname := table.GetName(); strings.Compare(prevName, dbname) >= 0 {
+				return errors.Errorf(
+					"tables[%d] %s cannot be after or equal to tables[%d] %s",
+					i, dbname,
+					i-1, prevName,
+				)
+			}
+		}
+		prevName = table.GetName()
+	}
+	return nil
+}
+
+// Validate performs cursory validation.
+func (r *DatabaseRootTable) Validate() error {
+	if len(r.GetName()) == 0 {
+		return ErrEmptyTableName
+	}
+	// allow empty root table
+	if err := r.GetRef().Validate(true); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ApplySubBlock applies a sub-block change with a field id.
+func (r *DatabaseRoot) ApplySubBlock(id uint32, next block.SubBlock) error {
+	// noop
+	return nil
+}
+
+// GetSubBlocks returns all constructed sub-blocks by ID.
+// May return nil, and values may also be nil.
+func (r *DatabaseRoot) GetSubBlocks() map[uint32]block.SubBlock {
+	return map[uint32]block.SubBlock{
+		1: newDbRootTableSetContainer(r, nil),
+	}
+}
+
+// GetSubBlockCtor returns a function which creates or returns the existing
+// sub-block at reference id. Can return nil to indicate invalid reference id.
+func (r *DatabaseRoot) GetSubBlockCtor(id uint32) block.SubBlockCtor {
+	switch id {
+	case 1:
+		return func(create bool) block.SubBlock {
+			return newDbRootTableSetContainer(r, nil)
+		}
+	}
+	return nil
+}
+
+// GetRootTableSet returns the root table set sub-block.
+//
+// bcs is optional
+func (r *DatabaseRoot) GetRootTableSet(bcs *block.Cursor) *namedsbset.NamedSubBlockSet {
+	if bcs != nil {
+		bcs = bcs.FollowSubBlock(1)
+		b, _ := bcs.GetBlock()
+		nrs, ok := b.(*namedsbset.NamedSubBlockSet)
+		if !ok || nrs.GetCursor() == nil {
+			nrs = newDbRootTableSetContainer(r, bcs)
+			bcs.SetBlock(nrs, true)
+		}
+		return nrs
+	}
+	return newDbRootTableSetContainer(r, nil)
+}
+
+// InsertTable inserts a new table. Caller should check if it doesn't exist before calling.
+//
+// Returns new cursor, added.
+// bcs can be nil, or should be located at root.
+func (r *DatabaseRoot) InsertTable(name string, ref *block.BlockRef, bcs *block.Cursor) (*block.Cursor, bool) {
+	// Insert the named table record and sort the database catalog.
+	set := r.GetRootTableSet(bcs)
+	r.Tables = append(r.Tables, &DatabaseRootTable{Name: name, Ref: ref})
+	set.SortNamedRefs()
+
+	// Locate the inserted table cursor when a database cursor is available.
+	var ebcs *block.Cursor
+	if bcs != nil {
+		_, ebcs, _ = set.LookupByName(name)
+	}
+	return ebcs, true
+}
+
+// _ is a type assertion
+var (
+	_ block.Block              = (*DatabaseRoot)(nil)
+	_ block.BlockWithSubBlocks = (*DatabaseRoot)(nil)
+)

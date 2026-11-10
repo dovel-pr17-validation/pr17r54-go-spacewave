@@ -1,0 +1,458 @@
+syntax = "proto3";
+package electron.desktop_runtime;
+
+option go_package = "github.com/s4wave/spacewave/bldr/web/electron/desktop-runtime;desktop_runtime";
+
+// DesktopRuntimeResourceService exposes Electron main desktop-shell lifecycle.
+service DesktopRuntimeResourceService {
+  // WatchDesktopState streams the current desktop shell state.
+  rpc WatchDesktopState(WatchDesktopStateRequest) returns (stream WatchDesktopStateResponse);
+
+  // SetDesktopState publishes projected desktop runtime status.
+  rpc SetDesktopState(SetDesktopStateRequest) returns (SetDesktopStateResponse);
+
+  // OpenOrFocusMainWindow opens or focuses the main app window.
+  rpc OpenOrFocusMainWindow(OpenOrFocusMainWindowRequest) returns (OpenOrFocusMainWindowResponse);
+
+  // QuitDesktopRuntime requests a clean user-initiated runtime quit.
+  rpc QuitDesktopRuntime(QuitDesktopRuntimeRequest) returns (QuitDesktopRuntimeResponse);
+}
+
+// DesktopCLIInstallResourceService exposes desktop-owned CLI install state.
+service DesktopCLIInstallResourceService {
+  // WatchCLIInstallState streams detected CLI install state.
+  rpc WatchCLIInstallState(WatchCLIInstallStateRequest) returns (stream WatchCLIInstallStateResponse);
+
+  // InvokeCLIInstallAction invokes a generation-bound CLI install action.
+  rpc InvokeCLIInstallAction(InvokeCLIInstallActionRequest) returns (InvokeCLIInstallActionResponse);
+}
+
+// DesktopRuntimeState describes Electron main desktop-shell state.
+message DesktopRuntimeState {
+  // MainWindowOpen is set when the main app window exists.
+  bool main_window_open = 1;
+  // Quitting is set after explicit user quit begins.
+  bool quitting = 2;
+  // StatusText is short display text for native status surfaces.
+  string status_text = 3;
+  // Health summarizes the status icon state.
+  DesktopRuntimeHealth health = 4;
+  // Lifecycle describes the native runtime process lifecycle.
+  DesktopRuntimeLifecycle lifecycle = 5;
+  // Listener describes background listener and CLI reachability.
+  DesktopRuntimeListenerStatus listener = 6;
+  // Sessions contains bounded session rows for native status surfaces.
+  repeated DesktopRuntimeNavigationItem sessions = 7;
+  // Spaces contains bounded Space rows for native status surfaces.
+  repeated DesktopRuntimeNavigationItem spaces = 8;
+  // Activity contains bounded recent activity rows.
+  repeated DesktopRuntimeActivityItem activity = 9;
+  // Update describes native runtime update readiness.
+  DesktopRuntimeUpdateStatus update = 10;
+  // AttentionItems contains user-actionable attention rows.
+  repeated DesktopRuntimeAttentionItem attention_items = 11;
+  // Actions contains bounded explicit command rows.
+  repeated DesktopRuntimeActionItem actions = 12;
+  // CliInstall contains compact desktop-managed CLI install status for tray surfaces.
+  DesktopRuntimeCLIInstallSummary cli_install = 13;
+}
+
+// DesktopCLIInstallStatus describes managed CLI install/update state.
+enum DesktopCLIInstallStatus {
+  // DESKTOP_CLI_INSTALL_STATUS_UNSPECIFIED leaves state unset.
+  DESKTOP_CLI_INSTALL_STATUS_UNSPECIFIED = 0;
+  // DESKTOP_CLI_INSTALL_STATUS_UNKNOWN indicates detection has not completed.
+  DESKTOP_CLI_INSTALL_STATUS_UNKNOWN = 1;
+  // DESKTOP_CLI_INSTALL_STATUS_MISSING indicates no managed CLI was detected.
+  DESKTOP_CLI_INSTALL_STATUS_MISSING = 2;
+  // DESKTOP_CLI_INSTALL_STATUS_INSTALLED indicates the managed CLI is current.
+  DESKTOP_CLI_INSTALL_STATUS_INSTALLED = 3;
+  // DESKTOP_CLI_INSTALL_STATUS_UPDATE_AVAILABLE indicates a release CLI is newer.
+  DESKTOP_CLI_INSTALL_STATUS_UPDATE_AVAILABLE = 4;
+  // DESKTOP_CLI_INSTALL_STATUS_CONFLICT indicates an unmanaged command is first on PATH.
+  DESKTOP_CLI_INSTALL_STATUS_CONFLICT = 5;
+  // DESKTOP_CLI_INSTALL_STATUS_ERROR indicates detection failed.
+  DESKTOP_CLI_INSTALL_STATUS_ERROR = 6;
+  // DESKTOP_CLI_INSTALL_STATUS_INSTALLING indicates a managed install is running.
+  DESKTOP_CLI_INSTALL_STATUS_INSTALLING = 7;
+  // DESKTOP_CLI_INSTALL_STATUS_UPDATING indicates a managed update is running.
+  DESKTOP_CLI_INSTALL_STATUS_UPDATING = 8;
+}
+
+// DesktopCLIInstallActionKind describes desktop-owned install actions.
+enum DesktopCLIInstallActionKind {
+  // DESKTOP_CLI_INSTALL_ACTION_KIND_UNSPECIFIED leaves the action unset.
+  DESKTOP_CLI_INSTALL_ACTION_KIND_UNSPECIFIED = 0;
+  // DESKTOP_CLI_INSTALL_ACTION_KIND_RECHECK reruns detection.
+  DESKTOP_CLI_INSTALL_ACTION_KIND_RECHECK = 1;
+  // DESKTOP_CLI_INSTALL_ACTION_KIND_OPEN_SETTINGS opens CLI settings.
+  DESKTOP_CLI_INSTALL_ACTION_KIND_OPEN_SETTINGS = 2;
+  // DESKTOP_CLI_INSTALL_ACTION_KIND_INSTALL installs a missing managed CLI.
+  DESKTOP_CLI_INSTALL_ACTION_KIND_INSTALL = 3;
+  // DESKTOP_CLI_INSTALL_ACTION_KIND_UPDATE updates an existing managed CLI.
+  DESKTOP_CLI_INSTALL_ACTION_KIND_UPDATE = 4;
+  // DESKTOP_CLI_INSTALL_ACTION_KIND_SELECT_TARGET selects an install target.
+  DESKTOP_CLI_INSTALL_ACTION_KIND_SELECT_TARGET = 5;
+}
+
+// DesktopCLIInstallTargetPathState describes PATH evidence for a target.
+enum DesktopCLIInstallTargetPathState {
+  // DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_UNSPECIFIED leaves PATH evidence unset.
+  DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_UNSPECIFIED = 0;
+  // DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_UNKNOWN means process evidence is weak.
+  DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_UNKNOWN = 1;
+  // DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_ON_PATH means the target directory is on PATH.
+  DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_ON_PATH = 2;
+  // DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_OFF_PATH means manual PATH remediation is needed.
+  DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_OFF_PATH = 3;
+  // DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_BLOCKED means policy rejects this target.
+  DESKTOP_CLI_INSTALL_TARGET_PATH_STATE_BLOCKED = 4;
+}
+
+// DesktopCLIEntrypointIdentity describes a detected or available CLI entrypoint.
+message DesktopCLIEntrypointIdentity {
+  // Path is the local command path when known.
+  string path = 1;
+  // ProjectId is the Spacewave project id reported by version JSON.
+  string project_id = 2;
+  // EntrypointRole is managed role identity such as cli or standalone.
+  string entrypoint_role = 3;
+  // ChannelKey is the release channel reported by the entrypoint.
+  string channel_key = 4;
+  // ManifestId is the selected Manifest id.
+  string manifest_id = 5;
+  // ManifestRev is the selected Manifest revision.
+  uint64 manifest_rev = 6;
+  // PlatformId is the native platform id.
+  string platform_id = 7;
+}
+
+// DesktopCLIInstallTarget describes one user-level install target candidate.
+message DesktopCLIInstallTarget {
+  // Id identifies the target within the desktop CLI install resource.
+  string id = 1;
+  // Label is primary display text.
+  string label = 2;
+  // Path is the filesystem path for the command.
+  string path = 3;
+  // Writable indicates detection believes the target can be written.
+  bool writable = 4;
+  // Selected indicates the default target.
+  bool selected = 5;
+  // Detail is secondary display text.
+  string detail = 6;
+  // Generation is the state generation this target was built from.
+  uint64 generation = 7;
+  // PathState describes whether process PATH evidence reaches this target.
+  DesktopCLIInstallTargetPathState path_state = 8;
+  // BlockedReason explains why target policy rejected this target.
+  string blocked_reason = 9;
+}
+
+// DesktopCLIInstallActionItem describes one generation-bound user action.
+message DesktopCLIInstallActionItem {
+  // Id identifies the action within the current state generation.
+  string id = 1;
+  // Kind is the action type.
+  DesktopCLIInstallActionKind kind = 2;
+  // Label is primary display text.
+  string label = 3;
+  // Enabled indicates the action can be invoked.
+  bool enabled = 4;
+  // TargetId identifies the target affected by the action when applicable.
+  string target_id = 5;
+  // Generation is the state generation this action was built from.
+  uint64 generation = 6;
+  // Detail is secondary display text.
+  string detail = 7;
+}
+
+// DesktopCLIInstallState describes desktop-managed CLI install state.
+message DesktopCLIInstallState {
+  // Status is the collapsed install/update state.
+  DesktopCLIInstallStatus status = 1;
+  // Label is primary display text.
+  string label = 2;
+  // Detail is secondary display text.
+  string detail = 3;
+  // Installed is the detected local CLI identity.
+  DesktopCLIEntrypointIdentity installed = 4;
+  // Available is the release-world CLI identity selected for install/update.
+  DesktopCLIEntrypointIdentity available = 5;
+  // Targets contains user-level install target candidates.
+  repeated DesktopCLIInstallTarget targets = 6;
+  // ConflictPath is the conflicting command path when status is CONFLICT.
+  string conflict_path = 7;
+  // ErrorMessage is the latest detection error.
+  string error_message = 8;
+  // Generation increments every time detection state changes.
+  uint64 generation = 9;
+  // SelectedTargetId identifies the target selected by the resource owner.
+  string selected_target_id = 10;
+  // Actions contains generation-bound resource actions.
+  repeated DesktopCLIInstallActionItem actions = 11;
+}
+
+// DesktopRuntimeHealth describes the collapsed tray icon status.
+enum DesktopRuntimeHealth {
+  // DESKTOP_RUNTIME_HEALTH_UNSPECIFIED leaves the icon status unset.
+  DESKTOP_RUNTIME_HEALTH_UNSPECIFIED = 0;
+  // DESKTOP_RUNTIME_HEALTH_STARTING indicates the runtime is starting.
+  DESKTOP_RUNTIME_HEALTH_STARTING = 1;
+  // DESKTOP_RUNTIME_HEALTH_HEALTHY indicates the runtime is reachable.
+  DESKTOP_RUNTIME_HEALTH_HEALTHY = 2;
+  // DESKTOP_RUNTIME_HEALTH_ACTIVE indicates useful background activity.
+  DESKTOP_RUNTIME_HEALTH_ACTIVE = 3;
+  // DESKTOP_RUNTIME_HEALTH_NEEDS_ATTENTION indicates user action is needed.
+  DESKTOP_RUNTIME_HEALTH_NEEDS_ATTENTION = 4;
+  // DESKTOP_RUNTIME_HEALTH_DISCONNECTED indicates the runtime is unreachable.
+  DESKTOP_RUNTIME_HEALTH_DISCONNECTED = 5;
+  // DESKTOP_RUNTIME_HEALTH_QUITTING indicates explicit shutdown is running.
+  DESKTOP_RUNTIME_HEALTH_QUITTING = 6;
+}
+
+// DesktopRuntimeLifecycle describes native runtime process state.
+enum DesktopRuntimeLifecycle {
+  // DESKTOP_RUNTIME_LIFECYCLE_UNSPECIFIED leaves lifecycle state unset.
+  DESKTOP_RUNTIME_LIFECYCLE_UNSPECIFIED = 0;
+  // DESKTOP_RUNTIME_LIFECYCLE_STARTING indicates startup is in progress.
+  DESKTOP_RUNTIME_LIFECYCLE_STARTING = 1;
+  // DESKTOP_RUNTIME_LIFECYCLE_RUNNING indicates the runtime is active.
+  DESKTOP_RUNTIME_LIFECYCLE_RUNNING = 2;
+  // DESKTOP_RUNTIME_LIFECYCLE_DISCONNECTED indicates the runtime is detached.
+  DESKTOP_RUNTIME_LIFECYCLE_DISCONNECTED = 3;
+  // DESKTOP_RUNTIME_LIFECYCLE_QUITTING indicates explicit shutdown is running.
+  DESKTOP_RUNTIME_LIFECYCLE_QUITTING = 4;
+}
+
+// DesktopRuntimeReachability describes a reachable runtime endpoint.
+enum DesktopRuntimeReachability {
+  // DESKTOP_RUNTIME_REACHABILITY_UNSPECIFIED leaves reachability unset.
+  DESKTOP_RUNTIME_REACHABILITY_UNSPECIFIED = 0;
+  // DESKTOP_RUNTIME_REACHABILITY_STARTING indicates binding is in progress.
+  DESKTOP_RUNTIME_REACHABILITY_STARTING = 1;
+  // DESKTOP_RUNTIME_REACHABILITY_REACHABLE indicates the endpoint is reachable.
+  DESKTOP_RUNTIME_REACHABILITY_REACHABLE = 2;
+  // DESKTOP_RUNTIME_REACHABILITY_UNREACHABLE indicates the endpoint failed.
+  DESKTOP_RUNTIME_REACHABILITY_UNREACHABLE = 3;
+}
+
+// DesktopRuntimeActivityState describes a runtime activity row.
+enum DesktopRuntimeActivityState {
+  // DESKTOP_RUNTIME_ACTIVITY_STATE_UNSPECIFIED leaves activity state unset.
+  DESKTOP_RUNTIME_ACTIVITY_STATE_UNSPECIFIED = 0;
+  // DESKTOP_RUNTIME_ACTIVITY_STATE_IDLE indicates no active work.
+  DESKTOP_RUNTIME_ACTIVITY_STATE_IDLE = 1;
+  // DESKTOP_RUNTIME_ACTIVITY_STATE_RUNNING indicates work is active.
+  DESKTOP_RUNTIME_ACTIVITY_STATE_RUNNING = 2;
+  // DESKTOP_RUNTIME_ACTIVITY_STATE_DONE indicates work completed.
+  DESKTOP_RUNTIME_ACTIVITY_STATE_DONE = 3;
+  // DESKTOP_RUNTIME_ACTIVITY_STATE_ATTENTION indicates work needs attention.
+  DESKTOP_RUNTIME_ACTIVITY_STATE_ATTENTION = 4;
+  // DESKTOP_RUNTIME_ACTIVITY_STATE_ERROR indicates work failed.
+  DESKTOP_RUNTIME_ACTIVITY_STATE_ERROR = 5;
+}
+
+// DesktopRuntimeAttentionKind describes user-actionable attention categories.
+enum DesktopRuntimeAttentionKind {
+  // DESKTOP_RUNTIME_ATTENTION_KIND_UNSPECIFIED leaves attention kind unset.
+  DESKTOP_RUNTIME_ATTENTION_KIND_UNSPECIFIED = 0;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_STARTING indicates startup status.
+  DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_STARTING = 1;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_DISCONNECTED indicates runtime loss.
+  DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_DISCONNECTED = 2;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_LISTENER_UNAVAILABLE indicates listener loss.
+  DESKTOP_RUNTIME_ATTENTION_KIND_LISTENER_UNAVAILABLE = 3;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_AUTH_REQUIRED indicates session auth is needed.
+  DESKTOP_RUNTIME_ATTENTION_KIND_AUTH_REQUIRED = 4;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_STEP_UP_REQUIRED indicates step-up auth is needed.
+  DESKTOP_RUNTIME_ATTENTION_KIND_STEP_UP_REQUIRED = 5;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_SYNC_ERROR indicates sync or listener failure.
+  DESKTOP_RUNTIME_ATTENTION_KIND_SYNC_ERROR = 6;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_UPDATE_READY indicates a native update is ready.
+  DESKTOP_RUNTIME_ATTENTION_KIND_UPDATE_READY = 7;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_RESTARTING indicates restart progress.
+  DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_RESTARTING = 8;
+  // DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_QUITTING indicates shutdown progress.
+  DESKTOP_RUNTIME_ATTENTION_KIND_RUNTIME_QUITTING = 9;
+}
+
+// DesktopRuntimeSeverity describes row urgency.
+enum DesktopRuntimeSeverity {
+  // DESKTOP_RUNTIME_SEVERITY_UNSPECIFIED leaves severity unset.
+  DESKTOP_RUNTIME_SEVERITY_UNSPECIFIED = 0;
+  // DESKTOP_RUNTIME_SEVERITY_INFO marks informational status.
+  DESKTOP_RUNTIME_SEVERITY_INFO = 1;
+  // DESKTOP_RUNTIME_SEVERITY_WARNING marks a recoverable warning.
+  DESKTOP_RUNTIME_SEVERITY_WARNING = 2;
+  // DESKTOP_RUNTIME_SEVERITY_CRITICAL marks a blocking issue.
+  DESKTOP_RUNTIME_SEVERITY_CRITICAL = 3;
+}
+
+// DesktopRuntimeActionKind describes explicit command categories.
+enum DesktopRuntimeActionKind {
+  // DESKTOP_RUNTIME_ACTION_KIND_UNSPECIFIED leaves action kind unset.
+  DESKTOP_RUNTIME_ACTION_KIND_UNSPECIFIED = 0;
+  // DESKTOP_RUNTIME_ACTION_KIND_OPEN_ROUTE opens or focuses an app route.
+  DESKTOP_RUNTIME_ACTION_KIND_OPEN_ROUTE = 1;
+  // DESKTOP_RUNTIME_ACTION_KIND_NEW_WINDOW opens an app route in a new window.
+  DESKTOP_RUNTIME_ACTION_KIND_NEW_WINDOW = 2;
+  // DESKTOP_RUNTIME_ACTION_KIND_COPY_TEXT copies text to the native clipboard.
+  DESKTOP_RUNTIME_ACTION_KIND_COPY_TEXT = 3;
+  // DESKTOP_RUNTIME_ACTION_KIND_REVEAL_PATH reveals a local path.
+  DESKTOP_RUNTIME_ACTION_KIND_REVEAL_PATH = 4;
+  // DESKTOP_RUNTIME_ACTION_KIND_QUIT requests explicit runtime quit.
+  DESKTOP_RUNTIME_ACTION_KIND_QUIT = 5;
+}
+
+// DesktopRuntimeListenerStatus describes background listener and CLI state.
+message DesktopRuntimeListenerStatus {
+  // Reachability describes whether the endpoint can be used.
+  DesktopRuntimeReachability reachability = 1;
+  // Label is short display text for the listener.
+  string label = 2;
+  // Detail is secondary display text for the listener.
+  string detail = 3;
+  // SocketPath is the local CLI socket path when known.
+  string socket_path = 4;
+  // ConnectedClients is the number of active CLI clients when known.
+  uint32 connected_clients = 5;
+}
+
+// DesktopRuntimeNavigationItem describes a bounded navigable status row.
+message DesktopRuntimeNavigationItem {
+  // Id identifies the row within the projected state.
+  string id = 1;
+  // Label is primary display text.
+  string label = 2;
+  // Detail is secondary display text.
+  string detail = 3;
+  // Route is the app route to open when selected.
+  string route = 4;
+  // Active is set when the row describes active foreground work.
+  bool active = 5;
+  // StatusText is compact status text for the row.
+  string status_text = 6;
+}
+
+// DesktopRuntimeActivityItem describes a bounded activity row.
+message DesktopRuntimeActivityItem {
+  // Id identifies the activity row.
+  string id = 1;
+  // Label is primary display text.
+  string label = 2;
+  // Detail is secondary display text.
+  string detail = 3;
+  // State describes the current activity state.
+  DesktopRuntimeActivityState state = 4;
+  // UpdatedAtUnixMs records the latest activity update time.
+  int64 updated_at_unix_ms = 5;
+}
+
+// DesktopRuntimeUpdateStatus describes native runtime update state.
+message DesktopRuntimeUpdateStatus {
+  // Ready is set when a native update is ready to apply.
+  bool ready = 1;
+  // Version is the available version when known.
+  string version = 2;
+  // Label is primary display text.
+  string label = 3;
+  // Detail is secondary display text.
+  string detail = 4;
+}
+
+// DesktopRuntimeCLIInstallSummary is compact CLI install state for tray readback.
+message DesktopRuntimeCLIInstallSummary {
+  // Status mirrors the desktop CLI install child resource status.
+  DesktopCLIInstallStatus status = 1;
+  // Label is primary display text.
+  string label = 2;
+  // Detail is secondary display text.
+  string detail = 3;
+  // Route opens the settings surface that owns install/update actions.
+  string route = 4;
+}
+
+// DesktopRuntimeAttentionItem describes a user-actionable attention row.
+message DesktopRuntimeAttentionItem {
+  // Kind describes the attention category.
+  DesktopRuntimeAttentionKind kind = 1;
+  // Severity describes the attention urgency.
+  DesktopRuntimeSeverity severity = 2;
+  // Label is primary display text.
+  string label = 3;
+  // Detail is secondary display text.
+  string detail = 4;
+  // Route is the app route that can resolve the item when available.
+  string route = 5;
+}
+
+// DesktopRuntimeActionItem describes an explicit command row.
+message DesktopRuntimeActionItem {
+  // Id identifies the action row.
+  string id = 1;
+  // Kind describes the command category.
+  DesktopRuntimeActionKind kind = 2;
+  // Label is primary display text.
+  string label = 3;
+  // Detail is secondary display text.
+  string detail = 4;
+  // Route is the app route used by route-opening actions.
+  string route = 5;
+  // Value is action-specific text such as a copy value or filesystem path.
+  string value = 6;
+  // Enabled indicates whether the command can run.
+  bool enabled = 7;
+}
+
+// WatchDesktopStateRequest is the request for WatchDesktopState.
+message WatchDesktopStateRequest {}
+
+// WatchDesktopStateResponse is the response for WatchDesktopState.
+message WatchDesktopStateResponse {
+  // State is the current desktop runtime state.
+  DesktopRuntimeState state = 1;
+}
+
+// SetDesktopStateRequest is the request for SetDesktopState.
+message SetDesktopStateRequest {
+  // State is the projected desktop runtime state.
+  DesktopRuntimeState state = 1;
+}
+
+// SetDesktopStateResponse is the response for SetDesktopState.
+message SetDesktopStateResponse {}
+
+// OpenOrFocusMainWindowRequest is the request for OpenOrFocusMainWindow.
+message OpenOrFocusMainWindowRequest {
+  // Route is the app route to open after focusing the singleton window.
+  string route = 1;
+  // InstalledApp is the application bundle that requested the desktop.
+  // Desktop app updates replace this bundle; empty keeps the last one.
+  string installed_app = 2;
+}
+
+// OpenOrFocusMainWindowResponse is the response for OpenOrFocusMainWindow.
+message OpenOrFocusMainWindowResponse {}
+
+// QuitDesktopRuntimeRequest is the request for QuitDesktopRuntime.
+message QuitDesktopRuntimeRequest {}
+
+// QuitDesktopRuntimeResponse is the response for QuitDesktopRuntime.
+message QuitDesktopRuntimeResponse {}
+
+// WatchCLIInstallStateRequest is the request for WatchCLIInstallState.
+message WatchCLIInstallStateRequest {}
+
+// WatchCLIInstallStateResponse is the response for WatchCLIInstallState.
+message WatchCLIInstallStateResponse {
+  // State is the current CLI install state.
+  DesktopCLIInstallState state = 1;
+}
+
+message InvokeCLIInstallActionRequest {
+  string action_id = 1;
+  uint64 generation = 2;
+}
+
+message InvokeCLIInstallActionResponse {}

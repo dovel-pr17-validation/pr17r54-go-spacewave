@@ -1,0 +1,252 @@
+package kvtx_block_okra
+
+import (
+	"bytes"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/block/blob"
+)
+
+const (
+	entryChildRefIDBase = 1000000
+	entryValueRefIDBase = 2000000
+)
+
+// NewPageBlock constructs a new Okra page block.
+func NewPageBlock() block.Block {
+	return &Page{}
+}
+
+// DecodedBlockCacheTypeKey returns the decoded-block cache type key.
+func (p *Page) DecodedBlockCacheTypeKey() string {
+	return "db/kvtx/block/okra.Page"
+}
+
+func entryChildRefID(index int) uint32 {
+	return entryChildRefIDBase + uint32(index) //nolint:gosec // page entry indexes are bounded by the in-memory page representation.
+}
+
+func entryValueRefID(index int) uint32 {
+	return entryValueRefIDBase + uint32(index) //nolint:gosec // page entry indexes are bounded by the in-memory page representation.
+}
+
+func entryIndexFromChildRefID(id uint32) (int, bool) {
+	if id < entryChildRefIDBase || id >= entryValueRefIDBase {
+		return 0, false
+	}
+	return int(id - entryChildRefIDBase), true
+}
+
+func entryIndexFromValueRefID(id uint32) (int, bool) {
+	if id < entryValueRefIDBase {
+		return 0, false
+	}
+	return int(id - entryValueRefIDBase), true
+}
+
+// Validate performs cursory checks of the packed page object.
+func (p *Page) Validate() error {
+	// Require page entries and a hash of the configured Okra size.
+	entries := p.GetEntries()
+	if len(entries) == 0 || len(p.GetPageHash()) != HashSize {
+		return errors.Wrapf(
+			ErrUnexpectedPageMetadata,
+			"level %d entries %d page_hash_len %d",
+			p.GetLevel(),
+			len(entries),
+			len(p.GetPageHash()),
+		)
+	}
+
+	// Validate entry ordering and references while deriving the page bounds and size.
+	var size uint64
+	var prevKey []byte
+	var firstKey []byte
+	for idx, ent := range entries {
+		if ent == nil || len(ent.GetHash()) != HashSize {
+			return errors.Wrapf(ErrUnexpectedEntryMetadata, "entry %d hash_len %d", idx, len(ent.GetHash()))
+		}
+		if ent.GetAnchor() {
+			if idx != 0 || len(ent.GetKey()) != 0 {
+				return errors.Wrapf(ErrUnexpectedEntryMetadata, "entry %d invalid anchor", idx)
+			}
+		} else {
+			key := ent.GetKey()
+			if len(key) == 0 {
+				return errors.Wrapf(ErrUnexpectedEntryMetadata, "entry %d empty key", idx)
+			}
+			if prevKey != nil && bytes.Compare(prevKey, key) >= 0 {
+				return errors.Wrapf(ErrUnsortedEntries, "entry %d", idx)
+			}
+			if firstKey == nil {
+				firstKey = key
+			}
+			prevKey = key
+		}
+
+		// Check the references permitted at the page level and accumulate entry size.
+		if p.GetLevel() == 0 {
+			if !ent.GetChildRef().GetEmpty() {
+				return errors.Wrapf(ErrUnexpectedEntryMetadata, "entry %d leaf child ref", idx)
+			}
+			if ent.GetAnchor() && (!ent.GetValueRef().GetEmpty() || ent.GetValueIsBlob() || ent.GetValueBlob() != nil) {
+				return errors.Wrapf(ErrUnexpectedEntryMetadata, "entry %d anchor value", idx)
+			}
+		} else {
+			if !ent.GetValueRef().GetEmpty() || ent.GetValueIsBlob() || ent.GetValueBlob() != nil {
+				return errors.Wrapf(ErrUnexpectedEntryMetadata, "entry %d internal value", idx)
+			}
+			if !ent.GetChildRef().GetEmpty() {
+				if err := ent.GetChildRef().Validate(false); err != nil {
+					return errors.Wrap(err, "child_ref")
+				}
+			}
+		}
+		if ent.GetValueBlob() != nil && (!ent.GetValueIsBlob() || !ent.GetValueRef().GetEmpty()) {
+			return errors.Wrapf(ErrUnexpectedEntryMetadata, "entry %d ambiguous inline value", idx)
+		}
+		size += ent.GetSize()
+	}
+
+	// Check the stored page bounds, anchor marker and size against its entries.
+	if p.GetStartsAtAnchor() != entries[0].GetAnchor() {
+		return errors.Wrap(ErrUnexpectedPageMetadata, "starts_at_anchor mismatch")
+	}
+	if p.GetStartsAtAnchor() {
+		if len(p.GetLowerBound()) != 0 && !bytes.Equal(p.GetLowerBound(), firstKey) {
+			return errors.Wrap(ErrUnexpectedPageMetadata, "anchor page lower bound")
+		}
+	} else if !bytes.Equal(p.GetLowerBound(), firstKey) {
+		return errors.Wrap(ErrUnexpectedPageMetadata, "lower bound mismatch")
+	}
+	if upper := p.GetUpperBound(); len(upper) != 0 && firstKey != nil &&
+		bytes.Compare(firstKey, upper) >= 0 {
+		return errors.Wrap(ErrUnexpectedPageMetadata, "upper bound before first key")
+	}
+	if p.GetSize() != size {
+		return errors.Wrapf(ErrUnexpectedPageMetadata, "size %d != %d", p.GetSize(), size)
+	}
+	return nil
+}
+
+// ValidateDecodedBlock validates the page once when a cursor decodes it, so a
+// page served from the decoded-block cache was validated when it was decoded.
+func (p *Page) ValidateDecodedBlock() error {
+	return p.Validate()
+}
+
+// ApplyBlockRef applies a ref change with a field id.
+func (p *Page) ApplyBlockRef(id uint32, ptr *block.BlockRef) error {
+	if idx, ok := entryIndexFromChildRefID(id); ok {
+		if idx >= len(p.Entries) || p.Entries[idx] == nil {
+			return ErrUnexpectedEntryMetadata
+		}
+		p.Entries[idx].ChildRef = ptr
+		return nil
+	}
+	if idx, ok := entryIndexFromValueRefID(id); ok {
+		if idx >= len(p.Entries) || p.Entries[idx] == nil {
+			return ErrUnexpectedEntryMetadata
+		}
+		p.Entries[idx].ValueRef = ptr
+		return nil
+	}
+	return nil
+}
+
+// GetBlockRefs returns all block references by ID.
+func (p *Page) GetBlockRefs() (map[uint32]*block.BlockRef, error) {
+	if p == nil {
+		return nil, nil
+	}
+	refs := make(map[uint32]*block.BlockRef)
+	for idx, ent := range p.GetEntries() {
+		if ent == nil {
+			continue
+		}
+		if !ent.GetChildRef().GetEmpty() {
+			refs[entryChildRefID(idx)] = ent.GetChildRef()
+		}
+		if !ent.GetValueRef().GetEmpty() {
+			refs[entryValueRefID(idx)] = ent.GetValueRef()
+		}
+	}
+	return refs, nil
+}
+
+// GetBlockRefCtor returns the constructor for the block at the ref id.
+func (p *Page) GetBlockRefCtor(id uint32) block.Ctor {
+	if _, ok := entryIndexFromChildRefID(id); ok {
+		return NewPageBlock
+	}
+	return nil
+}
+
+// FollowChild follows an internal entry child page.
+func (p *Page) FollowChild(cursor *block.Cursor, index int) *block.Cursor {
+	if p == nil || index < 0 || index >= len(p.GetEntries()) {
+		return nil
+	}
+	ent := p.GetEntries()[index]
+	return cursor.FollowRef(entryChildRefID(index), ent.GetChildRef())
+}
+
+// FollowValue follows a leaf entry value.
+func (p *Page) FollowValue(cursor *block.Cursor, index int) *block.Cursor {
+	if p == nil || index < 0 || index >= len(p.GetEntries()) {
+		return nil
+	}
+	ent := p.GetEntries()[index]
+	if ent.GetValueBlob() != nil {
+		return cursor.FollowSubBlock(entryValueRefID(index))
+	}
+	return cursor.FollowRef(entryValueRefID(index), ent.GetValueRef())
+}
+
+// GetSubBlocks exposes inline Blobs through the ordinary cursor lifecycle.
+func (p *Page) GetSubBlocks() map[uint32]block.SubBlock {
+	var values map[uint32]block.SubBlock
+	for index, entry := range p.GetEntries() {
+		if entry.GetValueBlob() != nil {
+			if values == nil {
+				values = make(map[uint32]block.SubBlock)
+			}
+			values[entryValueRefID(index)] = entry.GetValueBlob()
+		}
+	}
+	return values
+}
+
+// SharesDecodedBlock marks decoded pages as shareable between transactions:
+// readers never mutate a page, and writers build new pages.
+// FollowValue follows only existing inline Blobs, so traversal never creates
+// a field on a shared page.
+func (p *Page) SharesDecodedBlock() {}
+
+// GetSubBlockCtor returns the constructor for an inline Blob value.
+func (p *Page) GetSubBlockCtor(id uint32) block.SubBlockCtor {
+	index, ok := entryIndexFromValueRefID(id)
+	if !ok || index >= len(p.Entries) || p.Entries[index] == nil {
+		return nil
+	}
+	return blob.NewBlobSubBlockCtor(&p.Entries[index].ValueBlob)
+}
+
+// ApplySubBlock applies an inline value update to its page entry.
+func (p *Page) ApplySubBlock(id uint32, next block.SubBlock) error {
+	index, ok := entryIndexFromValueRefID(id)
+	if !ok || index >= len(p.Entries) || p.Entries[index] == nil {
+		return ErrUnexpectedEntryMetadata
+	}
+	return block.ApplySubBlock(&p.Entries[index].ValueBlob, next)
+}
+
+// Verify the Page block contracts.
+var (
+	_ block.Block                 = (*Page)(nil)
+	_ block.BlockWithRefs         = (*Page)(nil)
+	_ block.BlockWithSubBlocks    = (*Page)(nil)
+	_ block.DecodedBlockShareable = (*Page)(nil)
+	_ block.DecodedBlockValidator = (*Page)(nil)
+)

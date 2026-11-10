@@ -1,0 +1,62 @@
+package s4wave_provider_local
+
+import (
+	"context"
+
+	resource_client "github.com/s4wave/spacewave/bldr/resource/client"
+)
+
+// LocalProvider is the SDK wrapper for the LocalProviderResourceService.
+type LocalProvider struct {
+	client  *resource_client.Client
+	ref     resource_client.ResourceRef
+	service SRPCLocalProviderResourceServiceClient
+}
+
+// NewLocalProvider creates a new LocalProvider resource wrapper.
+func NewLocalProvider(client *resource_client.Client, ref resource_client.ResourceRef) (*LocalProvider, error) {
+	srpcClient, err := ref.GetClient()
+	if err != nil {
+		return nil, err
+	}
+	return &LocalProvider{
+		client:  client,
+		ref:     ref,
+		service: NewSRPCLocalProviderResourceServiceClient(srpcClient),
+	}, nil
+}
+
+// GetResourceRef returns the resource reference.
+func (l *LocalProvider) GetResourceRef() resource_client.ResourceRef {
+	return l.ref
+}
+
+// Release releases the resource reference.
+func (l *LocalProvider) Release() {
+	l.ref.Release()
+}
+
+// CreateAccount creates a ProviderAccount and Session on the local provider.
+func (l *LocalProvider) CreateAccount(ctx context.Context) (*CreateAccountResponse, error) {
+	return l.service.CreateAccount(ctx, &CreateAccountRequest{})
+}
+
+// AttachAccount registers the existing Session in a local account volume.
+func (l *LocalProvider) AttachAccount(ctx context.Context, accountID string) (*AttachAccountResponse, error) {
+	return l.service.AttachAccount(ctx, &AttachAccountRequest{AccountId: accountID})
+}
+
+// PreparePairingSession creates an unregistered local Session for receiving an account.
+func (l *LocalProvider) PreparePairingSession(ctx context.Context) (*CreateAccountResponse, error) {
+	return l.service.CreateAccount(ctx, &CreateAccountRequest{DeferRegistration: true})
+}
+
+// CompleteSpaceLinkEnrollment creates or reopens the caller's own local
+// session from the supplied Device key and joins the target Space through the
+// one-use targeted invite from a local SpaceLink approval.
+func (l *LocalProvider) CompleteSpaceLinkEnrollment(
+	ctx context.Context,
+	req *CompleteSpaceLinkEnrollmentRequest,
+) (*CompleteSpaceLinkEnrollmentResponse, error) {
+	return l.service.CompleteSpaceLinkEnrollment(ctx, req)
+}

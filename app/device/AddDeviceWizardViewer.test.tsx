@@ -1,0 +1,865 @@
+import { spawnSync } from 'child_process'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+
+import React, { type DependencyList } from 'react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
+
+import { SetSpaceIndexPathOp } from '@s4wave/core/space/world/ops/ops.pb.js'
+import { SET_SPACE_INDEX_PATH_OP_ID } from '@s4wave/core/space/world/ops/set-space-settings.js'
+import {
+  SpaceLinkCallback,
+  SpaceLinkCallbackStatus,
+  SpaceLinkCompletionMode,
+} from '@s4wave/sdk/provider/spacewave/spacewave.pb.js'
+import {
+  SecretKindSSHPassword,
+  SecretKindSSHPrivateKey,
+  SSHPrivateKeyContentType,
+  SSHTextCredentialContentType,
+} from '@s4wave/sdk/secret/secret.js'
+import { CREATE_SSH_HOST_OP_ID } from '@s4wave/sdk/sshhost/create-ssh-host.js'
+import { CreateSshHostOp } from '@s4wave/sdk/sshhost/sshhost.pb.js'
+import { CREATE_TERMINAL_OP_ID } from '@s4wave/sdk/terminal/create-terminal.js'
+import type { WorldQuery } from '@s4wave/sdk/world/world-query.js'
+import {
+  CreateTerminalOp,
+  TerminalTargetKind,
+} from '@s4wave/sdk/terminal/terminal.pb.js'
+import { keysWorld } from '@s4wave/web/test/world-query.js'
+
+import { ComputersDashboardTypeID } from './computers.js'
+
+const h = vi.hoisted(() => ({
+  applyWorldOp: vi.fn().mockResolvedValue({ seqno: 1n, sysErr: false }),
+  deleteObject: vi.fn().mockResolvedValue({ deleted: true }),
+  navigateToObjects: vi.fn(),
+  navigate: vi.fn(),
+  updateState: vi.fn().mockResolvedValue(undefined),
+  persistDraftState: vi.fn().mockResolvedValue(undefined),
+  handleConfigDataChange: vi.fn(),
+  setCreating: vi.fn(),
+  previewSpaceLink: vi.fn(),
+  approveSpaceLink: vi.fn(),
+  createSecret: vi.fn().mockResolvedValue({ secret: {} }),
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
+  currentStep: 1,
+  configData: undefined as Uint8Array | undefined,
+  providerId: 'spacewave',
+  sessionInfoLoading: false,
+  spaceSettingsIndexPath: 'wizard/device-setup',
+  worldObjects: [
+    { objectKey: 'computers', objectType: 'spacewave/computers' },
+    { objectKey: 'devices/build-host', objectType: 'spacewave/device' },
+  ],
+}))
+
+vi.mock('../wizard/useWizardState.js', () => ({
+  useWizardState: () => ({
+    objectKey: 'wizard/device-setup',
+    state: {
+      step: h.currentStep,
+      targetTypeId: 'spacewave/device',
+      targetKeyPrefix: 'devices/',
+      name: 'Build Host',
+    },
+    localName: 'Build Host',
+    creating: false,
+    setCreating: h.setCreating,
+    sessionPeerId: '12D3KooWSession',
+    spaceWorld: {
+      ...keysWorld(() => h.worldObjects.map((obj) => obj.objectKey)),
+      applyWorldOp: h.applyWorldOp,
+      deleteObject: h.deleteObject,
+    },
+    spaceSettings: {
+      indexPath: h.spaceSettingsIndexPath,
+      pluginIds: ['spacewave-web'],
+    },
+    navigateToObjects: h.navigateToObjects,
+    wizardResource: { value: { updateState: h.updateState } },
+    configEditor: { element: null, value: undefined },
+    configData: h.configData,
+    persistDraftState: h.persistDraftState,
+    handleConfigDataChange: h.handleConfigDataChange,
+    handleUpdateName: vi.fn(),
+    handleBack: vi.fn(),
+    handleCancel: vi.fn(),
+  }),
+}))
+
+vi.mock('@aptre/bldr-sdk/hooks/useResource.js', () => ({
+  useResourceValue: (resource: { value?: unknown }) => resource.value,
+}))
+
+vi.mock('@s4wave/web/contexts/contexts.js', () => ({
+  SessionContext: {
+    useContext: () => ({
+      value: {
+        spacewave: {
+          previewSpaceLink: h.previewSpaceLink,
+          approveSpaceLink: h.approveSpaceLink,
+        },
+      },
+    }),
+  },
+  SpaceContext: {
+    useContext: () => ({
+      value: {
+        createSecret: h.createSecret,
+      },
+    }),
+  },
+  SharedObjectContext: {
+    useContext: () => ({ value: { meta: { sharedObjectId: 'space-1' } } }),
+  },
+}))
+
+vi.mock('@s4wave/web/hooks/useSessionInfo.js', () => ({
+  useSessionInfo: () => ({
+    sessionInfo: {
+      cryptoInfo: {
+        publicKeyPem:
+          '-----BEGIN PUBLIC KEY-----\nmock\n-----END PUBLIC KEY-----',
+      },
+    },
+    loading: h.sessionInfoLoading,
+    providerId: h.providerId,
+    supportsDeviceApproval: h.providerId === 'spacewave',
+  }),
+}))
+
+vi.mock('@s4wave/web/router/router.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  useNavigate: () => h.navigate,
+}))
+
+vi.mock('@s4wave/web/contexts/SpaceContainerContext.js', () => ({
+  SpaceContainerContext: {
+    useContext: () => ({
+      spaceWorldResource: {},
+    }),
+  },
+}))
+
+vi.mock('@s4wave/web/hooks/useWorldQuery.js', async () => {
+  const { typedObjectsWorld, useFakeWorldQuery } =
+    await import('@s4wave/web/test/world-query.js')
+  const world = typedObjectsWorld(() => h.worldObjects)
+  return {
+    useWorldQuery: <T,>(
+      _world: unknown,
+      query: WorldQuery<T>,
+      deps: DependencyList,
+    ) => useFakeWorldQuery(world, query, deps),
+  }
+})
+
+vi.mock('@s4wave/web/ui/toaster.js', () => ({
+  toast: {
+    success: h.toastSuccess,
+    error: h.toastError,
+  },
+}))
+
+import { AddDeviceWizardViewer } from './AddDeviceWizardViewer.js'
+
+function installSetupCommand(): string {
+  return `tmp=$(mktemp) || exit; trap 'rm -f "$tmp"' 0 HUP INT TERM; curl -fsSL --output "$tmp" https://raw.githubusercontent.com/s4wave/spacewave/master/scripts/spacewave.sh || exit; sh "$tmp" device setup --label 'Build Host' --target-hint space-1`
+}
+
+function renderedInstallSetupCommand(): string {
+  const command = screen.getByText(installSetupCommand()).textContent
+  if (!command) throw new Error('expected the install setup command')
+  return command
+}
+
+describe('AddDeviceWizardViewer', () => {
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+    h.currentStep = 1
+    h.configData = undefined
+    h.providerId = 'spacewave'
+    h.sessionInfoLoading = false
+    h.spaceSettingsIndexPath = 'wizard/device-setup'
+    h.worldObjects = [
+      { objectKey: 'computers', objectType: ComputersDashboardTypeID },
+      { objectKey: 'devices/build-host', objectType: 'spacewave/device' },
+    ]
+  })
+
+  it('shows direct and bootstrap setup commands before the Device ticket is available', () => {
+    renderViewer()
+
+    expect(screen.getByText('Add Device')).toBeTruthy()
+    expect(screen.queryByText('Link My Device')).toBeNull()
+    expect(screen.getByText('Spacewave already installed')).toBeTruthy()
+    expect(screen.getByText('Install and run')).toBeTruthy()
+    expect(
+      screen.getByText(
+        /^spacewave device setup --label 'Build Host' --target-hint space-1$/,
+      ),
+    ).toBeTruthy()
+    expect(screen.getByText(installSetupCommand())).toBeTruthy()
+    expect(screen.getByText('2. Paste the Device ticket')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^approve$/i })).toBeNull()
+  })
+
+  it('does not execute a truncated bootstrap when curl fails', () => {
+    renderViewer()
+    const dir = mkdtempSync(join(tmpdir(), 'spacewave-device-bootstrap-'))
+    const bin = join(dir, 'bin')
+    const marker = join(dir, 'script-ran')
+    const curl = join(bin, 'curl')
+    try {
+      mkdirSync(bin)
+      writeFileSync(
+        curl,
+        `#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then
+    output="$2"
+    break
+  fi
+  shift
+done
+printf '%s\\n' 'printf "%s\\n" script-ran > "$SPACEWAVE_TEST_MARKER"' > "\${output:?}"
+printf '%s' 'truncated' >> "\${output:?}"
+exit 22
+`,
+      )
+      chmodSync(curl, 0o755)
+
+      const result = spawnSync('sh', ['-c', renderedInstallSetupCommand()], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          SPACEWAVE_TEST_MARKER: marker,
+        },
+      })
+
+      expect(result.error).toBeUndefined()
+      expect(result.status).not.toBe(0)
+      expect(existsSync(marker)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('runs the downloaded bootstrap with the displayed setup arguments', () => {
+    renderViewer()
+    const dir = mkdtempSync(join(tmpdir(), 'spacewave-device-bootstrap-'))
+    const bin = join(dir, 'bin')
+    const args = join(dir, 'args')
+    const curl = join(bin, 'curl')
+    try {
+      mkdirSync(bin)
+      writeFileSync(
+        curl,
+        `#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then
+    output="$2"
+    break
+  fi
+  shift
+done
+printf '%s\\n' '#!/bin/sh' 'printf "%s\\n" "$@" > "$SPACEWAVE_TEST_ARGS"' > "\${output:?}"
+`,
+      )
+      chmodSync(curl, 0o755)
+
+      const result = spawnSync('sh', ['-c', renderedInstallSetupCommand()], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          SPACEWAVE_TEST_ARGS: args,
+        },
+      })
+
+      expect(result.error).toBeUndefined()
+      expect(result.status).toBe(0)
+      expect(readFileSync(args, 'utf8')).toBe(
+        'device\nsetup\n--label\nBuild Host\n--target-hint\nspace-1\n',
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('uses the shared compact input class for the Device name', () => {
+    h.currentStep = 0
+    renderViewer()
+
+    const name = screen.getByLabelText('Device Name')
+    expect(name.className).toContain('text-xs')
+    expect(name.className).not.toMatch(/(^|\s)text-base($|\s)/)
+    expect(name.className).not.toMatch(/(^|\s)text-sm($|\s)/)
+  })
+
+  it('approves a CLI SpaceLink ticket and persists the completion command', async () => {
+    const ticket = bytesToBase64(new Uint8Array([1, 2, 3]))
+    h.previewSpaceLink.mockResolvedValue({
+      label: 'Build Host',
+      agentPeerId: new Uint8Array([4, 5]),
+      targetHint: new TextEncoder().encode('space-1'),
+      completionMode: SpaceLinkCompletionMode.SpaceLinkCompletionMode_CLI,
+    })
+    h.approveSpaceLink.mockResolvedValue({
+      completionMode: SpaceLinkCompletionMode.SpaceLinkCompletionMode_CLI,
+      completion: {
+        status: SpaceLinkCallbackStatus.SpaceLinkCallbackStatus_OK,
+        nonce: new Uint8Array([9]),
+      },
+    })
+    h.configData = new TextEncoder().encode(JSON.stringify({ ticket }))
+    renderViewer()
+
+    expect(
+      screen.getByPlaceholderText(/paste the base64 ticket/i),
+    ).toHaveProperty('value', ticket)
+    expect(screen.getByText('Approve Device ticket')).toBeTruthy()
+    expect(screen.queryByText('Spacewave already installed')).toBeNull()
+    expect(screen.queryByText('Install and run')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /approve/i }))
+
+    await waitFor(() => expect(h.updateState).toHaveBeenCalled())
+    expect(h.previewSpaceLink).toHaveBeenCalledWith({
+      ticket: new Uint8Array([1, 2, 3]),
+    })
+    expect(h.approveSpaceLink).toHaveBeenCalledWith({
+      ticket: new Uint8Array([1, 2, 3]),
+      resourceId: new TextEncoder().encode('space-1'),
+    })
+    const update = h.updateState.mock.calls.at(-1)?.[0] as
+      | { step?: number; configData?: Uint8Array }
+      | undefined
+    if (!update?.configData) {
+      throw new Error('expected wizard state update')
+    }
+    expect(update.step).toBe(2)
+    const config = JSON.parse(new TextDecoder().decode(update.configData)) as {
+      ticket?: string
+      completion?: string
+    }
+    expect(config.ticket).toBe(ticket)
+    if (!config.completion) {
+      throw new Error('expected completion')
+    }
+    const completion = SpaceLinkCallback.fromBinary(
+      base64ToBytes(config.completion),
+    )
+    expect(completion.status).toBe(
+      SpaceLinkCallbackStatus.SpaceLinkCallbackStatus_OK,
+    )
+  })
+
+  it('replaces SpaceLink approval with the Cloud sign-in affordance for local sessions', () => {
+    h.providerId = 'local'
+    renderViewer()
+
+    expect(screen.getByText('Spacewave Cloud required')).toBeTruthy()
+    expect(
+      screen.getByText(
+        'Device linking requires a Spacewave Cloud session. Sign in or create an account to continue.',
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByPlaceholderText(/paste the base64 ticket/i)).toBeNull()
+    expect(screen.queryByText('Spacewave already installed')).toBeNull()
+    expect(screen.queryByText('Install and run')).toBeNull()
+    expect(screen.queryByText(/^spacewave device setup/)).toBeNull()
+    expect(
+      screen.queryByText(/raw\.githubusercontent\.com\/s4wave\/spacewave/),
+    ).toBeNull()
+    expect(screen.queryByRole('button', { name: /^approve$/i })).toBeNull()
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Sign in or create account' }),
+    )
+    expect(h.navigate).toHaveBeenCalledWith({ path: '/login' })
+    expect(h.previewSpaceLink).not.toHaveBeenCalled()
+    expect(h.approveSpaceLink).not.toHaveBeenCalled()
+  })
+
+  it('maps an unimplemented approval RPC to the Cloud-session explanation', async () => {
+    const ticket = bytesToBase64(new Uint8Array([1, 2, 3]))
+    h.configData = new TextEncoder().encode(JSON.stringify({ ticket }))
+    h.previewSpaceLink.mockRejectedValue(
+      new Error('Server error: unimplemented'),
+    )
+    renderViewer()
+
+    fireEvent.click(screen.getByRole('button', { name: /^approve$/i }))
+
+    await waitFor(() =>
+      expect(h.toastError).toHaveBeenCalledWith(
+        'Device linking requires a Spacewave Cloud session. Sign in or create an account to continue.',
+      ),
+    )
+    expect(h.toastError).not.toHaveBeenCalledWith(
+      expect.stringMatching(/unimplemented/i),
+    )
+  })
+
+  it('promotes Computers after completion and opens the created Device object', async () => {
+    h.currentStep = 2
+    h.configData = new TextEncoder().encode(
+      JSON.stringify({ completion: 'completion' }),
+    )
+    renderViewer()
+
+    expect(await screen.findByText('Device Objects')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /open device/i }))
+
+    await waitFor(() => expect(h.deleteObject).toHaveBeenCalled())
+    expect(h.applyWorldOp).toHaveBeenCalledWith(
+      SET_SPACE_INDEX_PATH_OP_ID,
+      expect.any(Uint8Array),
+      '12D3KooWSession',
+    )
+    const settingsOpData: unknown = h.applyWorldOp.mock.calls[0]?.[1]
+    if (!(settingsOpData instanceof Uint8Array)) {
+      throw new Error('expected settings op bytes')
+    }
+    const settingsOp = SetSpaceIndexPathOp.fromBinary(settingsOpData)
+    expect(settingsOp.indexPath).toBe('computers')
+
+    expect(h.deleteObject).toHaveBeenCalledWith('wizard/device-setup')
+    expect(h.navigateToObjects).toHaveBeenCalledWith(['devices/build-host'])
+  })
+
+  it('creates an SSH-only Host without unavailable-install or runtime review copy', async () => {
+    h.currentStep = 1
+    h.configData = new TextEncoder().encode(
+      JSON.stringify({
+        mode: 'ssh',
+        ssh: {
+          host: 'build.example.com',
+          port: 2222,
+          username: 'ubuntu',
+          authMode: 'password',
+          setupMode: 'host',
+          hostKeyAlgorithm: 'ssh-ed25519',
+          hostKeyFingerprint: 'SHA256:trusted-host',
+        },
+      }),
+    )
+    renderViewer()
+
+    expect(screen.getByPlaceholderText('host.example.com')).toHaveProperty(
+      'value',
+      'build.example.com',
+    )
+    expect(screen.getByPlaceholderText('SSH password')).toBeTruthy()
+    expect(
+      screen.getByRole('button', { name: /add ssh host and open terminal/i }),
+    ).toHaveProperty('disabled', false)
+    expect(screen.queryByText('Runtime')).toBeNull()
+    expect(screen.queryByText('Native SSH connector required')).toBeNull()
+    expect(
+      screen.queryByText(
+        'Install Agent is not available until secure bootstrap is configured.',
+      ),
+    ).toBeNull()
+
+    fireEvent.change(screen.getByPlaceholderText('SSH password'), {
+      target: { value: 'raw-secret-value' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /open terminal/i }))
+
+    await waitFor(() => expect(h.createSecret).toHaveBeenCalled())
+    expect(h.createSecret).toHaveBeenCalledWith({
+      objectKey: 'build-host-ssh-password-1',
+      displayName: 'Build Host SSH password',
+      kind: SecretKindSSHPassword,
+      contentType: SSHTextCredentialContentType,
+      value: new TextEncoder().encode('raw-secret-value'),
+      readerPublicKeyPem: new TextEncoder().encode(
+        '-----BEGIN PUBLIC KEY-----\nmock\n-----END PUBLIC KEY-----',
+      ),
+    })
+
+    const hostCall = h.applyWorldOp.mock.calls.find(
+      ([opId]) => opId === CREATE_SSH_HOST_OP_ID,
+    ) as [string, unknown, string?] | undefined
+    if (!hostCall) throw new Error('expected SSH Host create op')
+    const hostOpData: unknown = hostCall[1]
+    if (!(hostOpData instanceof Uint8Array)) {
+      throw new Error('expected SSH Host op bytes')
+    }
+    const hostOp = CreateSshHostOp.fromBinary(hostOpData)
+    expect(hostOp.objectKey).toBe('build-host-1')
+    expect(hostOp.endpoint).toEqual({
+      host: 'build.example.com',
+      port: 2222,
+      username: 'ubuntu',
+    })
+    expect(hostOp.credentials).toEqual({
+      passwordSecretObjectKey: 'build-host-ssh-password-1',
+    })
+    expect(JSON.stringify(hostOp)).not.toContain('raw-secret-value')
+
+    const terminalCall = h.applyWorldOp.mock.calls.find(
+      ([opId]) => opId === CREATE_TERMINAL_OP_ID,
+    ) as [string, unknown, string?] | undefined
+    if (!terminalCall) throw new Error('expected SSH Host terminal create op')
+    const terminalOpData: unknown = terminalCall[1]
+    if (!(terminalOpData instanceof Uint8Array)) {
+      throw new Error('expected terminal op bytes')
+    }
+    const terminalOp = CreateTerminalOp.fromBinary(terminalOpData)
+    expect(terminalOp.targetKind).toBe(TerminalTargetKind.SSH_HOST)
+    expect(terminalOp.sshHostObjectKey).toBe('build-host-1')
+    expect(terminalOp.deviceObjectKey ?? '').toBe('')
+    expect(terminalOp.devicePeerId ?? '').toBe('')
+    expect(JSON.stringify(terminalOp)).not.toContain('raw-secret-value')
+
+    expect(
+      h.applyWorldOp.mock.calls.some(
+        ([opId]) => typeof opId === 'string' && opId.includes('/device'),
+      ),
+    ).toBe(false)
+    expect(h.deleteObject).toHaveBeenCalledWith('wizard/device-setup')
+    expect(h.navigateToObjects).toHaveBeenCalledWith(['build-host-terminal-1'])
+  })
+
+  it('allows a blank SSH password for empty-password or no-auth hosts', async () => {
+    h.currentStep = 1
+    h.configData = new TextEncoder().encode(
+      JSON.stringify({
+        mode: 'ssh',
+        ssh: {
+          host: 'build.example.com',
+          port: 22,
+          username: 'ubuntu',
+          authMode: 'password',
+          hostKeyAlgorithm: 'ssh-ed25519',
+          hostKeyFingerprint: 'SHA256:trusted-host',
+        },
+      }),
+    )
+    renderViewer()
+
+    expect(
+      screen.getByText(
+        'Leave blank if the host accepts an empty password or requires no authentication.',
+      ),
+    ).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /open terminal/i }))
+
+    await waitFor(() => expect(h.createSecret).toHaveBeenCalled())
+    expect(h.createSecret).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: SecretKindSSHPassword,
+        value: new Uint8Array(),
+      }),
+    )
+    expect(
+      h.applyWorldOp.mock.calls.some(
+        ([opId]) => opId === CREATE_SSH_HOST_OP_ID,
+      ),
+    ).toBe(true)
+    expect(h.navigateToObjects).toHaveBeenCalledWith(['build-host-terminal-1'])
+  })
+
+  it('allows private-key auth without passphrase or prefilled host key trust', async () => {
+    h.currentStep = 1
+    h.configData = new TextEncoder().encode(
+      JSON.stringify({
+        mode: 'ssh',
+        ssh: {
+          host: '192.168.1.15',
+          port: 1940,
+          username: 'root',
+          authMode: 'private-key',
+          hostKeyAlgorithm: '',
+        },
+      }),
+    )
+    renderViewer()
+
+    const privateKey =
+      '-----BEGIN OPENSSH PRIVATE KEY-----\nmock-key\n-----END OPENSSH PRIVATE KEY-----'
+    fireEvent.change(
+      screen.getByPlaceholderText('-----BEGIN OPENSSH PRIVATE KEY-----'),
+      {
+        target: { value: privateKey },
+      },
+    )
+    const openButton = screen.getByRole('button', { name: /open terminal/i })
+    expect(openButton).toHaveProperty('disabled', false)
+    fireEvent.click(openButton)
+
+    await waitFor(() => expect(h.createSecret).toHaveBeenCalledTimes(1))
+    expect(h.createSecret).toHaveBeenCalledWith({
+      objectKey: 'build-host-ssh-private-key-1',
+      displayName: 'Build Host SSH private key',
+      kind: SecretKindSSHPrivateKey,
+      contentType: SSHPrivateKeyContentType,
+      value: new TextEncoder().encode(privateKey),
+      readerPublicKeyPem: new TextEncoder().encode(
+        '-----BEGIN PUBLIC KEY-----\nmock\n-----END PUBLIC KEY-----',
+      ),
+    })
+
+    const hostCall = h.applyWorldOp.mock.calls.find(
+      ([opId]) => opId === CREATE_SSH_HOST_OP_ID,
+    )
+    if (!hostCall) throw new Error('expected SSH Host create op')
+    const hostOpData: unknown = hostCall[1]
+    if (!(hostOpData instanceof Uint8Array)) {
+      throw new Error('expected SSH Host op bytes')
+    }
+    const hostOp = CreateSshHostOp.fromBinary(hostOpData)
+    expect(hostOp.endpoint).toEqual({
+      host: '192.168.1.15',
+      port: 1940,
+      username: 'root',
+    })
+    expect(hostOp.credentials).toEqual({
+      privateKeySecretObjectKey: 'build-host-ssh-private-key-1',
+    })
+    expect(hostOp.hostKeyPins ?? []).toHaveLength(0)
+  })
+
+  it('normalizes ssh-keyscan host key lines when creating an SSH Host', async () => {
+    h.currentStep = 1
+    h.configData = new TextEncoder().encode(
+      JSON.stringify({
+        mode: 'ssh',
+        ssh: {
+          host: '192.168.1.15',
+          port: 1940,
+          username: 'root',
+          authMode: 'password',
+          hostKeyPublicKey:
+            '[192.168.1.15]:1940 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDtrusted',
+        },
+      }),
+    )
+    renderViewer()
+
+    fireEvent.change(screen.getByPlaceholderText('SSH password'), {
+      target: { value: 'raw-secret-value' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /open terminal/i }))
+
+    await waitFor(() =>
+      expect(h.applyWorldOp).toHaveBeenCalledWith(
+        CREATE_SSH_HOST_OP_ID,
+        expect.any(Uint8Array),
+        '12D3KooWSession',
+      ),
+    )
+
+    const hostCall = h.applyWorldOp.mock.calls.find(
+      ([opId]) => opId === CREATE_SSH_HOST_OP_ID,
+    )
+    if (!hostCall) throw new Error('expected SSH Host create op')
+    const hostOpData: unknown = hostCall[1]
+    if (!(hostOpData instanceof Uint8Array)) {
+      throw new Error('expected SSH Host op bytes')
+    }
+    const hostOp = CreateSshHostOp.fromBinary(hostOpData)
+    expect(hostOp.endpoint).toEqual({
+      host: '192.168.1.15',
+      port: 1940,
+      username: 'root',
+    })
+    const pins = hostOp.hostKeyPins ?? []
+    expect(pins).toHaveLength(1)
+    expect(pins[0]?.algorithm).toBe('ssh-rsa')
+    expect(pins[0]?.publicKey).toBe(
+      'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDtrusted',
+    )
+  })
+
+  it('stores bare authorized-key trust input when creating an SSH Host', async () => {
+    h.currentStep = 1
+    h.configData = new TextEncoder().encode(
+      JSON.stringify({
+        mode: 'ssh',
+        ssh: {
+          host: '192.168.1.15',
+          port: 1940,
+          username: 'root',
+          authMode: 'password',
+          hostKeyPublicKey:
+            'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItrustedbarekey',
+        },
+      }),
+    )
+    renderViewer()
+
+    fireEvent.change(screen.getByPlaceholderText('SSH password'), {
+      target: { value: 'raw-secret-value' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /open terminal/i }))
+
+    await waitFor(() =>
+      expect(h.applyWorldOp).toHaveBeenCalledWith(
+        CREATE_SSH_HOST_OP_ID,
+        expect.any(Uint8Array),
+        '12D3KooWSession',
+      ),
+    )
+
+    const hostCall = h.applyWorldOp.mock.calls.find(
+      ([opId]) => opId === CREATE_SSH_HOST_OP_ID,
+    )
+    if (!hostCall) throw new Error('expected SSH Host create op')
+    const hostOpData: unknown = hostCall[1]
+    if (!(hostOpData instanceof Uint8Array)) {
+      throw new Error('expected SSH Host op bytes')
+    }
+    const hostOp = CreateSshHostOp.fromBinary(hostOpData)
+    const pins = hostOp.hostKeyPins ?? []
+    expect(pins).toHaveLength(1)
+    expect(pins[0]?.algorithm).toBe('ssh-ed25519')
+    expect(pins[0]?.publicKey).toBe(
+      'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItrustedbarekey',
+    )
+  })
+
+  it('rejects direct Install Agent selection without side effects', () => {
+    h.currentStep = 1
+    h.configData = new TextEncoder().encode(
+      JSON.stringify({
+        mode: 'ssh',
+        ssh: {
+          host: 'install.example.com',
+          port: 22,
+          username: 'root',
+          authMode: 'password',
+          setupMode: 'host',
+        },
+      }),
+    )
+    renderViewer()
+
+    const install = screen.getByRole('button', { name: 'Install Agent' })
+    expect(install).toHaveProperty('disabled', true)
+    fireEvent.click(install)
+
+    expect(
+      screen
+        .getByRole('button', { name: 'Add SSH Host' })
+        .getAttribute('aria-pressed'),
+    ).toBe('true')
+    expect(h.toastError).not.toHaveBeenCalled()
+    expectNoInstallAgentSideEffects()
+  })
+
+  it.each(['spacewave', 'local'])(
+    'rejects a restored Install Agent mode without %s side effects',
+    (providerId) => {
+      h.currentStep = 1
+      h.providerId = providerId
+      h.configData = new TextEncoder().encode(
+        JSON.stringify({
+          mode: 'ssh',
+          ticket: 'persisted-ticket',
+          completion: 'persisted-completion',
+          ssh: {
+            host: 'install.example.com',
+            port: 22,
+            username: 'root',
+            authMode: 'password',
+            setupMode: 'install-agent',
+            setupStatus: {
+              state: 'terminal_created',
+              hostObjectKey: 'persisted-host',
+              terminalObjectKey: 'persisted-terminal',
+            },
+          },
+        }),
+      )
+      renderViewer()
+
+      expect(screen.queryByText('Remote setup')).toBeNull()
+      expect(screen.queryByText('Complete setup')).toBeNull()
+      expect(
+        screen.queryByPlaceholderText(/paste the base64 ticket/i),
+      ).toBeNull()
+      expect(screen.queryByRole('button', { name: /^approve$/i })).toBeNull()
+      expect(
+        screen.queryByRole('button', { name: 'Sign in or create account' }),
+      ).toBeNull()
+      const finalize = screen.getByRole('button', {
+        name: 'Install Agent unavailable',
+      })
+      expect(finalize).toHaveProperty('disabled', true)
+      fireEvent.click(finalize)
+
+      expect(
+        screen.queryByText(
+          'Install Agent is not available until secure bootstrap is configured.',
+        ),
+      ).toBeNull()
+      expect(h.toastError).not.toHaveBeenCalled()
+      expectNoInstallAgentSideEffects()
+    },
+  )
+})
+
+function renderViewer() {
+  render(
+    <AddDeviceWizardViewer
+      objectInfo={{}}
+      worldState={{
+        value: null,
+        loading: false,
+        error: null,
+        retry: vi.fn(),
+      }}
+    />,
+  )
+}
+
+function expectNoInstallAgentSideEffects() {
+  expect(h.applyWorldOp).not.toHaveBeenCalled()
+  expect(h.createSecret).not.toHaveBeenCalled()
+  expect(h.deleteObject).not.toHaveBeenCalled()
+  expect(h.navigateToObjects).not.toHaveBeenCalled()
+  expect(h.navigate).not.toHaveBeenCalled()
+  expect(h.previewSpaceLink).not.toHaveBeenCalled()
+  expect(h.approveSpaceLink).not.toHaveBeenCalled()
+  expect(h.persistDraftState).not.toHaveBeenCalled()
+  expect(h.handleConfigDataChange).not.toHaveBeenCalled()
+  expect(h.updateState).not.toHaveBeenCalled()
+  expect(h.setCreating).not.toHaveBeenCalled()
+  expect(h.toastSuccess).not.toHaveBeenCalled()
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value)
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0))
+}

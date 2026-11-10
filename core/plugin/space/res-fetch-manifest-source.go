@@ -1,0 +1,99 @@
+package plugin_space
+
+import (
+	"context"
+	"slices"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/directive"
+	manifest "github.com/s4wave/spacewave/bldr/manifest"
+)
+
+// resolveSourceFetchManifest relays an approved manifest request to the parent
+// bus. The parent directive exists only while the Space approval remains. It
+// adds a value only when the parent supplies manifests, so an empty parent
+// never masks the Space World resolver.
+func (c *Controller) resolveSourceFetchManifest(
+	ctx context.Context,
+	handler directive.ResolverHandler,
+	dir manifest.FetchManifest,
+) error {
+	for {
+		source, approved, waitCh := c.getManifestSourceApproval(dir.GetManifestId())
+		if source == nil || !approved {
+			_ = handler.ClearValues()
+			handler.MarkIdle(true)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-waitCh:
+			}
+			continue
+		}
+
+		demandCtx, cancel := context.WithCancel(ctx)
+		_, release, err := bus.ExecCollectValuesWatch[*manifest.FetchManifestValue](
+			demandCtx,
+			source,
+			dir,
+			true,
+			func(_ []error, vals []*manifest.FetchManifestValue) error {
+				// Skip updates after the demand context canceled.
+				if demandCtx.Err() != nil {
+					return nil
+				}
+
+				// Republish the collected manifest refs as one value.
+				refs := make([]*manifest.ManifestRef, 0)
+				for _, val := range vals {
+					refs = append(refs, val.GetManifestRefs()...)
+				}
+				_ = handler.ClearValues()
+				if len(refs) != 0 {
+					_, _ = handler.AddValue(&manifest.FetchManifestValue{ManifestRefs: refs})
+				}
+				handler.MarkIdle(true)
+				return nil
+			},
+			nil,
+		)
+		if err != nil {
+			cancel()
+			return err
+		}
+
+		// Keep the parent demand until the source or the approval changes.
+		// The broadcast also fires for unrelated state such as resolver
+		// registration, which must not restart the parent fetch.
+		for {
+			select {
+			case <-ctx.Done():
+				cancel()
+				release()
+				return ctx.Err()
+			case <-waitCh:
+			}
+			var next bus.Bus
+			next, approved, waitCh = c.getManifestSourceApproval(dir.GetManifestId())
+			if next != source || !approved {
+				break
+			}
+		}
+		cancel()
+		release()
+	}
+}
+
+// getManifestSourceApproval snapshots the parent source and SpaceSettings gate.
+func (c *Controller) getManifestSourceApproval(manifestID string) (bus.Bus, bool, <-chan struct{}) {
+	// Snapshot the parent source, approval, and wait channel under the lock.
+	var source bus.Bus
+	var approved bool
+	var waitCh <-chan struct{}
+	c.bcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+		source = c.manifestSource
+		approved = slices.Contains(c.pluginIDs, manifestID)
+		waitCh = getWaitCh()
+	})
+	return source, approved, waitCh
+}

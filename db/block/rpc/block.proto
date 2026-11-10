@@ -1,0 +1,202 @@
+syntax = "proto3";
+package block.rpc;
+
+import "github.com/s4wave/spacewave/net/hash/hash.proto";
+import "github.com/s4wave/spacewave/db/block/block.proto";
+
+// BlockStore wraps a BlockStore interface with a RPC service.
+service BlockStore {
+  // GetHashType requests the preferred hash type for the store.
+  rpc GetHashType(GetHashTypeRequest) returns (GetHashTypeResponse);
+
+  // GetSupportedFeatures requests the native feature bitmask for the store.
+  rpc GetSupportedFeatures(GetSupportedFeaturesRequest) returns (GetSupportedFeaturesResponse);
+
+  // PutBlock requests to put a block into the store.
+  rpc PutBlock(PutBlockRequest) returns (PutBlockResponse);
+
+  // PutBlockBatch requests to put blocks into the store as a batch.
+  rpc PutBlockBatch(PutBlockBatchRequest) returns (PutBlockBatchResponse);
+
+  // GetBlock requests to lookup a block from the store.
+  rpc GetBlock(GetBlockRequest) returns (GetBlockResponse);
+
+  // GetBlockExists requests to check if a block exists in the store.
+  rpc GetBlockExists(GetBlockExistsRequest) returns (GetBlockExistsResponse);
+
+  // GetBlockExistsBatch requests to check if blocks exist in the store.
+  rpc GetBlockExistsBatch(GetBlockExistsBatchRequest) returns (GetBlockExistsBatchResponse);
+
+  // RmBlock requests to remove a block from the store.
+  // Does not return an error if the block was not present.
+  // In some cases, will return before confirming delete.
+  rpc RmBlock(RmBlockRequest) returns (RmBlockResponse);
+
+  // StatBlock requests block metadata without reading block data.
+  rpc StatBlock(StatBlockRequest) returns (StatBlockResponse);
+
+  // Sync is the durability barrier: it drains buffered writes and blocks until
+  // every prior write is durable.
+  rpc Sync(SyncRequest) returns (SyncResponse);
+}
+
+// GetHashTypeRequest requests the preferred hash type for the store.
+message GetHashTypeRequest {}
+
+// GetHashTypeResponse is the response to requesting the preferred hash type.
+message GetHashTypeResponse {
+  // HashType is the store's preferred hash type.
+  .hash.HashType hash_type = 1;
+}
+
+// GetSupportedFeaturesRequest requests the native feature bitmask for the store.
+message GetSupportedFeaturesRequest {}
+
+// GetSupportedFeaturesResponse is the response to requesting native features.
+message GetSupportedFeaturesResponse {
+  // Features is the native feature bitmask.
+  .block.StoreFeature features = 1;
+}
+
+// PutBlockRequest requests to put a block into the store.
+message PutBlockRequest {
+  // Data is the data to put into the store.
+  bytes data = 1;
+  // PutOpts are any options when putting the block into the store.
+  .block.PutOpts put_opts = 2;
+}
+
+// PutBlockResponse is the response to putting a block in the store.
+message PutBlockResponse {
+  // Ref is the reference of the added block.
+  .block.BlockRef ref = 1;
+  // Existed indicates the block already existed.
+  bool existed = 2;
+  // Error is any error adding the block to the store.
+  string error = 3;
+}
+
+// PutBlockBatchEntry is one block write in a batch request.
+message PutBlockBatchEntry {
+  // Ref is the expected content-addressed block reference.
+  .block.BlockRef ref = 1;
+  // Data is the encoded block payload.
+  bytes data = 2;
+  // Refs are outgoing refs for GC bookkeeping.
+  repeated .block.BlockRef refs = 3;
+  // Tombstone marks the block ref as deleted.
+  bool tombstone = 4;
+  // RefsKnown declares refs complete, as block.PutOpts.refs_known does.
+  bool refs_known = 5;
+}
+
+// PutBlockBatchRequest requests to put blocks into the store as a batch.
+message PutBlockBatchRequest {
+  // Entries are the batch write entries.
+  repeated PutBlockBatchEntry entries = 1;
+}
+
+// PutBlockBatchResponse is the response to putting blocks as a batch.
+message PutBlockBatchResponse {
+  // Error is any error adding blocks to the store.
+  string error = 1;
+  // Existed reports, for each request entry in order, whether the block was
+  // already stored before the write. A tombstone entry reports false.
+  repeated bool existed = 2;
+}
+
+// GetBlockRequest requests to get a block from the store.
+message GetBlockRequest {
+  // Ref is the reference to the block to fetch.
+  .block.BlockRef ref = 1;
+  // WithRefs requests the block's outgoing refs with its data.
+  bool with_refs = 2;
+  // Background marks the read as background work: a remote fetch it needs
+  // yields to foreground fetches on the same store.
+  bool background = 3;
+}
+
+// GetBlockResponse is the response to looking up a block in the store.
+message GetBlockResponse {
+  // Exists indicates if the block exists or not.
+  bool exists = 1;
+  // Data is the data, if exists.
+  bytes data = 2;
+  // Error is any error getting the block from the store.
+  string error = 3;
+  // Refs are the block's outgoing refs when with_refs was requested and
+  // refs_known is set. Empty with refs_known set means a leaf.
+  repeated .block.BlockRef refs = 4;
+  // RefsKnown indicates the store recorded the block's outgoing refs.
+  bool refs_known = 5;
+}
+
+// GetBlockExistsRequest requests to check if a block exists in the store.
+message GetBlockExistsRequest {
+  // Ref is the reference to the block to check.
+  .block.BlockRef ref = 1;
+}
+
+// GetBlockExistsResponse is the response to checking if a block is in the store.
+message GetBlockExistsResponse {
+  // Exists indicates if the block exists or not.
+  bool exists = 1;
+  // Error is any error checking the block in the store.
+  string error = 2;
+}
+
+// GetBlockExistsBatchRequest requests to check if blocks exist in the store.
+message GetBlockExistsBatchRequest {
+  // Refs are the references to check.
+  repeated .block.BlockRef refs = 1;
+}
+
+// GetBlockExistsBatchResponse is the response to checking if blocks are in the store.
+message GetBlockExistsBatchResponse {
+  // Exists indicates existence for each requested ref.
+  repeated bool exists = 1;
+  // Error is any error checking blocks in the store.
+  string error = 2;
+}
+
+// RmBlockRequest requests to remove a block from the store.
+message RmBlockRequest {
+  // Ref is the reference to the block to remove.
+  .block.BlockRef ref = 1;
+}
+
+// RmBlockResponse is the response to removing a block from the store.
+message RmBlockResponse {
+  // Error is any error removing the block in the store.
+  // Will be empty if the block did not exist.
+  string error = 1;
+}
+
+// StatBlockRequest requests metadata about a block.
+message StatBlockRequest {
+  // Ref is the reference to the block to stat.
+  .block.BlockRef ref = 1;
+}
+
+// StatBlockResponse is the response to statting a block.
+message StatBlockResponse {
+  // Ref is the block reference.
+  .block.BlockRef ref = 1;
+  // Size is the block data size in bytes, or -1 if unknown.
+  int64 size = 2;
+  // Exists indicates if the block exists.
+  bool exists = 3;
+  // Error is any error statting the block.
+  string error = 4;
+}
+
+// SyncRequest requests a durability barrier on the store.
+message SyncRequest {}
+
+// SyncResponse is the response to a durability barrier.
+message SyncResponse {
+  // Fenced reports whether a durability fence was applied.
+  bool fenced = 1;
+  // Error is any error fencing the store.
+  string error = 2;
+}

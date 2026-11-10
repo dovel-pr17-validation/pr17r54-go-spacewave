@@ -1,0 +1,67 @@
+package store
+
+// setTransportFetchMaxBytes caps every transport fetch at the platform limit.
+func (e *PackReader) setTransportFetchMaxBytes(maxBytes int) {
+	e.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		if maxBytes > 0 {
+			e.transportFetchMaxBytes = maxBytes
+			e.normalizeTransportLocked()
+		}
+	})
+}
+
+func (e *PackReader) normalizeTransportLocked() {
+	// Choose valid minimum transport and alignment windows.
+	if e.minWindow <= 0 {
+		e.minWindow = defaultTransportMinWindow
+	}
+	if e.transportQuantum <= 0 {
+		e.transportQuantum = e.minWindow
+	}
+
+	// Cap transport windows at the platform fetch byte limit.
+	if e.transportFetchMaxBytes > 0 {
+		if e.minWindow > e.transportFetchMaxBytes {
+			e.minWindow = e.transportFetchMaxBytes
+		}
+		if e.transportQuantum > e.transportFetchMaxBytes {
+			e.transportQuantum = e.transportFetchMaxBytes
+		}
+		if e.maxWindow <= 0 || e.maxWindow > e.transportFetchMaxBytes {
+			e.maxWindow = e.transportFetchMaxBytes
+		}
+	}
+
+	// Keep the maximum and active transport windows within normalized bounds.
+	minMaxWindow := max(e.minWindow, e.transportQuantum)
+	if e.maxWindow > 0 && e.maxWindow < minMaxWindow {
+		e.maxWindow = minMaxWindow
+	}
+	e.currentWindow = e.clampWindow(e.currentWindow)
+}
+
+// SetExactReads makes each miss fetch exactly the bytes it needs, such as one
+// block's extent, with no minimum window, alignment, adaptive growth or
+// read-ahead. It suits a transport whose cost is the bytes moved over few
+// connections, over packs whose neighboring bytes are unrelated blocks.
+func (e *PackReader) SetExactReads() {
+	e.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		e.exactReads = true
+	})
+}
+
+// SetReadWindow sets the minimum transport window and its alignment quantum,
+// which bound the bytes one miss fetches. A transport with cheap round trips
+// over packs without locality, such as SFTP, wants a window near one block; a
+// transport with costly requests wants a wide one. Zero keeps the default.
+func (e *PackReader) SetReadWindow(size int) {
+	if size <= 0 {
+		return
+	}
+	e.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		e.minWindow = size
+		e.transportQuantum = size
+		e.currentWindow = size
+		e.normalizeTransportLocked()
+	})
+}

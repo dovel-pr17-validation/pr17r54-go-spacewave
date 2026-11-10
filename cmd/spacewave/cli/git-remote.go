@@ -1,0 +1,175 @@
+//go:build !js
+
+package spacewave_cli
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/aperturerobotics/cli"
+	"github.com/pkg/errors"
+	git_remote "github.com/s4wave/spacewave/core/git/remote"
+)
+
+// gitRemoteHelperName is the executable Git runs for spacewave:// remotes.
+const gitRemoteHelperName = "git-remote-spacewave"
+
+// gitRemoteURLPrefix is the URL scheme of a Space Git remote.
+const gitRemoteURLPrefix = "spacewave://"
+
+// buildGitRemoteCommand builds the git remote command group.
+func buildGitRemoteCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "remote",
+		Usage: "push and fetch Git repositories to a Space with spacewave:// remotes",
+		Subcommands: []*cli.Command{
+			buildGitRemoteInstallCommand(),
+			buildGitRemoteServeCommand(),
+		},
+	}
+}
+
+// buildGitRemoteInstallCommand builds the git remote install subcommand.
+func buildGitRemoteInstallCommand() *cli.Command {
+	var statePath string
+	var dir string
+	return &cli.Command{
+		Name:  "install",
+		Usage: "install " + gitRemoteHelperName + " so Git can use spacewave:// remotes",
+		Description: "Writes " + gitRemoteHelperName + " next to this spacewave binary, or into\n" +
+			"--dir, which must be on your path. Then add a remote:\n\n" +
+			"  git remote add space spacewave://<space>/<object-key>\n" +
+			"  git push space master\n\n" +
+			"To use a session other than the first, name it in the address:\n\n" +
+			"  git remote add space spacewave:///u/<n>/so/<space>/-/<object-key>\n\n" +
+			"The first push creates the Git repository object. Install also sets\n" +
+			"protocol.spacewave.allow in your global Git config, so submodules may\n" +
+			"clone spacewave:// URLs. Rerunning install rewrites the helper for the\n" +
+			"current binary and daemon flags.",
+		Flags: []cli.Flag{
+			statePathFlag(&statePath),
+			socketPathFlag(),
+			&cli.StringFlag{
+				Name:        "dir",
+				Usage:       "directory to write the helper into (default: this binary's directory)",
+				Destination: &dir,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			// Resolve the spacewave binary and helper directory.
+			exe, err := os.Executable()
+			if err != nil {
+				return errors.Wrap(err, "find the spacewave binary")
+			}
+			exe, err = filepath.EvalSymlinks(exe)
+			if err != nil {
+				return errors.Wrap(err, "find the spacewave binary")
+			}
+			if dir == "" {
+				dir = filepath.Dir(exe)
+			}
+			daemonFlags, err := gitDaemonFlags(c, statePath)
+			if err != nil {
+				return err
+			}
+
+			// Write the remote helper script and report its path.
+			serveArgs := append(append([]string{exe, "git", "remote", "serve"}, daemonFlags...), "--")
+			script := "#!/bin/sh\n" +
+				"# Serves spacewave:// Git remotes. Written by spacewave git remote install.\n" +
+				"exec " + shellJoin(serveArgs) + " \"$@\"\n"
+			path := filepath.Join(dir, gitRemoteHelperName)
+			if err := os.WriteFile(path, []byte(script), 0o755); err != nil { //nolint:gosec // Git must execute the helper.
+				return errors.Wrap(err, "write the remote helper")
+			}
+
+			// Git refuses unknown transports in submodules unless allowed.
+			if _, err := gitOutput(c.Context, "config", "--global", "protocol.spacewave.allow", "always"); err != nil {
+				return errors.Wrap(err, "allow spacewave:// in submodules")
+			}
+			os.Stdout.WriteString("installed " + path + "\n")
+			return nil
+		},
+	}
+}
+
+// buildGitRemoteServeCommand builds the git remote serve subcommand that Git
+// runs through git-remote-spacewave.
+func buildGitRemoteServeCommand() *cli.Command {
+	var statePath, spaceID string
+	var sessIdx int
+	return &cli.Command{
+		Name:      "serve",
+		Usage:     "serve a spacewave:// Git remote on stdin and stdout (run by git)",
+		ArgsUsage: "<remote> <url>",
+		Hidden:    true,
+		Flags:     commonFsFlags(&statePath, &spaceID, &sessIdx),
+		Action: func(c *cli.Context) error {
+			// Parse the remote URL and Git directory.
+			ctx := c.Context
+			uri, err := parseGitRemoteURL(c.Args().Get(1))
+			if err != nil {
+				return err
+			}
+			if sessIdx == 0 {
+				sessIdx = int(uri.sessionIdx)
+			}
+			gitDir, err := gitRemoteDir()
+			if err != nil {
+				return err
+			}
+
+			// Mount the Git engine and run the remote helper.
+			mount, cleanup, err := mountGitEngine(c, statePath, uri.spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			helper := git_remote.NewHelper(mount.engine, uri.objectKey, gitDir)
+			if err := helper.Run(ctx, os.Stdin, os.Stdout); err != nil {
+				return err
+			}
+			if !helper.Pushed() {
+				return nil
+			}
+			return waitSpaceStorageSynced(ctx, mount.sess, mount.spaceID)
+		},
+	}
+}
+
+// parseGitRemoteURL parses a spacewave://<space>/<object-key> URL, or the
+// session-qualified spacewave:///u/<n>/so/<space>/-/<object-key>. The session
+// index is zero when the URL names none. Git passes the address without the
+// scheme for the spacewave::<address> form.
+func parseGitRemoteURL(url string) (fsURI, error) {
+	// Parse a session-qualified address as a Spacewave URI naming one object.
+	addr := strings.TrimPrefix(url, gitRemoteURLPrefix)
+	if strings.HasPrefix(addr, "/u/") {
+		uri, err := parseFsURI(addr, "", 0)
+		if err != nil {
+			return fsURI{}, errors.Wrapf(err, "remote URL %q", url)
+		}
+		if uri.spaceID == "" || uri.path != "" {
+			return fsURI{}, errors.Errorf("remote URL %q is not %s/u/<n>/so/<space>/-/<object-key>", url, gitRemoteURLPrefix)
+		}
+		return uri, nil
+	}
+
+	// Split a short address at the end of the Space ID.
+	space, objectKey, ok := strings.Cut(addr, "/")
+	if !ok || space == "" || objectKey == "" {
+		return fsURI{}, errors.Errorf("remote URL %q is not %s<space>/<object-key>", url, gitRemoteURLPrefix)
+	}
+	return fsURI{spaceID: space, objectKey: objectKey}, nil
+}
+
+// gitRemoteDir returns the local repository's Git directory, which Git passes
+// to remote helpers in GIT_DIR.
+func gitRemoteDir() (string, error) {
+	dir := os.Getenv("GIT_DIR")
+	if dir == "" {
+		return "", errors.New("GIT_DIR is not set; git runs this command for spacewave:// remotes")
+	}
+	return filepath.Abs(dir)
+}

@@ -1,0 +1,248 @@
+package identity_world
+
+import (
+	"context"
+	"slices"
+	"strings"
+
+	"github.com/aperturerobotics/cayley"
+	"github.com/aperturerobotics/cayley/quad"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/world"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	"github.com/s4wave/spacewave/identity"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+const (
+	// KeypairPrefix is the prefix applied to the keypair peer id.
+	KeypairPrefix = "kp/"
+	// KeypairTypeID is the type identifier for a Keypair.
+	KeypairTypeID = identity.KeypairTypeID
+
+	// PredObjectToKeypair links any object to a Keypair.
+	// The meaning of the link is source-specific.
+	PredObjectToKeypair = quad.IRI(KeypairTypeID + "-link")
+)
+
+const keypairGraphPathLimit uint32 = 1_000_000
+
+// NewKeypairKey builds a key from a peer id.
+func NewKeypairKey(peerIDString string) string {
+	return KeypairPrefix + peerIDString
+}
+
+// NewObjectToKeypairQuad creates a quad linking any object to a Keypair.
+func NewObjectToKeypairQuad(objKey, keypairObjKey string) world.GraphQuad {
+	return world.NewGraphQuadWithKeys(
+		objKey,
+		PredObjectToKeypair.String(),
+		keypairObjKey,
+		"",
+	)
+}
+
+// FollowKeypair follows & checks a reference to a Keypair.
+func FollowKeypair(
+	ctx context.Context,
+	accessState world.AccessWorldStateFunc,
+	keypairRef *bucket.ObjectRef,
+) (*identity.Keypair, error) {
+	// Validate the keypair reference before reading its block.
+	var err error
+	if keypairRef.GetEmpty() {
+		return nil, errors.New("empty keypair ref")
+	}
+	if err := keypairRef.Validate(); err != nil {
+		return nil, err
+	}
+
+	// Decode and validate the referenced keypair record.
+	var entity *identity.Keypair
+	_, err = world.AccessObject(ctx, accessState, keypairRef, func(bcs *block.Cursor) error {
+		// Decode the referenced keypair block.
+		var err error
+		entity, err = identity.UnmarshalKeypair(ctx, bcs)
+		return err
+	})
+	if err == nil {
+		err = entity.Validate()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return entity, nil
+}
+
+// LookupKeypair looks up an entity with the given key.
+// returns nil, nil, nil if not found.
+func LookupKeypair(ctx context.Context, w world.WorldState, objKey string) (*identity.Keypair, world.ObjectState, error) {
+	// Look up the keypair object and preserve its handle for the caller.
+	obj, objFound, err := w.GetObject(ctx, objKey)
+	if err != nil {
+		world.ReleaseObjectState(obj)
+		return nil, nil, err
+	}
+	if !objFound {
+		return nil, nil, nil
+	}
+
+	// Decode the stored keypair while preserving its object handle.
+	var entity *identity.Keypair
+	_, _, err = world.AccessObjectState(ctx, obj, false, func(bcs *block.Cursor) error {
+		var err error
+		entity, err = identity.UnmarshalKeypair(ctx, bcs)
+		return err
+	})
+	if err != nil {
+		world.ReleaseObjectState(obj)
+		return nil, nil, err
+	}
+	return entity, obj, nil
+}
+
+// LookupKeypairBody looks up a keypair without returning its object-state handle.
+func LookupKeypairBody(ctx context.Context, w world.WorldState, objKey string) (*identity.Keypair, error) {
+	kp, state, err := LookupKeypair(ctx, w, objKey)
+	world.ReleaseObjectState(state)
+	return kp, err
+}
+
+// LookupKeypairs looks up a set of keypairs.
+func LookupKeypairs(ctx context.Context, w world.WorldState, objKeys []string) ([]*identity.Keypair, error) {
+	kps := make([]*identity.Keypair, len(objKeys))
+	for i, objKey := range objKeys {
+		var err error
+		kps[i], err = LookupKeypairBody(ctx, w, objKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return kps, nil
+}
+
+// CollectAllKeypairs collects all Keypair states located in the store.
+// Returns the keypairs and their object keys.
+func CollectAllKeypairs(ctx context.Context, w world.WorldState) ([]*identity.Keypair, []string, error) {
+	// Collect and sort the object keys for stored keypairs.
+	var objKeys []string
+	err := world_types.IterateObjectsWithType(ctx, w, KeypairTypeID, func(objKey string) (bool, error) {
+		if !strings.HasPrefix(objKey, KeypairPrefix) {
+			return true, nil
+		}
+		objKeys = append(objKeys, objKey)
+		return true, nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	slices.Sort(objKeys)
+
+	// Resolve the collected keypair keys.
+	list, err := LookupKeypairs(ctx, w, objKeys)
+
+	return list, objKeys, err
+}
+
+// ListKeypairEntities lists all Entity that link to the given keypairs.
+// Returns the entity object keys.
+func ListKeypairEntities(ctx context.Context, w world.WorldState, keypairKeys ...string) ([]string, error) {
+	return world.CollectPathWithKeys(
+		ctx,
+		w,
+		keypairKeys,
+		func(p *cayley.Path) (*cayley.Path, error) {
+			// Traverse incoming links and retain entity objects.
+			p = p.In(PredObjectToKeypair)
+			p = world_types.LimitNodesToTypes(p, EntityTypeID)
+			return p, nil
+		},
+	)
+}
+
+// CollectKeypairEntities collects all Entity linking to the keypairs.
+// Returns the entities and their object keys.
+func CollectKeypairEntities(ctx context.Context, w world.WorldState, keypairKeys ...string) ([]*identity.Entity, []string, error) {
+	// Find the entity objects linked to the selected keypairs.
+	objKeys, err := ListKeypairEntities(ctx, w, keypairKeys...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Read the entities identified by the keypair links.
+	ents, err := LookupEntities(ctx, w, objKeys)
+	if err != nil {
+		return nil, objKeys, err
+	}
+	return ents, objKeys, nil
+}
+
+// ListKeypairLinks collects all Object linking directly to the Keypair.
+// Returns the linking object keys.
+func ListKeypairLinks(ctx context.Context, w world.WorldState, keypairKeys ...string) ([]string, error) {
+	return world.CollectGraphPathStepWithKeys(
+		ctx,
+		w,
+		keypairKeys,
+		world.GraphPathDirectionIn,
+		PredObjectToKeypair.String(),
+		keypairGraphPathLimit,
+	)
+}
+
+// ListObjectKeypairs lists all Keypair linked to directly by the Objects.
+func ListObjectKeypairs(ctx context.Context, w world.WorldState, objectKeys ...string) ([]string, error) {
+	return world.CollectGraphPathStepWithKeys(
+		ctx,
+		w,
+		objectKeys,
+		world.GraphPathDirectionOut,
+		PredObjectToKeypair.String(),
+		keypairGraphPathLimit,
+	)
+}
+
+// CollectObjectKeypairs collects all Keypair linked to by the given Objects.
+// Returns the keypairs and their object keys.
+func CollectObjectKeypairs(ctx context.Context, w world.WorldState, objectKeys ...string) ([]*identity.Keypair, []string, error) {
+	// Find the keypair objects linked to the selected objects.
+	kpObjectKeys, err := ListEntityKeypairs(ctx, w, objectKeys...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Read each linked keypair without retaining its object handle.
+	kps := make([]*identity.Keypair, len(kpObjectKeys))
+	for i, objKey := range kpObjectKeys {
+		var err error
+		kps[i], err = LookupKeypairBody(ctx, w, objKey)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return kps, kpObjectKeys, nil
+}
+
+// LinkObjectToKeypair looks up the keypair w/ the peer ID or creates it.
+// Links objKey to the keypair using the object linking quad.
+func LinkObjectToKeypair(
+	ctx context.Context,
+	w world.WorldState,
+	sender peer.ID,
+	objKey string,
+	keypairPeer peer.ID,
+	authMethodID string,
+	authMethodParams []byte,
+) (*identity.Keypair, string, error) {
+	kp, kpKey, err := LookupOrStoreKeypair(ctx, w, sender, keypairPeer, authMethodID, authMethodParams)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// link the object with the keypair
+	err = w.SetGraphQuad(ctx, NewObjectToKeypairQuad(objKey, kpKey))
+	return kp, kpKey, err
+}

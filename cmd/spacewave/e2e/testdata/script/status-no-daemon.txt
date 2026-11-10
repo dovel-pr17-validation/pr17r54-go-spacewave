@@ -1,0 +1,5 @@
+# Status autostarts the daemon when no daemon is running and reports the empty
+# session set.
+spacewave --state-path $WORK/state status
+stdout "Status:           running"
+stdout "Session:          none (no session found at index 1)"

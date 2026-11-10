@@ -1,0 +1,986 @@
+//go:build !js
+
+package bldr_plugin_compiler_js
+
+import (
+	"context"
+	"encoding/hex"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/configset"
+	configset_proto "github.com/aperturerobotics/controllerbus/controller/configset/proto"
+	protobuf_go_lite_json "github.com/aperturerobotics/protobuf-go-lite/json"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/aperturerobotics/util/fsutil"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/bldr/distpath"
+	frontend "github.com/s4wave/spacewave/bldr/frontend"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_builder "github.com/s4wave/spacewave/bldr/manifest/builder"
+	bldr_platform "github.com/s4wave/spacewave/bldr/platform"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	bldr_plugin_compiler "github.com/s4wave/spacewave/bldr/plugin/compiler"
+	bldr_web_bundler "github.com/s4wave/spacewave/bldr/web/bundler"
+	bldr_web_bundler_esbuild "github.com/s4wave/spacewave/bldr/web/bundler/esbuild"
+	bldr_web_bundler_esbuild_compiler "github.com/s4wave/spacewave/bldr/web/bundler/esbuild/compiler"
+	bldr_web_bundler_rolldown "github.com/s4wave/spacewave/bldr/web/bundler/rolldown"
+	bldr_web_bundler_vite "github.com/s4wave/spacewave/bldr/web/bundler/vite"
+	bldr_web_bundler_vite_compiler "github.com/s4wave/spacewave/bldr/web/bundler/vite/compiler"
+	entrypoint_browser_bundle "github.com/s4wave/spacewave/bldr/web/entrypoint/browser/bundle"
+	web_pkg "github.com/s4wave/spacewave/bldr/web/pkg"
+	web_pkg_external "github.com/s4wave/spacewave/bldr/web/pkg/external"
+	bldr_web_plugin "github.com/s4wave/spacewave/bldr/web/plugin"
+	web_view "github.com/s4wave/spacewave/bldr/web/view"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/sirupsen/logrus"
+)
+
+// ControllerID is the compiler controller ID.
+const ControllerID = ConfigID
+
+// Version is the controller version.
+var Version = controller.MustParseVersion("0.0.1")
+
+// controllerDescrip is the controller description.
+var controllerDescrip = "js plugin compiler controller"
+
+// Controller is the compiler controller.
+type Controller struct {
+	*bus.BusController[*Config]
+	preBuildHooks []preBuildHookEntry
+
+	// bcast guards build admission and completion.
+	bcast broadcast.Broadcast
+	// activeBuilds is the number of admitted builds that have not returned.
+	activeBuilds int
+	// closing rejects new builds after Close starts.
+	closing bool
+}
+
+func (c *Controller) admitBuild() (func(), error) {
+	// Reserve the build admission lock.
+	locked := c.bcast.Lock()
+
+	// Reject new builds after shutdown starts.
+	if c.closing {
+		locked.Unlock()
+		return nil, errors.New("js compiler is closed")
+	}
+
+	// Record the admitted build before releasing the lock.
+	c.activeBuilds++
+	locked.Unlock()
+
+	// Return the release callback that wakes Close after completion.
+	return func() {
+		locked := c.bcast.Lock()
+		c.activeBuilds--
+		locked.Broadcast()
+		locked.Unlock()
+	}, nil
+}
+
+// Close rejects new builds and waits for admitted builds to finish.
+func (c *Controller) Close() error {
+	for {
+		locked := c.bcast.Lock()
+		c.closing = true
+		if c.activeBuilds == 0 {
+			locked.Unlock()
+			return nil
+		}
+		waitCh := locked.WaitCh()
+		locked.Unlock()
+		<-waitCh
+	}
+}
+
+// preBuildHookEntry pairs a pre-build hook with its optional provenance declaration.
+type preBuildHookEntry struct {
+	// hook is the pre-build callback.
+	hook PreBuildHook
+	// provenance declares the hook's deterministic inputs, or nil when the hook
+	// is undeclared and keeps the compiler always-building.
+	provenance *PreBuildHookProvenance
+}
+
+// Factory is the factory for the compiler controller.
+type Factory = bus.BusFactory[*Config, *Controller]
+
+// NewControllerWithBusController constructs a new plugin compiler controller with an existing BusController.
+func NewControllerWithBusController(base *bus.BusController[*Config]) (*Controller, error) {
+	return &Controller{
+		BusController: base,
+	}, nil
+}
+
+// NewController constructs a new plugin compiler controller.
+func NewController(le *logrus.Entry, b bus.Bus, conf *Config) (*Controller, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, err
+	}
+
+	base := bus.NewBusController(
+		le,
+		b,
+		conf,
+		ControllerID,
+		Version,
+		controllerDescrip,
+	)
+
+	return NewControllerWithBusController(base)
+}
+
+// NewFactory constructs a new plugin compiler controller factory.
+func NewFactory(b bus.Bus) controller.Factory {
+	return bus.NewBusControllerFactory(
+		b,
+		ConfigID,
+		ControllerID,
+		Version,
+		controllerDescrip,
+		NewConfig,
+		NewControllerWithBusController,
+	)
+}
+
+// PreBuildHook is a callback called before building the plugin.
+// Returns an optional PreBuildResult.
+type PreBuildHook func(
+	ctx context.Context,
+	builderConf *bldr_manifest_builder.BuilderConfig,
+	worldEng world.Engine,
+) (*PreBuildHookResult, error)
+
+// AddPreBuildHook adds a callback that is called just after constructing the
+// plugin working dir. The hook declares no provenance, so it keeps the compiler
+// always-building.
+// NOTE: may be removed in future.
+func (c *Controller) AddPreBuildHook(hook PreBuildHook) {
+	c.AddPreBuildHookWithProvenance(hook, nil)
+}
+
+// AddPreBuildHookWithProvenance registers a pre-build hook together with a
+// declaration of its complete deterministic provenance. A hook whose declared
+// inputs fully determine its outputs becomes eligible for startup cache reuse:
+// its declared inputs are folded into the build's startup input set and
+// validated on every startup like any other build input. A nil provenance
+// registers an undeclared, always-building hook.
+func (c *Controller) AddPreBuildHookWithProvenance(hook PreBuildHook, provenance *PreBuildHookProvenance) {
+	if hook != nil {
+		c.preBuildHooks = append(c.preBuildHooks, preBuildHookEntry{hook: hook, provenance: provenance})
+	}
+}
+
+// Execute executes the controller goroutine.
+func (c *Controller) Execute(ctx context.Context) error {
+	return nil
+}
+
+// SupportsStartupManifestCache returns true if startup cache reuse is safe.
+// Reuse is safe when every registered pre-build hook has declared complete
+// deterministic provenance; an undeclared hook keeps the compiler
+// always-building.
+func (c *Controller) SupportsStartupManifestCache() bool {
+	for _, entry := range c.preBuildHooks {
+		if entry.provenance == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// BuildManifest compiles the manifest with the given builder args.
+func (c *Controller) BuildManifest(
+	ctx context.Context,
+	args *bldr_manifest_builder.BuildManifestArgs,
+	host bldr_manifest_builder.BuildManifestHost,
+) (*bldr_manifest_builder.BuilderResult, error) {
+	// Resolve the controller and builder configuration for this manifest.
+	conf := c.GetConfig()
+	builderConf := args.GetBuilderConfig()
+	meta, buildPlatform, err := builderConf.GetManifestMeta().Resolve()
+	if err != nil {
+		return nil, err
+	}
+
+	// Capture the manifest identity and effective JavaScript build policy.
+	pluginID := meta.GetManifestId()
+	platformID := meta.GetPlatformId()
+	manifestID := strings.TrimSpace(meta.GetManifestId())
+	buildType := bldr_manifest.ToBuildType(meta.GetBuildType())
+	isRelease := buildType.IsRelease()
+	jsMinification := builderConf.GetBuildPolicy().ResolveJsMinification(buildType)
+	jsSourcemaps := builderConf.GetBuildPolicy().ResolveJsSourcemaps(buildType)
+
+	// Scope compiler diagnostics to this manifest and platform.
+	le := c.GetLogger().
+		WithField("manifest-id", manifestID).
+		WithField("build-type", buildType).
+		WithField("platform-id", platformID)
+
+	// Do nothing if we are not targeting a supported JavaScript platform.
+	basePlatformID := buildPlatform.GetBasePlatformID()
+	if basePlatformID != bldr_platform.PlatformID_WEB && basePlatformID != bldr_platform.PlatformID_JS {
+		le.Warnf("skipping build for non-js platform: %v", buildPlatform.GetInputPlatformID())
+		return nil, nil
+	}
+	releaseBuild, err := c.admitBuild()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseBuild()
+	le.Debug("building js plugin")
+
+	// Prepare output paths for the JavaScript build.
+	workingPath := builderConf.GetWorkingPath()
+	outDistPath := filepath.Join(workingPath, "dist")
+	outAssetsPath := filepath.Join(workingPath, "assets")
+
+	// Locate the Bldr distribution sources used by the entrypoint.
+	distSourcePath := builderConf.GetDistSourcePath()
+
+	// build output world engine
+	buildWorld := world.NewBusEngine(ctx, c.GetBus(), builderConf.GetEngineId())
+
+	// The JS plugin compiler owns the dist tree; stale hashed plugin entrypoints
+	// can retain dead frontend asset hashes across rebuilds.
+	if err := fsutil.CleanCreateDir(outDistPath); err != nil {
+		return nil, err
+	}
+	if err := fsutil.CreateDir(outAssetsPath); err != nil {
+		return nil, err
+	}
+
+	// Check out the previous result if any to save time.
+	// Note: JS compiler doesn't have a fast-rebuild path like Go compiler yet.
+	prevResult := args.GetPrevBuilderResult()
+	if !prevResult.GetManifestRef().GetEmpty() && !isRelease {
+		prevManifestRef := prevResult.GetManifestRef()
+		_, err = builderConf.CheckoutManifest(
+			ctx,
+			le,
+			buildWorld.AccessWorldState,
+			prevManifestRef.GetManifestRef(),
+			"", // no dist path
+			outAssetsPath,
+		)
+		if err != nil {
+			// Log warning but continue, as checkout failure isn't fatal for a full build.
+			le.WithError(err).Warn("failed to check out previous manifest assets")
+		}
+	}
+
+	// build base config
+	buildCtrlConf := conf.CloneVT()
+	if buildCtrlConf == nil {
+		buildCtrlConf = &Config{}
+	}
+
+	// apply the per-build-type configs
+	buildCtrlConf.FlattenBuildTypes(buildType)
+
+	// apply the per-platform-type configs
+	buildCtrlConf.FlattenPlatformTypes(buildPlatform)
+
+	// call any pre-build hooks, folding each hook's declared deterministic
+	// provenance into the build's startup input set so the cache validates hook
+	// inputs like any other build input. Undeclared hooks contribute nothing and
+	// the compiler stays startup-cache-ineligible.
+	var hookStartupInputPaths []string
+	var hookEnvStartupInputs []*bldr_manifest_builder.InputManifest_StartupInput
+	for _, entry := range c.preBuildHooks {
+		res, err := entry.hook(ctx, builderConf, buildWorld)
+		if err != nil {
+			return nil, err
+		}
+
+		// merge the returned config
+		buildCtrlConf.Merge(res.GetConfig())
+
+		// record the hook's declared deterministic provenance
+		hookStartupInputPaths = append(hookStartupInputPaths, entry.provenance.StartupInputPaths(builderConf.GetSourcePath())...)
+		hookEnvStartupInputs = append(hookEnvStartupInputs, entry.provenance.EnvStartupInputs()...)
+	}
+
+	// Compact web packages list
+	webPkgs := bldr_web_bundler.CompactWebPkgRefConfigs(slices.Clone(buildCtrlConf.GetWebPkgs()))
+
+	// Esbuild configuration
+	esbuildBundleMetas := buildCtrlConf.GetEsbuildBundles()
+	baseEsbuildFlags := buildCtrlConf.GetEsbuildFlags() // Use raw flags
+
+	// Prepare backend and frontend entrypoints from the config.
+	// We clone the slices to avoid modifying the original config object directly,
+	// although buildCtrlConf itself is already a clone.
+	backendEntrypoints := slices.Clone(buildCtrlConf.GetBackendEntrypoints())
+	frontendEntrypoints := slices.Clone(buildCtrlConf.GetFrontendEntrypoints())
+	hasFrontendEntrypoints := len(frontendEntrypoints) != 0
+	liveFrontend := buildType.IsDev() && builderConf.GetBuildPolicy().GetFrontendDevelopment()
+	providesWebPkgs := slices.ContainsFunc(webPkgs, func(pkg *bldr_web_bundler.WebPkgRefConfig) bool {
+		return !pkg.GetExclude()
+	})
+	var snapshotModules []*JsModule
+	frontendBindings := make(map[string]*frontend.Binding)
+
+	// Configure bundles and potentially add default entrypoints based on jsModules.
+	// This adds default Vite bundles for modules defined with the shortcut syntax.
+	// If bundles with the same name ("fe" or "be") are already defined in vite_bundles,
+	// they will be merged later during the Vite compiler build step.
+	for _, mod := range buildCtrlConf.GetModules() {
+		// on the frontend, pass BldrExternal as external packages.
+		var externalPkgs []string
+
+		// configure the bundle type
+		var bundleID string
+		modKind := mod.GetKind()
+		switch modKind {
+		case JsModuleKind_JS_MODULE_KIND_BACKEND:
+			// vite bundle id
+			bundleID = "be"
+		case JsModuleKind_JS_MODULE_KIND_FRONTEND:
+			// vite bundle id
+			bundleID = "fe"
+			hasFrontendEntrypoints = true
+
+			// external pkgs
+			externalPkgs = web_pkg_external.BldrExternal
+		default:
+			return nil, errors.Errorf("unknown js module kind: %s", modKind.String())
+		}
+
+		// Live views carry a stable source attachment instead of a snapshot bundle.
+		if liveFrontend && modKind == JsModuleKind_JS_MODULE_KIND_FRONTEND {
+			source := path.Clean(mod.GetPath())
+			frontendBindings[source] = &frontend.Binding{Entrypoint: source}
+			if mod.GetEntrypoint() {
+				frontendEntrypoints = append(frontendEntrypoints, &FrontendEntrypoint{
+					SetRenderMode: &web_view.SetRenderModeRequest{
+						RenderMode:      web_view.RenderMode_RenderMode_REACT_COMPONENT,
+						FrontendBinding: &frontend.Binding{Entrypoint: path.Clean(mod.GetPath())},
+					},
+					WebViewId:       mod.GetWebViewId(),
+					WebViewParentId: mod.GetWebViewParentId(),
+				})
+			}
+			// Shared packages still need their immutable provider assets. This
+			// bundle discovers their subpaths without loading a snapshot view.
+			if !providesWebPkgs {
+				continue
+			}
+		} else {
+			snapshotModules = append(snapshotModules, mod)
+		}
+
+		// add a bundle for this module
+		inputPath := path.Clean(mod.GetPath())
+		buildCtrlConf.ViteBundles = append(buildCtrlConf.ViteBundles, &bldr_web_bundler_vite_compiler.ViteBundleMeta{
+			Id: bundleID,
+			Entrypoints: []*bldr_web_bundler_vite_compiler.ViteBundleEntrypoint{{
+				InputPath: inputPath,
+			}},
+			ViteConfigPaths:      mod.GetViteConfigPaths(),
+			DisableProjectConfig: mod.GetDisableProjectConfig(),
+
+			// TODO: is there a way we can set this dynamically at runtime?
+			// TODO: if the plugin ID changes this URL will change.
+			PublicPath: bldr_plugin.PluginAssetHTTPPath(pluginID, path.Join("v", "b", bundleID)),
+
+			ExternalPkgs:  externalPkgs,
+			BundleWebPkgs: modKind == JsModuleKind_JS_MODULE_KIND_BACKEND,
+		})
+	}
+	if hasFrontendEntrypoints {
+		webPkgs = bldr_web_bundler.CompactWebPkgRefConfigs(
+			append(webPkgs, bldr_web_bundler.GetBldrDistWebPkgRefConfigs()...),
+		)
+	}
+
+	// Vite configuration
+	viteBundleMetas := buildCtrlConf.GetViteBundles()
+	baseViteConfPaths := buildCtrlConf.GetViteConfigPaths()
+	viteDisableProjectConfig := buildCtrlConf.GetViteDisableProjectConfig()
+
+	// Collect web package references from bundlers
+	var allWebPkgRefs web_pkg.WebPkgRefSlice
+
+	// Store output metadata from bundlers
+	var esbuildOutputMeta []*bldr_web_bundler_esbuild.EsbuildOutputMeta
+	var viteOutputMeta []*bldr_web_bundler_vite.ViteOutputMeta
+	var startupInputPaths []string
+
+	// Build Esbuild bundles if configured
+	if len(esbuildBundleMetas) != 0 {
+		le.Info("building esbuild bundles")
+		esbuildBundlerConf := &bldr_web_bundler_esbuild_compiler.Config{
+			Bundles:      esbuildBundleMetas,
+			WebPkgs:      webPkgs,
+			EsbuildFlags: baseEsbuildFlags,
+		}
+		if err := esbuildBundlerConf.Validate(); err != nil {
+			return nil, errors.Wrap(err, "invalid esbuild bundler config")
+		}
+
+		esbuildBuilderProto, err := configset_proto.NewControllerConfig(configset.NewControllerConfig(1, esbuildBundlerConf), true)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal esbuild bundler config")
+		}
+
+		esbuildWebPkgRefs, esbuildSrcFiles, esbuildOutMeta, err := bldr_plugin_compiler.BuildAndCheckoutEsbuildSubManifest(
+			ctx,
+			le,
+			host,
+			buildWorld,
+			outAssetsPath,
+			esbuildBuilderProto,
+		)
+		if err != nil {
+			return nil, err
+		}
+		esbuildOutputMeta = esbuildOutMeta
+		allWebPkgRefs = append(allWebPkgRefs, esbuildWebPkgRefs...)
+		startupInputPaths = append(startupInputPaths, esbuildSrcFiles...)
+	}
+
+	// Build Vite bundles if configured
+	if len(viteBundleMetas) != 0 {
+		le.Info("building vite bundles")
+		viteBundlerConf := &bldr_web_bundler_vite_compiler.Config{
+			Bundles:              viteBundleMetas,
+			WebPkgs:              webPkgs,
+			ViteConfigPaths:      baseViteConfPaths,
+			DisableProjectConfig: viteDisableProjectConfig,
+			SqlSchemaPaths:       buildCtrlConf.GetSqlSchemaPaths(),
+		}
+		if err := viteBundlerConf.Validate(); err != nil {
+			return nil, errors.Wrap(err, "invalid vite bundler config")
+		}
+
+		viteBuilderProto, err := configset_proto.NewControllerConfig(configset.NewControllerConfig(1, viteBundlerConf), true)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal vite bundler config")
+		}
+
+		viteWebPkgRefs, viteSrcFiles, viteOutMeta, err := bldr_plugin_compiler.BuildAndCheckoutViteSubManifest(
+			ctx,
+			le,
+			host,
+			buildWorld,
+			outAssetsPath,
+			viteBuilderProto,
+		)
+		if err != nil {
+			return nil, err
+		}
+		viteOutputMeta = viteOutMeta
+		allWebPkgRefs = append(allWebPkgRefs, viteWebPkgRefs...)
+		startupInputPaths = append(startupInputPaths, viteSrcFiles...)
+	}
+
+	// Asset consumers discover source bindings through the same entrypoint manifest.
+	if len(frontendBindings) != 0 {
+		preserve := slices.ContainsFunc(viteBundleMetas, func(bundle *bldr_web_bundler_vite_compiler.ViteBundleMeta) bool { return bundle.GetId() == "fe" })
+		if err := writeFrontendBindings(outAssetsPath, frontendBindings, preserve); err != nil {
+			return nil, err
+		}
+	}
+
+	// Snapshot entries identify emitted bytes; live entries retain their binding.
+	backendEntrypoints, frontendEntrypoints, err = CreateEntrypointsFromViteOutputs(
+		outAssetsPath,
+		snapshotModules,
+		viteOutputMeta,
+		backendEntrypoints,
+		frontendEntrypoints,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateFrontendEntrypointAssetClosure(outAssetsPath, frontendEntrypoints); err != nil {
+		return nil, err
+	}
+
+	// Record every renderer dependency before separating package providers.
+	excludedIDs := bldr_web_bundler.ExcludedWebPkgIDs(webPkgs)
+	frontendWebPkgPaths := make(map[string]string, len(allWebPkgRefs)+len(excludedIDs))
+	for _, id := range allWebPkgRefs.ToWebPkgIDList() {
+		frontendWebPkgPaths[id] = ""
+	}
+	for id := range excludedIDs {
+		frontendWebPkgPaths[id] = ""
+	}
+	for _, entrypoint := range frontendEntrypoints {
+		if render := entrypoint.GetSetRenderMode(); render != nil {
+			render.WebPkgPaths = frontendWebPkgPaths
+		}
+	}
+
+	// Keep only packages this plugin supplies, ordered for deterministic output.
+	allWebPkgRefs = allWebPkgRefs.FilterExcluded(excludedIDs)
+	web_pkg.SortWebPkgRefs(allWebPkgRefs)
+
+	// Record the pinned dist dependency inputs used by the direct owner.
+	distDepsPackagePath := distpath.Resolve(distSourcePath, "dist", "deps", "package.json")
+
+	// -- Compile the main JS entrypoint (plugin-{hash}.mjs) --
+	le.Info("compiling js plugin entrypoint")
+	entrypointTsSrcPath := distpath.Resolve(distSourcePath, "plugin", "compiler", "js", "entrypoint.ts")
+
+	// Verify entrypoint source exists
+	if _, err := os.Stat(entrypointTsSrcPath); err != nil {
+		return nil, errors.Wrapf(err, "js plugin entrypoint source: %s", entrypointTsSrcPath)
+	}
+
+	// Marshal backend entrypoints to JSON array string
+	backendEpJsonBytes, err := protobuf_go_lite_json.MarshalSlice(protobuf_go_lite_json.DefaultMarshalerConfig, backendEntrypoints)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to marshal backend entrypoints")
+	}
+	backendEpJsonStr := string(backendEpJsonBytes)
+
+	// Marshal frontend entrypoints to JSON array string
+	frontendEpJsonBytes, err := protobuf_go_lite_json.MarshalSlice(protobuf_go_lite_json.DefaultMarshalerConfig, frontendEntrypoints)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to marshal frontend entrypoints")
+	}
+	frontendEpJsonStr := string(frontendEpJsonBytes)
+
+	// Marshal host config set to JSON array string.
+	hostConfigSet := buildCtrlConf.GetHostConfigSet()
+	hostConfigSetJsonStr := "undefined"
+	if len(hostConfigSet) != 0 {
+		hostConfigSetJson, err := protobuf_go_lite_json.MarshalMap(protobuf_go_lite_json.DefaultMarshalerConfig, hostConfigSet)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal host config set")
+		}
+		hostConfigSetJsonStr = string(hostConfigSetJson)
+	}
+
+	// Marshal web pkgs configuration to JSON
+	handleWebPkgsJsonStr := "undefined"
+	webPkgIds := allWebPkgRefs.ToWebPkgIDList()
+	if len(webPkgIds) != 0 {
+		// HandlePluginId is filled in at runtime.
+		handleWebPkgs := &bldr_web_plugin.HandleWebPkgsViaPluginAssetsRequest{
+			WebPkgsPath:  bldr_plugin.PluginAssetsWebPkgsDir,
+			WebPkgIdList: webPkgIds,
+		}
+		handleWebPkgsJson, err := handleWebPkgs.MarshalJSON()
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal handle web pkgs request")
+		}
+		handleWebPkgsJsonStr = string(handleWebPkgsJson)
+	}
+
+	// Pass serialized plugin configuration to the JavaScript compiler.
+	defines := map[string]string{
+		// Pass JSON array strings as compile-time definitions.
+		"__BLDR_BACKEND_ENTRYPOINTS__":  backendEpJsonStr,
+		"__BLDR_FRONTEND_ENTRYPOINTS__": frontendEpJsonStr,
+		"__BLDR_HOST_CONFIG_SET__":      hostConfigSetJsonStr,
+		"__BLDR_HANDLE_WEB_PKGS__":      handleWebPkgsJsonStr,
+		"__BLDR_WEB_PLUGIN_ID__":        strconv.Quote(conf.GetWebPluginId()),
+	}
+
+	// Select the source-map mode before compiling the plugin entrypoint.
+	sourceMap := "none"
+	if jsSourcemaps {
+		sourceMap = "inline"
+	}
+
+	// Compile the plugin entrypoint and capture its emitted assets.
+	result, err := bldr_web_bundler_rolldown.Build(
+		ctx,
+		le,
+		workingPath,
+		distSourcePath,
+		&bldr_web_bundler_rolldown.BuildRequest{
+			WorkingDir:   workingPath,
+			SourceRoot:   builderConf.GetSourcePath(),
+			OutputRoot:   outDistPath,
+			BldrDistRoot: distSourcePath,
+			Entrypoints: []*bldr_web_bundler_rolldown.Entrypoint{{
+				Name:      "plugin",
+				InputPath: entrypointTsSrcPath,
+			}},
+			Format:         "es",
+			Platform:       "browser",
+			Target:         "es2024",
+			EntryFileNames: "plugin-[hash].mjs",
+			ChunkFileNames: "[name]-[hash].mjs",
+			AssetFileNames: "[name]-[hash][extname]",
+			Sourcemap:      sourceMap,
+			Minify:         jsMinification,
+			TreeShaking:    true,
+			Banner:         entrypoint_browser_bundle.DefaultBanner()["js"],
+			Defines:        defines,
+			Loaders: map[string]string{
+				".wasm": "asset", ".woff": "asset", ".woff2": "asset",
+				".png": "asset", ".jpg": "asset", ".jpeg": "asset",
+				".svg": "asset", ".gif": "asset",
+			},
+		},
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compile js plugin entrypoint")
+	}
+
+	// Resolve the emitted plugin entrypoint path.
+	compiledEntrypointRelPath := path.Clean(filepath.ToSlash(result.GetEntrypointOutputs()["plugin"]))
+	if compiledEntrypointRelPath == "." || compiledEntrypointRelPath == "" {
+		return nil, errors.New("direct owner returned no js plugin entrypoint output")
+	}
+
+	// Record the emitted entrypoint and its discovered inputs.
+	le.Debugf("compiled js plugin entrypoint to %s", compiledEntrypointRelPath)
+	startupInputPaths = append(startupInputPaths, result.GetInputs()...)
+	startupInputPaths = append(startupInputPaths, distDepsPackagePath)
+
+	// Include the lockfile when the distribution package has one.
+	distDepsLockPath := filepath.Join(filepath.Dir(distDepsPackagePath), "bun.lock")
+	if _, err := os.Stat(distDepsLockPath); err == nil {
+		startupInputPaths = append(startupInputPaths, distDepsLockPath)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// Include declared hook files among the startup inputs.
+	startupInputPaths = append(startupInputPaths, hookStartupInputPaths...)
+
+	// Anchor relative inputs to the plugin source root.
+	for i, inputPath := range startupInputPaths {
+		if !filepath.IsAbs(inputPath) {
+			startupInputPaths[i] = filepath.Join(builderConf.GetSourcePath(), filepath.FromSlash(inputPath))
+		}
+	}
+
+	// Keep only inputs under the source root. A dependency resolved from the
+	// module cache is immutable for its pin, so go.mod and go.sum stand in for it.
+	startupInputPaths = keepSourceInputs(builderConf.GetSourcePath(), startupInputPaths)
+
+	// Store all build inputs relative to the plugin source root.
+	if err := fsutil.ConvertPathsToRelative(builderConf.GetSourcePath(), startupInputPaths); err != nil {
+		return nil, err
+	}
+
+	// Normalize and sort startup inputs for stable manifest metadata.
+	for i := range startupInputPaths {
+		startupInputPaths[i] = filepath.ToSlash(filepath.Clean(startupInputPaths[i]))
+	}
+	slices.Sort(startupInputPaths)
+	startupInputPaths = slices.Compact(startupInputPaths)
+
+	// Build final input manifest metadata
+	inputManifestMeta := &InputManifestMeta{
+		WebPkgRefs: allWebPkgRefs,
+		WebPkgs:    webPkgs,
+
+		EsbuildBundles: esbuildBundleMetas,
+		EsbuildFlags:   baseEsbuildFlags,
+		EsbuildOutputs: esbuildOutputMeta,
+
+		ViteBundles:              viteBundleMetas,
+		ViteConfigPaths:          baseViteConfPaths,
+		ViteOutputs:              viteOutputMeta,
+		ViteDisableProjectConfig: viteDisableProjectConfig,
+
+		CompiledEntrypointPath: compiledEntrypointRelPath,
+	}
+	inputManifestMetaBin, err := inputManifestMeta.MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to marshal input manifest metadata")
+	}
+
+	// Create the InputManifest object. Sub-manifest source files and the
+	// entrypoint bundle graph jointly determine the cached JS artifact.
+	inputManifest := bldr_manifest_builder.NewInputManifest(startupInputPaths, inputManifestMetaBin)
+
+	// Fold declared pre-build hook environment provenance into the startup inputs
+	// so a changed value invalidates the cache on the next startup.
+	for _, envInput := range hookEnvStartupInputs {
+		inputManifest.AddStartupInput(envInput)
+	}
+	inputManifest.SortStartupInputs()
+
+	// -- Commit assets to the manifest store --
+	tx, err := buildWorld.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Discard()
+
+	// Commit manifest with assets.
+	// Dist path and entrypoint name are empty for JS plugins, as the primary
+	// entrypoint is the compiled asset specified in InputManifestMeta.
+	le.Debug("committing assets to manifest")
+	committedManifest, committedManifestRef, err := builderConf.CommitManifestWithPaths(
+		ctx,
+		le,
+		tx,
+		meta,
+		compiledEntrypointRelPath,
+		outDistPath,
+		outAssetsPath,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// -- Finalize and return result --
+	le.Debug("js plugin build complete")
+	builderResult := bldr_manifest_builder.NewBuilderResult(
+		committedManifest,
+		committedManifestRef,
+		inputManifest, // Include the input manifest with metadata
+	)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	return builderResult, nil
+}
+
+// keepSourceInputs returns the paths under sourcePath. A path outside that root
+// is a module-cache file, fixed by the module pin, so go.mod and go.sum replace
+// it. The input manifest stores only source-relative paths.
+func keepSourceInputs(sourcePath string, paths []string) []string {
+	// Keep each path the source root already contains.
+	kept := make([]string, 0, len(paths))
+	outside := false
+	for _, inputPath := range paths {
+		rel, err := filepath.Rel(sourcePath, inputPath)
+		if err != nil || !filepath.IsLocal(rel) {
+			outside = true
+			continue
+		}
+		kept = append(kept, inputPath)
+	}
+	if !outside {
+		return kept
+	}
+
+	// Record the module pins so a version change still invalidates the cache.
+	for _, name := range []string{"go.mod", "go.sum"} {
+		pin := filepath.Join(sourcePath, name)
+		info, err := os.Stat(pin)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		kept = append(kept, pin)
+	}
+	return kept
+}
+
+// CreateEntrypointsFromViteOutputs builds backend and frontend entrypoints from
+// Vite outputs. Local frontend script URLs identify the exact emitted bytes.
+func CreateEntrypointsFromViteOutputs(
+	assetsDir string,
+	modules []*JsModule,
+	viteOutputMeta []*bldr_web_bundler_vite.ViteOutputMeta,
+	existingBackendEntrypoints []*BackendEntrypoint,
+	existingFrontendEntrypoints []*FrontendEntrypoint,
+) ([]*BackendEntrypoint, []*FrontendEntrypoint, error) {
+	// Clone configured entrypoints before adding outputs from Vite.
+	backendEntrypoints := slices.Clone(existingBackendEntrypoints)
+	frontendEntrypoints := make([]*FrontendEntrypoint, len(existingFrontendEntrypoints))
+	for idx, entrypoint := range existingFrontendEntrypoints {
+		frontendEntrypoints[idx] = entrypoint.CloneVT()
+	}
+
+	// Add configured module entrypoints to the existing build results.
+	for _, mod := range modules {
+		inputPath := path.Clean(mod.GetPath())
+		modKind := mod.GetKind()
+
+		// Skip modules that should only be bundled as assets.
+		if !mod.GetEntrypoint() {
+			continue
+		}
+
+		// Find the corresponding Vite output for this module
+		var jsOutputPath string
+		var cssOutputPaths []string
+
+		for _, output := range viteOutputMeta {
+			matchesEntrypoint := output.GetEntrypointPath() != "" && output.GetEntrypointPath() == inputPath
+			outputPath := output.GetPath()
+			if strings.HasSuffix(outputPath, ".mjs") || strings.HasSuffix(outputPath, ".js") {
+				if matchesEntrypoint {
+					jsOutputPath = path.Join(bldr_plugin_compiler.ViteAssetSubdir, outputPath)
+				}
+			} else if strings.HasSuffix(outputPath, ".css") {
+				// empty entrypointPath = global css files
+				if matchesEntrypoint || output.GetEntrypointPath() == "" {
+					cssOutputPaths = append(cssOutputPaths, path.Join(bldr_plugin_compiler.ViteAssetSubdir, outputPath))
+				}
+			}
+		}
+
+		// Add entrypoints based on module kind
+		switch modKind {
+		case JsModuleKind_JS_MODULE_KIND_BACKEND:
+			if jsOutputPath == "" {
+				break
+			}
+			backendEntrypoints = append(backendEntrypoints, &BackendEntrypoint{
+				ImportPath: path.Join("/assets", jsOutputPath),
+			})
+		case JsModuleKind_JS_MODULE_KIND_FRONTEND:
+			if jsOutputPath == "" {
+				break
+			}
+
+			// Create frontend entrypoint with filters from the module.
+			frontendEp := &FrontendEntrypoint{
+				SetRenderMode: &web_view.SetRenderModeRequest{
+					RenderMode: web_view.RenderMode_RenderMode_REACT_COMPONENT,
+					ScriptPath: jsOutputPath,
+				},
+				WebViewId:       mod.GetWebViewId(),
+				WebViewParentId: mod.GetWebViewParentId(),
+			}
+
+			// Add CSS links if any
+			if len(cssOutputPaths) != 0 {
+				frontendEp.SetHtmlLinks = &web_view.SetHtmlLinksRequest{
+					Clear:    true,
+					SetLinks: make(map[string]*web_view.HtmlLink),
+				}
+
+				for _, cssPath := range cssOutputPaths {
+					linkKey := "css-" + path.Base(cssPath)
+					frontendEp.SetHtmlLinks.SetLinks[linkKey] = &web_view.HtmlLink{
+						Rel:  "stylesheet",
+						Href: cssPath,
+					}
+				}
+			}
+
+			frontendEntrypoints = append(frontendEntrypoints, frontendEp)
+		}
+	}
+
+	// Bind every local frontend root URL to its emitted bytes while preserving
+	// stable Vite filenames, configured URL parameters, and external URLs.
+	for idx, entrypoint := range frontendEntrypoints {
+		setRenderMode := entrypoint.GetSetRenderMode()
+		if setRenderMode == nil || setRenderMode.GetFrontendBinding() != nil {
+			continue
+		}
+		scriptPath, local, err := normalizeFrontendAssetPath(setRenderMode.GetScriptPath())
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "frontend entrypoint script[%d]", idx)
+		}
+		if !local {
+			continue
+		}
+
+		identity, err := bldr_manifest_builder.CaptureFileIdentity(
+			filepath.Join(assetsDir, filepath.FromSlash(scriptPath)),
+		)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "capture frontend entrypoint content identity %q", scriptPath)
+		}
+		scriptURL, err := url.Parse(setRenderMode.GetScriptPath())
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "parse frontend entrypoint script URL %q", setRenderMode.GetScriptPath())
+		}
+		query := scriptURL.Query()
+		query.Set("bldr_content", hex.EncodeToString(identity.GetSha256()))
+		scriptURL.RawQuery = query.Encode()
+		setRenderMode.ScriptPath = scriptURL.String()
+	}
+
+	return backendEntrypoints, frontendEntrypoints, nil
+}
+
+// ValidateFrontendEntrypointAssetClosure verifies that renderer assets exist in the manifest.
+func ValidateFrontendEntrypointAssetClosure(
+	assetsDir string,
+	frontendEntrypoints []*FrontendEntrypoint,
+) error {
+	for idx, entrypoint := range frontendEntrypoints {
+		if setRenderMode := entrypoint.GetSetRenderMode(); setRenderMode != nil && setRenderMode.GetFrontendBinding() == nil {
+			if err := validateFrontendAssetPath(
+				assetsDir,
+				setRenderMode.GetScriptPath(),
+				"frontend entrypoint script",
+				idx,
+			); err != nil {
+				return err
+			}
+		}
+		if setHTMLLinks := entrypoint.GetSetHtmlLinks(); setHTMLLinks != nil {
+			for key, link := range setHTMLLinks.GetSetLinks() {
+				if err := validateFrontendAssetPath(
+					assetsDir,
+					link.GetHref(),
+					"frontend html link "+key,
+					idx,
+				); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateFrontendAssetPath(assetsDir, assetPath, label string, entrypointIdx int) error {
+	// Resolve the advertised frontend asset against the asset directory.
+	cleanPath, ok, err := normalizeFrontendAssetPath(assetPath)
+	if err != nil {
+		return errors.Wrapf(err, "%s[%d]", label, entrypointIdx)
+	}
+	if !ok {
+		return nil
+	}
+	statPath := filepath.Join(assetsDir, filepath.FromSlash(cleanPath))
+	info, err := os.Stat(statPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errors.Errorf("%s[%d] advertises missing asset %q in assets filesystem", label, entrypointIdx, cleanPath)
+		}
+		return errors.Wrapf(err, "%s[%d] stat advertised asset %q", label, entrypointIdx, cleanPath)
+	}
+	if info.IsDir() {
+		return errors.Errorf("%s[%d] advertises directory %q as asset", label, entrypointIdx, cleanPath)
+	}
+	return nil
+}
+
+func normalizeFrontendAssetPath(assetPath string) (string, bool, error) {
+	// Ignore empty, external, and local frontend asset URLs.
+	if assetPath == "" {
+		return "", false, nil
+	}
+	assetURL, err := url.Parse(assetPath)
+	if err != nil {
+		return "", false, errors.Wrap(err, "parse local plugin asset URL")
+	}
+	if assetURL.IsAbs() || assetURL.Host != "" || strings.HasPrefix(assetURL.Path, "/") {
+		return "", false, nil
+	}
+	cleanPath := path.Clean(assetURL.Path)
+	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", false, errors.Errorf("invalid local plugin asset path %q", assetPath)
+	}
+	return cleanPath, true, nil
+}
+
+// GetSupportedPlatforms returns the base platform IDs this compiler supports.
+func (c *Controller) GetSupportedPlatforms() []string {
+	return []string{bldr_platform.PlatformID_WEB, bldr_platform.PlatformID_JS}
+}
+
+// _ is a type assertion
+var _ bldr_manifest_builder.Controller = (*Controller)(nil)

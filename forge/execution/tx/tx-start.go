@@ -1,0 +1,141 @@
+package execution_tx
+
+import (
+	"context"
+	"time"
+
+	timestamp "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	forge_value "github.com/s4wave/spacewave/forge/value"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// NewTxStart constructs a new START transaction.
+//
+// A new claim stays live until leaseExpiresAt unless its holder renews it.
+func NewTxStart(peerID peer.ID, leaseExpiresAt time.Time, claimIDs ...string) *Tx {
+	claimID := implicitClaim.GetClaimId()
+	if len(claimIDs) != 0 {
+		claimID = claimIDs[0]
+	}
+	return &Tx{
+		TxType: TxType_TxType_START,
+		TxStart: &TxStart{
+			PeerId:         peerID.String(),
+			ClaimId:        claimID,
+			LeaseExpiresAt: timestamp.New(leaseExpiresAt),
+		},
+	}
+}
+
+// NewTxStartTxn constructs a new START transaction.
+func NewTxStartTxn() Transaction {
+	return &TxStart{}
+}
+
+// GetTxType returns the type of transaction this is.
+func (t *TxStart) GetTxType() TxType {
+	return TxType_TxType_START
+}
+
+// Validate performs a cursory check of the transaction.
+// Note: this should not fetch network data.
+func (t *TxStart) Validate() error {
+	// Require the executor peer, claim identity, and claim lease.
+	if len(t.GetPeerId()) == 0 {
+		return peer.ErrEmptyPeerID
+	}
+	if _, err := t.ParsePeerID(); err != nil {
+		return err
+	}
+	if t.GetClaimId() == "" {
+		return errors.New("claim_id cannot be empty")
+	}
+	if t.GetLeaseExpiresAt() == nil {
+		return errors.New("lease_expires_at cannot be empty")
+	}
+	return nil
+}
+
+// ExecuteTx executes the transaction against the execution instance.
+func (t *TxStart) ExecuteTx(
+	ctx context.Context,
+	sender peer.ID,
+	exCursor *block.Cursor,
+	root *forge_execution.Execution,
+) error {
+	// Require the execution peer and claim identity to match the start request.
+	txPeerID, err := t.ParsePeerID()
+	if err != nil {
+		return err
+	}
+	if len(txPeerID) == 0 {
+		return peer.ErrEmptyPeerID
+	}
+	if len(sender) != 0 && sender != txPeerID {
+		return errors.Errorf(
+			"tx body peer id %s must match sender %s",
+			txPeerID.String(), sender.String(),
+		)
+	}
+	if err := root.CheckPeerID(txPeerID); err != nil {
+		return err
+	}
+	if placement := root.GetPlacement(); placement != nil && placement.GetPeerId() != txPeerID.String() {
+		return errors.Errorf("execution peer %s does not match placement peer %s", txPeerID, placement.GetPeerId())
+	}
+	if t.GetClaimId() == "" {
+		return errors.New("claim_id cannot be empty")
+	}
+
+	// Determine whether the execution can adopt or create this claim.
+	execState := root.GetExecutionState()
+	switch execState {
+	case forge_execution.State_ExecutionState_PENDING:
+	case forge_execution.State_ExecutionState_RUNNING,
+		forge_execution.State_ExecutionState_CANCELING:
+		claim := root.GetClaim()
+		if claim != nil {
+			if claim.GetClaimId() != t.GetClaimId() {
+				return &ClaimHeldError{
+					ClaimID: claim.GetClaimId(),
+					Epoch:   claim.GetEpoch(),
+				}
+			}
+			return nil
+		}
+	default:
+		return errors.Wrapf(
+			forge_value.ErrUnknownState,
+			"%s", execState.String(),
+		)
+	}
+
+	// Create the next execution claim and persist its running state.
+	claimEpoch := root.GetClaim().GetEpoch() + 1
+	if claimEpoch == 0 {
+		return errors.New("execution claim epoch overflow")
+	}
+	root.Claim = &forge_execution.Claim{
+		ClaimId:        t.GetClaimId(),
+		Epoch:          claimEpoch,
+		LeaseExpiresAt: t.GetLeaseExpiresAt(),
+	}
+	if execState == forge_execution.State_ExecutionState_PENDING {
+		root.ExecutionState = forge_execution.State_ExecutionState_RUNNING
+	}
+	exCursor.SetBlock(root, true)
+
+	return root.Validate()
+}
+
+// ParsePeerID parses the peer ID field.
+func (t *TxStart) ParsePeerID() (peer.ID, error) {
+	return confparse.ParsePeerID(t.GetPeerId())
+}
+
+// _ is a type assertion
+var _ Transaction = (*TxStart)(nil)

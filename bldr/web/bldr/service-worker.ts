@@ -1,0 +1,2430 @@
+import { castToError } from 'starpc'
+import { ServiceWorkerHostClient } from '../runtime/sw/sw_srpc.pb.js'
+import { proxyFetch } from '../fetch/fetch.js'
+import { WebRuntimeClientType } from '../runtime/runtime.pb.js'
+import {
+  ConnectWebRuntimeAck,
+  type DedicatedRuntimeHostConnectControl,
+  WebDocumentToWorker,
+} from '../runtime/runtime.js'
+import { BLDR_URI_PREFIXES } from './constants.js'
+import {
+  type BrowserReleaseDescriptor,
+  type BrowserReleaseState,
+  BROWSER_RELEASE_STATE_SCHEMA_VERSION,
+  buildOfflineNavigationFallbacks,
+  buildReleaseCachePaths,
+  createEmptyBrowserReleaseState,
+  isBrowserCacheSupportedURL,
+  normalizeReleasePath,
+  promoteBrowserRelease,
+  retainedGenerationIds,
+  sameBrowserRelease,
+} from './browser-release-state.js'
+import { isCrossTabMessage, handleCrossTabMessage } from './cross-tab-broker.js'
+import { randomId } from './random-id.js'
+import { ServiceWorkerFetchTracker } from './service-worker-fetch-tracker.js'
+import {
+  WebDocumentTracker,
+  type OpenWebRuntimePortResult,
+} from './web-document-tracker.js'
+import { markStartupBoundary } from './startup-marks.js'
+
+declare let BLDR_DEBUG: boolean
+
+// Default type of `self` is `WorkerGlobalScope & typeof globalThis`
+// https://github.com/microsoft/TypeScript/issues/14877
+declare let self: ServiceWorkerGlobalScope
+
+// note: logs don't appear in console in firefox
+const serviceWorkerLogicalId = `service-worker-${self.location.host.replace(/:/g, '-')}`
+const serviceWorkerId = `${serviceWorkerLogicalId}-${randomId()}`
+
+// baseURL is the base URL to use for paths.
+const baseURL = new URL(self.location.toString())
+
+const controlCacheName = 'bldr-control'
+const browserReleasePath = '/browser-release.json'
+const bootAssetPath = '/boot.mjs'
+const browserIndexPath = '/b/__index.html'
+const rootNavigationPath = '/'
+const browserReleaseStatePath = '/__bldr/browser-release-state.json'
+const pluginDistPathPrefix = '/b/pd/'
+const pluginAssetsPathPrefix = '/b/pa/'
+const pluginWebPkgPathPrefix = '/b/pkg/'
+const pluginHttpPathPrefix = '/p/'
+const frontendPathPrefix = '/b/fe/'
+// devFrontendCachePrefix starts the name of a development frontend session's
+// module cache.
+const devFrontendCachePrefix = 'bldr-dev-frontend-'
+const browserRuntimeFetchHeaderTimeoutMs = 30000
+// browserRuntimeFetchRelayWaitMs bounds how long a static plugin asset fetch
+// waits for the next runtime relay across a page-client close gap before failing.
+const browserRuntimeFetchRelayWaitMs = 5000
+
+// CACHES is the list of fixed caches.
+const CACHES: Record<string, Cache | undefined> = {
+  [controlCacheName]: undefined,
+}
+const serviceWorkerFetchTracker = new ServiceWorkerFetchTracker()
+// Lifecycle probes bound repeated refocus checks; direct manifest fetches
+// always check for updates in the background.
+const browserReleaseLifecycleSyncFreshMs = 30000
+
+// BrowserReleaseSyncOptions selects release-sync freshness semantics.
+export interface BrowserReleaseSyncOptions {
+  discoveredRelease?: BrowserReleaseDescriptor | null
+  lifecycleProbe?: boolean
+}
+
+// ServiceWorkerMessageDeps collects message-handler collaborators.
+export interface ServiceWorkerMessageDeps {
+  clients: Clients
+  fetchTracker: Pick<ServiceWorkerFetchTracker, 'abortClient'>
+  webDocumentTracker: Pick<WebDocumentTracker, 'handleWebDocumentMessage'> &
+    Partial<Pick<WebDocumentTracker, 'openWebRuntimePortWithResult'>>
+  syncLatestBrowserRelease(
+    options?: BrowserReleaseSyncOptions,
+  ): Promise<BrowserReleaseState>
+  refreshBrowserIndexCache(clientId: string): Promise<Response>
+  handleCrossTabMessage(
+    clients: Clients,
+    senderId: string,
+    data: unknown,
+  ): Promise<void>
+}
+
+// BrowserReleaseSyncMessage asks the SW to refresh the release manifest.
+export interface BrowserReleaseSyncMessage {
+  bldrSyncManifest?: boolean
+}
+
+// BrowserIndexRefreshMessage asks the SW to refresh the runtime browser shell.
+export interface BrowserIndexRefreshMessage {
+  bldrRefreshBrowserIndex?: boolean
+}
+// PluginManifestRootMessage announces the selected plugin manifest root.
+export interface PluginManifestRootMessage {
+  bldrPluginManifestRoot?: {
+    pluginId: string
+    rootHash: string
+  }
+}
+
+interface DedicatedRuntimeHostConnectRequest {
+  from: string
+  webRuntimeId: string
+  init: Uint8Array
+  port: MessagePort
+}
+
+// BrowserFetchSourceKind classifies the ServiceWorker fetch authority.
+export type BrowserFetchSourceKind =
+  | 'root-document'
+  | 'browser-index'
+  | 'boot-asset'
+  | 'release-asset'
+  | 'plugin-dist'
+  | 'plugin-assets'
+  | 'bldr-runtime'
+  | 'native-fetch'
+
+// BrowserFetchSource records the typed origin of a ServiceWorker request.
+export interface BrowserFetchSource {
+  kind: BrowserFetchSourceKind
+  path: string
+  sameOrigin: boolean
+  runtime: boolean
+}
+
+// BrowserControlCacheRowKind names fixed rows in the control cache.
+export type BrowserControlCacheRowKind =
+  | 'root-document'
+  | 'browser-index'
+  | 'stable-boot-asset'
+  | 'browser-release-state'
+
+// BrowserControlCacheRow records a fixed control-cache row.
+export interface BrowserControlCacheRow {
+  kind: BrowserControlCacheRowKind
+  path: string
+  cacheName: typeof controlCacheName
+}
+
+interface CacheRow {
+  kind?: BrowserControlCacheRowKind
+  path: string
+  cacheName: string
+}
+
+// BrowserRuntimeFetchErrorCode is the bounded failure vocabulary for runtime fetches.
+export type BrowserRuntimeFetchErrorCode =
+  | 'no-ready-document'
+  | 'resume-unavailable'
+  | 'stream-open-timeout'
+  | 'generation-closed'
+  | 'runtime-unavailable'
+  | 'plugin-asset-missing'
+  | 'plugin-asset-unavailable'
+  | 'plugin-root-changed'
+  | 'request-canceled'
+
+// BrowserPluginAssetFetchResultCode is the plugin asset lease result surfaced
+// to browser importers and backend asset loading.
+export type BrowserPluginAssetFetchResultCode =
+  | 'live'
+  | 'missing'
+  | 'unavailable'
+  | 'generation-closed'
+  | 'root-changed'
+  | 'runtime-unavailable'
+  | 'canceled'
+
+// BrowserRuntimeFetchError is serialized to runtime fetch failure responses.
+export interface BrowserRuntimeFetchError {
+  code: BrowserRuntimeFetchErrorCode
+  source: BrowserFetchSourceKind
+  path: string
+  message: string
+  status: number
+  pluginAssetFetchResult?: BrowserPluginAssetFetchResultCode
+}
+
+export interface BrowserRuntimeFetchFailureInput {
+  status?: number
+  message?: string
+  aborted?: boolean
+}
+
+export interface BrowserRuntimeFetchClientTracker {
+  hasRuntimeFetchRelay(): boolean
+}
+
+// resetServiceWorkerTestState clears module-level state for unit tests.
+export function resetServiceWorkerTestState(): void {
+  CACHES[controlCacheName] = undefined
+  devFrontendCache = null
+  browserReleaseSyncInFlight = null
+  browserReleaseLifecycleSyncLastSuccessMs = Number.NEGATIVE_INFINITY
+  firstWebDocumentMessageMarked = false
+  activePluginRoots.clear()
+  desiredPluginRoots.clear()
+  pluginRootUpdates.clear()
+  pluginRootAnnouncementSeqs.clear()
+}
+
+let browserReleaseSyncInFlight: Promise<void> | null = null
+let browserReleaseLifecycleSyncLastSuccessMs = Number.NEGATIVE_INFINITY
+let firstWebDocumentMessageMarked = false
+const activePluginRoots = new Map<string, string>()
+const desiredPluginRoots = new Map<string, string>()
+const pluginRootUpdates = new Map<string, Promise<void>>()
+// pluginRootAnnouncementSeqs counts root announcements per plugin. A runtime
+// announces a root only once it serves the root's files, so a successor
+// runtime is ready for a plugin after its next announcement.
+const pluginRootAnnouncementSeqs = new Map<string, number>()
+let pluginRootAnnounced = newPluginRootAnnouncedSignal()
+
+interface CacheWriteContext {
+  cacheName: string
+  operation: string
+  generationId?: string
+  controlRowKind?: BrowserControlCacheRowKind
+}
+
+const browserControlCacheRows: Record<
+  BrowserControlCacheRowKind,
+  BrowserControlCacheRow
+> = {
+  'root-document': {
+    kind: 'root-document',
+    path: rootNavigationPath,
+    cacheName: controlCacheName,
+  },
+  'browser-index': {
+    kind: 'browser-index',
+    path: browserIndexPath,
+    cacheName: controlCacheName,
+  },
+  'stable-boot-asset': {
+    kind: 'stable-boot-asset',
+    path: bootAssetPath,
+    cacheName: controlCacheName,
+  },
+  'browser-release-state': {
+    kind: 'browser-release-state',
+    path: browserReleaseStatePath,
+    cacheName: controlCacheName,
+  },
+}
+
+// getBrowserControlCacheRow returns the typed fixed row for a control-cache entry.
+export function getBrowserControlCacheRow(
+  kind: BrowserControlCacheRowKind,
+): BrowserControlCacheRow {
+  return browserControlCacheRows[kind]
+}
+
+function buildCacheRequest(path: string): Request {
+  return new Request(new URL(path, baseURL).toString())
+}
+
+function buildControlCacheRequest(row: CacheRow): Request {
+  return buildCacheRequest(row.path)
+}
+
+function canCacheRequest(request: Request): boolean {
+  return isBrowserCacheSupportedURL(request.url)
+}
+
+function canCacheBrowserReleaseRequests(): boolean {
+  return isBrowserCacheSupportedURL(new URL(bootAssetPath, baseURL))
+}
+
+function buildGenerationCacheName(generationId: string): string {
+  return `bldr-generation-${generationId}`
+}
+
+async function getControlCache(): Promise<Cache> {
+  const cached = CACHES[controlCacheName]
+  if (cached) {
+    return cached
+  }
+  const cache = await caches.open(controlCacheName)
+  CACHES[controlCacheName] = cache
+  return cache
+}
+
+async function putCacheResponse(
+  cache: Cache,
+  request: Request,
+  response: Response,
+  context: CacheWriteContext,
+): Promise<boolean> {
+  try {
+    await cache.put(request, response)
+    return true
+  } catch (error) {
+    const generation = context.generationId
+      ? ` generation=${context.generationId}`
+      : ''
+    const row = context.controlRowKind ? ` row=${context.controlRowKind}` : ''
+    console.warn(
+      'ServiceWorker: %s: cache write failed: operation=%s cache=%s%s%s url=%s: %s',
+      serviceWorkerId,
+      context.operation,
+      context.cacheName,
+      generation,
+      row,
+      request.url,
+      castToError(error, 'unknown error').message,
+    )
+    return false
+  }
+}
+
+function buildJsonResponse(method: string, value: unknown): Response {
+  const response = new Response(
+    method === 'HEAD' ? null : JSON.stringify(value),
+    {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+    },
+  )
+  return response
+}
+
+function buildHeadResponse(response: Response): Response {
+  return new Response(null, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers),
+  })
+}
+
+async function responseForMethod(
+  request: Request,
+  response: Response,
+): Promise<Response> {
+  if (request.method === 'HEAD') return buildHeadResponse(response)
+  const range = request.headers.get('Range')
+  if (request.method !== 'GET' || response.status !== 200 || !range)
+    return response
+  const ifRange = request.headers.get('If-Range')
+  if (
+    ifRange &&
+    ifRange !== response.headers.get('ETag') &&
+    ifRange !== response.headers.get('Last-Modified')
+  )
+    return response
+  const match = /^bytes=(\d*)-(\d*)$/.exec(range)
+  // Unsupported range forms retain the complete response, as HTTP permits.
+  if (!match || (!match[1] && !match[2])) return response
+  const body = await response.blob()
+  const size = body.size
+  const start = match[1]
+    ? Number(match[1])
+    : Math.max(0, size - Number(match[2]))
+  const end =
+    match[1] && match[2] ? Math.min(Number(match[2]), size - 1) : size - 1
+  const headers = new Headers(response.headers)
+  headers.set('Accept-Ranges', 'bytes')
+  // Cache bodies contain decoded bytes, which are the range reader's offsets.
+  headers.delete('Content-Encoding')
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start > end ||
+    start >= size
+  ) {
+    headers.set('Content-Range', `bytes */${size}`)
+    headers.set('Content-Length', '0')
+    return new Response(null, { status: 416, headers })
+  }
+  headers.set('Content-Range', `bytes ${start}-${end}/${size}`)
+  headers.set('Content-Length', String(end - start + 1))
+  return new Response(body.slice(start, end + 1), { status: 206, headers })
+}
+
+async function readCachedJson<T>(row: CacheRow): Promise<T | null> {
+  const request = buildControlCacheRequest(row)
+  if (!canCacheRequest(request)) {
+    return null
+  }
+  const cache = await getControlCache()
+  const response = await cache.match(request)
+  if (!response) {
+    return null
+  }
+  return (await response.json()) as T
+}
+
+async function writeCachedJson(
+  row: CacheRow,
+  value: unknown,
+): Promise<boolean> {
+  const request = buildControlCacheRequest(row)
+  if (!canCacheRequest(request)) {
+    return true
+  }
+  const cache = await getControlCache()
+  return putCacheResponse(cache, request, buildJsonResponse('GET', value), {
+    cacheName: row.cacheName,
+    operation: 'write control JSON',
+    controlRowKind: row.kind,
+  })
+}
+
+async function loadBrowserReleaseState(): Promise<BrowserReleaseState> {
+  const state = await readCachedJson<BrowserReleaseState>(
+    getBrowserControlCacheRow('browser-release-state'),
+  )
+  if (!state) {
+    return createEmptyBrowserReleaseState()
+  }
+  if (state.schemaVersion !== BROWSER_RELEASE_STATE_SCHEMA_VERSION) {
+    return createEmptyBrowserReleaseState()
+  }
+  return state
+}
+
+async function saveBrowserReleaseState(
+  state: BrowserReleaseState,
+): Promise<boolean> {
+  return writeCachedJson(
+    getBrowserControlCacheRow('browser-release-state'),
+    state,
+  )
+}
+
+async function cacheStableBootAsset(): Promise<void> {
+  const request = buildControlCacheRequest(
+    getBrowserControlCacheRow('stable-boot-asset'),
+  )
+  if (!canCacheRequest(request)) {
+    return
+  }
+
+  let response: Response
+  try {
+    response = await fetch(
+      new Request(request.url, {
+        cache: 'reload',
+      }),
+    )
+  } catch (error) {
+    console.warn(
+      'ServiceWorker: %s: unable to refresh stable boot asset: %s',
+      serviceWorkerId,
+      castToError(error, 'unknown error').message,
+    )
+    return
+  }
+  if (!response.ok) {
+    console.warn(
+      'ServiceWorker: %s: stable boot asset fetch failed: %d',
+      serviceWorkerId,
+      response.status,
+    )
+    return
+  }
+  const cache = await getControlCache()
+  await putCacheResponse(cache, request, response.clone(), {
+    cacheName: controlCacheName,
+    operation: 'refresh stable boot asset',
+    controlRowKind: 'stable-boot-asset',
+  })
+}
+
+async function fetchLatestBrowserRelease(): Promise<BrowserReleaseDescriptor | null> {
+  let response: Response
+  try {
+    response = await fetch(
+      new Request(new URL(browserReleasePath, baseURL).toString(), {
+        cache: 'no-cache',
+      }),
+    )
+  } catch (error) {
+    console.warn(
+      'ServiceWorker: %s: unable to fetch browser release manifest: %s',
+      serviceWorkerId,
+      castToError(error, 'unknown error').message,
+    )
+    return null
+  }
+  if (!response.ok) {
+    console.warn(
+      'ServiceWorker: %s: browser release manifest fetch failed: %d',
+      serviceWorkerId,
+      response.status,
+    )
+    return null
+  }
+  return (await response.json()) as BrowserReleaseDescriptor
+}
+
+async function stageBrowserRelease(
+  release: BrowserReleaseDescriptor,
+): Promise<boolean> {
+  const cacheName = buildGenerationCacheName(release.generationId)
+  const cache = await caches.open(cacheName)
+  for (const path of buildReleaseCachePaths(release)) {
+    const request = buildCacheRequest(path)
+    if (!canCacheRequest(request)) {
+      console.warn(
+        'ServiceWorker: %s: refusing to stage %s for %s, cache scheme unsupported',
+        serviceWorkerId,
+        path,
+        release.generationId,
+      )
+      return false
+    }
+    if (await cache.match(request)) continue
+
+    // Generation paths are immutable, so the HTTP cache may answer: a release
+    // the page is loading is staged without downloading it a second time.
+    let response: Response
+    try {
+      response = await fetch(new Request(request.url, { priority: 'low' }))
+    } catch (error) {
+      console.warn(
+        'ServiceWorker: %s: failed to stage %s for %s: %s',
+        serviceWorkerId,
+        path,
+        release.generationId,
+        castToError(error, 'unknown error').message,
+      )
+      return false
+    }
+    if (!response.ok) {
+      console.warn(
+        'ServiceWorker: %s: refusing to stage %s for %s, status=%d',
+        serviceWorkerId,
+        path,
+        release.generationId,
+        response.status,
+      )
+      return false
+    }
+    if (
+      !(await putCacheResponse(cache, request, response.clone(), {
+        cacheName,
+        operation: 'stage browser release',
+        generationId: release.generationId,
+      }))
+    ) {
+      return false
+    }
+  }
+  for (const path of buildReleaseCachePaths(release)) {
+    const cached = await cache.match(buildCacheRequest(path))
+    if (!cached) {
+      console.warn(
+        'ServiceWorker: %s: staged cache missing %s for %s',
+        serviceWorkerId,
+        path,
+        release.generationId,
+      )
+      return false
+    }
+  }
+  return true
+}
+
+async function pruneReleaseCaches(state: BrowserReleaseState): Promise<void> {
+  const retainedCaches = new Set<string>([controlCacheName])
+  if (devFrontendCache) {
+    retainedCaches.add(devFrontendCache.name)
+  }
+  for (const generationId of retainedGenerationIds(state)) {
+    retainedCaches.add(buildGenerationCacheName(generationId))
+  }
+  const cacheNames = await caches.keys()
+  for (const cacheName of cacheNames) {
+    if (!retainedCaches.has(cacheName)) {
+      await caches.delete(cacheName)
+    }
+  }
+}
+
+export async function syncLatestBrowserRelease(
+  options: BrowserReleaseSyncOptions = {},
+): Promise<BrowserReleaseState> {
+  if (!canCacheBrowserReleaseRequests()) {
+    return createEmptyBrowserReleaseState()
+  }
+
+  const lifecycleProbeStartedMs = options.lifecycleProbe ? performance.now() : 0
+  let state = options.lifecycleProbe
+    ? await loadBrowserReleaseState()
+    : undefined
+  if (
+    options.lifecycleProbe &&
+    state?.promotedCurrent &&
+    lifecycleProbeStartedMs - browserReleaseLifecycleSyncLastSuccessMs <
+      browserReleaseLifecycleSyncFreshMs
+  ) {
+    await pruneReleaseCaches(state)
+    return state
+  }
+
+  await cacheStableBootAsset()
+
+  state = state ?? (await loadBrowserReleaseState())
+  const release =
+    options.discoveredRelease ?? (await fetchLatestBrowserRelease())
+  if (!release) {
+    await pruneReleaseCaches(state)
+    return state
+  }
+
+  if (
+    sameBrowserRelease(state.discovered, release) &&
+    sameBrowserRelease(state.staged, release) &&
+    sameBrowserRelease(state.promotedCurrent, release)
+  ) {
+    if (options.lifecycleProbe) {
+      browserReleaseLifecycleSyncLastSuccessMs = lifecycleProbeStartedMs
+    }
+    await pruneReleaseCaches(state)
+    return state
+  }
+
+  const discoveredState = { ...state, discovered: release }
+  if (!(await saveBrowserReleaseState(discoveredState))) {
+    await pruneReleaseCaches(state)
+    return state
+  }
+  state = discoveredState
+
+  if (!(await stageBrowserRelease(release))) {
+    await pruneReleaseCaches(state)
+    return state
+  }
+
+  const promotedState = promoteBrowserRelease(state, release)
+  if (!(await saveBrowserReleaseState(promotedState))) {
+    await pruneReleaseCaches(state)
+    return state
+  }
+  state = promotedState
+  await pruneReleaseCaches(state)
+  if (options.lifecycleProbe) {
+    browserReleaseLifecycleSyncLastSuccessMs = lifecycleProbeStartedMs
+  }
+  return state
+}
+
+function runBrowserReleaseSync(
+  promise: Promise<BrowserReleaseState | null>,
+): Promise<void> {
+  return promise.then(
+    () => undefined,
+    (error) => {
+      console.warn(
+        'ServiceWorker: %s: browser release sync failed: %s',
+        serviceWorkerId,
+        castToError(error, 'unknown error').message,
+      )
+    },
+  )
+}
+
+async function matchStableBootAsset(
+  request: Request,
+): Promise<Response | null> {
+  const cacheRequest = buildControlCacheRequest(
+    getBrowserControlCacheRow('stable-boot-asset'),
+  )
+  if (!canCacheRequest(cacheRequest)) {
+    return null
+  }
+  const cache = await getControlCache()
+  const response = await cache.match(cacheRequest)
+  if (!response) {
+    return null
+  }
+  return responseForMethod(request, response)
+}
+
+async function matchBrowserIndexCache(
+  request: Request,
+): Promise<Response | null> {
+  const cacheRequest = buildControlCacheRequest(
+    getBrowserControlCacheRow('browser-index'),
+  )
+  if (!canCacheRequest(cacheRequest)) {
+    return null
+  }
+  const cache = await getControlCache()
+  const response = await cache.match(cacheRequest)
+  if (!response) {
+    return null
+  }
+  return responseForMethod(request, response)
+}
+
+async function matchRootNavigationCache(
+  request: Request,
+): Promise<Response | null> {
+  const cacheRequest = buildControlCacheRequest(
+    getBrowserControlCacheRow('root-document'),
+  )
+  if (!canCacheRequest(cacheRequest)) {
+    return null
+  }
+  const cache = await getControlCache()
+  const response = await cache.match(cacheRequest)
+  if (!response) {
+    return null
+  }
+  return responseForMethod(request, response)
+}
+
+async function cacheBrowserIndexResponse(response: Response): Promise<void> {
+  if (!response.ok) {
+    return
+  }
+  const cache = await getControlCache()
+  const row = getBrowserControlCacheRow('browser-index')
+  const request = buildControlCacheRequest(row)
+  if (canCacheRequest(request)) {
+    await putCacheResponse(cache, request, response.clone(), {
+      cacheName: row.cacheName,
+      operation: 'cache browser index response',
+      controlRowKind: row.kind,
+    })
+  }
+}
+
+async function cacheRootNavigationResponse(response: Response): Promise<void> {
+  if (!response.ok) {
+    return
+  }
+  const row = getBrowserControlCacheRow('root-document')
+  const request = buildControlCacheRequest(row)
+  if (!canCacheRequest(request)) {
+    return
+  }
+  const cache = await getControlCache()
+  await putCacheResponse(cache, request, response.clone(), {
+    cacheName: row.cacheName,
+    operation: 'cache root navigation response',
+    controlRowKind: row.kind,
+  })
+}
+
+// refreshBrowserIndexCache fetches and stores the runtime browser shell.
+export async function refreshBrowserIndexCache(
+  clientId: string,
+): Promise<Response> {
+  const request = buildControlCacheRequest(
+    getBrowserControlCacheRow('browser-index'),
+  )
+  const response = await proxyFetch(swHost, request, clientId)
+  if (response.ok) {
+    await cacheBrowserIndexResponse(response)
+  }
+  return response
+}
+
+async function matchPromotedGenerationResponse(
+  request: Request,
+): Promise<Response | null> {
+  if (!canCacheBrowserReleaseRequests()) {
+    return null
+  }
+
+  const pathname = normalizeReleasePath(new URL(request.url).pathname)
+  const accept = request.headers.get('Accept') ?? ''
+  const isNavigation =
+    request.mode === 'navigate' ||
+    request.destination === 'document' ||
+    accept.includes('text/html')
+  const state = await loadBrowserReleaseState()
+
+  for (const release of [state.promotedCurrent, state.promotedPrevious]) {
+    if (!release) {
+      continue
+    }
+    const cache = await caches.open(
+      buildGenerationCacheName(release.generationId),
+    )
+    const candidates = isNavigation
+      ? buildOfflineNavigationFallbacks(pathname, release)
+      : [pathname]
+    for (const candidate of candidates) {
+      const response = await cache.match(buildCacheRequest(candidate))
+      if (response) {
+        return responseForMethod(request, response)
+      }
+    }
+  }
+
+  return null
+}
+
+async function matchPromotedCurrentGenerationResponse(
+  request: Request,
+): Promise<Response | null> {
+  if (!canCacheBrowserReleaseRequests()) {
+    return null
+  }
+
+  const pathname = normalizeReleasePath(new URL(request.url).pathname)
+  const state = await loadBrowserReleaseState()
+  const release = state.promotedCurrent
+  if (!release) {
+    return null
+  }
+  if (!new Set(buildReleaseCachePaths(release)).has(pathname)) {
+    return null
+  }
+
+  const cache = await caches.open(
+    buildGenerationCacheName(release.generationId),
+  )
+  const response = await cache.match(buildCacheRequest(pathname))
+  if (!response) {
+    return null
+  }
+  return responseForMethod(request, response)
+}
+
+interface StaticPluginAsset {
+  pluginId: string
+  rootHash: string
+  // pinned is set when the path names the manifest root. Pinned files are
+  // immutable, so they stay current when the announced root changes.
+  pinned: boolean
+  generationId?: string
+}
+
+// staticPluginAssetPinnedRoot returns the manifest root named by a
+// /<prefix>/<plugin>/manifest/<root>/<file> path, or null when unpinned.
+function staticPluginAssetPinnedRoot(
+  source: BrowserFetchSource,
+): string | null {
+  const pluginId = staticPluginAssetPluginId(source)
+  if (!pluginId) {
+    return null
+  }
+  const prefixLen = source.path.startsWith(pluginDistPathPrefix)
+    ? pluginDistPathPrefix.length
+    : pluginAssetsPathPrefix.length
+  const suffix = source.path.slice(prefixLen + pluginId.length)
+  const manifestPrefix = '/manifest/'
+  if (!suffix.startsWith(manifestPrefix)) {
+    return null
+  }
+  const slash = suffix.indexOf('/', manifestPrefix.length)
+  if (slash <= manifestPrefix.length) {
+    return null
+  }
+  return suffix.slice(manifestPrefix.length, slash)
+}
+
+// isStaticPluginAssetCurrent checks that an asset's root may still be served.
+function isStaticPluginAssetCurrent(asset: StaticPluginAsset): boolean {
+  return (
+    asset.pinned || activePluginRoots.get(asset.pluginId) === asset.rootHash
+  )
+}
+
+// staticPluginAssetPluginId returns the plugin serving a static plugin asset
+// path, or null for other paths.
+function staticPluginAssetPluginId(source: BrowserFetchSource): string | null {
+  let prefix: string
+  if (source.path.startsWith(pluginDistPathPrefix)) {
+    prefix = pluginDistPathPrefix
+  } else if (source.path.startsWith(pluginAssetsPathPrefix)) {
+    prefix = pluginAssetsPathPrefix
+  } else {
+    return null
+  }
+  const pathAfterPrefix = source.path.slice(prefix.length)
+  const slash = pathAfterPrefix.indexOf('/')
+  if (slash <= 0) {
+    return null
+  }
+  return pathAfterPrefix.slice(0, slash)
+}
+
+async function resolveStaticPluginAsset(
+  source: BrowserFetchSource,
+): Promise<StaticPluginAsset | null> {
+  const pluginId = staticPluginAssetPluginId(source)
+  if (!pluginId) {
+    return null
+  }
+  const pinnedRoot = staticPluginAssetPinnedRoot(source)
+  if (pinnedRoot) {
+    const state = await loadBrowserReleaseState()
+    return {
+      pluginId,
+      rootHash: pinnedRoot,
+      pinned: true,
+      generationId: state.promotedCurrent?.generationId,
+    }
+  }
+  // Only the currently active announced root may be served or cached. A root
+  // that is not yet active waits for its activation update; it never falls
+  // back to persisted roots, and old roots never satisfy new requests.
+  let rootHash = activePluginRoots.get(pluginId)
+  if (!rootHash) {
+    await pluginRootUpdates.get(pluginId)
+    rootHash = activePluginRoots.get(pluginId)
+  }
+  if (!rootHash) {
+    return null
+  }
+  const state = await loadBrowserReleaseState()
+  return {
+    pluginId,
+    rootHash,
+    pinned: false,
+    generationId: state.promotedCurrent?.generationId,
+  }
+}
+
+// staticPluginAssetCacheRequest builds the generation-cache key for a plugin
+// asset. The key binds the manifest root hash to the pathname and search, so
+// cached bytes from one root can never satisfy a request for another root.
+function staticPluginAssetCacheRequest(
+  asset: StaticPluginAsset,
+  request: Request,
+): Request {
+  const url = new URL(request.url)
+  const rootParam = `__bldr_plugin_root=${encodeURIComponent(asset.rootHash)}`
+  const search = url.search
+    ? `?${rootParam}&${url.search.slice(1)}`
+    : `?${rootParam}`
+  return buildCacheRequest(`${url.pathname}${search}`)
+}
+
+async function cacheStaticPluginAsset(
+  asset: StaticPluginAsset,
+  request: Request,
+  response: Response,
+): Promise<void> {
+  if (
+    request.method !== 'GET' ||
+    !response.ok ||
+    !asset.generationId ||
+    !isStaticPluginAssetCurrent(asset)
+  ) {
+    return
+  }
+  const cacheRequest = staticPluginAssetCacheRequest(asset, request)
+  if (!canCacheRequest(cacheRequest)) {
+    return
+  }
+  const state = await loadBrowserReleaseState()
+  if (state.promotedCurrent?.generationId !== asset.generationId) {
+    return
+  }
+  const cacheName = buildGenerationCacheName(asset.generationId)
+  const cache = await caches.open(cacheName)
+  await putCacheResponse(cache, cacheRequest, response, {
+    cacheName,
+    operation: 'cache static plugin asset',
+    generationId: asset.generationId,
+  })
+}
+
+async function matchStaticPluginAsset(
+  asset: StaticPluginAsset,
+  request: Request,
+): Promise<Response | null> {
+  if (
+    request.method !== 'GET' ||
+    request.cache === 'reload' ||
+    request.cache === 'no-cache' ||
+    !asset.generationId
+  ) {
+    return null
+  }
+  const state = await loadBrowserReleaseState()
+  if (state.promotedCurrent?.generationId !== asset.generationId) {
+    return null
+  }
+  const cache = await caches.open(buildGenerationCacheName(asset.generationId))
+  const response = await cache.match(
+    staticPluginAssetCacheRequest(asset, request),
+  )
+  if (!response || !isStaticPluginAssetCurrent(asset)) {
+    return null
+  }
+  const cachedResponse = await responseForMethod(request, response)
+  if (!isStaticPluginAssetCurrent(asset)) {
+    return null
+  }
+  const headers = new Headers(cachedResponse.headers)
+  headers.set('X-Bldr-Plugin-Asset-Cache', 'generation')
+  return new Response(cachedResponse.body, {
+    status: cachedResponse.status,
+    statusText: cachedResponse.statusText,
+    headers,
+  })
+}
+
+function newPluginRootAnnouncedSignal(): {
+  promise: Promise<void>
+  resolve: () => void
+} {
+  let resolve!: () => void
+  const promise = new Promise<void>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+// announcePluginManifestRoot records a root announcement and wakes waiters.
+function announcePluginManifestRoot(pluginId: string): void {
+  pluginRootAnnouncementSeqs.set(
+    pluginId,
+    (pluginRootAnnouncementSeqs.get(pluginId) ?? 0) + 1,
+  )
+  const announced = pluginRootAnnounced
+  pluginRootAnnounced = newPluginRootAnnouncedSignal()
+  announced.resolve()
+}
+
+// waitForPluginRootAnnouncement waits until the plugin's root is announced
+// after the announcement numbered afterSeq. Returns false on timeout.
+async function waitForPluginRootAnnouncement(
+  pluginId: string,
+  afterSeq: number,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadlineMs = Date.now() + timeoutMs
+  while ((pluginRootAnnouncementSeqs.get(pluginId) ?? 0) <= afterSeq) {
+    const remainingMs = deadlineMs - Date.now()
+    if (remainingMs <= 0) {
+      return false
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      pluginRootAnnounced.promise,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, remainingMs)
+      }),
+    ])
+    clearTimeout(timer)
+  }
+  return true
+}
+
+// activatePluginManifestRoot activates an announced root when it is still the
+// desired root. Activation is in-memory only; a restarted service worker waits
+// for the next announcement instead of reactivating persisted state.
+async function activatePluginManifestRoot(
+  pluginId: string,
+  rootHash: string,
+): Promise<void> {
+  if (desiredPluginRoots.get(pluginId) !== rootHash) {
+    return
+  }
+  activePluginRoots.set(pluginId, rootHash)
+}
+
+export async function handleBrowserReleaseRequest(
+  ev: FetchEvent,
+): Promise<Response> {
+  const request = ev.request
+  const state = await loadBrowserReleaseState()
+  if (state.promotedCurrent) {
+    // A complete generation can start immediately. Discover and stage updates
+    // for the next navigation without putting the network on this tab's path.
+    ev.waitUntil(
+      runBrowserReleaseSync(
+        fetchLatestBrowserRelease().then((release) =>
+          release
+            ? syncLatestBrowserRelease({ discoveredRelease: release })
+            : null,
+        ),
+      ),
+    )
+    return buildJsonResponse(request.method, state.promotedCurrent)
+  }
+
+  const latestRelease = await fetchLatestBrowserRelease()
+  if (!latestRelease) {
+    const fallback = state.promotedPrevious
+    if (fallback) {
+      return buildJsonResponse(request.method, fallback)
+    }
+    throw new Error('browser release manifest unavailable')
+  }
+
+  ev.waitUntil(
+    runBrowserReleaseSync(
+      syncLatestBrowserRelease({ discoveredRelease: latestRelease }),
+    ),
+  )
+  return buildJsonResponse(request.method, latestRelease)
+}
+
+// onWebDocumentsExhausted notifies all web documents we need a new connection.
+const onWebDocumentsExhausted = async () => {
+  await self.clients.claim()
+  const currClients = await self.clients.matchAll({ type: 'window' })
+  if (BLDR_DEBUG) {
+    console.log(
+      'ServiceWorker: %s: notifying %d clients we want a connection',
+      serviceWorkerLogicalId,
+      currClients.length,
+    )
+  }
+  for (const client of currClients) {
+    client.postMessage({
+      from: serviceWorkerLogicalId,
+      init: true,
+    })
+  }
+}
+
+// webDocumentTracker tracks the set of connected remote WebDocument.
+const webDocumentTracker = new WebDocumentTracker(
+  serviceWorkerId,
+  WebRuntimeClientType.WebRuntimeClientType_SERVICE_WORKER,
+  onWebDocumentsExhausted,
+  // We don't support calling the ServiceWorker from WebDocument.
+  null,
+  null,
+  serviceWorkerLogicalId,
+)
+
+// webRuntimeClient manages the connection to the WebRuntime.
+const webRuntimeClient = webDocumentTracker.webRuntimeClient
+
+// swHostClient attempts to contact the WebRuntime over any of the WebDocument relays.
+const swHostClient = webRuntimeClient.rpcClient
+
+// swHost is the RPC client for the ServiceWorkerHost.
+const swHost = new ServiceWorkerHostClient(swHostClient)
+
+// install is the beginning of service worker registration.
+// setup resources such as offline caches.
+// note: does not activate until some time after this returns.
+async function swInstall() {
+  markStartupBoundary('service-worker.install-start', {
+    source: 'service-worker',
+    serviceWorkerId,
+  })
+  await self.skipWaiting()
+  markStartupBoundary('service-worker.install-ready', {
+    source: 'service-worker',
+    serviceWorkerId,
+  })
+}
+
+// swActivate is called when the service worker becomes active.
+export async function swActivate() {
+  markStartupBoundary('service-worker.activate-start', {
+    source: 'service-worker',
+    serviceWorkerId,
+  })
+  // Claim all clients.
+
+  await self.clients.claim()
+  await getControlCache()
+  // Offline staging runs under the document's sync message. Fetch events cannot
+  // run until activation settles, so network downloads must not be awaited here.
+  markStartupBoundary('service-worker.activate-ready', {
+    source: 'service-worker',
+    serviceWorkerId,
+  })
+}
+
+function readDedicatedRuntimeHostConnectRequest(
+  data: unknown,
+  ports: readonly MessagePort[],
+): DedicatedRuntimeHostConnectRequest | null {
+  if (!data || typeof data !== 'object') {
+    return null
+  }
+  const msg = data as WebDocumentToWorker
+  const connect = msg.connectDedicatedRuntimeHost
+  const port = connect?.port ?? ports[0]
+  if (
+    !msg.from ||
+    !connect?.webRuntimeId ||
+    !(connect.init instanceof Uint8Array) ||
+    !port
+  ) {
+    return null
+  }
+  return {
+    from: msg.from,
+    webRuntimeId: connect.webRuntimeId,
+    init: connect.init,
+    port,
+  }
+}
+
+async function handleDedicatedRuntimeHostConnectRequest(
+  request: DedicatedRuntimeHostConnectRequest,
+  tracker: ServiceWorkerMessageDeps['webDocumentTracker'],
+): Promise<void> {
+  const postAck = (ack: ConnectWebRuntimeAck, runtimePort?: MessagePort) => {
+    try {
+      request.port.postMessage(ack, runtimePort ? [runtimePort] : [])
+    } catch (err) {
+      runtimePort?.close()
+      throw err
+    } finally {
+      request.port.close()
+    }
+  }
+
+  if (!tracker.openWebRuntimePortWithResult) {
+    postAck({
+      from: serviceWorkerLogicalId,
+      error: 'dedicated runtime host relay unavailable',
+    })
+    return
+  }
+
+  const abortController = new AbortController()
+  request.port.onmessage = (
+    ev: MessageEvent<DedicatedRuntimeHostConnectControl | null>,
+  ) => {
+    const data = ev.data
+    if (data?.cancelDedicatedRuntimeHostConnect) {
+      abortController.abort(
+        new DOMException(
+          'dedicated runtime host connect canceled',
+          'AbortError',
+        ),
+      )
+    }
+  }
+  request.port.start()
+
+  markStartupBoundary('dedicated-host.service-worker-connect-start', {
+    source: 'service-worker',
+    serviceWorkerId,
+    runtimeId: request.webRuntimeId,
+    requesterDocumentId: request.from,
+  })
+  let runtimeResult: OpenWebRuntimePortResult
+  try {
+    runtimeResult = await tracker.openWebRuntimePortWithResult(
+      request.init,
+      request.from,
+      abortController.signal,
+    )
+  } catch (err) {
+    if (abortController.signal.aborted) {
+      request.port.close()
+      return
+    }
+    const message = err instanceof Error ? err.message : String(err)
+    postAck({
+      from: serviceWorkerLogicalId,
+      error: message,
+    })
+    markStartupBoundary('dedicated-host.service-worker-connect-failed', {
+      source: 'service-worker',
+      serviceWorkerId,
+      runtimeId: request.webRuntimeId,
+      requesterDocumentId: request.from,
+      error: message,
+    })
+    return
+  } finally {
+    request.port.onmessage = null
+  }
+  postAck(
+    {
+      from: serviceWorkerLogicalId,
+      webRuntimePort: runtimeResult.webRuntimePort,
+      hostDocumentId: runtimeResult.hostDocumentId,
+      hostGeneration: runtimeResult.hostGeneration,
+    },
+    runtimeResult.webRuntimePort,
+  )
+  markStartupBoundary('dedicated-host.service-worker-connect-ready', {
+    source: 'service-worker',
+    serviceWorkerId,
+    runtimeId: request.webRuntimeId,
+    requesterDocumentId: request.from,
+  })
+}
+
+// handleServiceWorkerMessage routes a page message to its ServiceWorker handler.
+export function handleServiceWorkerMessage(
+  ev: ExtendableMessageEvent,
+  deps: ServiceWorkerMessageDeps,
+): void {
+  const pluginManifestRoot = readPluginManifestRootMessage(ev.data)
+  if (pluginManifestRoot) {
+    const { pluginId, rootHash } = pluginManifestRoot
+    announcePluginManifestRoot(pluginId)
+    desiredPluginRoots.set(pluginId, rootHash)
+    if (activePluginRoots.get(pluginId) !== rootHash) {
+      activePluginRoots.delete(pluginId)
+    }
+    const previousUpdate = pluginRootUpdates.get(pluginId) ?? Promise.resolve()
+    const update = previousUpdate
+      .then(() => activatePluginManifestRoot(pluginId, rootHash))
+      .finally(() => {
+        if (pluginRootUpdates.get(pluginId) === update) {
+          pluginRootUpdates.delete(pluginId)
+        }
+      })
+    pluginRootUpdates.set(pluginId, update)
+    ev.waitUntil(update)
+    return
+  }
+
+  if (isBrowserReleaseSyncMessage(ev.data)) {
+    if (browserReleaseSyncInFlight) {
+      return
+    }
+    const syncPromise = runBrowserReleaseSync(
+      deps.syncLatestBrowserRelease({ lifecycleProbe: true }),
+    ).finally(() => {
+      if (browserReleaseSyncInFlight === syncPromise) {
+        browserReleaseSyncInFlight = null
+      }
+    })
+    browserReleaseSyncInFlight = syncPromise
+    ev.waitUntil(syncPromise)
+    return
+  }
+
+  if (isBrowserIndexRefreshMessage(ev.data)) {
+    const senderId = (ev.source as Client)?.id || ''
+    ev.waitUntil(deps.refreshBrowserIndexCache(senderId))
+    return
+  }
+  const dedicatedHostConnect = readDedicatedRuntimeHostConnectRequest(
+    ev.data,
+    ev.ports ?? [],
+  )
+  if (dedicatedHostConnect) {
+    ev.waitUntil(
+      handleDedicatedRuntimeHostConnectRequest(
+        dedicatedHostConnect,
+        deps.webDocumentTracker,
+      ),
+    )
+    return
+  }
+
+  // Cross-tab channel broker: handle hello/goodbye before WebDocument messages.
+  if (isCrossTabMessage(ev.data)) {
+    const senderId = (ev.source as Client)?.id
+    if (senderId) {
+      if (ev.data.crossTab === 'goodbye') {
+        deps.fetchTracker.abortClient(
+          senderId,
+          new Error('service worker client closed'),
+        )
+      }
+      ev.waitUntil(deps.handleCrossTabMessage(deps.clients, senderId, ev.data))
+    }
+    return
+  }
+  deps.webDocumentTracker.handleWebDocumentMessage(ev.data)
+  if (!firstWebDocumentMessageMarked) {
+    firstWebDocumentMessageMarked = true
+    markStartupBoundary('service-worker.first-document-message', {
+      source: 'service-worker',
+      serviceWorkerId,
+    })
+  }
+}
+
+function readPluginManifestRootMessage(
+  data: unknown,
+): PluginManifestRootMessage['bldrPluginManifestRoot'] | null {
+  if (!data || typeof data !== 'object') {
+    return null
+  }
+  const value = (data as PluginManifestRootMessage).bldrPluginManifestRoot
+  if (
+    !value ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value.pluginId) ||
+    !/^[1-9A-HJ-NP-Za-km-z]+$/.test(value.rootHash)
+  ) {
+    return null
+  }
+  return value
+}
+
+function isBrowserReleaseSyncMessage(
+  data: unknown,
+): data is BrowserReleaseSyncMessage {
+  if (!data || typeof data !== 'object') {
+    return false
+  }
+  return (data as BrowserReleaseSyncMessage).bldrSyncManifest === true
+}
+
+function isBrowserIndexRefreshMessage(
+  data: unknown,
+): data is BrowserIndexRefreshMessage {
+  if (!data || typeof data !== 'object') {
+    return false
+  }
+  return (data as BrowserIndexRefreshMessage).bldrRefreshBrowserIndex === true
+}
+
+function isNavigationRequest(request: Request): boolean {
+  const accept = request.headers.get('Accept') ?? ''
+  return (
+    request.mode === 'navigate' ||
+    request.destination === 'document' ||
+    accept.includes('text/html')
+  )
+}
+
+// classifyBrowserFetchSource returns the BrowserFetchSource for a request.
+export function classifyBrowserFetchSource(
+  request: Request,
+  matchPrefixes: readonly string[] = BLDR_URI_PREFIXES,
+): BrowserFetchSource {
+  const requestURL = new URL(request.url)
+  const path = requestURL.pathname
+  const sameOrigin = isSwOrigin(requestURL.origin)
+  const runtime =
+    sameOrigin &&
+    matchPrefixes.some((matchPrefix) => path.startsWith(matchPrefix))
+
+  let kind: BrowserFetchSourceKind = 'native-fetch'
+  if (
+    sameOrigin &&
+    path === rootNavigationPath &&
+    isNavigationRequest(request)
+  ) {
+    kind = 'root-document'
+  } else if (sameOrigin && path === browserIndexPath) {
+    kind = 'browser-index'
+  } else if (sameOrigin && path === bootAssetPath) {
+    kind = 'boot-asset'
+  } else if (sameOrigin && path === browserReleasePath) {
+    kind = 'release-asset'
+  } else if (sameOrigin && path.startsWith(pluginDistPathPrefix)) {
+    kind = 'plugin-dist'
+  } else if (
+    sameOrigin &&
+    (path.startsWith(pluginAssetsPathPrefix) ||
+      path.startsWith(pluginWebPkgPathPrefix) ||
+      path.startsWith(pluginHttpPathPrefix))
+  ) {
+    kind = 'plugin-assets'
+  } else if (runtime) {
+    kind = 'bldr-runtime'
+  }
+
+  return { kind, path, sameOrigin, runtime }
+}
+
+function isRuntimeFetchSource(source: BrowserFetchSource): boolean {
+  return source.runtime || source.kind === 'browser-index'
+}
+
+function isPluginRuntimeFetchSource(source: BrowserFetchSource): boolean {
+  return isPluginRuntimeFetchSourceKind(source.kind)
+}
+
+export function resolveBrowserRuntimeFetchClientId(
+  clientId: string | undefined,
+  source: BrowserFetchSource,
+  tracker: BrowserRuntimeFetchClientTracker,
+  serviceWorkerClientId: string,
+): string {
+  if (
+    isPluginRuntimeFetchSource(source) &&
+    !source.path.startsWith(pluginHttpPathPrefix) &&
+    tracker.hasRuntimeFetchRelay()
+  ) {
+    return serviceWorkerClientId
+  }
+  if (clientId) {
+    return clientId
+  }
+  if (isPluginRuntimeFetchSource(source) && tracker.hasRuntimeFetchRelay()) {
+    return serviceWorkerClientId
+  }
+  return ''
+}
+
+function isPluginRuntimeFetchSourceKind(kind: BrowserFetchSourceKind): boolean {
+  return kind === 'plugin-assets' || kind === 'plugin-dist'
+}
+
+function browserRuntimeFetchStatusForCode(
+  code: BrowserRuntimeFetchErrorCode,
+  fallbackStatus: number | undefined,
+): number {
+  if (code === 'request-canceled') {
+    return 499
+  }
+  if (code === 'stream-open-timeout') {
+    return 504
+  }
+  if (code === 'generation-closed') {
+    return 410
+  }
+  if (code === 'plugin-root-changed') {
+    return 409
+  }
+  if (code === 'plugin-asset-missing') {
+    return 404
+  }
+  if (code === 'runtime-unavailable') {
+    return 503
+  }
+  if (fallbackStatus && fallbackStatus >= 400 && fallbackStatus <= 599) {
+    return fallbackStatus
+  }
+  return 503
+}
+
+function pluginAssetFetchResultForErrorCode(
+  code: BrowserRuntimeFetchErrorCode,
+): BrowserPluginAssetFetchResultCode | undefined {
+  switch (code) {
+    case 'request-canceled':
+      return 'canceled'
+    case 'generation-closed':
+      return 'generation-closed'
+    case 'plugin-root-changed':
+      return 'root-changed'
+    case 'runtime-unavailable':
+    case 'no-ready-document':
+    case 'resume-unavailable':
+    case 'stream-open-timeout':
+      return 'runtime-unavailable'
+    case 'plugin-asset-missing':
+      return 'missing'
+    case 'plugin-asset-unavailable':
+      return 'unavailable'
+  }
+}
+
+function isAbortFailure(message: string): boolean {
+  return (
+    message.includes('aborterror') ||
+    message.includes('aborted') ||
+    message.includes('client closed') ||
+    message.includes('service worker client closed')
+  )
+}
+
+function isResumeUnavailableFailure(message: string): boolean {
+  return (
+    message.includes('resume') &&
+    (message.includes('not ready') ||
+      message.includes('unavailable') ||
+      message.includes('timed out') ||
+      message.includes('timeout'))
+  )
+}
+
+function isStreamOpenTimeoutFailure(message: string): boolean {
+  return (
+    message.includes('timeout opening stream with host') ||
+    message.includes('unable to open stream with host') ||
+    message.includes('timed out waiting') ||
+    message.includes('proxied fetch response headers')
+  )
+}
+
+// isRuntimeLostFailure matches streams failed because the runtime behind the
+// relay exited, such as a closed DedicatedWorker host. The next route reaches
+// a live runtime, so the request can be retried.
+function isRuntimeLostFailure(message: string): boolean {
+  return message.includes('closed: runtime-disconnected')
+}
+
+function isGenerationClosedFailure(message: string): boolean {
+  return (
+    message.includes('generation closed') ||
+    message.includes('runtime closed') ||
+    message.includes('worker closed') ||
+    message.includes('webruntimeclientinstance is closed') ||
+    message.includes('closed before resume-ready')
+  )
+}
+
+function isPluginAssetMissingFailure(message: string): boolean {
+  return message.includes('missing') || message.includes('404 page not found')
+}
+
+function shouldNormalizeRuntimeFetchFailure(
+  source: BrowserFetchSource,
+  failure: BrowserRuntimeFetchFailureInput,
+): boolean {
+  if (isPluginRuntimeFetchSource(source)) {
+    return true
+  }
+  const lowerMessage = (failure.message ?? '').toLowerCase()
+  return (
+    failure.aborted ||
+    isAbortFailure(lowerMessage) ||
+    isResumeUnavailableFailure(lowerMessage) ||
+    isStreamOpenTimeoutFailure(lowerMessage) ||
+    isGenerationClosedFailure(lowerMessage)
+  )
+}
+
+// classifyBrowserRuntimeFetchError maps proxy/runtime failures to bounded fetch errors.
+export function classifyBrowserRuntimeFetchError(
+  source: Pick<BrowserFetchSource, 'kind' | 'path'>,
+  failure: BrowserRuntimeFetchFailureInput = {},
+): BrowserRuntimeFetchError {
+  const message = failure.message || 'runtime fetch unavailable'
+  const lowerMessage = message.toLowerCase()
+  const code = classifyBrowserRuntimeFetchErrorCode(
+    source.kind,
+    failure,
+    lowerMessage,
+  )
+  const pluginAssetFetchResult = isPluginRuntimeFetchSourceKind(source.kind)
+    ? pluginAssetFetchResultForErrorCode(code)
+    : undefined
+  return {
+    code,
+    source: source.kind,
+    path: source.path,
+    message,
+    status: browserRuntimeFetchStatusForCode(code, failure.status),
+    pluginAssetFetchResult,
+  }
+}
+
+function classifyBrowserRuntimeFetchErrorCode(
+  sourceKind: BrowserFetchSourceKind,
+  failure: BrowserRuntimeFetchFailureInput,
+  lowerMessage: string,
+): BrowserRuntimeFetchErrorCode {
+  if (failure.aborted || isAbortFailure(lowerMessage)) {
+    return 'request-canceled'
+  }
+  if (isGenerationClosedFailure(lowerMessage)) {
+    return 'generation-closed'
+  }
+  if (!isPluginRuntimeFetchSourceKind(sourceKind)) {
+    if (isResumeUnavailableFailure(lowerMessage)) {
+      return 'resume-unavailable'
+    }
+    if (isStreamOpenTimeoutFailure(lowerMessage)) {
+      return 'stream-open-timeout'
+    }
+    return 'plugin-asset-unavailable'
+  }
+  if (
+    isResumeUnavailableFailure(lowerMessage) ||
+    isStreamOpenTimeoutFailure(lowerMessage) ||
+    isRuntimeLostFailure(lowerMessage)
+  ) {
+    return 'runtime-unavailable'
+  }
+  if (failure.status === 404 && isPluginAssetMissingFailure(lowerMessage)) {
+    return 'plugin-asset-missing'
+  }
+  return 'plugin-asset-unavailable'
+}
+
+async function readRuntimeFetchFailureMessage(
+  response: Response,
+): Promise<string> {
+  try {
+    const message = await response.clone().text()
+    return message.trim() || response.statusText || 'runtime fetch unavailable'
+  } catch (error) {
+    return castToError(error, 'runtime fetch unavailable').message
+  }
+}
+
+function buildBrowserRuntimeFetchErrorResponse(
+  error: BrowserRuntimeFetchError,
+  method: string,
+): Response {
+  const body =
+    method === 'HEAD'
+      ? null
+      : JSON.stringify({
+          schemaVersion: 1,
+          code: error.code,
+          source: error.source,
+          path: error.path,
+          message: error.message,
+          pluginAssetFetchResult: error.pluginAssetFetchResult,
+        })
+  const headers = new Headers({
+    'Cache-Control': 'no-store',
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-Bldr-Fetch-Source': error.source,
+    'X-Bldr-Runtime-Fetch-Error': error.code,
+  })
+  if (error.pluginAssetFetchResult) {
+    headers.set(
+      'X-Bldr-Plugin-Asset-Fetch-Result',
+      error.pluginAssetFetchResult,
+    )
+  }
+  return new Response(body, {
+    status: error.status,
+    headers,
+  })
+}
+
+function buildNoReadyDocumentResponse(
+  source: BrowserFetchSource,
+  method: string,
+): Response {
+  return buildBrowserRuntimeFetchErrorResponse(
+    {
+      code: isPluginRuntimeFetchSource(source)
+        ? 'runtime-unavailable'
+        : 'no-ready-document',
+      source: source.kind,
+      path: source.path,
+      message: 'runtime fetch requires a ready browser document',
+      status: 503,
+      pluginAssetFetchResult: isPluginRuntimeFetchSource(source)
+        ? 'runtime-unavailable'
+        : undefined,
+    },
+    method,
+  )
+}
+
+function addPluginAssetFetchResultHeader(
+  response: Response,
+  source: BrowserFetchSource,
+  result: BrowserPluginAssetFetchResultCode,
+): Response {
+  if (!isPluginRuntimeFetchSource(source)) {
+    return response
+  }
+  const headers = new Headers(response.headers)
+  headers.set('X-Bldr-Fetch-Source', source.kind)
+  headers.set('X-Bldr-Plugin-Asset-Fetch-Result', result)
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status >= 300 && status < 400
+}
+
+async function normalizeRuntimeFetchResponse(
+  source: BrowserFetchSource,
+  request: Request,
+  response: Response,
+  abortSignal?: AbortSignal,
+): Promise<Response> {
+  // A redirect to a manifest-pinned path answers the request; the browser
+  // follows it, so it is not a runtime failure.
+  if (response.ok || isRedirectStatus(response.status)) {
+    return addPluginAssetFetchResultHeader(response, source, 'live')
+  }
+  if (!isRuntimeFetchSource(source)) {
+    return response
+  }
+  if (
+    !isPluginRuntimeFetchSource(source) &&
+    source.kind !== 'browser-index' &&
+    source.kind !== 'bldr-runtime'
+  ) {
+    return response
+  }
+  const message = await readRuntimeFetchFailureMessage(response)
+  const failure = {
+    status: response.status,
+    message,
+    aborted: request.signal.aborted || abortSignal?.aborted,
+  }
+  if (!shouldNormalizeRuntimeFetchFailure(source, failure)) {
+    return response
+  }
+  const error = classifyBrowserRuntimeFetchError(source, {
+    status: failure.status,
+    message: failure.message,
+    aborted: failure.aborted,
+  })
+  return buildBrowserRuntimeFetchErrorResponse(error, request.method)
+}
+
+async function proxyBrowserRuntimeFetch(
+  source: BrowserFetchSource,
+  request: Request,
+  clientId: string,
+  opts?: {
+    abortSignal?: AbortSignal
+    headerTimeoutMs?: number
+  },
+): Promise<Response> {
+  const response = await proxyFetch(swHost, request, clientId, opts)
+  return normalizeRuntimeFetchResponse(
+    source,
+    request,
+    response,
+    opts?.abortSignal,
+  )
+}
+
+// isSwOrigin checks if the given origin matches the local origin.
+function isSwOrigin(origin: string): boolean {
+  return origin === self.location.origin
+}
+
+// parseDevFrontendSession returns the compiler session that names a
+// development frontend module path, such as abc123 in /b/fe/abc123/src/a.ts,
+// or null for other paths. Attached frontend services and entrypoint
+// redirects are not session module paths.
+export function parseDevFrontendSession(path: string): string | null {
+  // Split the session segment from the module path after the prefix.
+  const rest = path.startsWith(frontendPathPrefix)
+    ? path.slice(frontendPathPrefix.length)
+    : ''
+  const slash = rest.indexOf('/')
+  if (slash <= 0 || slash === rest.length - 1) {
+    return null
+  }
+  const session = rest.slice(0, slash)
+  if (session === 'rpc' || session === 'entrypoint') {
+    return null
+  }
+  return session
+}
+
+// isDevFrontendResponseCacheable reports whether the dev server's caching
+// headers let a module response be reused: immutable, or revalidated by ETag.
+function isDevFrontendResponseCacheable(response: Response): boolean {
+  if (response.status !== 200) {
+    return false
+  }
+  const cacheControl = response.headers.get('Cache-Control') ?? ''
+  if (cacheControl.includes('no-store')) {
+    return false
+  }
+  return cacheControl.includes('immutable') || response.headers.has('ETag')
+}
+
+// devFrontendCache is the cache for the current development frontend session.
+let devFrontendCache: { name: string; cache: Promise<Cache> } | null = null
+
+// openDevFrontendCache opens the module cache for a compiler session and
+// deletes the caches of earlier sessions, whose URLs no page requests again.
+function openDevFrontendCache(session: string): Promise<Cache> {
+  // Reuse the open cache while the session stays the same.
+  const name = devFrontendCachePrefix + session
+  if (devFrontendCache?.name === name) {
+    return devFrontendCache.cache
+  }
+
+  // Replace the earlier session's cache with this session's.
+  const cache = (async () => {
+    for (const cacheName of await caches.keys()) {
+      if (cacheName.startsWith(devFrontendCachePrefix) && cacheName !== name) {
+        await caches.delete(cacheName)
+      }
+    }
+    return caches.open(name)
+  })()
+  devFrontendCache = { name, cache }
+  return cache
+}
+
+// fetchDevFrontendModule serves a development frontend module, reusing the
+// session cache as the dev server's headers allow: an immutable module without
+// a request, and any other cached module after an ETag revalidation that
+// answers 304 instead of sending the module again.
+async function fetchDevFrontendModule(
+  ev: FetchEvent,
+  request: Request,
+  session: string,
+  fetchRuntime: (request: Request) => Promise<Response>,
+): Promise<Response> {
+  // Serve an immutable cached module without a request; a reload skips it.
+  const cache = await openDevFrontendCache(session)
+  const cached =
+    request.cache === 'reload' || request.cache === 'no-store'
+      ? undefined
+      : await cache.match(request)
+  if (cached?.headers.get('Cache-Control')?.includes('immutable')) {
+    return cached
+  }
+
+  // Revalidate a cached module by its ETag.
+  const etag = cached?.headers.get('ETag')
+  let forwarded = request
+  if (etag) {
+    const headers = new Headers(request.headers)
+    headers.set('If-None-Match', etag)
+    forwarded = new Request(request, { headers })
+  }
+  const response = await fetchRuntime(forwarded)
+  if (response.status === 304 && cached) {
+    return cached
+  }
+  if (isDevFrontendResponseCacheable(response)) {
+    ev.waitUntil(
+      putCacheResponse(cache, request, response.clone(), {
+        cacheName: devFrontendCachePrefix + session,
+        operation: 'dev-frontend-module',
+      }),
+    )
+  }
+  return response
+}
+
+// swFetch is called when the page attempts to fetch a resource.
+export async function swFetch(
+  ev: FetchEvent,
+  matchPrefixes = BLDR_URI_PREFIXES,
+): Promise<Response> {
+  const request = ev.request
+  let requestURL: URL
+  try {
+    requestURL = new URL(request.url)
+  } catch (error) {
+    console.warn(
+      'ServiceWorker: %s: malformed fetch request URL: %s: %s',
+      serviceWorkerId,
+      request.url,
+      castToError(error, 'invalid URL').message,
+    )
+    return new Response('malformed request URL', {
+      status: 400,
+    })
+  }
+  const requestPath = requestURL.pathname
+  const source = classifyBrowserFetchSource(request, matchPrefixes)
+
+  // Development bootstrap code binds a live compiler session, never a release.
+  if (source.sameOrigin && requestPath.startsWith('/bldr-dev/frontend-')) {
+    return fetch(new Request(request, { cache: 'no-store' }))
+  }
+
+  if (source.kind === 'release-asset' && requestPath === browserReleasePath) {
+    return handleBrowserReleaseRequest(ev)
+  }
+
+  // TODO: Browsers do not cancel request.signal when the request is canceled.
+  // This is a long-standing browser bug and is not yet fixed.
+  // See: https://github.com/w3c/ServiceWorker/issues/1544
+  // See: https://bugzilla.mozilla.org/show_bug.cgi?id=1394102
+  // See: https://bugzilla.mozilla.org/show_bug.cgi?id=1568422
+  //
+  // To view the effect of this:
+  // 1. Browse to a bldr site in one tab.
+  // 2. Browse to /p/does-not-exist/a/ in a new tab
+  // 3. The request will wait forever
+  // 4. Close the /p/does-not-exist tab.
+  // 5. Notice the request is not canceled.
+  // Note: ev.request.signal abort listeners never fire inside a service
+  // worker fetch handler (w3c/ServiceWorker issue 1544), so cancellation of
+  // the requesting tab cannot be observed here.
+
+  const useRuntimeFetch = source.runtime
+
+  if (!useRuntimeFetch) {
+    const skipGenerationCache =
+      request.cache === 'reload' || request.cache === 'no-cache'
+    if (!skipGenerationCache) {
+      const promotedResponse =
+        await matchPromotedCurrentGenerationResponse(request)
+      if (promotedResponse) {
+        return promotedResponse
+      }
+    }
+    // Check the cache (for e.x. index.html)
+    // NOTE: We do not want this, we want the latest index.html if possible.
+
+    // Use the built-in browser fetch.
+    if (BLDR_DEBUG) {
+      console.log(
+        'ServiceWorker: %s: using native fetch: %s',
+        serviceWorkerId,
+        request.url.toString(),
+      )
+    }
+
+    let response: Response | null
+    let responseErr: unknown | null = null
+    try {
+      response = await fetch(ev.request)
+    } catch (err) {
+      responseErr = err
+      console.warn(
+        'ServiceWorker: %s: native fetch failed: %s: %s',
+        serviceWorkerId,
+        request.url.toString(),
+        castToError(err, 'unknown error').message,
+      )
+      response = null
+    }
+
+    // request failed, attempt to fall back to cache.
+    if (!response || response.status < 200 || response.status >= 300) {
+      if (source.kind === 'root-document') {
+        const cachedRoot = await matchRootNavigationCache(request)
+        if (cachedRoot) {
+          return cachedRoot
+        }
+      }
+
+      if (requestPath === bootAssetPath) {
+        const bootResponse = await matchStableBootAsset(request)
+        if (bootResponse) {
+          return bootResponse
+        }
+      }
+
+      const cacheResp = await matchPromotedGenerationResponse(request)
+      if (cacheResp) {
+        return cacheResp
+      }
+    }
+
+    // finally throw err if any
+    if (responseErr) {
+      throw responseErr
+    }
+
+    if (source.kind === 'root-document' && response) {
+      await cacheRootNavigationResponse(response)
+    }
+
+    return response!
+  }
+
+  // Development frontend modules go through the session module cache.
+  const devFrontendSession = parseDevFrontendSession(requestPath)
+  if (
+    devFrontendSession &&
+    request.method === 'GET' &&
+    isBrowserCacheSupportedURL(requestURL)
+  ) {
+    return fetchDevFrontendModule(ev, request, devFrontendSession, (req) =>
+      fetchFromRuntime(ev, req, source),
+    )
+  }
+  if (source.sameOrigin && requestPath.startsWith(pluginWebPkgPathPrefix)) {
+    return fetchWebPkgFromRuntime(ev, request, source, matchPrefixes)
+  }
+  return fetchFromRuntime(ev, request, source)
+}
+
+// fetchWebPkgFromRuntime serves a shared web package file under the URL the
+// page requested. The runtime redirects /b/pkg/ to the files a release pins.
+// A browser keys a module by its request URL but resolves the module's
+// relative imports against the redirected URL, so a package reached through
+// both a bare and a relative import would load twice. Following the redirect
+// here keeps one instance per module when the page has no pinned import map
+// for the package, as in Firefox, which ignores every import map after the
+// document's first.
+async function fetchWebPkgFromRuntime(
+  ev: FetchEvent,
+  request: Request,
+  source: BrowserFetchSource,
+  matchPrefixes: readonly string[],
+): Promise<Response> {
+  const response = await fetchFromRuntime(ev, request, source)
+  const location = response.headers.get('Location')
+  if (!isRedirectStatus(response.status) || !location) {
+    return response
+  }
+  const target = new URL(location, request.url)
+  if (
+    !isSwOrigin(target.origin) ||
+    target.pathname.startsWith(pluginWebPkgPathPrefix)
+  ) {
+    return response
+  }
+  await response.body?.cancel()
+  const pinnedRequest = new Request(target, {
+    method: request.method,
+    headers: request.headers,
+    signal: request.signal,
+  })
+  const pinned = await fetchFromRuntime(
+    ev,
+    pinnedRequest,
+    classifyBrowserFetchSource(pinnedRequest, matchPrefixes),
+  )
+  // A fresh response carries no URL, so the browser keeps the request URL.
+  return new Response(pinned.body, {
+    status: pinned.status,
+    statusText: pinned.statusText,
+    headers: pinned.headers,
+  })
+}
+
+// fetchFromRuntime forwards a same-origin Bldr request to the runtime.
+async function fetchFromRuntime(
+  ev: FetchEvent,
+  request: Request,
+  source: BrowserFetchSource,
+): Promise<Response> {
+  // Log the forwarded request in debug builds.
+  const requestPath = source.path
+  if (BLDR_DEBUG) {
+    console.log(
+      'ServiceWorker: %s: forwarding fetch to runtime: %s',
+      serviceWorkerId,
+      request.url.toString(),
+    )
+  }
+
+  // The browser index falls back to its cached copy when the runtime fails.
+  if (requestPath === browserIndexPath) {
+    const response = await proxyBrowserRuntimeFetch(
+      source,
+      request,
+      ev.clientId || '',
+    )
+    if (response.ok) {
+      await cacheBrowserIndexResponse(response)
+      return response
+    }
+    const cached = await matchBrowserIndexCache(request)
+    if (cached) {
+      return cached
+    }
+    return response
+  }
+
+  // Resolve the manifest-pinned plugin asset this request names, if any.
+  const staticPluginAssetSource =
+    source.path.startsWith(pluginDistPathPrefix) ||
+    source.path.startsWith(pluginAssetsPathPrefix)
+  const staticPluginId = staticPluginAssetPluginId(source)
+  let staticPluginAsset = await resolveStaticPluginAsset(source)
+  // The cache key binds the manifest root, so a hit holds exactly
+  // the bytes the runtime would serve and needs no revalidation.
+  if (staticPluginAsset) {
+    const cached = await matchStaticPluginAsset(staticPluginAsset, request)
+    if (cached) {
+      return cached
+    }
+  }
+  // Both runtime attempts share a finite header budget. The first header
+  // timeout leaves enough time for one retry and runtime relay recovery.
+  const headerTimeoutDeadlineMs =
+    Date.now() +
+    2 * browserRuntimeFetchHeaderTimeoutMs +
+    browserRuntimeFetchRelayWaitMs
+  // A lost runtime's successor serves a plugin's files only after it
+  // announces the plugin root. Retrying sooner reaches an unregistered fs.
+  const waitForSuccessorRuntime = async (announcementSeq: number) => {
+    if (!staticPluginId) {
+      return
+    }
+    await waitForPluginRootAnnouncement(
+      staticPluginId,
+      announcementSeq,
+      Math.min(
+        browserRuntimeFetchHeaderTimeoutMs,
+        headerTimeoutDeadlineMs - Date.now(),
+      ),
+    )
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const headerTimeoutMs = Math.min(
+      browserRuntimeFetchHeaderTimeoutMs,
+      Math.max(0, headerTimeoutDeadlineMs - Date.now()),
+    )
+    const announcementSeq = staticPluginId
+      ? (pluginRootAnnouncementSeqs.get(staticPluginId) ?? 0)
+      : 0
+    if (headerTimeoutMs <= 0) {
+      return buildBrowserRuntimeFetchErrorResponse(
+        classifyBrowserRuntimeFetchError(source, {
+          message: 'timed out waiting for runtime fetch response headers',
+        }),
+        request.method,
+      )
+    }
+    const runtimeFetchClientId = resolveBrowserRuntimeFetchClientId(
+      ev.clientId || '',
+      source,
+      webDocumentTracker,
+      serviceWorkerLogicalId,
+    )
+    if (!runtimeFetchClientId) {
+      if (staticPluginAssetSource) {
+        if (staticPluginAsset) {
+          const cached = await matchStaticPluginAsset(
+            staticPluginAsset,
+            request,
+          )
+          if (cached) {
+            return cached
+          }
+        }
+        if (
+          attempt === 0 &&
+          (await webDocumentTracker.waitForRuntimeFetchRelay(
+            browserRuntimeFetchRelayWaitMs,
+          ))
+        ) {
+          continue
+        }
+      }
+      return buildNoReadyDocumentResponse(source, request.method)
+    }
+
+    const trackedFetch =
+      serviceWorkerFetchTracker.trackFetch(runtimeFetchClientId)
+    let response: Response
+    try {
+      response = await proxyBrowserRuntimeFetch(
+        source,
+        request,
+        runtimeFetchClientId,
+        {
+          abortSignal: trackedFetch.abortController.signal,
+          headerTimeoutMs,
+        },
+      ).finally(() => trackedFetch.release())
+    } catch (err) {
+      if (staticPluginAssetSource) {
+        if (staticPluginAsset) {
+          const cached = await matchStaticPluginAsset(
+            staticPluginAsset,
+            request,
+          )
+          if (cached) {
+            return cached
+          }
+        }
+        if (attempt === 0) {
+          const message = castToError(err, '').message.toLowerCase()
+          if (isRuntimeLostFailure(message)) {
+            await waitForSuccessorRuntime(announcementSeq)
+          }
+          if (
+            await webDocumentTracker.waitForRuntimeClientReady(
+              browserRuntimeFetchRelayWaitMs,
+            )
+          ) {
+            continue
+          }
+        }
+      }
+      throw err
+    }
+
+    if (
+      staticPluginAsset &&
+      !staticPluginAsset.pinned &&
+      desiredPluginRoots.get(staticPluginAsset.pluginId) !==
+        staticPluginAsset.rootHash
+    ) {
+      await pluginRootUpdates.get(staticPluginAsset.pluginId)
+      // An expired header budget falls through to the classified
+      // plugin-root-changed response instead of starting another attempt.
+      if (attempt === 0 && Date.now() < headerTimeoutDeadlineMs) {
+        await response.body?.cancel()
+        staticPluginAsset = await resolveStaticPluginAsset(source)
+        continue
+      }
+      // A request that spans a manifest-root transition must fail with a
+      // classified error so the runtime failure path restarts the graph.
+      // Never pin the client to the old root or serve old-root bytes.
+      return buildBrowserRuntimeFetchErrorResponse(
+        {
+          code: 'plugin-root-changed',
+          source: source.kind,
+          path: source.path,
+          message: 'plugin manifest root changed during fetch',
+          status: browserRuntimeFetchStatusForCode(
+            'plugin-root-changed',
+            undefined,
+          ),
+          pluginAssetFetchResult: pluginAssetFetchResultForErrorCode(
+            'plugin-root-changed',
+          ),
+        },
+        request.method,
+      )
+    }
+
+    // Recover transient delivery before the native module loader caches a
+    // failed dependency. The runtime client is resolved again on the retry.
+    const runtimeFetchErrorCode = response.headers.get(
+      'X-Bldr-Runtime-Fetch-Error',
+    )
+    if (
+      attempt === 0 &&
+      runtimeFetchErrorCode === 'runtime-unavailable' &&
+      (request.method === 'GET' || request.method === 'HEAD') &&
+      Date.now() < headerTimeoutDeadlineMs &&
+      !request.signal.aborted &&
+      !trackedFetch.abortController.signal.aborted
+    ) {
+      const message = await readRuntimeFetchFailureMessage(response)
+      await response.body?.cancel()
+      if (isRuntimeLostFailure(message.toLowerCase())) {
+        await waitForSuccessorRuntime(announcementSeq)
+      }
+      continue
+    }
+
+    if (staticPluginAssetSource) {
+      if (response.ok) {
+        if (!staticPluginAsset) {
+          return response
+        }
+        // Read the pinned asset fully before responding. A runtime lost
+        // mid-body retries through the next route instead of handing the
+        // module loader a truncated script it would cache as failed.
+        let body: ArrayBuffer
+        try {
+          body = await response.arrayBuffer()
+        } catch (err) {
+          const cached = await matchStaticPluginAsset(
+            staticPluginAsset,
+            request,
+          )
+          if (cached) {
+            return cached
+          }
+          if (attempt === 0 && !request.signal.aborted) {
+            await waitForSuccessorRuntime(announcementSeq)
+            if (
+              await webDocumentTracker.waitForRuntimeClientReady(
+                browserRuntimeFetchRelayWaitMs,
+              )
+            ) {
+              continue
+            }
+          }
+          throw err
+        }
+        const buffered = new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        })
+        ev.waitUntil(
+          cacheStaticPluginAsset(staticPluginAsset, request, buffered.clone()),
+        )
+        return buffered
+      }
+      if (staticPluginAsset) {
+        const cached = await matchStaticPluginAsset(staticPluginAsset, request)
+        if (cached) {
+          return cached
+        }
+      }
+    }
+    return response
+  }
+  // The loop returns or throws within two attempts; this satisfies control flow.
+  return buildNoReadyDocumentResponse(source, request.method)
+
+  // Note: caching responses here does not work with the custom app:// scheme
+  // in Electron (electron issue 35033).
+}
+
+function initServiceWorker() {
+  // install event is called when service worker is installed.
+  self.addEventListener('install', (ev: Event) => {
+    const e = ev as ExtendableEvent
+    e.waitUntil(swInstall())
+  })
+
+  // activate event is called when service worker is activated.
+  self.addEventListener('activate', (ev: Event) => {
+    const e = ev as ExtendableEvent
+    e.waitUntil(swActivate())
+  })
+
+  // message event is called when receiving a message from the page.
+  self.addEventListener('message', (ev: ExtendableMessageEvent) => {
+    handleServiceWorkerMessage(ev, {
+      clients: self.clients,
+      fetchTracker: serviceWorkerFetchTracker,
+      webDocumentTracker,
+      syncLatestBrowserRelease,
+      refreshBrowserIndexCache,
+      handleCrossTabMessage,
+    })
+  })
+
+  // fetch event is called when a URL within the scope is accessed.
+  self.addEventListener('fetch', (ev: FetchEvent) => {
+    // Leave cross-origin requests to the browser, so a CORS or network
+    // failure reaches the caller as a failed fetch, not a synthesized 500.
+    if (!isSwOrigin(new URL(ev.request.url).origin)) {
+      return
+    }
+    ev.respondWith(
+      swFetch(ev).catch((e) => {
+        const err = castToError(e, '500 internal error')
+        console.warn(
+          'ServiceWorker: %s: error handling fetch: %s',
+          serviceWorkerId,
+          ev.request.url.toString(),
+          err,
+        )
+        return new Response(err.message, {
+          status: 500,
+        })
+      }),
+    )
+  })
+}
+
+// IS_SERVICE_WORKER indicates if initServiceWorker was called.
+// If we are not a service worker, don't register callbacks.
+const IS_SERVICE_WORKER = !!self && !!self.clients
+if (IS_SERVICE_WORKER) {
+  initServiceWorker()
+}

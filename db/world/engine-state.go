@@ -1,0 +1,346 @@
+package world
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/db/tx"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// maxEngineWorldStateTries bounds retries of a complete World operation.
+const maxEngineWorldStateTries = 10
+
+// engineWorldState implements a WorldState on top of an Engine.
+// Short-lived transactions are created for each operation.
+type engineWorldState struct {
+	// e owns transaction snapshots and their publication.
+	e Engine
+	// write permits mutating operations.
+	write bool
+}
+
+// NewEngineWorldState constructs a WorldState with an Engine.
+func NewEngineWorldState(e Engine, write bool) WorldState {
+	return &engineWorldState{e: e, write: write}
+}
+
+// GetReadOnly returns if the state is read-only.
+func (e *engineWorldState) GetReadOnly() bool {
+	return !e.write
+}
+
+// Sync fences durable storage and advances the durable head via the engine.
+func (e *engineWorldState) Sync(ctx context.Context) (bool, error) {
+	return e.e.Sync(ctx)
+}
+
+// GetSeqno returns the current seqno of the world state.
+// This is also the sequence number of the most recent change.
+// Initializes at 0 for initial world state.
+func (e *engineWorldState) GetSeqno(ctx context.Context) (uint64, error) {
+	return e.e.GetSeqno(ctx)
+}
+
+// WaitSeqno waits for the seqno of the world state to be >= value.
+// Returns nil when the condition is reached.
+// If value == 0, this might return immediately unconditionally.
+func (e *engineWorldState) WaitSeqno(ctx context.Context, value uint64) (uint64, error) {
+	return e.e.WaitSeqno(ctx, value)
+}
+
+// WatchChanges forwards the Engine's change feed.
+func (e *engineWorldState) WatchChanges(
+	ctx context.Context,
+	afterSeqno uint64,
+	touches ChangeFilter,
+	cb func(seqno uint64, changes *ChangeSet) error,
+) error {
+	return WatchTouchingChanges(ctx, e.e, afterSeqno, touches, cb)
+}
+
+// WatchIndexedChanges forwards the Engine's indexed change feed.
+func (e *engineWorldState) WatchIndexedChanges(
+	ctx context.Context,
+	afterSeqno uint64,
+	interest *ChangeInterest,
+	cb func(seqno uint64, changes *ChangeSet) error,
+) error {
+	return WatchInterestedChanges(ctx, e.e, afterSeqno, interest, cb)
+}
+
+// WaitObjectRev waits for the object at key through the Engine's key watch.
+func (e *engineWorldState) WaitObjectRev(ctx context.Context, key string, rev uint64, ignoreNotFound bool) (uint64, error) {
+	return e.e.WaitObjectRev(ctx, key, rev, ignoreNotFound)
+}
+
+// BuildStorageCursor builds a cursor to the world storage with an empty ref.
+// The cursor should be released independently of the WorldState.
+// Be sure to call Release on the cursor when done.
+func (e *engineWorldState) BuildStorageCursor(ctx context.Context) (*bucket_lookup.Cursor, error) {
+	return e.e.BuildStorageCursor(ctx)
+}
+
+// StageWorldState opens a staging scope on the engine.
+func (e *engineWorldState) StageWorldState(ctx context.Context) (WorldStage, error) {
+	if !e.write {
+		return nil, tx.ErrNotWrite
+	}
+	return e.e.StageWorldState(ctx)
+}
+
+// AccessWorldState builds a bucket lookup cursor with an optional ref.
+// If the ref is empty, returns empty cursor in the same bucket + volume as the world.
+// The lookup cursor will be released after cb returns.
+func (e *engineWorldState) AccessWorldState(
+	ctx context.Context,
+	ref *bucket.ObjectRef,
+	cb func(*bucket_lookup.Cursor) error,
+) error {
+	return e.e.AccessWorldState(ctx, ref, cb)
+}
+
+// ApplyWorldOp applies a batch operation at the world level.
+// The handling of the operation is operation-type specific.
+// Returns the seqno following the operation execution.
+// If nil is returned for the error, implies success.
+func (e *engineWorldState) ApplyWorldOp(
+	ctx context.Context,
+	op Operation,
+	sender peer.ID,
+) (uint64, bool, error) {
+	var outSeqno uint64
+	var outSysErr bool
+	err := e.performOp(ctx, true, func(tx Tx) error {
+		var berr error
+		outSeqno, outSysErr, berr = tx.ApplyWorldOp(ctx, op, sender)
+		return berr
+	})
+	return outSeqno, outSysErr, err
+}
+
+// CreateObject creates a object with a key and initial root ref.
+// Returns ErrObjectExists if the object already exists.
+func (e *engineWorldState) CreateObject(ctx context.Context, key string, rootRef *bucket.ObjectRef) (ObjectState, error) {
+	var outState ObjectState
+	err := e.performOp(ctx, true, func(tx Tx) error {
+		// Create the object in a transaction and retain its engine-backed state.
+		obj, err := tx.CreateObject(ctx, key, rootRef)
+		ReleaseObjectState(obj)
+		if err != nil {
+			return err
+		}
+		outState = newEngineWorldStateObject(e, key)
+		return nil
+	})
+	return outState, err
+}
+
+// IterateObjects returns an iterator with the given object key prefix.
+// The prefix is NOT clipped from the output keys.
+// Keys are returned in sorted order.
+// Must call Next() or Seek() before valid.
+// Call Close when done with the iterator.
+// Any init errors will be available via the iterator's Err() method.
+func (e *engineWorldState) IterateObjects(ctx context.Context, prefix string, reversed bool) ObjectIterator {
+	return NewEngineObjectIterator(ctx, e.e, prefix, reversed)
+}
+
+// GetObject looks up an object by key.
+// Returns nil, false if not found.
+func (e *engineWorldState) GetObject(ctx context.Context, key string) (ObjectState, bool, error) {
+	// Look up object existence and construct its engine-backed state when found.
+	var found bool
+	err := e.performOp(ctx, false, func(tx Tx) error {
+		obj, exists, nerr := tx.GetObject(ctx, key)
+		ReleaseObjectState(obj)
+		found = exists
+		return nerr
+	})
+	var outState ObjectState
+	if err == nil && found {
+		outState = newEngineWorldStateObject(e, key)
+	}
+	return outState, found, err
+}
+
+// DeleteObject deletes an object and associated graph quads by ID.
+// Calls DeleteGraphObject internally.
+// Returns false, nil if not found.
+func (e *engineWorldState) DeleteObject(ctx context.Context, key string) (bool, error) {
+	var found bool
+	err := e.performOp(ctx, true, func(tx Tx) error {
+		var nerr error
+		found, nerr = tx.DeleteObject(ctx, key)
+		return nerr
+	})
+	return found, err
+}
+
+// RenameObject renames an object key and updates associated graph quads.
+func (e *engineWorldState) RenameObject(ctx context.Context, oldKey, newKey string, descendants bool) (ObjectState, error) {
+	var outState ObjectState
+	err := e.performOp(ctx, true, func(tx Tx) error {
+		// Rename the object in a transaction and retain its engine-backed state.
+		obj, err := tx.RenameObject(ctx, oldKey, newKey, descendants)
+		ReleaseObjectState(obj)
+		if err != nil {
+			return err
+		}
+		outState = newEngineWorldStateObject(e, newKey)
+		return nil
+	})
+	return outState, err
+}
+
+// AccessCayleyGraph calls a callback with a temporary Cayley graph handle.
+// All accesses of the handle should complete before returning cb.
+// Try to make access (queries) as short as possible.
+// Write operations will fail if the store is read-only.
+func (e *engineWorldState) AccessCayleyGraph(ctx context.Context, write bool, cb func(ctx context.Context, h CayleyHandle) error) error {
+	return e.performOp(ctx, write, func(tx Tx) error {
+		return tx.AccessCayleyGraph(ctx, write, cb)
+	})
+}
+
+// LookupGraphQuads searches for graph quads in the store.
+func (e *engineWorldState) LookupGraphQuads(ctx context.Context, filter GraphQuad, limit uint32) ([]GraphQuad, error) {
+	var quads []GraphQuad
+	err := e.performOp(ctx, false, func(tx Tx) error {
+		var berr error
+		quads, berr = tx.LookupGraphQuads(ctx, filter, limit)
+		return berr
+	})
+	return quads, err
+}
+
+// LookupGraphQuadsBatch searches for graph quads for each filter in one read transaction.
+func (e *engineWorldState) LookupGraphQuadsBatch(ctx context.Context, filters []GraphQuad, limitPerFilter uint32) ([][]GraphQuad, error) {
+	var results [][]GraphQuad
+	err := e.performOp(ctx, false, func(tx Tx) error {
+		var berr error
+		results, berr = tx.LookupGraphQuadsBatch(ctx, filters, limitPerFilter)
+		return berr
+	})
+	return results, err
+}
+
+// QueryGraphPath executes a bounded graph traversal.
+func (e *engineWorldState) QueryGraphPath(ctx context.Context, query *GraphPathQuery) (*GraphPathQueryResult, error) {
+	var result *GraphPathQueryResult
+	err := e.performOp(ctx, false, func(tx Tx) error {
+		var berr error
+		result, berr = tx.QueryGraphPath(ctx, query)
+		return berr
+	})
+	return result, err
+}
+
+// ListObjectsWithType reads one typed subject page in a short-lived transaction.
+func (e *engineWorldState) ListObjectsWithType(ctx context.Context, typeID, startAfter string, limit uint32) ([]string, bool, error) {
+	// Resolve this page through the engine's existing read operation.
+	var keys []string
+	var more bool
+	err := e.performOp(ctx, false, func(tx Tx) error {
+		var err error
+		keys, more, err = tx.ListObjectsWithType(ctx, typeID, startAfter, limit)
+		return err
+	})
+	return keys, more, err
+}
+
+// SetGraphQuad sets a quad in the graph store.
+// Subject: must be an existing object IRI: <object-key>
+// Predicate: a predicate string, e.x. IRI: <ref>
+// Object: an existing object IRI: <object-key>
+// If already exists, returns nil.
+func (e *engineWorldState) SetGraphQuad(ctx context.Context, q GraphQuad) error {
+	return e.performOp(ctx, true, func(tx Tx) error {
+		return tx.SetGraphQuad(ctx, q)
+	})
+}
+
+// DeleteGraphQuad deletes a quad from the graph store.
+// Note: if quad did not exist, returns nil.
+func (e *engineWorldState) DeleteGraphQuad(ctx context.Context, q GraphQuad) error {
+	return e.performOp(ctx, true, func(tx Tx) error {
+		return tx.DeleteGraphQuad(ctx, q)
+	})
+}
+
+// DeleteGraphObject deletes all quads with Subject or Object set to value.
+// May also remove objects with <predicate> or <value> set to the value.
+func (e *engineWorldState) DeleteGraphObject(ctx context.Context, value string) error {
+	return e.performOp(ctx, true, func(tx Tx) error {
+		return tx.DeleteGraphObject(ctx, value)
+	})
+}
+
+// HasObject reports whether an object exists at key. Each operation runs in its
+// own short-lived transaction, so this is a plain object-existence lookup with
+// no transaction-local knowledge to draw on.
+func (e *engineWorldState) HasObject(ctx context.Context, key string) (bool, error) {
+	var found bool
+	err := e.performOp(ctx, false, func(tx Tx) error {
+		var berr error
+		found, berr = tx.HasObject(ctx, key)
+		return berr
+	})
+	return found, err
+}
+
+// retryWorldOp reports whether a failed World operation may replay in a fresh
+// transaction: another writer moved the head, or the storage snapshot became
+// invalid.
+func retryWorldOp(err error) bool {
+	return IsSuperseded(err) || kvtx.RetryInvalidSnapshot(err)
+}
+
+// performOp replays a complete operation in a fresh transaction after either a
+// coordinated head change or an invalid storage snapshot. Each failed attempt
+// is discarded before the next transaction opens.
+func (e *engineWorldState) performOp(ctx context.Context, write bool, cb func(tx Tx) error) error {
+	if !e.write && write {
+		return tx.ErrNotWrite
+	}
+
+	var err error
+	for tries := 0; tries <= maxEngineWorldStateTries; tries++ {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		err = e.performOpOnce(ctx, write, cb)
+		if !retryWorldOp(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// performOpOnce owns one attempt, including commit and unconditional discard.
+func (e *engineWorldState) performOpOnce(ctx context.Context, write bool, cb func(tx Tx) error) error {
+	// Open the transaction for this engine operation attempt.
+	opTx, err := e.e.NewTransaction(ctx, write)
+	if err != nil {
+		return err
+	}
+	defer opTx.Discard()
+
+	// Apply the engine operation and commit successful writes.
+	if err := cb(opTx); err != nil {
+		return err
+	}
+	if write {
+		return opTx.Commit(ctx)
+	}
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ WorldState           = (*engineWorldState)(nil)
+	_ ObjectRevWaiter      = (*engineWorldState)(nil)
+	_ IndexedChangeWatcher = (*engineWorldState)(nil)
+)

@@ -1,0 +1,312 @@
+package forge_runtime
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"math"
+	"strconv"
+	"time"
+
+	"github.com/aperturerobotics/fastjson"
+	timestamp "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/block/quad"
+	"github.com/s4wave/spacewave/db/world"
+)
+
+const reservationObjectKeyPrefix = "forge/runtime/reservation/"
+
+// BuildReservationObjectKey builds the deterministic reservation key for a
+// capacity holder. Execution retries and standing node claims reuse the key
+// at the next reservation generation.
+func BuildReservationObjectKey(executionObjectKey string) string {
+	hash := sha256.Sum256([]byte(executionObjectKey))
+	return reservationObjectKeyPrefix + hex.EncodeToString(hash[:12])
+}
+
+// Reservation records a generation-fenced capacity grant. Runtime custody
+// follows its lease; a standing grant follows its placement edge.
+// The record is the durable truth: a Worker restart reconciles by reading it.
+type Reservation struct {
+	// WorkerObjectKey is the Forge Worker object key holding the capacity.
+	WorkerObjectKey string `json:"workerObjectKey,omitempty"`
+	// ExecutionObjectKey is the holder identity used to derive this grant key:
+	// an Execution attempt object key or a logical standing node identity.
+	ExecutionObjectKey string `json:"executionObjectKey,omitempty"`
+	// Request is the reserved capacity request.
+	Request ResourceRequest `json:"request"`
+	// Generation fences runtime custody. Resume after uncertainty increments
+	// the generation; calls fenced against an older generation are stale.
+	Generation uint64
+	// LeaseExpiresAt is when unobserved runtime custody expires. Standing
+	// grants retain their debit until the placement edge is removed.
+	LeaseExpiresAt *timestamp.Timestamp
+	// State is the reservation lifecycle state.
+	State ReservationState
+	// Runtime identifies the claimed backend runtime, set on activation.
+	Runtime BackendRuntimeIdentity
+	// Placement snapshots the edge that owns a standing grant. The graph edge
+	// is the lifetime authority; this receipt locates it after a restart.
+	Placement *quad.Quad
+	// Cleanup records the terminal cleanup receipt, set on release.
+	Cleanup *CleanupReceipt
+}
+
+// ObjectKey returns the deterministic reservation object key.
+func (r *Reservation) ObjectKey() string {
+	return BuildReservationObjectKey(r.ExecutionObjectKey)
+}
+
+// Validate validates the reservation.
+func (r *Reservation) Validate() error {
+	// Validate the reservation identity, generation and lifecycle fields.
+	switch {
+	case r.WorkerObjectKey == "":
+		return errors.New("worker_object_key cannot be empty")
+	case r.ExecutionObjectKey == "":
+		return errors.New("execution_object_key cannot be empty")
+	case r.Generation == 0:
+		return errors.New("generation must be set")
+	case !r.State.Valid():
+		return errors.Errorf("invalid reservation state %d", r.State)
+	case r.LeaseExpiresAt == nil:
+		return errors.New("lease_expires_at must be set")
+	}
+	if err := r.Request.Validate(); err != nil && r.Placement == nil {
+		// Validate the reserved resources and custody lease.
+		return errors.Wrap(err, "request")
+	}
+	if r.Placement != nil && (r.Request.Backend == "" || !r.Runtime.IsZero()) {
+		return errors.New("placement grants require a backend and cannot hold runtime custody")
+	}
+	if err := r.LeaseExpiresAt.Validate(false); err != nil {
+		return errors.Wrap(err, "lease_expires_at")
+	}
+	if r.Cleanup != nil {
+		// Require the cleanup receipt to agree with the reservation state.
+		if err := r.Cleanup.Validate(); err != nil {
+			return errors.Wrap(err, "cleanup")
+		}
+		switch r.State {
+		case ReservationStatePendingStop:
+			if r.Cleanup.Complete() {
+				return errors.New("pending-stop receipt must stay partial until the stop confirms")
+			}
+		case ReservationStateReleased:
+			if !r.Cleanup.Complete() {
+				return errors.New("released reservation requires the completed receipt")
+			}
+		default:
+			return errors.New("cleanup receipt requires pending-stop or released state")
+		}
+	}
+	return nil
+}
+
+// Outcome classifies the reservation for reconcile at the given time.
+func (r *Reservation) Outcome(now time.Time) ReservationOutcome {
+	switch {
+	case r.State.Terminal():
+		return OutcomeTerminal
+	case r.State == ReservationStateUncertain:
+		return OutcomeUncertain
+	case r.LeaseExpired(now):
+		return OutcomeUncertain
+	default:
+		return OutcomeActive
+	}
+}
+
+// LeaseExpired reports whether runtime custody is past due. Standing grants
+// follow their placement edge rather than a runtime lease.
+func (r *Reservation) LeaseExpired(now time.Time) bool {
+	return r.Placement == nil && r.LeaseExpiresAt != nil && now.After(r.LeaseExpiresAt.AsTime())
+}
+
+// Reset resets the block.
+func (r *Reservation) Reset() {
+	*r = Reservation{}
+}
+
+// MarshalVT marshals the block to binary.
+func (r *Reservation) MarshalVT() ([]byte, error) {
+	return r.MarshalJSON()
+}
+
+// UnmarshalVT unmarshals the block from binary.
+func (r *Reservation) UnmarshalVT(data []byte) error {
+	return r.UnmarshalJSON(data)
+}
+
+// MarshalJSON marshals the Reservation to JSON without reflection.
+func (r *Reservation) MarshalJSON() ([]byte, error) {
+	// Encode the Worker and Execution identities in a JSON reservation.
+	var arena fastjson.Arena
+	obj := arena.NewObject()
+	setStringJSONField(&arena, obj, "workerObjectKey", r.WorkerObjectKey)
+	setStringJSONField(&arena, obj, "executionObjectKey", r.ExecutionObjectKey)
+
+	// Persist the placement lifetime independently of leased runtime custody.
+	if r.Placement != nil {
+		data, err := r.Placement.MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+		var placementParser fastjson.Parser
+		value, err := placementParser.ParseBytes(data)
+		if err != nil {
+			return nil, err
+		}
+		obj.Set("placement", value)
+	}
+
+	// Encode the reserved resource request and generation.
+	req := arena.NewObject()
+	req.Set("milliCpu", arena.NewNumberString(strconv.FormatUint(r.Request.MilliCPU, 10)))
+	req.Set("memoryBytes", arena.NewNumberString(strconv.FormatUint(r.Request.MemoryBytes, 10)))
+	req.Set("backend", arena.NewString(r.Request.Backend))
+	obj.Set("request", req)
+	obj.Set("generation", arena.NewNumberString(strconv.FormatUint(r.Generation, 10)))
+
+	// Encode the reservation lease and lifecycle state.
+	tsValue, err := marshalTimestampField(&arena, r.LeaseExpiresAt)
+	if err != nil {
+		return nil, err
+	}
+	obj.Set("leaseExpiresAt", tsValue)
+	obj.Set("state", arena.NewNumberInt(int(r.State)))
+
+	// Include backend runtime custody when it has been claimed.
+	if !r.Runtime.IsZero() {
+		// Encode the backend runtime identity and stop command.
+		rt := arena.NewObject()
+		rt.Set("backend", arena.NewString(r.Runtime.Backend))
+		rt.Set("id", arena.NewString(r.Runtime.ID))
+		rt.Set("stopCommand", arena.NewString(r.Runtime.StopCommand))
+
+		// Encode the backend stop environment and timeout.
+		env := arena.NewArray()
+		for i, entry := range r.Runtime.StopEnv {
+			env.SetArrayItem(i, arena.NewString(entry))
+		}
+		rt.Set("stopEnv", env)
+		rt.Set("stopTimeoutSeconds", arena.NewNumberString(strconv.FormatUint(uint64(r.Runtime.StopTimeoutSeconds), 10)))
+		obj.Set("runtime", rt)
+	}
+
+	// Include the reservation cleanup receipt when available.
+	if r.Cleanup != nil {
+		cleanupValue, err := r.Cleanup.marshalJSONValue(&arena)
+		if err != nil {
+			return nil, err
+		}
+		obj.Set("cleanup", cleanupValue)
+	}
+	return obj.MarshalTo(nil), nil
+}
+
+// UnmarshalJSON unmarshals the Reservation from JSON without reflection.
+func (r *Reservation) UnmarshalJSON(data []byte) error {
+	// Parse the reservation JSON before restoring its fields.
+	var parser fastjson.Parser
+	value, err := parser.ParseBytes(data)
+	if err != nil {
+		return err
+	}
+
+	// Clear the receiver so omitted optional fields decode as unset.
+	*r = Reservation{}
+
+	// Accept a null reservation or require an object for decoding.
+	if value.Type() == fastjson.TypeNull {
+		return nil
+	}
+	if value.Type() != fastjson.TypeObject {
+		return errors.New("reservation must be object")
+	}
+
+	// Restore the reservation identity, request and generation.
+	r.WorkerObjectKey = string(value.GetStringBytes("workerObjectKey"))
+	r.ExecutionObjectKey = string(value.GetStringBytes("executionObjectKey"))
+	r.Request = ResourceRequest{
+		MilliCPU:    value.GetUint64("request", "milliCpu"),
+		MemoryBytes: value.GetUint64("request", "memoryBytes"),
+		Backend:     string(value.GetStringBytes("request", "backend")),
+	}
+	r.Generation = value.GetUint64("generation")
+
+	// Validate and restore the persisted reservation state.
+	state := value.GetInt("state")
+	if state < 0 || state > math.MaxUint8 {
+		return errors.Errorf("reservation state out of range: %d", state)
+	}
+	r.State = ReservationState(state) //nolint:gosec // the explicit uint8 range check bounds the persisted enum.
+
+	// Restore the optional reservation custody lease.
+	if tsValue := value.Get("leaseExpiresAt"); tsValue != nil && tsValue.Type() != fastjson.TypeNull {
+		ts := &timestamp.Timestamp{}
+		if err := ts.UnmarshalJSON(tsValue.MarshalTo(nil)); err != nil {
+			return errors.Wrap(err, "unmarshal lease_expires_at")
+		}
+		r.LeaseExpiresAt = ts
+	}
+
+	// Restore the standing grant's placement lifetime.
+	if placement := value.Get("placement"); placement != nil {
+		r.Placement = &quad.Quad{}
+		if err := r.Placement.UnmarshalJSON(placement.MarshalTo(nil)); err != nil {
+			return err
+		}
+	}
+
+	// Restore backend runtime custody and its stop environment.
+	if rt := value.Get("runtime"); rt != nil && rt.Type() == fastjson.TypeObject {
+		stopTimeoutSeconds := rt.GetUint64("stopTimeoutSeconds")
+		if stopTimeoutSeconds > math.MaxUint32 {
+			return errors.New("runtime stop timeout out of range")
+		}
+		r.Runtime = BackendRuntimeIdentity{
+			Backend:            string(rt.GetStringBytes("backend")),
+			ID:                 string(rt.GetStringBytes("id")),
+			StopCommand:        string(rt.GetStringBytes("stopCommand")),
+			StopTimeoutSeconds: uint32(stopTimeoutSeconds),
+		}
+		for _, entry := range rt.GetArray("stopEnv") {
+			r.Runtime.StopEnv = append(r.Runtime.StopEnv, string(entry.GetStringBytes()))
+		}
+	}
+
+	// Restore the optional reservation cleanup receipt.
+	if cleanupValue := value.Get("cleanup"); cleanupValue != nil && cleanupValue.Type() == fastjson.TypeObject {
+		cleanup := &CleanupReceipt{}
+		if err := cleanup.unmarshalJSONValue(cleanupValue); err != nil {
+			return errors.Wrap(err, "unmarshal cleanup")
+		}
+		r.Cleanup = cleanup
+	}
+	return nil
+}
+
+// LookupReservation loads one persisted Reservation or ErrReservationNotFound.
+// The loaded record is validated before use.
+func LookupReservation(ctx context.Context, ws world.WorldState, objKey string) (*Reservation, error) {
+	// Load the reservation and translate a missing World object.
+	res, err := world.LookupObjectBody[Reservation](ctx, ws, objKey)
+	if errors.Is(err, world.ErrObjectNotFound) {
+		return nil, ErrReservationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate the persisted reservation before returning it.
+	if err := res.Validate(); err != nil {
+		return nil, errors.Wrapf(err, "invalid reservation %s", objKey)
+	}
+	return res, nil
+}
+
+// _ is a type assertion
+var _ block.Block = (*Reservation)(nil)

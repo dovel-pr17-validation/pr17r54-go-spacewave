@@ -1,0 +1,509 @@
+package kvtx_block_okra
+
+import (
+	"bytes"
+	"context"
+	"slices"
+	"sync/atomic"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/kvtx"
+	trace "github.com/s4wave/spacewave/db/traceutil"
+)
+
+// Tx is an Okra k/v transaction.
+type Tx struct {
+	write bool
+	bcs   *block.Cursor
+	root  *Root
+	// readRoot borrows immutable page traversal for readonly stored roots.
+	readRoot *block.ReadCursor
+	// inlineValues permits the layout selected by the owning store's format tag.
+	inlineValues bool
+
+	tx         *block.Transaction
+	rel        func()
+	commitOnce atomic.Bool
+
+	rootChangedCb func(*block.Cursor)
+}
+
+// NewTx constructs a new Okra transaction.
+func NewTx(
+	ctx context.Context,
+	bcs *block.Cursor,
+	btx *block.Transaction,
+	write bool,
+	rootChangedCb func(*block.Cursor),
+) (*Tx, error) {
+	// Trace construction of the Okra transaction.
+	ctx, task := trace.NewTask(ctx, "hydra/kvtx-block-okra/new-tx")
+	defer task.End()
+
+	// Decode the Okra root from the supplied block cursor.
+	taskCtx, subtask := trace.NewTask(ctx, "hydra/kvtx-block-okra/new-tx/unmarshal-root")
+	root, err := block.UnmarshalBlock[Root](taskCtx, bcs)
+	subtask.End()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check the decoded root against its cursor references.
+	if err := validateRootAtCursor(root, bcs); err != nil {
+		return nil, err
+	}
+
+	// Bind the validated root to the block transaction and publication callback.
+	out := &Tx{
+		write:         write,
+		bcs:           bcs,
+		root:          root,
+		tx:            btx,
+		rootChangedCb: rootChangedCb,
+	}
+	if !write {
+		out.readRoot = block.NewReadCursor(ctx, bcs, root.GetRootPageRef())
+	}
+	return out, nil
+}
+
+func validateRootAtCursor(root *Root, bcs *block.Cursor) error {
+	// Accept root metadata that already carries a valid page reference.
+	err := root.Validate()
+	if err == nil {
+		return nil
+	}
+
+	// Permit a detached page reference only for a populated root.
+	if err != block.ErrEmptyBlockRef || root.GetSize() == 0 || !root.GetRootPageRef().GetEmpty() {
+		return err
+	}
+
+	// Resolve the detached root page through the cursor references.
+	refs, refsErr := bcs.GetAllRefs(true)
+	if refsErr != nil {
+		return refsErr
+	}
+	if refs[rootPageRefID] != nil {
+		return nil
+	}
+
+	return err
+}
+
+// GetCursor returns the cursor pointing to the root of the tree.
+func (t *Tx) GetCursor() *block.Cursor {
+	return t.bcs
+}
+
+// Commit commits the transaction to storage.
+func (t *Tx) Commit(ctx context.Context) (cerr error) {
+	if t.commitOnce.CompareAndSwap(false, true) {
+		if t.write {
+			if t.tx != nil {
+				br, _, err := t.tx.Write(ctx, true)
+				if err != nil {
+					cerr = err
+				} else if t.rootChangedCb != nil {
+					t.bcs.SetRefAtCursor(br, true)
+					t.rootChangedCb(t.bcs)
+				}
+			} else if btx := t.bcs.GetTransaction(); btx != nil {
+				_, _, cerr = btx.WriteAtRoot(ctx, false, t.bcs)
+			}
+		}
+		if t.rel != nil {
+			t.rel()
+		}
+	}
+	return
+}
+
+// Discard cancels the transaction.
+//
+// Staged writes belong to the block transaction. A tree borrowing its
+// cursor's transaction leaves them to that transaction's owner, which may
+// still publish blocks staged by other trees.
+func (t *Tx) Discard() {
+	if t.commitOnce.CompareAndSwap(false, true) {
+		t.tx.DiscardStagedWrites()
+		if t.rel != nil {
+			t.rel()
+		}
+	}
+}
+
+// Size returns the number of keys in the tree.
+func (t *Tx) Size(ctx context.Context) (uint64, error) {
+	return t.root.GetSize(), ctx.Err()
+}
+
+// Exists returns whether or not a key exists.
+func (t *Tx) Exists(ctx context.Context, key []byte) (bool, error) {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return false, kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return false, nil
+	}
+
+	// Reuse immutable page nodes without changing writer cursor ownership.
+	if t.readRoot != nil {
+		page, _, _, err := t.findReadEntry(ctx, key)
+		return page != nil, err
+	}
+
+	// Find the leaf page containing the requested key.
+	page, _, _, err := t.findEntry(ctx, key)
+
+	return page != nil, err
+}
+
+// Get returns the value of the specified key if it exists.
+func (t *Tx) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return nil, false, kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return nil, false, nil
+	}
+
+	// Traverse immutable nodes while preserving every value representation.
+	if t.readRoot != nil {
+		page, cursor, index, err := t.findReadEntry(ctx, key)
+		if err != nil || page == nil {
+			return nil, false, err
+		}
+		value, err := readEntryValue(ctx, page, cursor, index)
+		return value, true, err
+	}
+
+	// Locate the requested key and its value cursor.
+	page, cursor, index, err := t.findEntry(ctx, key)
+	if err != nil || page == nil {
+		return nil, false, err
+	}
+
+	// Decode the value stored in the matching leaf entry.
+	value, err := t.entryToValue(ctx, page, cursor, index)
+
+	return value, true, err
+}
+
+// GetBatch returns values for multiple keys.
+func (t *Tx) GetBatch(ctx context.Context, keys [][]byte) ([][]byte, []bool, error) {
+	// Preserve input positions while collecting the requested Okra keys.
+	values := make([][]byte, len(keys))
+	found := make([]bool, len(keys))
+	lookups := make([]batchLookup, 0, len(keys))
+	for i, key := range keys {
+		// Validate each requested key and retain its original batch position.
+		if len(key) == 0 {
+			return nil, nil, kvtx.ErrEmptyKey
+		}
+		lookups = append(lookups, batchLookup{
+			key:   key,
+			index: i,
+		})
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 || len(lookups) == 0 {
+		return values, found, nil
+	}
+
+	// Sort the lookups so each child page covers one contiguous run.
+	slices.SortFunc(lookups, func(a, b batchLookup) int {
+		return bytes.Compare(a.key, b.key)
+	})
+
+	// Load the root page for the batch traversal.
+	page, pageCursor, err := t.getRootPage(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Fill the batch results by traversing the requested keys together.
+	if err := t.findEntriesBatch(ctx, page, pageCursor, lookups, values, found); err != nil {
+		return nil, nil, err
+	}
+
+	return values, found, nil
+}
+
+// GetCursorAtKey returns the cursor at the specified key, if it exists.
+func (t *Tx) GetCursorAtKey(ctx context.Context, key []byte) (*block.Cursor, error) {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return nil, kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return nil, nil
+	}
+
+	// Materialize only the selected leaf when the caller needs a value cursor.
+	if t.readRoot != nil {
+		page, cursor, index, err := t.findReadEntry(ctx, key)
+		if err != nil || page == nil {
+			return nil, err
+		}
+		// Stored values need no materialized page or mutable ancestor edges.
+		if !page.hasInlineBlob(index) {
+			return page.followValue(cursor, index).Cursor(), nil
+		}
+
+		// Inline Blob values still require their owning page as a sub-block.
+		leaf := cursor.Cursor()
+		mutable, err := block.UnmarshalBlock[Page](ctx, leaf)
+		if err != nil {
+			return nil, err
+		}
+		return mutable.FollowValue(leaf, index), nil
+	}
+
+	// Locate the requested key and its value cursor.
+	page, cursor, index, err := t.findEntry(ctx, key)
+	if err != nil || page == nil {
+		return nil, err
+	}
+
+	return page.FollowValue(cursor, index), nil
+}
+
+// Set sets a key to a value.
+func (t *Tx) Set(ctx context.Context, key, val []byte) error {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Build the value entry for insertion into the Okra tree.
+	entry, err := t.buildValueEntry(ctx, key, val)
+	if err != nil {
+		return err
+	}
+
+	return t.setEntry(ctx, entry)
+}
+
+// SetCursorAtKey sets the key to a reference to the object at bcs.
+func (t *Tx) SetCursorAtKey(ctx context.Context, key []byte, bcs *block.Cursor, isBlob bool) error {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Materialize the supplied value cursor for the Okra entry.
+	valueRef, err := t.materializeValueCursor(ctx, bcs)
+	if err != nil {
+		return err
+	}
+
+	return t.setEntry(ctx, BuildEntry{
+		Key:         key,
+		ValueRef:    valueRef,
+		ValueIsBlob: isBlob,
+	})
+}
+
+// Delete removes a key from the tree.
+func (t *Tx) Delete(ctx context.Context, key []byte) error {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return nil
+	}
+
+	// Remove the requested leaf entry from the Okra tree.
+	_, err := t.deleteEntry(ctx, key)
+
+	return err
+}
+
+// DeleteCursorAtKey deletes the key and returns the cursor to the value.
+func (t *Tx) DeleteCursorAtKey(ctx context.Context, key []byte) (*block.Cursor, error) {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return nil, kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return nil, nil
+	}
+
+	// Locate the requested key and its value cursor.
+	page, cursor, index, err := t.findEntry(ctx, key)
+	if err != nil || page == nil {
+		return nil, err
+	}
+
+	// Retain the value cursor before removing its leaf entry.
+	valueCursor := page.FollowValue(cursor, index)
+	_, err = t.deleteEntry(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return valueCursor, nil
+}
+
+// GetAndDelete removes a key from the tree returning a value.
+func (t *Tx) GetAndDelete(ctx context.Context, key []byte) ([]byte, bool, error) {
+	// Require a nonempty key for the Okra operation.
+	if len(key) == 0 {
+		return nil, false, kvtx.ErrEmptyKey
+	}
+
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return nil, false, nil
+	}
+
+	// Read the existing value before removing its leaf entry.
+	value, found, err := t.Get(ctx, key)
+	if err != nil || !found {
+		return nil, found, err
+	}
+
+	// Remove the leaf entry after reading its value.
+	if _, err := t.deleteEntry(ctx, key); err != nil {
+		return nil, false, err
+	}
+
+	return value, true, nil
+}
+
+// ScanPrefix iterates over keys with a prefix.
+func (t *Tx) ScanPrefix(ctx context.Context, prefix []byte, cb func(key, val []byte) error) error {
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return nil
+	}
+
+	// Open an iterator positioned at the first matching key.
+	iter := t.Iterate(ctx, prefix, true, false)
+	defer iter.Close()
+	if err := iter.Seek(nil); err != nil {
+		return err
+	}
+
+	// Visit each matching Okra entry through the callback.
+	for iter.Valid() {
+		value, err := iter.Value()
+		if err != nil {
+			return err
+		}
+		if err := cb(iter.Key(), value); err != nil {
+			return err
+		}
+		iter.Next()
+	}
+
+	return iter.Err()
+}
+
+// ScanPrefixKeys iterates over keys with a prefix.
+func (t *Tx) ScanPrefixKeys(ctx context.Context, prefix []byte, cb func(key []byte) error) error {
+	// Stop the Okra operation if its context was canceled.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Avoid traversing an empty Okra tree.
+	if t.root.GetSize() == 0 {
+		return nil
+	}
+
+	// Open an iterator positioned at the first matching key.
+	iter := t.Iterate(ctx, prefix, true, false)
+	defer iter.Close()
+	if err := iter.Seek(nil); err != nil {
+		return err
+	}
+
+	// Visit each matching Okra entry through the callback.
+	for iter.Valid() {
+		if err := cb(iter.Key()); err != nil {
+			return err
+		}
+		iter.Next()
+	}
+
+	return iter.Err()
+}
+
+// Iterate returns an iterator with a given key prefix.
+func (t *Tx) Iterate(ctx context.Context, prefix []byte, sort, reverse bool) kvtx.Iterator {
+	return NewIterator(ctx, t, prefix, sort, reverse)
+}
+
+// BlockIterate returns the block iterator.
+func (t *Tx) BlockIterate(ctx context.Context, prefix []byte, sort, reverse bool) kvtx.BlockIterator {
+	return NewIterator(ctx, t, prefix, sort, reverse)
+}
+
+// _ is a type assertion
+var _ kvtx.BlockTx = (*Tx)(nil)

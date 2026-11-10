@@ -1,0 +1,174 @@
+package resource_root
+
+import (
+	"context"
+	"slices"
+	"sync"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/broadcast"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	resource_state "github.com/s4wave/spacewave/bldr/resource/state"
+	process_binding "github.com/s4wave/spacewave/core/plugin/process"
+	resource_cdn "github.com/s4wave/spacewave/core/resource/cdn"
+	resource_debugdb "github.com/s4wave/spacewave/core/resource/debugdb"
+	resource_listener "github.com/s4wave/spacewave/core/resource/listener"
+	yield_policy "github.com/s4wave/spacewave/core/resource/listener/yieldpolicy"
+	resource_session "github.com/s4wave/spacewave/core/resource/session"
+	"github.com/s4wave/spacewave/core/session"
+	s4wave_root "github.com/s4wave/spacewave/sdk/root"
+	"github.com/sirupsen/logrus"
+)
+
+// CoreRootServer implements the RootResourceService for s4wave core.
+type CoreRootServer struct {
+	// le is the logger
+	le *logrus.Entry
+	// b is the bus to look up and perform actions on
+	b bus.Bus
+	// hostPluginID is the plugin id that owns this resource root.
+	hostPluginID string
+	// appPluginIDs is the immutable application declaration supplied before publication.
+	appPluginIDs []string
+	// mountApp attaches a child installation through the composition root.
+	mountApp MountAppFunc
+	// stateAtomMgr manages state atom stores
+	stateAtomMgr *resource_state.StateAtomManager
+	// spaceRootAliasBcast broadcasts configured root registry changes.
+	spaceRootAliasBcast broadcast.Broadcast
+	// stateAtomStoreIndexMtx guards stateAtomStoreIndex setup.
+	stateAtomStoreIndexMtx sync.Mutex
+	// stateAtomStoreIndex tracks known root state atom store ids.
+	stateAtomStoreIndex *session.StateAtomStoreIndex
+	// releaseStateAtomStoreIndex releases the root object store handle.
+	releaseStateAtomStoreIndex func()
+	// stateAtomStoreClosed rejects lazy store acquisition after shutdown.
+	stateAtomStoreClosed bool
+	// stateAtomStoreIndexBuilder overrides the external acquisition in
+	// CoreRootServer tests.
+	stateAtomStoreIndexBuilder func(context.Context) (*session.StateAtomStoreIndex, func(), error)
+	// cdnRegistry owns the process-scoped map of CdnInstances.
+	cdnRegistry *resource_cdn.Registry
+	// rootMux is the Root resource mux this server is registered on. Bound web
+	// listeners serve it through their filtered Resource service.
+	rootMux srpc.Invoker
+	// webListeners owns daemon-background localhost web listeners.
+	webListeners *webListenerRegistry
+	// recoveryStatusRegistry owns volatile renderer recovery facts by logical
+	// session across separately mounted SessionResources.
+	recoveryStatusRegistry *resource_session.RecoveryStatusRegistry
+	// bindingRegistry wakes binding watches for this Resource root.
+	bindingRegistry *process_binding.BindingRegistry
+
+	// yieldBrokerMtx and listenerStatusMtx guard the injected shared brokers.
+	yieldBrokerMtx    sync.Mutex
+	yieldBroker       *yield_policy.Broker
+	listenerStatusMtx sync.Mutex
+	listenerStatus    *resource_listener.StatusBroker
+}
+
+// NewCoreRootServer creates a new CoreRootServer.
+func NewCoreRootServer(le *logrus.Entry, b bus.Bus) *CoreRootServer {
+	// Construct the root server and its process-scoped registries.
+	s := &CoreRootServer{
+		le: le,
+		b:  b,
+	}
+	s.stateAtomMgr = newStateAtomManager(s)
+	s.cdnRegistry = resource_cdn.NewRegistry(le, b)
+	s.webListeners = newWebListenerRegistry(le)
+	s.recoveryStatusRegistry = resource_session.NewRecoveryStatusRegistry()
+	s.bindingRegistry = process_binding.NewBindingRegistry()
+	return s
+}
+
+// SetBindingRegistry shares binding notifications with the parent Resource
+// root when this root belongs to a nested application.
+func (s *CoreRootServer) SetBindingRegistry(registry *process_binding.BindingRegistry) {
+	s.bindingRegistry = registry
+}
+
+// SetYieldBroker injects the shared listener yield broker. The composition
+// root that also wires the resource listener controller injects one broker so
+// takeover prompts and reclaim signals agree across consumers.
+func (s *CoreRootServer) SetYieldBroker(broker *yield_policy.Broker) {
+	s.yieldBrokerMtx.Lock()
+	defer s.yieldBrokerMtx.Unlock()
+	s.yieldBroker = broker
+}
+
+// getYieldBroker returns the injected broker, or nil before injection.
+func (s *CoreRootServer) getYieldBroker() *yield_policy.Broker {
+	s.yieldBrokerMtx.Lock()
+	defer s.yieldBrokerMtx.Unlock()
+	return s.yieldBroker
+}
+
+// SetListenerStatusBroker injects the shared listener status broker.
+func (s *CoreRootServer) SetListenerStatusBroker(broker *resource_listener.StatusBroker) {
+	s.listenerStatusMtx.Lock()
+	defer s.listenerStatusMtx.Unlock()
+	s.listenerStatus = broker
+}
+
+// getListenerStatusBroker returns the injected broker, or nil when the
+// runtime has no resource listener.
+func (s *CoreRootServer) getListenerStatusBroker() *resource_listener.StatusBroker {
+	s.listenerStatusMtx.Lock()
+	defer s.listenerStatusMtx.Unlock()
+	return s.listenerStatus
+}
+
+// SetHostPluginID records the plugin id serving this resource root.
+func (s *CoreRootServer) SetHostPluginID(pluginID string) {
+	s.hostPluginID = pluginID
+}
+
+// Close releases process-owned root resources.
+func (s *CoreRootServer) Close() {
+	if s.webListeners != nil {
+		s.webListeners.close()
+	}
+	if s.cdnRegistry != nil {
+		s.cdnRegistry.Close()
+	}
+	s.closeStateAtomStoreIndex()
+}
+
+// Register registers the server with the Root resource mux. Bound web
+// listeners serve the same mux, so register on it before they start.
+func (s *CoreRootServer) Register(mux srpc.Mux) error {
+	s.rootMux = mux
+	return s4wave_root.SRPCRegisterRootResourceService(mux, s)
+}
+
+// GetDebugDb returns a debug database resource for storage diagnostics.
+func (s *CoreRootServer) GetDebugDb(
+	ctx context.Context,
+	_ *s4wave_root.GetDebugDbRequest,
+) (*s4wave_root.GetDebugDbResponse, error) {
+	// Acquire the caller resource context.
+	resourceCtx, err := resource_server.MustGetResourceClientContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Construct and register the debug database resource.
+	debugResource := resource_debugdb.NewDebugDbResource(s.le, s.b)
+	id, err := resourceCtx.AddResource(debugResource.GetMux(), func() {})
+	if err != nil {
+		return nil, err
+	}
+
+	// Return the registered resource identifier.
+	return &s4wave_root.GetDebugDbResponse{ResourceId: id}, nil
+}
+
+// SetAppPluginIDs supplies application composition before the resource is published.
+func (s *CoreRootServer) SetAppPluginIDs(ids []string) {
+	s.appPluginIDs = slices.Clone(ids)
+}
+
+// _ is a type assertion
+var _ s4wave_root.SRPCRootResourceServiceServer = (*CoreRootServer)(nil)

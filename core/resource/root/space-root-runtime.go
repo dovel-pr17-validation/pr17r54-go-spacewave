@@ -1,0 +1,480 @@
+//go:build !js
+
+package resource_root
+
+import (
+	"context"
+	stderrors "errors"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/pipesock"
+	"github.com/pkg/errors"
+	entrypoint_state "github.com/s4wave/spacewave/bldr/entrypoint/state"
+	resource "github.com/s4wave/spacewave/bldr/resource"
+	resource_client "github.com/s4wave/spacewave/bldr/resource/client"
+	session "github.com/s4wave/spacewave/core/session"
+	space "github.com/s4wave/spacewave/core/space"
+	"github.com/s4wave/spacewave/net/util/randstring"
+	s4wave_root "github.com/s4wave/spacewave/sdk/root"
+	s4wave_session "github.com/s4wave/spacewave/sdk/session"
+)
+
+const spaceRootRuntimeSocketName = "spacewave.sock"
+
+const spaceRootRuntimeStartupReadyMessage = "ready"
+
+const spaceRootRuntimeStartupErrorPrefix = "error: "
+
+const spaceRootRuntimeStartupTimeoutEnvVar = "SPACEWAVE_DAEMON_STARTUP_TIMEOUT"
+
+var spaceRootRuntimeStartupTimeout = time.Minute
+
+type spaceRootRuntimeClient struct {
+	conn      net.Conn
+	resClient *resource_client.Client
+	root      spaceRootRuntimeRoot
+}
+
+type spaceRootRuntimeRoot interface {
+	WatchSessions(context.Context) (s4wave_root.SRPCRootResourceService_WatchSessionsClient, error)
+	MountSessionByIdx(context.Context, uint32) (*s4wave_root.MountSessionByIdxResponse, error)
+	GetSessionMetadata(context.Context, uint32) (*session.SessionMetadata, bool, error)
+}
+
+var connectSpaceRootRuntimeFunc = connectSpaceRootRuntime
+
+// WatchSpaceRootRuntime streams sessions from a selected configured root daemon.
+func (s *CoreRootServer) WatchSpaceRootRuntime(
+	req *s4wave_root.WatchSpaceRootRuntimeRequest,
+	strm s4wave_root.SRPCRootResourceService_WatchSpaceRootRuntimeStream,
+) error {
+	// Resolve the configured root alias and its daemon socket path.
+	ctx := strm.Context()
+	alias, err := s.lookupReadySpaceRootAlias(ctx, req.GetAliasId())
+	if err != nil {
+		return sendSpaceRootRuntimeError(strm, req.GetAliasId(), "", "", err)
+	}
+	statePath := alias.GetNative().GetPath()
+	if alias.GetKind() == s4wave_root.SpaceRootKind_SpaceRootKind_S4WAVE_FILE {
+		statePath = filepath.Dir(statePath)
+	}
+	socketPath := filepath.Join(statePath, spaceRootRuntimeSocketName)
+
+	// Report the daemon connection attempt to the runtime stream.
+	if err := strm.Send(&s4wave_root.WatchSpaceRootRuntimeResponse{
+		Status:     s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_CONNECTING,
+		AliasId:    alias.GetAliasId(),
+		StatePath:  statePath,
+		SocketPath: socketPath,
+	}); err != nil {
+		return err
+	}
+
+	// Connect to the root daemon and start it when requested.
+	client, err := connectSpaceRootRuntimeFunc(ctx, statePath)
+	if err != nil && req.GetAutostart() {
+		if err := strm.Send(&s4wave_root.WatchSpaceRootRuntimeResponse{
+			Status:     s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_STARTING,
+			AliasId:    alias.GetAliasId(),
+			StatePath:  statePath,
+			SocketPath: socketPath,
+		}); err != nil {
+			return err
+		}
+		if _, statErr := os.Stat(socketPath); statErr == nil {
+			if removeErr := os.Remove(socketPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				return sendSpaceRootRuntimeError(strm, alias.GetAliasId(), statePath, socketPath, errors.Wrap(removeErr, "remove stale daemon socket"))
+			}
+		}
+		if startErr := s.startSpaceRootRuntimeDaemon(ctx, statePath); startErr != nil {
+			return sendSpaceRootRuntimeError(strm, alias.GetAliasId(), statePath, socketPath, errors.Wrap(startErr, "start daemon"))
+		}
+		client, err = connectSpaceRootRuntimeFunc(ctx, statePath)
+	}
+	if err != nil {
+		return sendSpaceRootRuntimeError(strm, alias.GetAliasId(), statePath, socketPath, err)
+	}
+	defer client.Close()
+
+	// Open the daemon Session watch for the runtime stream.
+	watch, err := client.root.WatchSessions(ctx)
+	if err != nil {
+		return sendSpaceRootRuntimeError(strm, alias.GetAliasId(), statePath, socketPath, errors.Wrap(err, "watch sessions"))
+	}
+	defer watch.Close()
+
+	// Forward Session updates with metadata and available spaces.
+	for {
+		resp, err := watch.Recv()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return sendSpaceRootRuntimeError(strm, alias.GetAliasId(), statePath, socketPath, errors.Wrap(err, "watch sessions"))
+		}
+		sessions := resp.GetSessions()
+		if alias.GetKind() == s4wave_root.SpaceRootKind_SpaceRootKind_S4WAVE_FILE {
+			sessions = sessionsFromSpaceRootFile(alias.GetNative().GetPath(), sessions)
+		}
+		runtimeSessions := client.buildSpaceRootRuntimeSessions(ctx, sessions)
+		if err := strm.Send(&s4wave_root.WatchSpaceRootRuntimeResponse{
+			Status:          s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_READY,
+			AliasId:         alias.GetAliasId(),
+			StatePath:       statePath,
+			SocketPath:      socketPath,
+			Sessions:        sessions,
+			RuntimeSessions: runtimeSessions,
+		}); err != nil {
+			return err
+		}
+	}
+}
+
+// sessionsFromSpaceRootFile selects the shared catalog or one provider account.
+func sessionsFromSpaceRootFile(path string, entries []*session.SessionListEntry) []*session.SessionListEntry {
+	if filepath.Base(path) == entrypoint_state.Filename {
+		return entries
+	}
+	filtered := make([]*session.SessionListEntry, 0, len(entries))
+	for _, entry := range entries {
+		ref := entry.GetSessionRef().GetProviderResourceRef()
+		filename := strings.ReplaceAll("p/"+ref.GetProviderId()+"/"+ref.GetProviderAccountId(), "/", "_") + ".s4wave"
+		if filepath.Base(path) == filename {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func (c *spaceRootRuntimeClient) buildSpaceRootRuntimeSessions(
+	ctx context.Context,
+	sessions []*session.SessionListEntry,
+) []*s4wave_root.SpaceRootRuntimeSession {
+	// Build runtime records with metadata and spaces for each Session.
+	out := make([]*s4wave_root.SpaceRootRuntimeSession, 0, len(sessions))
+	for _, entry := range sessions {
+		runtimeSession := &s4wave_root.SpaceRootRuntimeSession{Session: entry}
+		idx := entry.GetSessionIndex()
+		meta, notFound, err := c.root.GetSessionMetadata(ctx, idx)
+		if err != nil {
+			runtimeSession.Error = errors.Wrap(err, "read session metadata").Error()
+			out = append(out, runtimeSession)
+			continue
+		}
+		if !notFound {
+			runtimeSession.Metadata = meta
+		}
+		spaces, err := c.listSpaceRootRuntimeSessionSpaces(ctx, idx)
+		if err != nil {
+			runtimeSession.Error = err.Error()
+			out = append(out, runtimeSession)
+			continue
+		}
+		runtimeSession.Spaces = spaces
+		out = append(out, runtimeSession)
+	}
+	return out
+}
+
+func (c *spaceRootRuntimeClient) listSpaceRootRuntimeSessionSpaces(
+	ctx context.Context,
+	idx uint32,
+) ([]*space.SpaceSoListEntry, error) {
+	// Mount the Session when a resource client is available.
+	if c.resClient == nil {
+		return nil, nil
+	}
+	mount, err := c.root.MountSessionByIdx(ctx, idx)
+	if err != nil {
+		return nil, errors.Wrap(err, "mount session")
+	}
+	if mount.GetNotFound() {
+		return nil, nil
+	}
+
+	// Acquire the mounted Session resource for the space list.
+	ref := c.resClient.CreateResourceReference(mount.GetResourceId())
+	sess, err := s4wave_session.NewSession(c.resClient, ref)
+	if err != nil {
+		ref.Release()
+		return nil, errors.Wrap(err, "session resource")
+	}
+	defer sess.Release()
+
+	// Open the Session resource watch and read its initial space list.
+	watch, err := sess.WatchResourcesList(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "watch spaces")
+	}
+	defer watch.Close()
+	resp, err := watch.Recv()
+	if err != nil {
+		return nil, errors.Wrap(err, "read spaces")
+	}
+	return resp.GetSpacesList(), nil
+}
+
+func (s *CoreRootServer) lookupReadySpaceRootAlias(
+	ctx context.Context,
+	aliasID string,
+) (*s4wave_root.SpaceRootAliasRecord, error) {
+	// Require the root alias identifier before resolving its record.
+	aliasID = strings.TrimSpace(aliasID)
+	if aliasID == "" {
+		return nil, errors.New("space root alias id is required")
+	}
+	records, err := s.snapshotSpaceRootAliases(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find the requested root alias and require its ready status.
+	for _, record := range records {
+		if record.GetAliasId() != aliasID {
+			continue
+		}
+		if record.GetStatus() != s4wave_root.SpaceRootStatus_SpaceRootStatus_READY {
+			return nil, errors.Errorf("configured root is not ready: %s", record.GetStatusMessage())
+		}
+		return record, nil
+	}
+	return nil, errors.Errorf("configured root alias %q was not found", aliasID)
+}
+
+func connectSpaceRootRuntime(ctx context.Context, statePath string) (*spaceRootRuntimeClient, error) {
+	// Connect to the daemon socket and construct its runtime client.
+	socketPath := filepath.Join(statePath, spaceRootRuntimeSocketName)
+	conn, err := dialSpaceRootRuntime(ctx, socketPath)
+	if err != nil {
+		return nil, spaceRootRuntimeNotListeningError(socketPath)
+	}
+	client, err := buildSpaceRootRuntimeClient(ctx, conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+func dialSpaceRootRuntime(ctx context.Context, socketPath string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, "unix", socketPath)
+}
+
+func buildSpaceRootRuntimeClient(ctx context.Context, conn net.Conn) (*spaceRootRuntimeClient, error) {
+	// Create the SRPC client for the daemon connection.
+	srpcClient, err := srpc.NewClientWithConn(conn, true, nil)
+	if err != nil {
+		conn.Close()
+		return nil, errors.Wrap(err, "create srpc client")
+	}
+
+	// Create the resource client over the daemon SRPC service.
+	resourceSvc := resource.NewSRPCResourceServiceClient(srpcClient)
+	resClient, err := resource_client.NewClient(ctx, resourceSvc)
+	if err != nil {
+		conn.Close()
+		return nil, errors.Wrap(err, "resource client")
+	}
+
+	// Acquire the root resource for the daemon runtime client.
+	rootRef := resClient.AccessRootResource()
+	root, err := s4wave_root.NewRoot(resClient, rootRef)
+	if err != nil {
+		rootRef.Release()
+		resClient.Release()
+		conn.Close()
+		return nil, errors.Wrap(err, "root resource")
+	}
+
+	return &spaceRootRuntimeClient{
+		conn:      conn,
+		resClient: resClient,
+		root:      root,
+	}, nil
+}
+
+func (c *spaceRootRuntimeClient) Close() {
+	if c.root != nil {
+		if releaser, ok := c.root.(interface{ Release() }); ok {
+			releaser.Release()
+		}
+	}
+	if c.resClient != nil {
+		c.resClient.Release()
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
+
+func (s *CoreRootServer) startSpaceRootRuntimeDaemon(ctx context.Context, statePath string) error {
+	// Read the configured deadline for daemon startup.
+	startupTimeout, err := getSpaceRootRuntimeStartupTimeout()
+	if err != nil {
+		return err
+	}
+
+	// Bound the daemon startup wait with a cancellable context.
+	startCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+
+	// Open the pipe that receives the daemon startup result.
+	pipeID := "spacewave-daemon-" + randstring.RandomIdentifier(6)
+	pipeListener, err := pipesock.BuildPipeListener(s.le, statePath, pipeID)
+	if err != nil {
+		return errors.Wrap(err, "listen for daemon startup")
+	}
+	defer pipeListener.Close()
+
+	// Resolve the executable used to start the daemon.
+	exePath, err := os.Executable()
+	if err != nil {
+		return errors.Wrap(err, "resolve executable")
+	}
+
+	// Prepare the daemon command for the selected state root.
+	cmd := exec.Command(
+		exePath,
+		"--state-path", statePath,
+		"serve",
+		"--daemon-startup-pipe-id", pipeID,
+	)
+
+	// Redirect the daemon standard streams to the null device.
+	nullFile, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return errors.Wrap(err, "open devnull")
+	}
+	defer nullFile.Close()
+	cmd.Stdin = nullFile
+	cmd.Stdout = nullFile
+	cmd.Stderr = nullFile
+
+	// Start the daemon process for the selected state root.
+	if err := cmd.Start(); err != nil {
+		return errors.Wrap(err, "start daemon process")
+	}
+
+	// Wait for daemon readiness and release the process handle.
+	if err := waitForSpaceRootRuntimeStartup(startCtx, pipeListener); err != nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Process.Release()
+		}
+		return err
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	return nil
+}
+
+func getSpaceRootRuntimeStartupTimeout() (time.Duration, error) {
+	// Read and parse the configured daemon startup duration.
+	raw := os.Getenv(spaceRootRuntimeStartupTimeoutEnvVar)
+	if raw == "" {
+		return spaceRootRuntimeStartupTimeout, nil
+	}
+	dur, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, errors.Wrap(err, spaceRootRuntimeStartupTimeoutEnvVar)
+	}
+	return dur, nil
+}
+
+func waitForSpaceRootRuntimeStartup(ctx context.Context, pipeListener net.Listener) error {
+	// Receive the daemon startup message while cancellation closes the pipe.
+	type startupResult struct {
+		msg string
+		err error
+	}
+	resCh := make(chan startupResult, 1)
+	go func() {
+		conn, err := pipeListener.Accept()
+		if err != nil {
+			resCh <- startupResult{err: err}
+			return
+		}
+		msg, err := readSpaceRootRuntimeStartupMessage(conn)
+		resCh <- startupResult{msg: msg, err: err}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = pipeListener.Close()
+	}()
+
+	// Resolve daemon readiness or return its startup failure.
+	select {
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "wait for daemon startup")
+	case res := <-resCh:
+		if res.err != nil {
+			if ctx.Err() != nil {
+				return errors.Wrap(ctx.Err(), "wait for daemon startup")
+			}
+			return errors.Wrap(res.err, "wait for daemon startup")
+		}
+		switch {
+		case res.msg == spaceRootRuntimeStartupReadyMessage:
+			return nil
+		case strings.HasPrefix(res.msg, spaceRootRuntimeStartupErrorPrefix):
+			return errors.New(strings.TrimPrefix(res.msg, spaceRootRuntimeStartupErrorPrefix))
+		default:
+			return errors.Errorf("unexpected daemon startup status %q", res.msg)
+		}
+	}
+}
+
+func readSpaceRootRuntimeStartupMessage(conn net.Conn) (string, error) {
+	// Close the startup connection after consuming its message.
+	defer conn.Close()
+
+	// Read and validate the daemon startup message.
+	msg, err := io.ReadAll(conn)
+	if err != nil {
+		return "", errors.Wrap(err, "read startup message")
+	}
+	text := strings.TrimSpace(string(msg))
+	if text == "" {
+		return "", errors.New("empty daemon startup message")
+	}
+	return text, nil
+}
+
+func sendSpaceRootRuntimeError(
+	strm s4wave_root.SRPCRootResourceService_WatchSpaceRootRuntimeStream,
+	aliasID string,
+	statePath string,
+	socketPath string,
+	err error,
+) error {
+	if err == nil {
+		return nil
+	}
+	if stderrors.Is(errors.Cause(err), syscall.ENOENT) {
+		err = errors.Errorf("no daemon listening at %s", socketPath)
+	}
+	return strm.Send(&s4wave_root.WatchSpaceRootRuntimeResponse{
+		Status:     s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_ERROR,
+		AliasId:    aliasID,
+		StatePath:  statePath,
+		SocketPath: socketPath,
+		Error:      err.Error(),
+	})
+}
+
+func spaceRootRuntimeNotListeningError(socketPath string) error {
+	return errors.Errorf(
+		"no daemon listening at %s: start Spacewave for this state root or enable autostart",
+		socketPath,
+	)
+}

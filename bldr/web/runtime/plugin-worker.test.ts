@@ -1,0 +1,392 @@
+import { afterEach, describe, expect, test, vi } from 'vitest'
+
+import {
+  PluginWorker,
+  PLUGIN_STARTUP_FAILURE_SHUTDOWN_DELAY_MS,
+  parsePluginWorkerName,
+  waitPluginStartupFailureShutdownDelay,
+} from './plugin-worker.js'
+
+describe('parsePluginWorkerName', () => {
+  test('strips wrapper parameters from the worker identity', () => {
+    expect(
+      parsePluginWorkerName(
+        'plugin/spacewave-app?s=/b/pd/app.mjs&p=1',
+      ),
+    ).toBe('plugin/spacewave-app')
+  })
+})
+
+describe('waitPluginStartupFailureShutdownDelay', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  test('waits before allowing failed plugin workers to shut down', async () => {
+    vi.useFakeTimers()
+    const complete = vi.fn()
+    const wait = waitPluginStartupFailureShutdownDelay().then(complete)
+
+    await vi.advanceTimersByTimeAsync(
+      PLUGIN_STARTUP_FAILURE_SHUTDOWN_DELAY_MS - 1,
+    )
+    expect(complete).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1)
+    await wait
+    expect(complete).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('PluginWorker startup shutdown', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
+  test('keeps startup pending while waiting for the next WebDocument', async () => {
+    vi.useFakeTimers()
+    const global = new FakeDedicatedWorkerGlobal()
+    const startPlugin = vi.fn()
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.stubGlobal('navigator', {})
+
+    const worker = new PluginWorker(
+      global as unknown as DedicatedWorkerGlobalScope,
+      startPlugin,
+      null,
+    )
+    const postMessage = vi.spyOn(worker.webDocumentTracker, 'postMessage')
+    global.dispatchMessage({
+      initData: new TextEncoder().encode(btoa('{}')),
+    })
+
+    await vi.runAllTimersAsync()
+    await Promise.resolve()
+
+    expect(startPlugin).not.toHaveBeenCalled()
+    expect(postMessage).toHaveBeenCalledWith({
+      from: 'plugin/spacewave-core',
+      startupMark: expect.objectContaining({
+        label: 'worker.init-message-received',
+      }),
+    })
+    expect(global.close).not.toHaveBeenCalled()
+    expect(consoleWarn).not.toHaveBeenCalled()
+  })
+
+  test('aborts plugin work before terminal close tears down runtime streams', async () => {
+    vi.useFakeTimers()
+    const global = new FakeDedicatedWorkerGlobal()
+    vi.stubGlobal('navigator', {})
+    const events: string[] = []
+    let pluginSignal: AbortSignal | undefined
+    let pluginStarted: (() => void) | undefined
+    const started = new Promise<void>((resolve) => {
+      pluginStarted = resolve
+    })
+    const worker = new PluginWorker(
+      global as unknown as DedicatedWorkerGlobalScope,
+      vi.fn(async (opts) => {
+        pluginSignal = opts.signal
+        opts.signal.addEventListener('abort', () => events.push('abort'))
+        pluginStarted?.()
+      }),
+      null,
+    )
+    vi.spyOn(worker.webDocumentTracker, 'waitConn').mockResolvedValue(undefined)
+    vi.spyOn(
+      worker.webDocumentTracker,
+      'requestWebRtcBridge',
+    ).mockResolvedValue(null)
+    vi.spyOn(worker.webDocumentTracker, 'requestOpfsWorker').mockResolvedValue(
+      null,
+    )
+    vi.spyOn(worker.webDocumentTracker, 'close').mockImplementation(() => {
+      if (!pluginSignal?.aborted) {
+        events.push('retry-error')
+      }
+      events.push('tracker-close')
+    })
+
+    const documentChannel = new MessageChannel()
+    global.dispatchMessage({
+      from: 'document-1',
+      initData: new TextEncoder().encode(btoa('{}')),
+      initPort: documentChannel.port1,
+    })
+    await started
+
+    documentChannel.port2.postMessage({
+      from: 'document-1',
+      close: true,
+      terminal: true,
+    })
+    await vi.waitFor(() => expect(pluginSignal?.aborted).toBe(true))
+
+    expect(events).toEqual(['abort', 'tracker-close'])
+    await vi.runAllTimersAsync()
+    expect(global.close).toHaveBeenCalledOnce()
+  })
+
+  test('keeps plugin work alive across non-terminal WebDocument reloads', async () => {
+    const global = new FakeDedicatedWorkerGlobal()
+    vi.stubGlobal('navigator', {})
+    const worker = new PluginWorker(
+      global as unknown as DedicatedWorkerGlobalScope,
+      vi.fn(),
+      null,
+    )
+    const close = vi.spyOn(worker.webDocumentTracker, 'close')
+
+    const documentChannel = new MessageChannel()
+    worker.webDocumentTracker.handleWebDocumentMessage({
+      from: 'document-1',
+      initPort: documentChannel.port1,
+    })
+    documentChannel.port2.postMessage({
+      from: 'document-1',
+      close: true,
+    })
+    await Promise.resolve()
+
+    expect(close).not.toHaveBeenCalled()
+    expect(global.close).not.toHaveBeenCalled()
+  })
+
+  test('reports startup errors by lifecycle state instead of message text', async () => {
+    vi.useFakeTimers()
+    const global = new FakeDedicatedWorkerGlobal()
+    vi.stubGlobal('navigator', {})
+    const worker = new PluginWorker(
+      global as unknown as DedicatedWorkerGlobalScope,
+      vi.fn(),
+      null,
+    )
+    vi.spyOn(worker.webDocumentTracker, 'waitConn').mockRejectedValue(
+      new Error('closed while waiting for WebDocument'),
+    )
+    const postMessage = vi.spyOn(worker.webDocumentTracker, 'postMessage')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    global.dispatchMessage({
+      initData: new TextEncoder().encode(btoa('{}')),
+    })
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith({
+        from: 'plugin/spacewave-core',
+        close: true,
+        failureReason: 'closed while waiting for WebDocument',
+      }),
+    )
+
+    await vi.runAllTimersAsync()
+    expect(global.close).toHaveBeenCalledOnce()
+  })
+
+  test('reports one runtime failure close before idempotent shutdown', async () => {
+    vi.useFakeTimers()
+    const global = new FakeDedicatedWorkerGlobal()
+    vi.stubGlobal('navigator', {})
+    const worker = new PluginWorker(
+      global as unknown as DedicatedWorkerGlobalScope,
+      vi.fn(),
+      null,
+    )
+    const postMessage = vi.spyOn(worker.webDocumentTracker, 'postMessage')
+
+    const firstFailure = worker.reportRuntimeFailure(
+      new Error('fatal wasm exit'),
+    )
+    const secondFailure = worker.reportRuntimeFailure(
+      new Error('second fatal wasm exit'),
+    )
+
+    expect(postMessage).toHaveBeenCalledWith({
+      from: 'plugin/spacewave-core',
+      close: true,
+      failureReason: 'fatal wasm exit',
+    })
+    expect(
+      postMessage.mock.calls.filter(([msg]) => msg.failureReason),
+    ).toHaveLength(1)
+
+    await vi.runAllTimersAsync()
+    await Promise.all([firstFailure, secondFailure])
+
+    expect(global.close).toHaveBeenCalledTimes(1)
+    expect(
+      postMessage.mock.calls.filter(([msg]) => msg.failureReason),
+    ).toHaveLength(1)
+  })
+
+  test('installs OPFS bridge global before starting Config A plugins', async () => {
+    const global = new FakeDedicatedWorkerGlobal()
+    vi.stubGlobal('navigator', {})
+    const opfsChannel = new MessageChannel()
+    const refreshedOpfsChannel = new MessageChannel()
+    const installRemoteDriver = vi.fn()
+    const globals = globalThis as typeof globalThis & {
+      __spacewaveOpfsBridgePort?: {
+        request: (op: string, args: unknown) => Promise<unknown>
+        close: () => void
+      }
+      __spacewaveInstallOpfsRemoteDriver?: (port: {
+        request: (op: string, args: unknown) => Promise<unknown>
+        close: () => void
+      }) => boolean
+    }
+    globals.__spacewaveInstallOpfsRemoteDriver = installRemoteDriver
+    const startPlugin = vi.fn()
+    const started = new Promise<void>((resolve) => {
+      startPlugin.mockImplementation(async () => {
+        resolve()
+      })
+    })
+    const worker = new PluginWorker(
+      global as unknown as DedicatedWorkerGlobalScope,
+      startPlugin,
+      null,
+    )
+    vi.spyOn(worker.webDocumentTracker, 'waitConn').mockResolvedValue(undefined)
+    vi.spyOn(
+      worker.webDocumentTracker,
+      'requestWebRtcBridge',
+    ).mockResolvedValue(null)
+    vi.spyOn(worker.webDocumentTracker, 'requestOpfsWorker')
+      .mockResolvedValueOnce(opfsChannel.port1)
+      .mockResolvedValueOnce(refreshedOpfsChannel.port1)
+
+    global.dispatchMessage({
+      initData: new TextEncoder().encode(btoa('{}')),
+      workerCommsDetect: {
+        config: 'A',
+        caps: {
+          crossOriginIsolated: false,
+          sabAvailable: false,
+          opfsAvailable: false,
+          webLocksAvailable: true,
+          broadcastChannelAvailable: true,
+        },
+      },
+    })
+
+    await started
+
+    expect(worker.webDocumentTracker.requestOpfsWorker).toHaveBeenCalledOnce()
+    const opfsBridge = globals.__spacewaveOpfsBridgePort
+    expect(opfsBridge).toBeDefined()
+    expect(opfsBridge).not.toBe(opfsChannel.port1)
+    expect(installRemoteDriver.mock.calls[0]?.[0]).toBe(opfsBridge)
+
+    const nextRequest = new Promise<MessageEvent<unknown>>((resolve) => {
+      opfsChannel.port2.addEventListener(
+        'message',
+        (event) => resolve(event as MessageEvent<unknown>),
+        { once: true },
+      )
+      opfsChannel.port2.start()
+    })
+    const getRoot = opfsBridge!.request('getRoot', { ready: true })
+    const request = await nextRequest
+    expect(request.data).toMatchObject({ op: 'getRoot', args: { ready: true } })
+    opfsChannel.port2.postMessage({
+      id: (request.data as { id: number }).id,
+      ok: true,
+      result: { id: 1 },
+    })
+    await expect(getRoot).resolves.toEqual({ id: 1 })
+
+    ;(
+      worker as unknown as {
+        refreshOpfsBridge: () => void
+      }
+    ).refreshOpfsBridge()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(worker.webDocumentTracker.requestOpfsWorker).toHaveBeenCalledTimes(2)
+    const refreshedBridge = globals.__spacewaveOpfsBridgePort
+    expect(refreshedBridge).toBeDefined()
+    expect(refreshedBridge).not.toBe(refreshedOpfsChannel.port1)
+    expect(refreshedBridge).not.toBe(opfsBridge)
+    expect(installRemoteDriver.mock.calls[1]?.[0]).toBe(refreshedBridge)
+    opfsBridge?.close()
+    refreshedBridge?.close()
+    opfsChannel.port1.close()
+    opfsChannel.port2.close()
+    refreshedOpfsChannel.port1.close()
+    refreshedOpfsChannel.port2.close()
+    delete globals.__spacewaveOpfsBridgePort
+    delete globals.__spacewaveInstallOpfsRemoteDriver
+  })
+
+  test('does not install an OPFS bridge under config C', async () => {
+    const global = new FakeDedicatedWorkerGlobal()
+    vi.stubGlobal('navigator', {})
+    const globals = globalThis as typeof globalThis & {
+      __spacewaveOpfsBridgePort?: { close: () => void }
+      __spacewaveInstallOpfsRemoteDriver?: (port: unknown) => boolean
+    }
+    const installRemoteDriver = vi.fn()
+    globals.__spacewaveInstallOpfsRemoteDriver = installRemoteDriver
+    const startPlugin = vi.fn()
+    const started = new Promise<void>((resolve) => {
+      startPlugin.mockImplementation(async () => {
+        resolve()
+      })
+    })
+    const worker = new PluginWorker(
+      global as unknown as DedicatedWorkerGlobalScope,
+      startPlugin,
+      null,
+    )
+    vi.spyOn(worker.webDocumentTracker, 'waitConn').mockResolvedValue(undefined)
+    vi.spyOn(
+      worker.webDocumentTracker,
+      'requestWebRtcBridge',
+    ).mockResolvedValue(null)
+    const requestOpfsWorker = vi.spyOn(
+      worker.webDocumentTracker,
+      'requestOpfsWorker',
+    )
+
+    global.dispatchMessage({
+      initData: new TextEncoder().encode(btoa('{}')),
+      workerCommsDetect: {
+        config: 'C',
+        caps: {
+          crossOriginIsolated: true,
+          sabAvailable: true,
+          opfsAvailable: true,
+          webLocksAvailable: true,
+          broadcastChannelAvailable: true,
+        },
+      },
+    })
+
+    await started
+
+    expect(requestOpfsWorker).not.toHaveBeenCalled()
+    expect(globals.__spacewaveOpfsBridgePort).toBeUndefined()
+    expect(installRemoteDriver).not.toHaveBeenCalled()
+    delete globals.__spacewaveInstallOpfsRemoteDriver
+  })
+})
+
+class FakeDedicatedWorkerGlobal {
+  public readonly name = 'plugin/spacewave-core?s=/b/pd/core.mjs&t=wasm&p=1'
+  public readonly close = vi.fn()
+  private messageHandler?: (ev: MessageEvent) => void
+
+  public addEventListener(type: string, handler: EventListener): void {
+    if (type === 'message') {
+      this.messageHandler = handler as (ev: MessageEvent) => void
+    }
+  }
+
+  public dispatchMessage(data: unknown): void {
+    this.messageHandler?.({ data } as MessageEvent)
+  }
+}

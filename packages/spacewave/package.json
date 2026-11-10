@@ -1,0 +1,60 @@
+{
+  "name": "spacewave",
+  "version": "0.1.0-rc.1",
+  "description": "Typed live collections backed by a durable Spacewave World",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/s4wave/spacewave.git",
+    "directory": "packages/spacewave"
+  },
+  "homepage": "https://github.com/s4wave/spacewave/tree/master/packages/spacewave#readme",
+  "bugs": "https://github.com/s4wave/spacewave/issues",
+  "type": "module",
+  "engines": {
+    "node": ">=24.15.0 <27"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/types/packages/spacewave/index.d.ts",
+      "import": "./dist/index.mjs"
+    },
+    "./server": {
+      "types": "./dist/types/packages/spacewave/server.d.ts",
+      "import": "./dist/server.mjs"
+    },
+    "./react": {
+      "types": "./dist/types/packages/spacewave/react.d.ts",
+      "import": "./dist/react.mjs"
+    }
+  },
+  "types": "./dist/types/packages/spacewave/index.d.ts",
+  "dependencies": {
+    "@standard-schema/spec": "^1.1.0"
+  },
+  "peerDependencies": {
+    "react": ">=19.2.0 <20",
+    "@types/react": ">=19.2.0 <20",
+    "@types/node": ">=24 <27"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "@types/react": {
+      "optional": true
+    },
+    "@types/node": {
+      "optional": true
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "examples",
+    "API.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "license": "Apache-2.0"
+}

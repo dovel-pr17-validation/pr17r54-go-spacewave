@@ -1,0 +1,126 @@
+package forge_pass
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	world_control "github.com/s4wave/spacewave/db/world/control"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	forge_target "github.com/s4wave/spacewave/forge/target"
+	"github.com/sirupsen/logrus"
+)
+
+const passGraphPathLimit uint32 = 1_000_000
+
+// CheckPassType checks the type graph quad for a Pass.
+func CheckPassType(ctx context.Context, ws world.WorldState, objKey string) error {
+	return world_types.CheckObjectType(ctx, ws, objKey, PassTypeID)
+}
+
+// LookupPass looks up a Pass in the world.
+func LookupPass(ctx context.Context, ws world.WorldState, objKey string) (*Pass, *forge_target.Target, error) {
+	// Unmarshal the Pass and its linked Target from the object block.
+	obj, err := world.MustGetObject(ctx, ws, objKey)
+	if err != nil {
+		world.ReleaseObjectState(obj)
+		return nil, nil, err
+	}
+	defer world.ReleaseObjectState(obj)
+	var pass *Pass
+	var tgt *forge_target.Target
+	_, _, err = world.AccessObjectState(ctx, obj, false, func(bcs *block.Cursor) error {
+		var err error
+		pass, err = UnmarshalPass(ctx, bcs)
+		if err == nil && !pass.GetTargetRef().GetEmpty() {
+			tgt, _, err = pass.FollowTargetRef(ctx, bcs)
+		}
+		return err
+	})
+	return pass, tgt, err
+}
+
+// WaitPassComplete waits until the Pass is in the COMPLETE state.
+func WaitPassComplete(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	passObjectKey string,
+) (*Pass, error) {
+	// wait for Pass to complete
+	var finalState *Pass
+	var lastState State
+	loop := world_control.NewWatchLoop(
+		le,
+		passObjectKey,
+		world_control.NewWaitForStateHandler(
+			func(ctx context.Context, ws world.WorldState, obj world.ObjectState, rootCs *block.Cursor, rev uint64) (bool, error) {
+				// Track the pass state and log failures until it completes.
+				if obj == nil {
+					return true, nil
+				}
+				pass, err := UnmarshalPass(ctx, rootCs)
+				if err != nil {
+					return false, err
+				}
+				nextState := pass.GetPassState()
+				if nextState != lastState {
+					lastState = nextState
+					le.Debugf("pass is in state: %s", nextState.String())
+					result := pass.GetResult()
+					if ferr := result.GetFailError(); ferr != "" && !result.GetCanceled() {
+						le.WithError(errors.New(ferr)).Warn("pass failed")
+					}
+				}
+				complete := pass.IsComplete()
+				if complete {
+					finalState = pass
+				}
+				return !complete, nil
+			},
+		),
+	)
+	if err := loop.Execute(ctx, ws); err != nil {
+		return nil, err
+	}
+	return finalState, nil
+}
+
+// ListPassExecutions lists all Execution object keys that are linked to by the Pass.
+func ListPassExecutions(ctx context.Context, w world.WorldState, passKeys ...string) ([]string, error) {
+	return world.CollectGraphPathStepWithKeys(
+		ctx,
+		w,
+		passKeys,
+		world.GraphPathDirectionOut,
+		PredPassToExecution.String(),
+		passGraphPathLimit,
+	)
+}
+
+// CollectPassExecutions collects all Executions linked to by the Pass.
+// If any of the linked states are invalid, returns an error.
+func CollectPassExecutions(
+	ctx context.Context,
+	ws world.WorldState,
+	passObjectKeys ...string,
+) ([]*forge_execution.Execution, []string, error) {
+	// Look up each linked Execution object body.
+	kpObjectKeys, err := ListPassExecutions(ctx, ws, passObjectKeys...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Look up each linked Execution object body.
+	states := make([]*forge_execution.Execution, len(kpObjectKeys))
+	for i, objKey := range kpObjectKeys {
+		states[i], err = world.LookupObjectBody[forge_execution.Execution](ctx, ws, objKey)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return states, kpObjectKeys, nil
+}

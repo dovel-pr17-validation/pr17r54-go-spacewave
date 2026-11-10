@@ -1,0 +1,148 @@
+import { useCallback } from 'react'
+import { useWatchStateRpc } from '@aptre/bldr-react'
+import { useResourceValue } from '@aptre/bldr-sdk/hooks/useResource.js'
+
+import { SessionContext } from '@s4wave/web/contexts/contexts.js'
+import {
+  WatchControllersRequest,
+  WatchControllersResponse,
+  WatchDirectivesRequest,
+  WatchDirectivesResponse,
+  WatchNetworkStatsRequest,
+  WatchNetworkStatsResponse,
+  WatchPluginsRequest,
+  WatchPluginsResponse,
+  WatchRecoveryStatusRequest,
+  WatchRecoveryStatusResponse,
+  type RecoveryStatus,
+} from '@s4wave/sdk/status/status.pb.js'
+import type { SpaceSoListEntry } from '@s4wave/core/space/space.pb.js'
+import {
+  WatchResourcesListRequest as SessionWatchResourcesListRequest,
+  WatchResourcesListResponse as SessionWatchResourcesListResponse,
+} from '@s4wave/sdk/session/session.pb.js'
+
+// useWatchControllers streams the list of active controllers from the session.
+// Returns the latest WatchControllersResponse or null while loading.
+export function useWatchControllers(): WatchControllersResponse | null {
+  const session = SessionContext.useContext()
+  const sessionValue = useResourceValue(session)
+
+  const watchFn = useCallback(
+    (_: WatchControllersRequest, signal: AbortSignal) =>
+      sessionValue?.systemStatus.watchControllers(signal) ?? null,
+    [sessionValue],
+  )
+
+  return useWatchStateRpc(
+    watchFn,
+    {},
+    WatchControllersRequest.equals,
+    WatchControllersResponse.equals,
+  )
+}
+
+// useWatchDirectives streams the list of active directives from the session.
+// Returns the latest WatchDirectivesResponse or null while loading.
+export function useWatchDirectives(): WatchDirectivesResponse | null {
+  const session = SessionContext.useContext()
+  const sessionValue = useResourceValue(session)
+
+  const watchFn = useCallback(
+    (_: WatchDirectivesRequest, signal: AbortSignal) =>
+      sessionValue?.systemStatus.watchDirectives(signal) ?? null,
+    [sessionValue],
+  )
+
+  return useWatchStateRpc(
+    watchFn,
+    {},
+    WatchDirectivesRequest.equals,
+    WatchDirectivesResponse.equals,
+  )
+}
+
+// useWatchPlugins streams active plugin load requests from the session.
+// Returns the latest WatchPluginsResponse or null while loading.
+export function useWatchPlugins(): WatchPluginsResponse | null {
+  const session = SessionContext.useContext()
+  const sessionValue = useResourceValue(session)
+
+  const watchFn = useCallback(
+    (_: WatchPluginsRequest, signal: AbortSignal) =>
+      sessionValue?.systemStatus.watchPlugins(signal) ?? null,
+    [sessionValue],
+  )
+
+  return useWatchStateRpc(
+    watchFn,
+    {},
+    WatchPluginsRequest.equals,
+    WatchPluginsResponse.equals,
+  )
+}
+
+// useWatchNetworkStats streams the session transport's live network snapshot.
+// Returns the latest WatchNetworkStatsResponse or null while loading.
+export function useWatchNetworkStats(): WatchNetworkStatsResponse | null {
+  const session = SessionContext.useContext()
+  const sessionValue = useResourceValue(session)
+
+  const watchFn = useCallback(
+    (_: WatchNetworkStatsRequest, signal: AbortSignal) =>
+      sessionValue?.systemStatus.watchNetworkStats(signal) ?? null,
+    [sessionValue],
+  )
+
+  return useWatchStateRpc(
+    watchFn,
+    {},
+    WatchNetworkStatsRequest.equals,
+    WatchNetworkStatsResponse.equals,
+  )
+}
+
+// useWatchSpacesList streams the session's current space list from the
+// existing WatchResourcesList RPC. Returns null while loading.
+export function useWatchSpacesList(): ReadonlyArray<SpaceSoListEntry> | null {
+  const session = SessionContext.useContext()
+  const sessionValue = useResourceValue(session)
+
+  const watchFn = useCallback(
+    (_: SessionWatchResourcesListRequest, signal: AbortSignal) =>
+      sessionValue?.watchResourcesList({}, signal) ?? null,
+    [sessionValue],
+  )
+
+  const resp = useWatchStateRpc(
+    watchFn,
+    {},
+    SessionWatchResourcesListRequest.equals,
+    SessionWatchResourcesListResponse.equals,
+  )
+
+  return resp?.spacesList ?? null
+}
+
+// useWatchRecoveryStatus streams the composed runtime recovery status: launcher
+// release and update state, plugin manifest recovery, native packages, and the
+// boot and runtime asset reports. Returns null while loading.
+export function useWatchRecoveryStatus(): RecoveryStatus | null {
+  const session = SessionContext.useContext()
+  const sessionValue = useResourceValue(session)
+
+  const watchFn = useCallback(
+    (_: WatchRecoveryStatusRequest, signal: AbortSignal) =>
+      sessionValue?.systemStatus.watchRecoveryStatus(signal) ?? null,
+    [sessionValue],
+  )
+
+  const resp = useWatchStateRpc(
+    watchFn,
+    {},
+    WatchRecoveryStatusRequest.equals,
+    WatchRecoveryStatusResponse.equals,
+  )
+
+  return resp ? (resp.status ?? {}) : null
+}

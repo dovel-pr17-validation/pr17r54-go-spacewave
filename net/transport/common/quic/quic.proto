@@ -1,0 +1,39 @@
+syntax = "proto3";
+package transport.quic;
+
+message Opts {
+  // MaxIdleTimeoutDur is the duration of idle after which conn is closed.
+  //
+  // Defaults to 10s.
+  string max_idle_timeout_dur = 1;
+	// MaxIncomingStreams is the maximum number of concurrent bidirectional
+	// streams that a peer is allowed to open.
+  //
+  // If unset or negative, defaults to 100000.
+  int32 max_incoming_streams = 2;
+  // DisableKeepAlive disables the keep alive packets.
+  //
+  bool disable_keep_alive = 3;
+  // KeepAliveDur is the duration between keep-alive pings.
+  //
+  // If disable_keep_alive is set, this value is ignored.
+  // If unset, sets keep-alive to half of MaxIdleTimeout.
+  string keep_alive_dur = 7;
+  // DisableDatagrams disables the unreliable datagrams feature.
+  // Both peers must support it for it to be enabled, regardless of this flag.
+  bool disable_datagrams = 4;
+  // DisablePathMtuDiscovery disables sending packets to discover max packet size.
+  bool disable_path_mtu_discovery = 5;
+  // Verbose indicates to use verbose logging.
+  // Note: this is VERY verbose, logs every packet sent.
+  bool verbose = 6;
+  // InitialPacketSize is the packet size used before path MTU discovery, and
+  // the only size when discovery is disabled. Transports that carry each
+  // packet as one message without an IP path MTU, such as WebSocket, set the
+  // largest size QUIC allows, which is 1452 bytes.
+  //
+  // Values above the largest size use the largest size.
+  // If unset, defaults to 1200, which fits every IP path including tunnels
+  // with a 1280 byte MTU.
+  uint32 initial_packet_size = 8;
+}

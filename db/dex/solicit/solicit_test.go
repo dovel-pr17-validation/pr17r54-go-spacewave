@@ -1,0 +1,50 @@
+package dex_solicit_test
+
+import (
+	"testing"
+
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller/configset"
+	csp "github.com/aperturerobotics/controllerbus/controller/configset/proto"
+	"github.com/s4wave/spacewave/db/bucket"
+	lc "github.com/s4wave/spacewave/db/bucket/lookup/concurrent"
+	ee "github.com/s4wave/spacewave/db/dex/e2e"
+	dex_solicit "github.com/s4wave/spacewave/db/dex/solicit"
+	"github.com/s4wave/spacewave/db/testbed"
+
+	link_solicit_controller "github.com/s4wave/spacewave/net/link/solicit/controller"
+)
+
+func TestSolicitE2E_DEX(t *testing.T) {
+	ee.TestMultiNodeDEX(
+		t,
+		func(bc *bucket.Config) error {
+			// Configure concurrent bucket lookup to wait for network blocks.
+			lookupConf := &lc.Config{
+				NotFoundBehavior:  lc.NotFoundBehavior_NotFoundBehavior_LOOKUP_DIRECTIVE_WAIT,
+				PutBlockBehavior:  lc.PutBlockBehavior_PutBlockBehavior_ALL,
+				WritebackBehavior: lc.WritebackBehavior_WritebackBehavior_ALL,
+			}
+			cc, err := csp.NewControllerConfig(configset.NewControllerConfig(1, lookupConf), false)
+			if err != nil {
+				return err
+			}
+			bc.Lookup = &bucket.LookupConfig{
+				Controller: cc,
+			}
+			return nil
+		},
+		func(t *testbed.Testbed, bc *bucket.Config) ([]config.Config, error) {
+			// Register factories for solicitation and DEX controllers.
+			t.StaticResolver.AddFactory(link_solicit_controller.NewFactory())
+			t.StaticResolver.AddFactory(dex_solicit.NewFactory(t.Bus))
+			return []config.Config{
+				&link_solicit_controller.Config{},
+				&dex_solicit.Config{
+					BucketId: bc.GetId(),
+				},
+			}, nil
+		},
+		ee.RetainStored,
+	)
+}

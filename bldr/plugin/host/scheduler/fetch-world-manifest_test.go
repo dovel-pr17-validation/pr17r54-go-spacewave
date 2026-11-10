@@ -1,0 +1,4942 @@
+package plugin_host_scheduler
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller"
+	configset "github.com/aperturerobotics/controllerbus/controller/configset"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/promise"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/go-git/go-billy/v6/memfs"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	bldr_plugin_host "github.com/s4wave/spacewave/bldr/plugin/host"
+	plugin_host_controller "github.com/s4wave/spacewave/bldr/plugin/host/controller"
+	"github.com/s4wave/spacewave/db/block"
+	block_mock "github.com/s4wave/spacewave/db/block/mock"
+	block_store "github.com/s4wave/spacewave/db/block/store"
+	block_store_controller "github.com/s4wave/spacewave/db/block/store/controller"
+	block_store_kvtx "github.com/s4wave/spacewave/db/block/store/kvtx"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	transform_gzip "github.com/s4wave/spacewave/db/block/transform/gzip"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	lookup_concurrent "github.com/s4wave/spacewave/db/bucket/lookup/concurrent"
+	"github.com/s4wave/spacewave/db/dex"
+	store_kvkey "github.com/s4wave/spacewave/db/store/kvkey"
+	store_kvtx_inmem "github.com/s4wave/spacewave/db/store/kvtx/inmem"
+	"github.com/s4wave/spacewave/db/testbed"
+	"github.com/s4wave/spacewave/db/unixfs"
+	"github.com/s4wave/spacewave/db/volume"
+	"github.com/s4wave/spacewave/db/world"
+	world_block "github.com/s4wave/spacewave/db/world/block"
+	"github.com/s4wave/spacewave/net/hash"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+func TestDirectFetchHandlerPreservesCurrentStateAcrossEmptyGap(t *testing.T) {
+	// Create the test logger.
+	le := logrus.NewEntry(logrus.New())
+	host1 := &testPluginHost{id: "desktop/linux/amd64"}
+	host2 := &testPluginHost{id: "desktop/linux/amd64"}
+	pi := &pluginInstance{
+		c: &Controller{
+			conf: &Config{},
+		},
+		le:                      le,
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	handler := pi.newDirectFetchHandler(context.Background(), &pluginHostSet{pluginHosts: []bldr_plugin_host.PluginHost{host1}})
+
+	// Build the fetch manifest value for the handler.
+	val1 := bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{
+		newTestManifestRef("spacewave-app", "desktop/linux/amd64", 1, "bucket-1"),
+	})
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(1, val1))
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.pluginHost != host1 || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state to be set from first fetched manifest")
+	}
+	if execState.manifestSnapshot.GetManifestRef() == nil {
+		t.Fatal("expected manifest snapshot ref to be set")
+	}
+
+	// Remove the manifest value from the handler.
+	handler.HandleValueRemoved(nil, directive.NewAttachedValue(1, val1))
+
+	// Check the execute plugin routine state.
+	execState = pi.executePluginRoutine.GetState()
+	if execState == nil || execState.pluginHost != host1 {
+		t.Fatal("expected execute state to remain during empty fetch-manifest gap")
+	}
+	if pi.downloadManifestRoutine.GetState() == nil {
+		t.Fatal("expected download manifest state to remain during empty fetch-manifest gap")
+	}
+	originalExecState := execState
+
+	// Publish the manifest value to the handler.
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(1, val1))
+
+	// Check the execute plugin routine state.
+	execState = pi.executePluginRoutine.GetState()
+	if execState != originalExecState {
+		t.Fatal("expected re-adding the same manifest target to avoid resetting execute state")
+	}
+
+	// Build the fetch manifest value for the handler.
+	val2 := bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{
+		newTestManifestRef("spacewave-app", "desktop/linux/amd64", 2, "bucket-2"),
+	})
+	handler = pi.newDirectFetchHandler(context.Background(), &pluginHostSet{pluginHosts: []bldr_plugin_host.PluginHost{host2}})
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(2, val2))
+
+	// Check the execute plugin routine state.
+	execState = pi.executePluginRoutine.GetState()
+	if execState == nil || execState.pluginHost != host2 {
+		t.Fatal("expected execute state to update to replacement plugin host")
+	}
+	if execState.manifestSnapshot.GetManifestRef() == nil {
+		t.Fatal("expected replacement manifest snapshot ref to be set")
+	}
+}
+
+func TestDirectFetchHandlerSuppressesConfiguredBucketOnly(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+	const noCopyBucketID = "dist/project"
+	const worldBucketID = "plugin-host-world"
+	host := &testPluginHost{id: "desktop/linux/amd64"}
+	pi := &pluginInstance{
+		c: &Controller{
+			conf: &Config{EngineId: worldBucketID, NoCopyBucketIds: []string{noCopyBucketID}},
+		},
+		le:                      le,
+		manifestCopyStatus:      ccontainer.NewCContainer[*manifestCopyStatus](nil),
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	handler := pi.newDirectFetchHandler(ctx, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	})
+
+	// Build the fetch manifest value for the handler.
+	suppressed := bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{
+		newTestManifestRef("spacewave-app", "desktop/linux/amd64", 1, noCopyBucketID),
+	})
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(1, suppressed))
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected configured no-copy manifest to remain executable")
+	}
+	if pi.downloadManifestRoutine.GetState() != nil {
+		t.Fatal("configured no-copy manifest set download state")
+	}
+	status := pi.manifestCopyStatus.GetValue()
+	if status == nil ||
+		status.phase != manifestCopyPhaseSuppressed ||
+		status.class != manifestCopyClassSuppressed ||
+		status.sourceBucketID != noCopyBucketID ||
+		status.destinationBucketID != worldBucketID {
+		t.Fatalf("suppressed copy status = %#v", status)
+	}
+
+	// Build the fetch manifest value for the handler.
+	dynamic := bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{
+		newTestManifestRef("spacewave-app", "desktop/linux/amd64", 2, "dynamic-provider"),
+	})
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(2, dynamic))
+
+	// Check the download manifest routine state.
+	downloadState := pi.downloadManifestRoutine.GetState()
+	if downloadState == nil || downloadState.GetManifestRef().GetBucketId() != "dynamic-provider" {
+		t.Fatalf("dynamic download state = %#v, want dynamic provider", downloadState)
+	}
+}
+
+func TestDirectFetchHandlerPrefersCurrentStateAcrossEqualRevOverlap(t *testing.T) {
+	// Create the test logger.
+	le := logrus.NewEntry(logrus.New())
+	host := &testPluginHost{id: "desktop/linux/amd64"}
+	pi := &pluginInstance{
+		c: &Controller{
+			conf: &Config{},
+		},
+		le:                      le,
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	handler := pi.newDirectFetchHandler(context.Background(), &pluginHostSet{pluginHosts: []bldr_plugin_host.PluginHost{host}})
+
+	// Build the fetch manifest value for the handler.
+	val1 := bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{
+		newTestManifestRef("spacewave-app", "desktop/linux/amd64", 7, "bucket-a"),
+	})
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(1, val1))
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state after first manifest")
+	}
+	firstRef := execState.manifestSnapshot.GetManifestRef()
+	if firstRef == nil {
+		t.Fatal("expected first manifest ref")
+	}
+
+	// Build the fetch manifest value for the handler.
+	val2 := bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{
+		newTestManifestRef("spacewave-app", "desktop/linux/amd64", 7, "bucket-b"),
+	})
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(2, val2))
+
+	// Check the execute plugin routine state.
+	execState = pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state during equal-rev overlap")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(firstRef) {
+		t.Fatal("expected equal-rev overlap to preserve the current execute target")
+	}
+
+	// Remove the manifest value from the handler.
+	handler.HandleValueRemoved(nil, directive.NewAttachedValue(1, val1))
+
+	// Check the execute plugin routine state.
+	execState = pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state after removing original candidate")
+	}
+	if execState.manifestSnapshot.GetManifestRef().EqualVT(firstRef) {
+		t.Fatal("expected execute target to switch once the original candidate is removed")
+	}
+}
+
+func TestExecutePluginArgsEqualHandlesNilManifestRefs(t *testing.T) {
+	if !executePluginArgsEqual(
+		&executePluginArgs{manifestSnapshot: &bldr_manifest.ManifestSnapshot{}},
+		&executePluginArgs{manifestSnapshot: &bldr_manifest.ManifestSnapshot{}},
+	) {
+		t.Fatal("expected args with nil manifest refs to compare equal")
+	}
+
+	withRef := &executePluginArgs{
+		manifestSnapshot: &bldr_manifest.ManifestSnapshot{
+			ManifestRef: &bucket.ObjectRef{BucketId: "bucket"},
+		},
+	}
+	withoutRef := &executePluginArgs{manifestSnapshot: &bldr_manifest.ManifestSnapshot{}}
+	if executePluginArgsEqual(withRef, withoutRef) {
+		t.Fatal("expected args with one nil manifest ref to differ")
+	}
+}
+
+func TestExecutePluginArgsEqualIgnoresBucketForSameManifestRoot(t *testing.T) {
+	// Build the root block ref for the fixture.
+	rootRef := block.NewBlockRef(hash.NewHash(hash.HashType_HashType_BLAKE3, []byte{1, 2, 3}))
+	remote := &executePluginArgs{
+		manifestSnapshot: &bldr_manifest.ManifestSnapshot{
+			ManifestRef: &bucket.ObjectRef{
+				BucketId: "remote",
+				RootRef:  rootRef.Clone(),
+			},
+		},
+	}
+	local := &executePluginArgs{
+		manifestSnapshot: &bldr_manifest.ManifestSnapshot{
+			ManifestRef: &bucket.ObjectRef{
+				BucketId: "local",
+				RootRef:  rootRef.Clone(),
+			},
+		},
+	}
+	if !executePluginArgsEqual(remote, local) {
+		t.Fatal("expected local manifest copy to preserve execute state")
+	}
+
+	// Create the test logger.
+	le := logrus.NewEntry(logrus.New())
+	ctr := routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le)
+	ctr.SetState(remote)
+	if _, changed, _, _ := ctr.SetState(local); changed {
+		t.Fatal("expected local manifest copy not to reset the execute routine")
+	}
+
+	// Clone the root ref for the changed manifest.
+	changedRoot := rootRef.Clone()
+	changedRoot.Hash.Hash[0] ^= 0xff
+	local.manifestSnapshot.ManifestRef.RootRef = changedRoot
+	if executePluginArgsEqual(remote, local) {
+		t.Fatal("expected a changed manifest root to reset execute state")
+	}
+}
+
+func TestFilterPluginPlatformIDsHonorsPlatformPolicy(t *testing.T) {
+	// Build the platform allowlist config.
+	conf := webPlatformAllowlistConfig("spacewave-v86")
+	got := conf.FilterPluginPlatformIDs("spacewave-core", []string{
+		"js",
+		"web/js/wasm",
+		"desktop/darwin/arm64",
+	})
+	want := []string{"js", "desktop/darwin/arm64"}
+	if len(got) != len(want) {
+		t.Fatalf("platform ids: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("platform ids: got %v, want %v", got, want)
+		}
+	}
+
+	// Filter the platform ids through the config.
+	got = conf.FilterPluginPlatformIDs("spacewave-v86", []string{"js", "web/js/wasm"})
+	want = []string{"js", "web/js/wasm"}
+	if len(got) != len(want) {
+		t.Fatalf("allowed platform ids: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("allowed platform ids: got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestFilterPluginPlatformIDsHonorsDeniedPlugins(t *testing.T) {
+	conf := &Config{PlatformSelectionPolicies: []*PlatformSelectionPolicy{{
+		PlatformId:      "web/js/wasm",
+		DeniedPluginIds: []string{"core"},
+	}}}
+	platforms := []string{"js", "web/js/wasm"}
+	if got, want := conf.FilterPluginPlatformIDs("core", platforms), []string{"js"}; !slices.Equal(got, want) {
+		t.Fatalf("denied plugin platforms = %v, want %v", got, want)
+	}
+	if got := conf.FilterPluginPlatformIDs("external", platforms); !slices.Equal(got, platforms) {
+		t.Fatalf("unlisted plugin platforms = %v, want %v", got, platforms)
+	}
+}
+
+func TestDirectFetchHandlerFiltersWebPlatformForUnlistedPlugin(t *testing.T) {
+	// Create the test logger.
+	le := logrus.NewEntry(logrus.New())
+	webHost := &testPluginHost{id: "web/js/wasm"}
+	jsHost := &testPluginHost{id: "js"}
+	pi := &pluginInstance{
+		c: &Controller{
+			conf: webPlatformAllowlistConfig("spacewave-v86"),
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	handler := pi.newDirectFetchHandler(context.Background(), &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{jsHost, webHost},
+	})
+
+	// Publish the manifest value to the handler.
+	handler.HandleValueAdded(nil, directive.NewAttachedValue(1, bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{
+		newTestManifestRef("spacewave-core", "web/js/wasm", 99, "bucket-web"),
+		newTestManifestRef("spacewave-core", "js", 1, "bucket-js"),
+	})))
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.pluginHost != jsHost {
+		t.Fatal("expected unlisted plugin to use js fallback instead of web/js/wasm")
+	}
+}
+
+func TestFetchManifestValueStorerRepairsMissingManifestLink(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	ref := newTestStoredManifestRef(t, ctx, tb, "spacewave-core", "desktop/darwin/arm64", 1)
+	manifestKey := bldr_manifest.NewManifestArtifactKey(ref.GetManifestRef())
+	if _, _, err := bldr_manifest_world.SetManifest(ctx, ws, peer.ID("test"), manifestKey, ref.GetManifestRef()); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors = %v", errs)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected orphaned manifest to be unreachable, got %d", len(got))
+	}
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	pi := &pluginInstance{
+		c: &Controller{
+			objKey:        objKey,
+			peerID:        peer.ID("test"),
+			worldStateCtr: ccontainer.NewCContainer(wsv),
+		},
+		le: le,
+	}
+	storer := &fetchManifestValueStorer{
+		pi:     pi,
+		value:  promise.NewPromiseWithResult(bldr_manifest.NewFetchManifestValue([]*bldr_manifest.ManifestRef{ref}), nil),
+		refIdx: 0,
+	}
+	if err := storer.execFetchManifestValueStorer(ctx); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err = bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors = %v", errs)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected repaired manifest link, got %d", len(got))
+	}
+	if !got[0].ManifestRef.EqualVT(ref.GetManifestRef()) {
+		t.Fatal("manifest ref changed during repair")
+	}
+}
+
+func TestWatchWorldManifestUsesStartupManifestRefsAndSkipsBadCandidate(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	goodRef := newTestStoredManifestRef(t, ctx, tb, "spacewave-core", "desktop/darwin/arm64", 7)
+	const goodRefKey = "plugin-host/ref/good"
+	storeTestManifestRefObject(t, ctx, ws, goodRefKey, goodRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, goodRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	badRef := newTestStoredManifestRef(t, ctx, tb, "spacewave-core", "desktop/darwin/arm64", 9)
+	badRef.GetManifestRef().RootRef.Hash.Hash[0] ^= 0xff
+	const badRefKey = "plugin-host/ref/missing"
+	storeTestManifestRefObject(t, ctx, ws, badRefKey, badRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, badRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state from good startup manifest ref")
+	}
+	if execState.pluginHost != host {
+		t.Fatal("expected execute state to use matching plugin host")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(goodRef.GetManifestRef()) {
+		t.Fatal("expected skipped bad ref not to clear the good execute candidate")
+	}
+}
+
+func TestWatchWorldManifestFiltersWebPlatformForUnlistedPlugin(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a manifest in the test World.
+	webRef, webRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "web/js/wasm", 99)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, webRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+	jsRef, jsRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "js", 1)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, jsRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+	_ = webRef
+
+	// Create the plugin host fixture.
+	webHost := &testPluginHost{id: "web/js/wasm"}
+	jsHost := &testPluginHost{id: "js"}
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   webPlatformAllowlistConfig("spacewave-v86"),
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{jsHost, webHost},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.pluginHost != jsHost {
+		t.Fatal("expected unlisted startup plugin to use js fallback")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(jsRef.GetManifestRef()) {
+		t.Fatal("expected unlisted startup plugin not to select web/js/wasm manifest")
+	}
+}
+
+func TestWatchWorldManifestExecutesBootstrapManifestAndRecordsUnreadableRetainedRef(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a manifest in the test World.
+	bootstrapRef, bootstrapRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "desktop/darwin/arm64", 7)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, bootstrapRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Retain the manifest reference.
+	retainedRef := newTestStoredManifestRef(t, ctx, tb, "other-plugin", "desktop/darwin/arm64", 9)
+	const retainedRefKey = "plugin-host/ref/unreadable-retained"
+	storeTestManifestRefObject(t, ctx, ws, retainedRefKey, retainedRef)
+	corruptTestWorldObjectRoot(t, ctx, ws, retainedRefKey)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, retainedRefKey, "")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	ctrl := &Controller{
+		bus:    tb.Bus,
+		conf:   &Config{},
+		objKey: objKey,
+		pluginStatusCtr: ccontainer.NewCContainerWithEqual(
+			&bldr_plugin.PluginStatusSnapshot{},
+			(*bldr_plugin.PluginStatusSnapshot).EqualVT,
+		),
+		pluginStatus: make(map[string]*bldr_plugin.PluginStatus),
+	}
+	pi := &pluginInstance{
+		c:                       ctrl,
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state from readable bootstrap manifest")
+	}
+	if execState.pluginHost != host {
+		t.Fatal("expected execute state to use matching plugin host")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(bootstrapRef.GetManifestRef()) {
+		t.Fatal("expected unreadable retained ref not to clear the bootstrap execute candidate")
+	}
+
+	// Check the plugin status.
+	status := ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 1 {
+		t.Fatalf("expected one plugin status, got %d", len(status.Plugins))
+	}
+	lastError := status.Plugins[0].GetLastErrorMessage()
+	if !strings.Contains(lastError, "startup manifest refs: 1 skipped startup manifest ref(s)") {
+		t.Fatalf("unexpected retained-ref diagnostic: %q", lastError)
+	}
+	if !strings.Contains(lastError, retainedRefKey) {
+		t.Fatalf("retained-ref diagnostic %q does not mention ref key %q", lastError, retainedRefKey)
+	}
+}
+
+func TestWatchWorldManifestExecutesReadableLauncherWithUnavailableRetainedReleaseCdnCandidate(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "spacewave/launcher"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store the launcher manifest reference.
+	launcherRef, launcherRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-launcher", "desktop/darwin/arm64", 12)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, launcherRefKey, "spacewave-launcher")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Retain the manifest reference.
+	retainedRef := newTestStoredManifestRef(t, ctx, tb, "spacewave-launcher", "desktop/darwin/arm64", 13)
+	retainedRef.GetManifestRef().BucketId = "spacewave-cdn-release-retained"
+	const retainedRefKey = "release/manifests/spacewave-launcher/desktop/darwin/arm64/cdn-retained"
+	storeTestManifestRefObject(t, ctx, ws, retainedRefKey, retainedRef)
+	retainedEdge := bldr_manifest_world.NewManifestQuad(objKey, retainedRefKey, "")
+	if err := ws.SetGraphQuad(ctx, retainedEdge); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	ctrl := &Controller{
+		bus:    tb.Bus,
+		conf:   &Config{},
+		objKey: objKey,
+		pluginStatusCtr: ccontainer.NewCContainerWithEqual(
+			&bldr_plugin.PluginStatusSnapshot{},
+			(*bldr_plugin.PluginStatusSnapshot).EqualVT,
+		),
+		pluginStatus: make(map[string]*bldr_plugin.PluginStatus),
+	}
+	pi := &pluginInstance{
+		c:                       ctrl,
+		le:                      le,
+		pluginID:                "spacewave-launcher",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected launcher manifest store object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state from readable launcher candidate")
+	}
+	if execState.pluginHost != host {
+		t.Fatal("expected execute state to use matching plugin host")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(launcherRef.GetManifestRef()) {
+		t.Fatal("expected unavailable retained release/CDN candidate not to replace the readable launcher candidate")
+	}
+
+	// Check the plugin status.
+	status := ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 1 {
+		t.Fatalf("expected one plugin status, got %d", len(status.Plugins))
+	}
+	lastError := status.Plugins[0].GetLastErrorMessage()
+	if !strings.Contains(lastError, "startup manifest refs: 1 skipped startup manifest ref(s)") {
+		t.Fatalf("unexpected retained release/CDN diagnostic: %q", lastError)
+	}
+	if !strings.Contains(lastError, retainedRefKey) {
+		t.Fatalf("retained release/CDN diagnostic %q does not mention ref key %q", lastError, retainedRefKey)
+	}
+	if !strings.Contains(lastError, "bucket=spacewave-cdn-release-retained") {
+		t.Fatalf("retained release/CDN diagnostic %q does not mention missing CDN bucket", lastError)
+	}
+
+	// Assert the expected state.
+	if err := ws.DeleteGraphQuad(ctx, retainedEdge); err != nil {
+		t.Fatal(err.Error())
+	}
+	deleted, err := ws.DeleteObject(ctx, retainedRefKey)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !deleted {
+		t.Fatal("expected retained release ref object to be deleted")
+	}
+
+	// Process the manifest World state.
+	wait, _, err = pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// The watch loop must wait for changes after pruning.
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes after pruning")
+	}
+
+	// Check the execute plugin routine state.
+	execState = pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected readable launcher candidate to remain selected after pruning")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(launcherRef.GetManifestRef()) {
+		t.Fatal("expected pruned scan to keep the readable launcher candidate")
+	}
+	status = ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 1 {
+		t.Fatalf("expected existing plugin status to remain, got %d", len(status.Plugins))
+	}
+	if lastError = status.Plugins[0].GetLastErrorMessage(); lastError != "" {
+		t.Fatalf("expected startup manifest skip status to clear after pruning, got %q", lastError)
+	}
+}
+
+func TestWatchWorldManifestIgnoresWrongPlatformRetainedRefAndSelectsCurrent(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a manifest in the test World.
+	currentRef, currentRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "desktop/darwin/arm64", 7)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, currentRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	ignoredRef := newTestStoredManifestRef(t, ctx, tb, "spacewave-core", "desktop/linux/amd64", 99)
+	const ignoredRefKey = "plugin-host/ref/wrong-platform"
+	storeTestManifestRefObject(t, ctx, ws, ignoredRefKey, ignoredRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, ignoredRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	ctrl := &Controller{
+		bus:    tb.Bus,
+		conf:   &Config{},
+		objKey: objKey,
+		pluginStatusCtr: ccontainer.NewCContainerWithEqual(
+			&bldr_plugin.PluginStatusSnapshot{},
+			(*bldr_plugin.PluginStatusSnapshot).EqualVT,
+		),
+		pluginStatus: make(map[string]*bldr_plugin.PluginStatus),
+	}
+	pi := &pluginInstance{
+		c:                       ctrl,
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state from current platform candidate")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(currentRef.GetManifestRef()) {
+		t.Fatal("expected wrong-platform retained ref to be ignored during execute selection")
+	}
+	if downloadState := pi.downloadManifestRoutine.GetState(); downloadState != nil &&
+		downloadState.GetManifestRef().EqualVT(ignoredRef.GetManifestRef()) {
+		t.Fatal("expected wrong-platform retained ref not to be scheduled for download")
+	}
+
+	// Check the plugin status.
+	status := ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 0 {
+		t.Fatalf("expected ignored retained ref not to surface as a skip error, got %+v", status.Plugins)
+	}
+	{
+		objectState, ok, err := ws.GetObject(ctx, ignoredRefKey)
+		world.ReleaseObjectState(objectState)
+		if err != nil {
+			t.Fatal(err.Error())
+		} else if !ok {
+			t.Fatal("expected ignored retained ref to remain in the graph")
+		}
+	}
+}
+
+func TestWatchWorldManifestQuarantinesWrongManifestIDRetainedRef(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a manifest in the test World.
+	currentRef, currentRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "desktop/darwin/arm64", 7)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, currentRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	quarantinedRef := newTestStoredManifestRef(t, ctx, tb, "other-plugin", "desktop/darwin/arm64", 99)
+	const quarantinedRefKey = "plugin-host/ref/wrong-manifest-id"
+	storeTestManifestRefObject(t, ctx, ws, quarantinedRefKey, quarantinedRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, quarantinedRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	ctrl := &Controller{
+		bus:    tb.Bus,
+		conf:   &Config{},
+		objKey: objKey,
+		pluginStatusCtr: ccontainer.NewCContainerWithEqual(
+			&bldr_plugin.PluginStatusSnapshot{},
+			(*bldr_plugin.PluginStatusSnapshot).EqualVT,
+		),
+		pluginStatus: make(map[string]*bldr_plugin.PluginStatus),
+	}
+	pi := &pluginInstance{
+		c:                       ctrl,
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state from compatible current candidate")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(currentRef.GetManifestRef()) {
+		t.Fatal("expected quarantined retained ref not to replace current execute candidate")
+	}
+	if downloadState := pi.downloadManifestRoutine.GetState(); downloadState != nil &&
+		downloadState.GetManifestRef().EqualVT(quarantinedRef.GetManifestRef()) {
+		t.Fatal("expected quarantined retained ref not to be scheduled for download")
+	}
+
+	// Check the plugin status.
+	status := ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 1 {
+		t.Fatalf("expected one plugin status, got %d", len(status.Plugins))
+	}
+	lastError := status.Plugins[0].GetLastErrorMessage()
+	for _, want := range []string{
+		"startup manifest refs: 1 skipped startup manifest ref(s)",
+		quarantinedRefKey,
+		"quarantined",
+		"manifest-id-mismatch:other-plugin",
+	} {
+		if !strings.Contains(lastError, want) {
+			t.Fatalf("quarantine diagnostic %q does not contain %q", lastError, want)
+		}
+	}
+	{
+		objectState, ok, err := ws.GetObject(ctx, quarantinedRefKey)
+		world.ReleaseObjectState(objectState)
+		if err != nil {
+			t.Fatal(err.Error())
+		} else if !ok {
+			t.Fatal("expected quarantined retained ref to remain in the graph")
+		}
+	}
+}
+
+func TestWatchWorldManifestClearsSkippedRefStatusAfterBucketFix(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "spacewave/launcher"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store the launcher manifest reference.
+	launcherRef, launcherRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-launcher", "desktop/darwin/arm64", 12)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, launcherRefKey, "spacewave-launcher")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Retain the manifest reference.
+	retainedRef := newTestStoredManifestRef(t, ctx, tb, "spacewave-launcher", "desktop/darwin/arm64", 11)
+	retainedRef.GetManifestRef().BucketId = "missing-retained-bucket"
+	const retainedRefKey = "release/manifests/spacewave-launcher/desktop/darwin/arm64/fixable-retained"
+	storeTestManifestRefObject(t, ctx, ws, retainedRefKey, retainedRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, retainedRefKey, "")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	ctrl := &Controller{
+		bus:    tb.Bus,
+		conf:   &Config{},
+		objKey: objKey,
+		pluginStatusCtr: ccontainer.NewCContainerWithEqual(
+			&bldr_plugin.PluginStatusSnapshot{},
+			(*bldr_plugin.PluginStatusSnapshot).EqualVT,
+		),
+		pluginStatus: make(map[string]*bldr_plugin.PluginStatus),
+	}
+	pi := &pluginInstance{
+		c:                       ctrl,
+		le:                      le,
+		pluginID:                "spacewave-launcher",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected launcher manifest store object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state from readable launcher candidate")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(launcherRef.GetManifestRef()) {
+		t.Fatal("expected missing-bucket retained ref not to replace readable launcher candidate")
+	}
+	status := ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 1 {
+		t.Fatalf("expected one plugin status, got %d", len(status.Plugins))
+	}
+	lastError := status.Plugins[0].GetLastErrorMessage()
+	if !strings.Contains(lastError, "startup manifest refs: 1 skipped startup manifest ref(s)") {
+		t.Fatalf("unexpected retained-ref diagnostic: %q", lastError)
+	}
+	if !strings.Contains(lastError, "bucket=missing-retained-bucket") {
+		t.Fatalf("retained-ref diagnostic %q does not mention missing bucket", lastError)
+	}
+
+	// Retain the manifest reference.
+	retainedRef.GetManifestRef().BucketId = tb.BucketId
+	storeTestManifestRefObject(t, ctx, ws, retainedRefKey, retainedRef)
+
+	// Process the manifest World state.
+	wait, _, err = pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// The watch loop must wait for changes after the bucket fix.
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes after bucket fix")
+	}
+
+	// Check the execute plugin routine state.
+	execState = pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected readable launcher candidate to remain selected after bucket fix")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(launcherRef.GetManifestRef()) {
+		t.Fatal("expected fixed lower-rev retained ref not to replace readable launcher candidate")
+	}
+	status = ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 1 {
+		t.Fatalf("expected existing plugin status to remain, got %d", len(status.Plugins))
+	}
+	if lastError = status.Plugins[0].GetLastErrorMessage(); lastError != "" {
+		t.Fatalf("expected startup manifest skip status to clear after bucket fix, got %q", lastError)
+	}
+}
+
+func TestWatchWorldManifestLauncherStartsAfterPruningUnavailableRetainedReleaseRef(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "spacewave/launcher"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store the launcher manifest reference.
+	launcherRef, launcherRefKey := storeTestWorldManifest(t, ctx, ws, "spacewave-launcher", "desktop/darwin/arm64", 12)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, launcherRefKey, "spacewave-launcher")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Retain the manifest reference.
+	retainedRef := newTestStoredManifestRef(t, ctx, tb, "spacewave-launcher", "desktop/darwin/arm64", 13)
+	retainedRef.GetManifestRef().BucketId = "spacewave-cdn-release-retained"
+	const retainedRefKey = "release/manifests/spacewave-launcher/desktop/darwin/arm64/cdn-retained"
+	storeTestManifestRefObject(t, ctx, ws, retainedRefKey, retainedRef)
+	retainedEdge := bldr_manifest_world.NewManifestQuad(objKey, retainedRefKey, "")
+	if err := ws.SetGraphQuad(ctx, retainedEdge); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err := bldr_manifest_world.CollectStartupManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-launcher",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(got) != 1 {
+		t.Fatalf("pre-prune manifest count = %d", len(got))
+	}
+	if len(errs) != 1 {
+		t.Fatalf("pre-prune manifest errors = %v", errs)
+	}
+	if !strings.Contains(errs[0].Error(), retainedRefKey) {
+		t.Fatalf("pre-prune error %q does not mention retained ref key %q", errs[0].Error(), retainedRefKey)
+	}
+	if !strings.Contains(errs[0].Error(), "spacewave-cdn-release-retained") {
+		t.Fatalf("pre-prune error %q does not mention missing retained bucket", errs[0].Error())
+	}
+
+	// Assert the expected state.
+	if err := ws.DeleteGraphQuad(ctx, retainedEdge); err != nil {
+		t.Fatal(err.Error())
+	}
+	deleted, err := ws.DeleteObject(ctx, retainedRefKey)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !deleted {
+		t.Fatal("expected retained release ref object to be deleted")
+	}
+	objectState, ok, err := ws.GetObject(ctx, launcherRefKey)
+	world.ReleaseObjectState(objectState)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected launcher manifest object to remain after pruning retained ref")
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err = bldr_manifest_world.CollectStartupManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-launcher",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(errs) != 0 {
+		t.Fatalf("post-prune manifest errors = %v", errs)
+	}
+	if len(got) != 1 {
+		t.Fatalf("post-prune manifest count = %d", len(got))
+	}
+	if !got[0].ManifestRef.EqualVT(launcherRef.GetManifestRef()) {
+		t.Fatal("expected post-prune startup discovery to keep the readable launcher ref")
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	ctrl := &Controller{
+		bus:    tb.Bus,
+		conf:   &Config{},
+		objKey: objKey,
+		pluginStatusCtr: ccontainer.NewCContainerWithEqual(
+			&bldr_plugin.PluginStatusSnapshot{},
+			(*bldr_plugin.PluginStatusSnapshot).EqualVT,
+		),
+		pluginStatus: make(map[string]*bldr_plugin.PluginStatus),
+	}
+	pi := &pluginInstance{
+		c:                       ctrl,
+		le:                      le,
+		pluginID:                "spacewave-launcher",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected launcher manifest store object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected launcher execute state after pruning unavailable retained ref")
+	}
+	if execState.pluginHost != host {
+		t.Fatal("expected execute state to use matching plugin host")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(launcherRef.GetManifestRef()) {
+		t.Fatal("expected pruned copied state to execute the readable launcher candidate")
+	}
+	status := ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 0 {
+		t.Fatalf("expected no skipped-ref status after pruning, got %d plugin statuses", len(status.Plugins))
+	}
+}
+
+func TestWatchWorldManifestRecordsCompactSkippedRefStatusWhenNoCandidate(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	badRef := newTestStoredManifestRef(t, ctx, tb, "spacewave-core", "desktop/darwin/arm64", 9)
+	badRef.GetManifestRef().RootRef.Hash.Hash[0] ^= 0xff
+	const badRefKey = "plugin-host/ref/missing"
+	storeTestManifestRefObject(t, ctx, ws, badRefKey, badRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, badRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	ctrl := &Controller{
+		bus:    tb.Bus,
+		conf:   &Config{},
+		objKey: objKey,
+		pluginStatusCtr: ccontainer.NewCContainerWithEqual(
+			&bldr_plugin.PluginStatusSnapshot{},
+			(*bldr_plugin.PluginStatusSnapshot).EqualVT,
+		),
+		pluginStatus: make(map[string]*bldr_plugin.PluginStatus),
+	}
+	pi := &pluginInstance{
+		c:                       ctrl,
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+	if pi.executePluginRoutine.GetState() != nil {
+		t.Fatal("expected execute state to remain unset")
+	}
+	if pi.downloadManifestRoutine.GetState() != nil {
+		t.Fatal("expected download state to remain unset")
+	}
+
+	// Check the plugin status.
+	status := ctrl.GetPluginStatusCtr().GetValue()
+	if len(status.Plugins) != 1 {
+		t.Fatalf("expected one plugin status, got %d", len(status.Plugins))
+	}
+	lastError := status.Plugins[0].GetLastErrorMessage()
+	if !strings.Contains(lastError, "1 skipped startup manifest ref(s)") {
+		t.Fatalf("unexpected compact skip status: %q", lastError)
+	}
+	if !strings.Contains(lastError, badRefKey) {
+		t.Fatalf("compact skip status %q does not mention bad ref key %q", lastError, badRefKey)
+	}
+}
+
+func TestWatchWorldManifestSelectsManifestClassPairsByRevision(t *testing.T) {
+	const (
+		manifestClassLocal   = "local"
+		manifestClassNoCopy  = "no-copy"
+		manifestClassDynamic = "dynamic-external"
+	)
+	tests := []struct {
+		name              string
+		newerClass        string
+		olderClass        string
+		wantExecuteClass  string
+		wantDownloadClass string
+	}{
+		{
+			name:             "newer local over older no-copy",
+			newerClass:       manifestClassLocal,
+			olderClass:       manifestClassNoCopy,
+			wantExecuteClass: manifestClassLocal,
+		},
+		{
+			name:              "newer no-copy over older local",
+			newerClass:        manifestClassNoCopy,
+			olderClass:        manifestClassLocal,
+			wantExecuteClass:  manifestClassNoCopy,
+			wantDownloadClass: manifestClassNoCopy,
+		},
+		{
+			name:             "newer local over older dynamic",
+			newerClass:       manifestClassLocal,
+			olderClass:       manifestClassDynamic,
+			wantExecuteClass: manifestClassLocal,
+		},
+		{
+			name:              "newer dynamic over older local",
+			newerClass:        manifestClassDynamic,
+			olderClass:        manifestClassLocal,
+			wantExecuteClass:  manifestClassLocal,
+			wantDownloadClass: manifestClassDynamic,
+		},
+		{
+			name:              "newer no-copy over older dynamic",
+			newerClass:        manifestClassNoCopy,
+			olderClass:        manifestClassDynamic,
+			wantExecuteClass:  manifestClassNoCopy,
+			wantDownloadClass: manifestClassNoCopy,
+		},
+		{
+			name:              "newer dynamic over older no-copy",
+			newerClass:        manifestClassDynamic,
+			olderClass:        manifestClassNoCopy,
+			wantExecuteClass:  manifestClassNoCopy,
+			wantDownloadClass: manifestClassDynamic,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Bound the test with a timeout.
+			ctx := context.Background()
+			le := logrus.NewEntry(logrus.New())
+
+			// Start the World testbed.
+			tb, err := testbed.NewTestbed(ctx, le)
+			if err != nil {
+				t.Fatal(err.Error())
+			}
+			defer tb.Release()
+
+			// Build an empty cursor for the World state.
+			ocs, err := tb.BuildEmptyCursor(ctx)
+			if err != nil {
+				t.Fatal(err.Error())
+			}
+			defer ocs.Release()
+
+			// Build the mock World state.
+			ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+			if err != nil {
+				t.Fatal(err.Error())
+			}
+
+			// Name the fixture constants.
+			const (
+				objKey          = "plugin-host"
+				noCopyBucketID  = "dist/project"
+				dynamicBucketID = "dynamic-provider"
+				manifestID      = "spacewave-core"
+				platformID      = "desktop/darwin/arm64"
+			)
+			if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+				t.Fatal(err.Error())
+			}
+
+			// Define the candidate store helper.
+			storeCandidate := func(class string, rev uint64) *bldr_manifest.ManifestRef {
+				// Declare the fixture state.
+				var ref *bldr_manifest.ManifestRef
+				var refKey string
+				switch class {
+				case manifestClassLocal:
+					ref, refKey = storeTestWorldManifest(
+						t,
+						ctx,
+						ws,
+						manifestID,
+						platformID,
+						rev,
+					)
+				case manifestClassNoCopy, manifestClassDynamic:
+					bucketID := dynamicBucketID
+					if class == manifestClassNoCopy {
+						bucketID = noCopyBucketID
+					}
+					ref = newTestStoredManifestRefInBucket(
+						t,
+						ctx,
+						tb,
+						bucketID,
+						manifestID,
+						platformID,
+						rev,
+					)
+					refKey = "plugin-host/ref/" + class
+					storeTestManifestRefObject(t, ctx, ws, refKey, ref)
+				default:
+					t.Fatalf("unknown manifest class %q", class)
+				}
+				if err := ws.SetGraphQuad(
+					ctx,
+					bldr_manifest_world.NewManifestQuad(objKey, refKey, manifestID),
+				); err != nil {
+					t.Fatal(err.Error())
+				}
+				return ref
+			}
+
+			// Map the fixture manifest refs by id.
+			refs := map[string]*bldr_manifest.ManifestRef{
+				tt.newerClass: storeCandidate(tt.newerClass, 9),
+				tt.olderClass: storeCandidate(tt.olderClass, 7),
+			}
+			host := &testPluginHost{id: platformID}
+			ctrl := &Controller{
+				bus: tb.Bus,
+				conf: &Config{
+					NoCopyBucketIds: []string{noCopyBucketID},
+				},
+				objKey: objKey,
+			}
+			pi := &pluginInstance{
+				c:                       ctrl,
+				le:                      le,
+				pluginID:                manifestID,
+				manifestCopyStatus:      ccontainer.NewCContainer[*manifestCopyStatus](nil),
+				downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+				executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+			}
+
+			// Fetch the object from the World state.
+			obj, ok, err := ws.GetObject(ctx, objKey)
+			defer world.ReleaseObjectState(obj)
+			if err != nil {
+				t.Fatal(err.Error())
+			}
+			if !ok {
+				t.Fatal("expected plugin host object")
+			}
+			wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+				pluginHosts: []bldr_plugin_host.PluginHost{host},
+			}, ws, obj)
+			if err != nil {
+				t.Fatal(err.Error())
+			}
+			if !wait {
+				t.Fatal("expected watch loop to wait for changes")
+			}
+
+			// Check the execute plugin routine state.
+			execState := pi.executePluginRoutine.GetState()
+			if execState == nil || execState.manifestSnapshot == nil {
+				t.Fatal("expected executable manifest selection")
+			}
+			wantExecuteRef := refs[tt.wantExecuteClass].GetManifestRef()
+			if !execState.manifestSnapshot.GetManifestRef().EqualVT(wantExecuteRef) {
+				t.Fatalf(
+					"execute ref = %s, want %s class ref %s",
+					execState.manifestSnapshot.GetManifestRef().MarshalString(),
+					tt.wantExecuteClass,
+					wantExecuteRef.MarshalString(),
+				)
+			}
+
+			// Check the plugin manifest recovery status.
+			recovery := ctrl.pluginManifestRecoveryStatus[pluginInstanceKey(manifestID, "")]
+			if recovery == nil {
+				t.Fatal("expected retained manifest selection status")
+			}
+			wantDownloadRef := ""
+			if tt.wantDownloadClass != "" {
+				wantDownloadRef = refs[tt.wantDownloadClass].GetManifestRef().MarshalB58()
+			}
+			if recovery.DownloadManifestRef != wantDownloadRef {
+				t.Fatalf(
+					"download candidate = %q, want %s class ref %q",
+					recovery.DownloadManifestRef,
+					tt.wantDownloadClass,
+					wantDownloadRef,
+				)
+			}
+
+			// Check the download manifest routine state.
+			downloadState := pi.downloadManifestRoutine.GetState()
+			if tt.wantDownloadClass == manifestClassDynamic {
+				wantDynamicRef := refs[manifestClassDynamic].GetManifestRef()
+				if downloadState == nil ||
+					!downloadState.GetManifestRef().EqualVT(wantDynamicRef) {
+					t.Fatalf("download state = %#v, want dynamic manifest", downloadState)
+				}
+			} else if downloadState != nil {
+				t.Fatalf("non-dynamic candidate unexpectedly scheduled a copy: %#v", downloadState)
+			}
+
+			// Assert the expected state.
+			if tt.wantDownloadClass == manifestClassNoCopy {
+				status := pi.manifestCopyStatus.GetValue()
+				if status == nil ||
+					status.phase != manifestCopyPhaseSuppressed ||
+					status.class != manifestCopyClassSuppressed ||
+					status.sourceBucketID != noCopyBucketID {
+					t.Fatalf("suppressed copy status = %#v", status)
+				}
+			}
+		})
+	}
+}
+
+func TestWatchWorldManifestFallsBackToBestDownloadWhenNoLocalExecutable(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	newerRef := newTestStoredManifestRefInBucket(t, ctx, tb, "remote-bucket", "spacewave-core", "desktop/darwin/arm64", 9)
+	const newerRefKey = "plugin-host/ref/remote-newer"
+	storeTestManifestRefObject(t, ctx, ws, newerRefKey, newerRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, newerRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	olderRef := newTestStoredManifestRefInBucket(t, ctx, tb, "remote-bucket", "spacewave-core", "desktop/darwin/arm64", 7)
+	const olderRefKey = "plugin-host/ref/remote-older"
+	storeTestManifestRefObject(t, ctx, ws, olderRefKey, olderRef)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, olderRefKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Process the manifest World state.
+	wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !wait {
+		t.Fatal("expected watch loop to wait for changes")
+	}
+
+	// Check the download manifest routine state.
+	downloadState := pi.downloadManifestRoutine.GetState()
+	if downloadState == nil {
+		t.Fatal("expected remote manifest to be queued for download")
+	}
+	if !downloadState.GetManifestRef().EqualVT(newerRef.GetManifestRef()) {
+		t.Fatal("expected newest remote manifest to be queued for download")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected execute state to fall back to downloadable manifest")
+	}
+	if execState.pluginHost != host {
+		t.Fatal("expected execute state to use matching plugin host")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(newerRef.GetManifestRef()) {
+		t.Fatal("expected no-local fallback to select newest downloadable manifest")
+	}
+}
+
+func TestProcessManifestWorldStateRunsDownloadAndExecuteForRemoteManifest(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const remoteBucketID = "remote-manifest-bucket"
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, &bucket.Config{
+		Id:  remoteBucketID,
+		Rev: 1,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	ref := newTestStoredManifestRefInBucket(t, ctx, tb, remoteBucketID, "spacewave-core", "desktop/darwin/arm64", 2)
+	var worldBucketID string
+	if err := ws.AccessWorldState(ctx, nil, func(cursor *bucket_lookup.Cursor) error {
+		worldBucketID = cursor.GetOpArgs().GetBucketId()
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	if ref.GetManifestRef().GetBucketId() == worldBucketID {
+		t.Fatal("test manifest must start in a non-local bucket")
+	}
+
+	// Build the manifest object key.
+	manifestKey := bldr_manifest.NewManifestArtifactKey(ref.GetManifestRef())
+	if err := bldr_manifest_world.ExStoreManifestOp(ctx, ws, peer.ID("test"), manifestKey, []string{objKey}, ref); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host manifest store object")
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		manifestCopyStatus:      ccontainer.NewCContainer[*manifestCopyStatus](nil),
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// Process the manifest World state.
+	waitForChanges, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !waitForChanges {
+		t.Fatal("expected world manifest watch to continue")
+	}
+
+	// Check the download manifest routine state.
+	downloadState := pi.downloadManifestRoutine.GetState()
+	if downloadState == nil {
+		t.Fatal("expected remote manifest to schedule background DAG copy")
+	}
+	if !downloadState.GetManifestRef().EqualVT(ref.GetManifestRef()) {
+		t.Fatal("download manifest ref changed")
+	}
+
+	// Check the execute plugin routine state.
+	execState := pi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected remote manifest to be executable while copy runs")
+	}
+	if execState.pluginHost != host {
+		t.Fatal("expected execute state to use matching plugin host")
+	}
+	if !execState.manifestSnapshot.GetManifestRef().EqualVT(ref.GetManifestRef()) {
+		t.Fatal("execute manifest ref changed")
+	}
+	copyStatus := pi.manifestCopyStatus.GetValue()
+	if copyStatus == nil ||
+		copyStatus.phase != manifestCopyPhaseSelected ||
+		copyStatus.sourceBucketID != remoteBucketID ||
+		copyStatus.destinationBucketID == "" ||
+		copyStatus.sourceIdentity != manifestCopyIdentityExternal ||
+		copyStatus.destinationIdentity != manifestCopyIdentityLocal {
+		t.Fatalf("selected manifest accounting = %#v, want external source and local destination", copyStatus)
+	}
+	if execState.manifestSnapshot.GetManifest() == nil ||
+		!execState.manifestSnapshot.GetManifest().GetMeta().EqualVT(ref.GetMeta()) {
+		t.Fatal("execute manifest metadata changed")
+	}
+}
+
+func TestProcessManifestWorldStateSuppressesNoCopyBucketWhileDynamicManifestCopies(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	t.Cleanup(tb.Release)
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	t.Cleanup(ocs.Release)
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the fixture constants.
+	const (
+		objKey          = "plugin-host"
+		noCopyBucketID  = "dist/project"
+		dynamicBucketID = "dynamic-provider"
+		platformID      = "desktop/darwin/arm64"
+		suppressedID    = "embedded-plugin"
+		dynamicID       = "dynamic-plugin"
+	)
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+	for _, bucketID := range []string{noCopyBucketID, dynamicBucketID} {
+		if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, &bucket.Config{
+			Id:  bucketID,
+			Rev: 1,
+		}); err != nil {
+			t.Fatal(err.Error())
+		}
+	}
+
+	// Store a test manifest reference.
+	suppressedRef := newTestStoredManifestRefWithDistInBucket(
+		t,
+		ctx,
+		tb,
+		noCopyBucketID,
+		suppressedID,
+		platformID,
+		2,
+	)
+	dynamicRef := newTestStoredManifestRefWithDistInBucket(
+		t,
+		ctx,
+		tb,
+		dynamicBucketID,
+		dynamicID,
+		platformID,
+		2,
+	)
+	for _, ref := range []*bldr_manifest.ManifestRef{suppressedRef, dynamicRef} {
+		manifestKey := bldr_manifest.NewManifestArtifactKey(ref.GetManifestRef())
+		if err := bldr_manifest_world.ExStoreManifestOp(
+			ctx,
+			ws,
+			peer.ID("test"),
+			manifestKey,
+			[]string{objKey},
+			ref,
+		); err != nil {
+			t.Fatal(err.Error())
+		}
+	}
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host manifest store object")
+	}
+	var worldBucketID string
+	if err := ws.AccessWorldState(ctx, nil, func(cursor *bucket_lookup.Cursor) error {
+		worldBucketID = cursor.GetOpArgs().GetBucketId()
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	c := &Controller{
+		bus: tb.Bus,
+		conf: &Config{
+			NoCopyBucketIds: []string{noCopyBucketID},
+		},
+		objKey:          objKey,
+		peerID:          peer.ID("test"),
+		worldStateCtr:   ccontainer.NewCContainer(wsv),
+		pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+		pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+	}
+	host := &testPluginHost{id: platformID}
+	newInstance := func(pluginID string) *pluginInstance {
+		return &pluginInstance{
+			c:                       c,
+			le:                      le,
+			pluginID:                pluginID,
+			instanceKey:             pluginID,
+			runningPluginCtr:        ccontainer.NewCContainer(bldr_plugin.NewRunningPlugin(nil)),
+			manifestCopyStatus:      ccontainer.NewCContainer[*manifestCopyStatus](nil),
+			downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+			executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+		}
+	}
+	process := func(pi *pluginInstance) {
+		t.Helper()
+		wait, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+			pluginHosts: []bldr_plugin_host.PluginHost{host},
+		}, ws, obj)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		if !wait {
+			t.Fatal("expected world manifest watch to continue")
+		}
+	}
+
+	// Create the plugin instance fixture.
+	suppressed := newInstance(suppressedID)
+	process(suppressed)
+	if suppressed.downloadManifestRoutine.GetState() != nil {
+		t.Fatal("configured no-copy manifest set download state")
+	}
+	suppressedExec := suppressed.executePluginRoutine.GetState()
+	if suppressedExec == nil || suppressedExec.manifestSnapshot == nil {
+		t.Fatal("configured no-copy manifest was not executable")
+	}
+	status := suppressed.manifestCopyStatus.GetValue()
+	if status == nil ||
+		status.phase != manifestCopyPhaseSuppressed ||
+		status.class != manifestCopyClassSuppressed ||
+		status.sourceBucketID != noCopyBucketID ||
+		status.destinationBucketID != worldBucketID {
+		t.Fatalf("suppressed copy status = %#v", status)
+	}
+	if err := suppressed.execDownloadManifest(ctx, suppressedExec.manifestSnapshot); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the plugin instance fixture.
+	dynamic := newInstance(dynamicID)
+	process(dynamic)
+	dynamicDownload := dynamic.downloadManifestRoutine.GetState()
+	if dynamicDownload == nil {
+		t.Fatal("dynamic manifest did not set download state")
+	}
+	if dynamicDownload.GetManifestRef().GetBucketId() != dynamicBucketID {
+		t.Fatalf("dynamic source bucket = %q, want %q", dynamicDownload.GetManifestRef().GetBucketId(), dynamicBucketID)
+	}
+	if err := dynamic.execDownloadManifest(ctx, dynamicDownload); err != nil {
+		t.Fatal(err.Error())
+	}
+	dynamicStatus := dynamic.manifestCopyStatus.GetValue()
+	if dynamicStatus == nil || dynamicStatus.phase != manifestCopyPhaseDone {
+		t.Fatalf("dynamic copy status = %#v, want done", dynamicStatus)
+	}
+
+	// Collect the manifests for the controller.
+	suppressedManifests, suppressedErrs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		suppressedID,
+		[]string{platformID},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(suppressedErrs) != 0 {
+		t.Fatalf("suppressed manifest errors = %v", suppressedErrs)
+	}
+	if len(suppressedManifests) != 1 {
+		t.Fatalf("suppressed manifest count = %d, want 1", len(suppressedManifests))
+	}
+	if got := suppressedManifests[0].ManifestRef.GetBucketId(); got != noCopyBucketID {
+		t.Fatalf("suppressed manifest bucket = %q, want authoritative external bucket %q", got, noCopyBucketID)
+	}
+
+	// Collect the manifests for the controller.
+	dynamicManifests, dynamicErrs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		dynamicID,
+		[]string{platformID},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(dynamicErrs) != 0 {
+		t.Fatalf("dynamic manifest errors = %v", dynamicErrs)
+	}
+	if len(dynamicManifests) != 1 {
+		t.Fatalf("dynamic manifest count = %d, want 1", len(dynamicManifests))
+	}
+	if got := dynamicManifests[0].ManifestRef.GetBucketId(); got != worldBucketID {
+		t.Fatalf("dynamic manifest bucket = %q, want local world bucket %q", got, worldBucketID)
+	}
+}
+
+func TestCollectStartupManifestEligibilityDemandsExternalRefAndUsesWriteback(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const lookupBucketID = "startup-demand-release-bucket"
+	bucketLkConfig, err := bucket.NewLookupConfig(configset.NewControllerConfig(1, &lookup_concurrent.Config{
+		NotFoundBehavior: lookup_concurrent.NotFoundBehavior_NotFoundBehavior_LOOKUP_DIRECTIVE,
+	}))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	bucketConf, err := bucket.NewConfig(lookupBucketID, 1, bucketLkConfig)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, bucketConf); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the startup demand lookup observer.
+	lookupObserver := &startupDemandLookupObserver{waiting: make(chan struct{}, 1)}
+	observerRel, err := tb.Bus.AddController(ctx, lookupObserver, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer observerRel()
+
+	// Build the external manifest ref fixture.
+	remote := newTestExternalManifestRefWithDistAssets(
+		t,
+		ctx,
+		lookupBucketID,
+		"spacewave-core",
+		"desktop/darwin/arm64",
+		14,
+	)
+	cacheKey, err := store_kvkey.NewKVKey(nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	cacheStore := block_store_kvtx.NewKVTxBlock(cacheKey, store_kvtx_inmem.NewStore(), 0, true)
+	networkGets := &atomic.Uint32{}
+	provider := block_store.NewStore(
+		"test/startup-demand-provider",
+		&writebackLookupBlockStore{
+			StoreOps:    remote.store,
+			cache:       cacheStore,
+			networkGets: networkGets,
+		},
+	)
+	storeCtrl := block_store_controller.NewController(
+		le,
+		controller.NewInfo("test/startup-demand-provider", controller.MustParseVersion("0.0.1"), ""),
+		block_store_controller.NewBlockStoreBuilder(provider),
+		nil,
+		true,
+		[]string{lookupBucketID},
+		true,
+		false,
+	)
+
+	// Build the manifest object key.
+	manifestKey := bldr_manifest.NewManifestArtifactKey(remote.ref.GetManifestRef())
+	if err := bldr_manifest_world.ExStoreManifestOp(
+		ctx,
+		ws,
+		peer.ID("test"),
+		manifestKey,
+		[]string{objKey},
+		remote.ref,
+	); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Define the collect helper.
+	collect := func() ([]*bldr_manifest_world.StartupManifestCandidateEligibility, error) {
+		collectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return bldr_manifest_world.CollectStartupManifestEligibilityForManifestID(
+			collectCtx,
+			ws,
+			"spacewave-core",
+			[]string{"desktop/darwin/arm64"},
+			objKey,
+		)
+	}
+
+	// Declare the collect result type.
+	type collectResult struct {
+		candidates []*bldr_manifest_world.StartupManifestCandidateEligibility
+		err        error
+	}
+	collectDone := make(chan collectResult, 1)
+	go func() {
+		candidates, err := collect()
+		collectDone <- collectResult{candidates: candidates, err: err}
+	}()
+
+	// Wait for the expected outcome.
+	select {
+	case <-lookupObserver.waiting:
+	case result := <-collectDone:
+		t.Fatalf("startup eligibility completed before lookup provider readiness: %v", result.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup eligibility did not reach remote block lookup")
+	}
+	select {
+	case result := <-collectDone:
+		t.Fatalf("startup eligibility completed before provider registration: %v", result.err)
+	default:
+	}
+
+	// Start the manifest store controller.
+	storeRel, err := tb.Bus.AddController(ctx, storeCtrl, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer storeRel()
+
+	// Wait for the collection to finish.
+	result := <-collectDone
+	if result.err != nil {
+		t.Fatal(result.err.Error())
+	}
+	first := result.candidates
+
+	// Assert the expected state.
+	if len(first) != 1 || first[0].Eligibility != bldr_manifest_world.StartupManifestEligibilityEligible {
+		t.Fatalf("first startup candidates = %s", bldr_manifest_world.SummarizeStartupManifestEligibility(first, -1))
+	}
+
+	// Assert the expected state.
+	if !first[0].ManifestRef.EqualVT(remote.ref.GetManifestRef()) ||
+		!first[0].Manifest.GetMeta().EqualVT(remote.ref.GetMeta()) {
+		t.Fatal("first startup candidate changed external ref or metadata")
+	}
+	if selected := bldr_manifest_world.SelectableStartupManifests(first); len(selected) != 1 {
+		t.Fatalf("selected startup manifests = %d, want 1", len(selected))
+	}
+	if got := networkGets.Load(); got != 1 {
+		t.Fatalf("network block fetches after first startup read = %d, want 1", got)
+	}
+
+	// Collect the manifests a second time.
+	second, err := collect()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(second) != 1 || second[0].Eligibility != bldr_manifest_world.StartupManifestEligibilityEligible {
+		t.Fatalf("second startup candidates = %s", bldr_manifest_world.SummarizeStartupManifestEligibility(second, -1))
+	}
+	if got := networkGets.Load(); got != 1 {
+		t.Fatalf("network block fetches after cached startup read = %d, want 1", got)
+	}
+}
+
+func TestExecPluginReadsExternalManifestViaLookupBlockFromNetwork(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const lookupBucketID = "release-world-cdn-bucket"
+	bucketLkConfig, err := bucket.NewLookupConfig(configset.NewControllerConfig(1, &lookup_concurrent.Config{
+		NotFoundBehavior: lookup_concurrent.NotFoundBehavior_NotFoundBehavior_LOOKUP_DIRECTIVE,
+	}))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	bucketConf, err := bucket.NewConfig(lookupBucketID, 1, bucketLkConfig)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, bucketConf); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Build the external manifest ref fixture.
+	remote := newTestExternalManifestRefWithDistAssets(t, ctx, lookupBucketID, "spacewave-core", "desktop/darwin/arm64", 3)
+	remoteStore := block_store.NewStore("test/release-world-cdn", remote.store)
+	storeCtrl := block_store_controller.NewController(
+		le,
+		controller.NewInfo("test/release-world-cdn-store", controller.MustParseVersion("0.0.1"), ""),
+		block_store_controller.NewBlockStoreBuilder(remoteStore),
+		nil,
+		true,
+		[]string{lookupBucketID},
+		true,
+		false,
+	)
+	storeRel, err := tb.Bus.AddController(ctx, storeCtrl, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer storeRel()
+
+	// Name the fixture constants.
+	const refKey = "plugin-host/ref/release-world-cdn"
+	storeTestManifestRefObject(t, ctx, ws, refKey, remote.ref)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, refKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err := bldr_manifest_world.CollectStartupManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(got) != 0 {
+		t.Fatalf("startup discovery selected external CDN ref, got %d", len(got))
+	}
+	if len(errs) != 1 {
+		t.Fatalf("startup discovery errors = %v", errs)
+	}
+	if remote.store.gets.Load() != 0 {
+		t.Fatal("startup local-only discovery should not invoke LookupBlockFromNetwork")
+	}
+
+	// Create the plugin host fixture.
+	host := &releaseCDNRuntimePluginHost{
+		id: "desktop/darwin/arm64",
+	}
+	hostCtrl := plugin_host_controller.NewController(
+		le,
+		tb.Bus,
+		controller.NewInfo("test/plugin-host", controller.MustParseVersion("0.0.1"), ""),
+		host,
+	)
+	hostRel, err := tb.Bus.AddController(ctx, hostCtrl, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer hostRel()
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+
+	// Build the plugin instance fixture.
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:           tb.Bus,
+			conf:          &Config{},
+			objKey:        objKey,
+			worldStateCtr: ccontainer.NewCContainer(wsv),
+			hostVolumeCtr: ccontainer.NewCContainer(&hostVol{
+				vol: tb.Volume,
+				info: &volume.VolumeInfo{
+					VolumeId: tb.Volume.GetID(),
+				},
+			}),
+			pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+			pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+		},
+		le:               le,
+		pluginID:         "spacewave-core",
+		runningPluginCtr: ccontainer.NewCContainer[bldr_plugin.RunningPlugin](nil),
+		pluginLoadStateCtr: ccontainer.NewCContainer(
+			bldr_plugin.NewPluginLoadState(
+				nil,
+				bldr_plugin.InitialCapabilityRegistrationPending,
+			),
+		),
+	}
+
+	// Execute the plugin with the remote manifest.
+	if err := pi.execPlugin(ctx, &executePluginArgs{
+		manifestSnapshot: &bldr_manifest.ManifestSnapshot{
+			ManifestRef: remote.ref.GetManifestRef(),
+			Manifest:    remote.manifest,
+		},
+		pluginHost: host,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// The demand execution must read the remote blocks.
+	if remote.store.gets.Load() == 0 {
+		t.Fatal("expected demand execution to invoke LookupBlockFromNetwork")
+	}
+	accounting := pi.manifestCopyAccounting.Load()
+	if accounting == nil || accounting.counters == nil {
+		t.Fatal("expected demand accounting for executed manifest")
+	}
+	readCount, readBytes := accounting.counters.snapshot()
+	demandSnapshot := block.ReadCounterSnapshot{
+		BlockReadCount: readCount,
+		BlockReadBytes: readBytes,
+	}
+	if demandSnapshot.BlockReadCount == 0 || demandSnapshot.BlockReadBytes == 0 {
+		t.Fatalf("expected nonzero demand accounting, got %#v", demandSnapshot)
+	}
+	if string(host.distData) != "console.log('release cdn')\n" {
+		t.Fatalf("dist entrypoint bytes = %q", host.distData)
+	}
+	if string(host.assetsData) != "release asset\n" {
+		t.Fatalf("asset bytes = %q", host.assetsData)
+	}
+}
+
+func TestManifestDemandAccountingIncludesLiveReadsBeforeExecutionExit(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	store := block_mock.NewMockStore(0)
+	ref, _, err := block.PutBlock(ctx, store, block_mock.NewExample("live demand"))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	_, cursor := block.NewTransaction(store, nil, ref, nil)
+
+	// Build the manifest snapshot fixture.
+	snapshot := &bldr_manifest.ManifestSnapshot{
+		ManifestRef: &bucket.ObjectRef{
+			BucketId: "remote",
+			RootRef:  ref,
+		},
+	}
+	accounting := newManifestCopyAccounting(snapshot, "remote", "local")
+	readCtx, counter := block.WithReadCounter(ctx)
+	observation := &manifestDemandObservation{
+		accounting: accounting,
+		counter:    counter,
+	}
+	observation.register()
+	defer observation.finish()
+
+	// Assert the expected state.
+	if _, found, err := cursor.Fetch(readCtx); err != nil || !found {
+		t.Fatalf("access-manifest read = found %v, err %v", found, err)
+	}
+	observation.snapshot()
+	callbackStats := accounting.apply(bucket_lookup.ObjectCopyStats{})
+	if callbackStats.DemandReadCount == 0 || callbackStats.DemandReadBytes == 0 {
+		t.Fatalf("access-manifest demand stats = %#v, want nonzero", callbackStats)
+	}
+
+	// Assert the expected state.
+	if _, found, err := cursor.Fetch(readCtx); err != nil || !found {
+		t.Fatalf("live plugin read = found %v, err %v", found, err)
+	}
+	liveStats := accounting.apply(bucket_lookup.ObjectCopyStats{})
+	if liveStats.DemandReadCount <= callbackStats.DemandReadCount ||
+		liveStats.DemandReadBytes <= callbackStats.DemandReadBytes {
+		t.Fatalf("live demand stats = %#v, callback stats = %#v", liveStats, callbackStats)
+	}
+}
+
+func TestSupersededDownloadCannotPublishStatusOrMark(t *testing.T) {
+	// Build the test manifest refs and snapshots.
+	refA := newTestManifestRef("spacewave-core", "desktop/darwin/arm64", 1, "bucket-a")
+	refB := newTestManifestRef("spacewave-core", "desktop/darwin/arm64", 2, "bucket-b")
+	snapshotA := &bldr_manifest.ManifestSnapshot{ManifestRef: refA.GetManifestRef()}
+	snapshotB := &bldr_manifest.ManifestSnapshot{ManifestRef: refB.GetManifestRef()}
+	accountingA := newManifestCopyAccounting(snapshotA, "bucket-a", "local")
+	accountingB := newManifestCopyAccounting(snapshotB, "bucket-b", "local")
+
+	// Build the plugin instance with the superseded copy status.
+	pi := &pluginInstance{
+		manifestCopyStatus: ccontainer.NewCContainer[*manifestCopyStatus](nil),
+	}
+	pi.manifestCopyAccounting.Store(accountingB)
+	pi.manifestCopyStatus.SetValue(&manifestCopyStatus{
+		phase:       manifestCopyPhaseCopying,
+		manifestRef: snapshotB.GetManifestRef().MarshalString(),
+	})
+
+	// A superseded download must not publish status or marks.
+	for _, phase := range []manifestCopyPhase{manifestCopyPhaseDone, manifestCopyPhaseFailed} {
+		pi.setManifestCopyStatus(
+			phase,
+			manifestCopyClassImmediate,
+			snapshotA,
+			accountingA,
+			bucket_lookup.ObjectCopyStats{BlocksSeen: 99},
+		)
+		status := pi.manifestCopyStatus.GetValue()
+		if status == nil ||
+			status.phase != manifestCopyPhaseCopying ||
+			status.manifestRef != snapshotB.GetManifestRef().MarshalString() {
+			t.Fatalf("superseded download published %#v over current candidate", status)
+		}
+		if pi.emitManifestCopyStartupMark(phase, bucket_lookup.ObjectCopyStats{BlocksSeen: 99}, accountingA) {
+			t.Fatalf("superseded download emitted %s startup mark", phase)
+		}
+	}
+	if !pi.emitManifestCopyStartupMark(
+		manifestCopyPhaseDone,
+		bucket_lookup.ObjectCopyStats{},
+		accountingB,
+	) {
+		t.Fatal("current download startup mark was incorrectly gated")
+	}
+}
+
+func TestDownloadManifestCopiesRemoteDAGAndStoresLocalWorldRef(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const remoteBucketID = "remote-manifest-bucket"
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, &bucket.Config{
+		Id:  remoteBucketID,
+		Rev: 1,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	ref := newTestStoredManifestRefWithDistInBucket(t, ctx, tb, remoteBucketID, "spacewave-core", "desktop/darwin/arm64", 2)
+	var worldBucketID string
+	if err := ws.AccessWorldState(ctx, nil, func(cursor *bucket_lookup.Cursor) error {
+		worldBucketID = cursor.GetOpArgs().GetBucketId()
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	if ref.GetManifestRef().GetBucketId() == worldBucketID {
+		t.Fatal("test manifest must start in a non-local bucket")
+	}
+
+	// Build the manifest object key.
+	manifestKey := bldr_manifest.NewManifestArtifactKey(ref.GetManifestRef())
+	if err := bldr_manifest_world.ExStoreManifestOp(ctx, ws, peer.ID("test"), manifestKey, []string{objKey}, ref); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Simulate the startup execute path reading the remote manifest before the
+	// background copy gets worker time.
+	var remoteManifest *bldr_manifest.Manifest
+	if err := bldr_manifest_world.AccessManifest(ctx, le, ws.AccessWorldState, ref.GetManifestRef(), func(
+		ctx context.Context,
+		bls *bucket_lookup.Cursor,
+		bcs *block.Cursor,
+		manifest *bldr_manifest.Manifest,
+		distFS *unixfs.FSHandle,
+		assetsFS *unixfs.FSHandle,
+	) error {
+		remoteManifest = manifest.CloneVT()
+		_, _, err := distFS.LookupPath(ctx, manifest.GetEntrypoint())
+		return err
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	if remoteManifest == nil {
+		t.Fatal("expected remote manifest to be decoded")
+	}
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:             tb.Bus,
+			conf:            &Config{},
+			objKey:          objKey,
+			peerID:          peer.ID("test"),
+			worldStateCtr:   ccontainer.NewCContainer(wsv),
+			pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+			pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+		},
+		le:       le,
+		pluginID: "spacewave-core",
+	}
+	if err := pi.execDownloadManifest(ctx, &bldr_manifest.ManifestSnapshot{
+		ManifestRef: ref.GetManifestRef(),
+		Manifest:    remoteManifest,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Exactly one manifest must be collected without errors.
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors = %v", errs)
+	}
+	if len(got) != 1 {
+		t.Fatalf("manifest count = %d, want 1", len(got))
+	}
+
+	// The stored local manifest must keep its bucket and content.
+	localRef := got[0].ManifestRef
+	if localRef.GetBucketId() != worldBucketID {
+		t.Fatalf("manifest bucket = %q, want local world bucket %q", localRef.GetBucketId(), worldBucketID)
+	}
+	if !localRef.GetRootRef().EqualVT(ref.GetManifestRef().GetRootRef()) {
+		t.Fatal("local manifest root ref changed")
+	}
+	if !got[0].Manifest.GetMeta().EqualVT(remoteManifest.GetMeta()) {
+		t.Fatal("stored local manifest metadata changed")
+	}
+	if got[0].Manifest.GetEntrypoint() != remoteManifest.GetEntrypoint() {
+		t.Fatal("stored local manifest entrypoint changed")
+	}
+
+	// Fetch the manifest store object for the running instance.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host manifest store object")
+	}
+
+	// Build the running plugin instance fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	runningPi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	runningArgs := &executePluginArgs{
+		manifestSnapshot: &bldr_manifest.ManifestSnapshot{
+			ManifestRef: ref.GetManifestRef(),
+		},
+		pluginHost: host,
+	}
+	runningPi.executePluginRoutine.SetState(runningArgs)
+	if _, _, err := runningPi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	if runningPi.executePluginRoutine.GetState() != runningArgs {
+		t.Fatal("expected running remote manifest to stay active after local copy appears")
+	}
+
+	// Build the plugin instance fixture.
+	watchPi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	if _, _, err := watchPi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host},
+	}, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	if downloadState := watchPi.downloadManifestRoutine.GetState(); downloadState != nil {
+		t.Fatalf("expected local manifest to stop background copy scheduling, got %s", downloadState.GetManifestRef().MarshalString())
+	}
+	execState := watchPi.executePluginRoutine.GetState()
+	if execState == nil || execState.manifestSnapshot == nil {
+		t.Fatal("expected local manifest to remain executable")
+	}
+	if execState.manifestSnapshot.GetManifestRef().GetBucketId() != worldBucketID {
+		t.Fatal("expected executable manifest to use local world bucket")
+	}
+	if err := bldr_manifest_world.AccessManifest(ctx, le, ws.AccessWorldState, localRef, func(
+		ctx context.Context,
+		bls *bucket_lookup.Cursor,
+		bcs *block.Cursor,
+		manifest *bldr_manifest.Manifest,
+		distFS *unixfs.FSHandle,
+		assetsFS *unixfs.FSHandle,
+	) error {
+		_, _, err := distFS.LookupPath(ctx, manifest.GetEntrypoint())
+		return err
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func TestDownloadManifestRetriesIncompleteCopyBeforePublication(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const remoteBucketID = "spacewave-release"
+	remote := newTestExternalManifestRefWithDistAssets(t, ctx, remoteBucketID, "spacewave-core", "desktop/darwin/arm64", 14)
+	sourceStore := &failAfterRootBlockStore{
+		StoreOps: remote.store,
+		getCalls: &atomic.Int32{},
+		failed:   &atomic.Bool{},
+	}
+	sourceConf, err := bucket.NewConfig(remoteBucketID, 1, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	lookupRel, err := tb.Bus.AddController(ctx, &testSchedulerStaticLookupController{
+		bucketID: remoteBucketID,
+		handle: &testSchedulerStaticLookupHandle{
+			conf:   sourceConf,
+			lookup: &testSchedulerStaticLookup{store: sourceStore},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer lookupRel()
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:             tb.Bus,
+			conf:            &Config{},
+			objKey:          objKey,
+			peerID:          peer.ID("test"),
+			worldStateCtr:   ccontainer.NewCContainer(wsv),
+			pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+			pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+		},
+		le:       le,
+		pluginID: "spacewave-core",
+	}
+	snapshot := &bldr_manifest.ManifestSnapshot{
+		ManifestRef: remote.ref.GetManifestRef(),
+		Manifest:    remote.manifest,
+	}
+
+	// The background job retries the attempt that hit the injected failure.
+	if err := pi.execDownloadManifest(ctx, snapshot); err != nil {
+		t.Fatalf("copy failed: %v", err)
+	}
+	if !sourceStore.failed.Load() {
+		t.Fatal("copy finished without reaching the injected descendant failure")
+	}
+	got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors after retry = %v", errs)
+	}
+	if len(got) != 1 {
+		t.Fatalf("manifest count after retry = %d, want 1", len(got))
+	}
+	localRef := got[0].ManifestRef
+	if err := bldr_manifest_world.AccessManifest(
+		ctx,
+		le,
+		ws.AccessWorldState,
+		localRef,
+		func(
+			ctx context.Context,
+			_ *bucket_lookup.Cursor,
+			_ *block.Cursor,
+			manifest *bldr_manifest.Manifest,
+			distFS *unixfs.FSHandle,
+			assetsFS *unixfs.FSHandle,
+		) error {
+			if _, _, err := distFS.LookupPath(ctx, manifest.GetEntrypoint()); err != nil {
+				return err
+			}
+			if _, _, err := assetsFS.LookupPath(ctx, "asset.txt"); err != nil {
+				return err
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("incomplete local manifest DAG after retry: %v", err)
+	}
+}
+
+func TestDownloadManifestCopiesExternalVolumeDAGAndCachesSourceReads(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const remoteBucketID = "spacewave-release"
+	remote := newTestExternalManifestRefWithDistAssets(t, ctx, remoteBucketID, "spacewave-core", "desktop/darwin/arm64", 14)
+
+	// Build the writeback cache over the remote store.
+	cacheKey, err := store_kvkey.NewKVKey(nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	cache := block_store_kvtx.NewKVTxBlock(cacheKey, store_kvtx_inmem.NewStore(), 0, true)
+	networkGets := &atomic.Uint32{}
+	sourceStore := &writebackLookupBlockStore{
+		StoreOps:    remote.store,
+		cache:       cache,
+		networkGets: networkGets,
+	}
+
+	// Register the remote bucket as a static lookup source.
+	sourceConf, err := bucket.NewConfig(remoteBucketID, 1, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	lookupRel, err := tb.Bus.AddController(ctx, &testSchedulerStaticLookupController{
+		bucketID: remoteBucketID,
+		handle: &testSchedulerStaticLookupHandle{
+			conf:   sourceConf,
+			lookup: &testSchedulerStaticLookup{store: sourceStore},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer lookupRel()
+
+	// Declare the fixture state.
+	var worldBucketID string
+	if err := ws.AccessWorldState(ctx, nil, func(cursor *bucket_lookup.Cursor) error {
+		worldBucketID = cursor.GetOpArgs().GetBucketId()
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:             tb.Bus,
+			conf:            &Config{},
+			objKey:          objKey,
+			peerID:          peer.ID("test"),
+			worldStateCtr:   ccontainer.NewCContainer(wsv),
+			pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+			pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+		},
+		le:       le,
+		pluginID: "spacewave-core",
+	}
+	snapshot := &bldr_manifest.ManifestSnapshot{
+		ManifestRef: remote.ref.GetManifestRef(),
+		Manifest:    remote.manifest,
+	}
+
+	// Declare the fixture state.
+	var firstRoot *block.BlockRef
+	for i := range 2 {
+		if err := pi.execDownloadManifest(ctx, snapshot); err != nil {
+			t.Fatalf("copy attempt %d: %v", i+1, err)
+		}
+		got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+			ctx,
+			ws,
+			"spacewave-core",
+			[]string{"desktop/darwin/arm64"},
+			objKey,
+		)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		if len(errs) != 0 {
+			t.Fatalf("manifest errors after copy attempt %d = %v", i+1, errs)
+		}
+		if len(got) != 1 {
+			t.Fatalf("manifest count after copy attempt %d = %d, want 1", i+1, len(got))
+		}
+		localRef := got[0].ManifestRef
+		if localRef.GetBucketId() != worldBucketID {
+			t.Fatalf("manifest bucket after copy attempt %d = %q, want %q", i+1, localRef.GetBucketId(), worldBucketID)
+		}
+		if !localRef.GetRootRef().EqualVT(remote.ref.GetManifestRef().GetRootRef()) {
+			t.Fatalf("manifest root after copy attempt %d changed", i+1)
+		}
+		if !got[0].Manifest.GetMeta().EqualVT(remote.manifest.GetMeta()) {
+			t.Fatalf("manifest metadata after copy attempt %d changed", i+1)
+		}
+		if firstRoot == nil {
+			firstRoot = localRef.GetRootRef().CloneVT()
+		} else if !firstRoot.EqualVT(localRef.GetRootRef()) {
+			t.Fatal("local manifest root changed across cache-only copy")
+		}
+	}
+	if got := networkGets.Load(); got == 0 {
+		t.Fatal("external manifest copy did not demand any source blocks")
+	}
+	firstGets := networkGets.Load()
+	if err := pi.execDownloadManifest(ctx, snapshot); err != nil {
+		t.Fatal(err.Error())
+	}
+	if got := networkGets.Load(); got != firstGets {
+		t.Fatalf("source network fetches after cache-only copy = %d, want %d", got, firstGets)
+	}
+}
+
+func TestDownloadManifestCopiesSeveralRemoteDAGsOutsideWorldAccess(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	baseWS, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, baseWS, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Wrap the World state with access counting.
+	ws := &accessCountingWorldState{WorldState: baseWS}
+	var wsv world.WorldState = ws
+	pi := &pluginInstance{
+		c: &Controller{
+			bus: tb.Bus,
+			conf: &Config{
+				FetchConcurrency: 1,
+			},
+			objKey:          objKey,
+			peerID:          peer.ID("test"),
+			worldStateCtr:   ccontainer.NewCContainer(wsv),
+			pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+			pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+		},
+		le:       le,
+		pluginID: "spacewave-core",
+	}
+
+	// Queue three requests against one aggregate copy allowance of one.
+	type manifestCopyRequest struct {
+		ctx        context.Context
+		manifestID string
+		snapshot   *bldr_manifest.ManifestSnapshot
+		errCh      chan error
+		cancel     context.CancelFunc
+	}
+	requests := make([]*manifestCopyRequest, 0, 3)
+	observed := make(chan manifestCopyObservation, 3)
+	releaseCopy := make(chan struct{})
+	for i := range 3 {
+		suffix := string(rune('a' + i))
+		remoteBucketID := "remote-manifest-bucket-" + suffix
+		remote := newTestExternalManifestRefWithDistAssets(
+			t,
+			ctx,
+			remoteBucketID,
+			"spacewave-core-"+suffix,
+			"desktop/darwin/arm64",
+			uint64(20+i),
+		)
+		sourceStore := &blockingLookupBlockStore{
+			StoreOps:     remote.store,
+			activeAccess: &ws.active,
+			observed:     observed,
+			release:      releaseCopy,
+			once:         &sync.Once{},
+			manifestID:   remote.ref.GetMeta().GetManifestId(),
+		}
+		sourceConf, err := bucket.NewConfig(remoteBucketID, 1, nil)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		lookupRel, err := tb.Bus.AddController(ctx, &testSchedulerStaticLookupController{
+			bucketID: remoteBucketID,
+			handle: &testSchedulerStaticLookupHandle{
+				conf: sourceConf,
+				lookup: &testSchedulerStaticLookup{
+					store: sourceStore,
+				},
+			},
+		}, nil)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		defer lookupRel()
+
+		reqCtx, reqCancel := context.WithCancel(ctx)
+		defer reqCancel()
+		requests = append(requests, &manifestCopyRequest{
+			ctx:        reqCtx,
+			manifestID: remote.ref.GetMeta().GetManifestId(),
+			snapshot: &bldr_manifest.ManifestSnapshot{
+				ManifestRef: remote.ref.GetManifestRef(),
+				Manifest:    remote.manifest,
+			},
+			errCh:  make(chan error, 1),
+			cancel: reqCancel,
+		})
+	}
+	for _, req := range requests {
+		go func() {
+			req.errCh <- pi.execDownloadManifest(req.ctx, req.snapshot)
+		}()
+	}
+
+	// The first admitted copy enters traversal alone; the queued requests
+	// must not start reading source blocks.
+	var activeReq *manifestCopyRequest
+	var activeID string
+	select {
+	case obs := <-observed:
+		if obs.active != 0 {
+			t.Fatalf("source block read for %s ran with %d active world access(es)", obs.manifestID, obs.active)
+		}
+		activeID = obs.manifestID
+		for _, req := range requests {
+			if req.manifestID == obs.manifestID {
+				activeReq = req
+			}
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for the first source observation: %v", ctx.Err())
+	}
+	if activeReq == nil {
+		t.Fatalf("observed unknown manifest %s", activeID)
+	}
+	select {
+	case obs := <-observed:
+		t.Fatalf("queued request %s entered traversal while %s held the copy allowance", obs.manifestID, activeReq.manifestID)
+	default:
+	}
+
+	// Foreground World access must complete while the active copy holds the
+	// allowance: the copy holds no World access of its own.
+	fgCtx, fgCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer fgCancel()
+	var worldBucketID string
+	if err := ws.AccessWorldState(fgCtx, nil, func(cursor *bucket_lookup.Cursor) error {
+		worldBucketID = cursor.GetOpArgs().GetBucketId()
+		return nil
+	}); err != nil {
+		t.Fatalf("foreground world access failed while a copy held admission: %v", err)
+	}
+	if worldBucketID == "" {
+		t.Fatal("foreground world access returned an empty bucket id")
+	}
+
+	// Cancel one queued request while it waits for admission; it must exit
+	// without entering traversal or publishing.
+	var cancelReq, queuedReq *manifestCopyRequest
+	for _, req := range requests {
+		if req == activeReq {
+			continue
+		}
+		if cancelReq == nil {
+			cancelReq = req
+		} else {
+			queuedReq = req
+		}
+	}
+	cancelReq.cancel()
+	select {
+	case err := <-cancelReq.errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled queued copy failed with %v, want context.Canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for the canceled queued copy: %v", ctx.Err())
+	}
+	got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		baseWS,
+		cancelReq.manifestID,
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors for canceled copy %s = %v", cancelReq.manifestID, errs)
+	}
+	if len(got) != 0 {
+		t.Fatalf("canceled queued copy published %d manifests, want 0", len(got))
+	}
+
+	// Release the active copy; it completes and publishes its copied root.
+	close(releaseCopy)
+	select {
+	case err := <-activeReq.errCh:
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for the active manifest copy: %v", ctx.Err())
+	}
+
+	// The remaining queued request proceeds only after the allowance
+	// released: its first observation must record release already closed.
+	select {
+	case obs := <-observed:
+		if obs.manifestID != queuedReq.manifestID {
+			t.Fatalf("observed source read for %s, want %s", obs.manifestID, queuedReq.manifestID)
+		}
+		if obs.active != 0 {
+			t.Fatalf("source block read for %s ran with %d active world access(es)", obs.manifestID, obs.active)
+		}
+		if obs.copyBlocked {
+			t.Fatalf("queued request %s entered traversal before the copy allowance released", obs.manifestID)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for the queued copy to proceed: %v", ctx.Err())
+	}
+	select {
+	case err := <-queuedReq.errCh:
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for the queued manifest copy: %v", ctx.Err())
+	}
+
+	// Iterate the fixture cases.
+	for _, req := range []*manifestCopyRequest{activeReq, queuedReq} {
+		got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+			ctx,
+			baseWS,
+			req.manifestID,
+			[]string{"desktop/darwin/arm64"},
+			objKey,
+		)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		if len(errs) != 0 {
+			t.Fatalf("manifest errors for %s = %v", req.manifestID, errs)
+		}
+		if len(got) != 1 {
+			t.Fatalf("manifest count for %s = %d, want 1", req.manifestID, len(got))
+		}
+	}
+}
+
+func TestWatchWorldManifestSkipsUnchangedSelectionInputs(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	baseWS, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, baseWS, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+	var worldBucketID string
+	if err := baseWS.AccessWorldState(ctx, nil, func(cursor *bucket_lookup.Cursor) error {
+		worldBucketID = cursor.GetOpArgs().GetBucketId()
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Store a test manifest reference.
+	coreRef := newTestStoredManifestRefWithDistInBucket(
+		t,
+		ctx,
+		tb,
+		worldBucketID,
+		"spacewave-core",
+		"desktop/darwin/arm64",
+		1,
+	)
+
+	// Store the core manifest in the World.
+	coreKey := bldr_manifest.NewManifestArtifactKey(coreRef.GetManifestRef())
+	if err := bldr_manifest_world.ExStoreManifestOp(ctx, baseWS, peer.ID("test"), coreKey, []string{objKey}, coreRef); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Wrap the World state with access counting.
+	ws := &accessCountingWorldState{WorldState: baseWS}
+
+	// Fetch the plugin host object.
+	obj, ok, err := baseWS.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Build the plugin instance fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	hostSet := &pluginHostSet{pluginHosts: []bldr_plugin_host.PluginHost{host}}
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+
+	// The initial selection must access the World once.
+	if _, _, err := pi.processManifestWorldState(ctx, le, hostSet, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	if got := ws.total.Load(); got != 1 {
+		t.Fatalf("initial selection world accesses = %d, want 1", got)
+	}
+
+	// Store a test manifest reference.
+	webRef := newTestStoredManifestRefWithDistInBucket(
+		t,
+		ctx,
+		tb,
+		worldBucketID,
+		"spacewave-web",
+		"desktop/darwin/arm64",
+		1,
+	)
+	webKey := bldr_manifest.NewManifestArtifactKey(webRef.GetManifestRef())
+	if err := bldr_manifest_world.ExStoreManifestOp(ctx, baseWS, peer.ID("test"), webKey, []string{objKey}, webRef); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Fetch the plugin host object again.
+	obj, ok, err = baseWS.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object after unrelated manifest store")
+	}
+	if _, _, err := pi.processManifestWorldState(ctx, le, hostSet, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	if got := ws.total.Load(); got != 1 {
+		t.Fatalf("unchanged selection world accesses = %d, want 1", got)
+	}
+}
+
+func TestWatchWorldManifestReprocessesReplacementHostWithSamePlatform(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+	manifest, key := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "desktop/darwin/arm64", 1)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, key, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Fetch the plugin host object.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Create the plugin host fixture.
+	host1 := &testPluginHost{id: "desktop/darwin/arm64"}
+	hostSet1 := &pluginHostSet{pluginHosts: []bldr_plugin_host.PluginHost{host1}}
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	if _, _, err := pi.processManifestWorldState(ctx, le, hostSet1, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	initial := pi.executePluginRoutine.GetState()
+	if initial == nil || initial.pluginHost != host1 {
+		t.Fatal("expected first host to be selected")
+	}
+	if !initial.manifestSnapshot.GetManifestRef().EqualVT(manifest.GetManifestRef()) {
+		t.Fatal("expected first manifest to be selected")
+	}
+
+	// Create the plugin host fixture.
+	host2 := &testPluginHost{id: "desktop/darwin/arm64"}
+	if _, _, err := pi.processManifestWorldState(ctx, le, &pluginHostSet{
+		pluginHosts: []bldr_plugin_host.PluginHost{host2},
+	}, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	replaced := pi.executePluginRoutine.GetState()
+	if replaced == nil || replaced.pluginHost != host2 {
+		t.Fatal("replacement host with the same platform was not selected")
+	}
+}
+
+func TestWatchWorldManifestReprocessesNestedSelectionGraphChange(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the plugin host and nested object keys.
+	const objKey = "plugin-host"
+	const nestedKey = "plugin-host/retained"
+
+	// Create the manifest stores and link them.
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, nestedKey); err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objKey, nestedKey, "")); err != nil {
+		t.Fatal(err.Error())
+	}
+	first, firstKey := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "desktop/darwin/arm64", 1)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(nestedKey, firstKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Fetch the plugin host object.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatal("expected plugin host object")
+	}
+
+	// Create the plugin host fixture.
+	host := &testPluginHost{id: "desktop/darwin/arm64"}
+	hostSet := &pluginHostSet{pluginHosts: []bldr_plugin_host.PluginHost{host}}
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:    tb.Bus,
+			conf:   &Config{},
+			objKey: objKey,
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	if _, _, err := pi.processManifestWorldState(ctx, le, hostSet, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	initial := pi.executePluginRoutine.GetState()
+	if initial == nil || !initial.manifestSnapshot.GetManifestRef().EqualVT(first.GetManifestRef()) {
+		t.Fatal("expected first nested manifest to be selected")
+	}
+
+	// Store a manifest in the test World.
+	second, secondKey := storeTestWorldManifest(t, ctx, ws, "spacewave-core", "desktop/darwin/arm64", 2)
+	if err := ws.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(nestedKey, secondKey, "spacewave-core")); err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, _, err := pi.processManifestWorldState(ctx, le, hostSet, ws, obj); err != nil {
+		t.Fatal(err.Error())
+	}
+	updated := pi.executePluginRoutine.GetState()
+	if updated == nil || !updated.manifestSnapshot.GetManifestRef().EqualVT(second.GetManifestRef()) {
+		t.Fatal("nested manifest graph change did not update selection")
+	}
+}
+
+func TestDownloadManifestYieldsColdStartCopyUntilStartupGroupReady(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const remoteBucketID = "remote-manifest-bucket"
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, &bucket.Config{
+		Id:  remoteBucketID,
+		Rev: 1,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	ref := newTestStoredManifestRefWithDistInBucket(t, ctx, tb, remoteBucketID, "spacewave-core", "desktop/darwin/arm64", 2)
+	var remoteManifest *bldr_manifest.Manifest
+	if err := bldr_manifest_world.AccessManifest(ctx, le, ws.AccessWorldState, ref.GetManifestRef(), func(
+		ctx context.Context,
+		bls *bucket_lookup.Cursor,
+		bcs *block.Cursor,
+		manifest *bldr_manifest.Manifest,
+		distFS *unixfs.FSHandle,
+		assetsFS *unixfs.FSHandle,
+	) error {
+		remoteManifest = manifest.CloneVT()
+		_, _, err := distFS.LookupPath(ctx, manifest.GetEntrypoint())
+		return err
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	snapshot := &bldr_manifest.ManifestSnapshot{
+		ManifestRef: ref.GetManifestRef(),
+		Manifest:    remoteManifest,
+	}
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	gate := newTestManifestCopyGate(false)
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:                 tb.Bus,
+			conf:                &Config{},
+			objKey:              objKey,
+			peerID:              peer.ID("test"),
+			worldStateCtr:       ccontainer.NewCContainer(wsv),
+			manifestCopyGateCtr: ccontainer.NewCContainer[ManifestCopyGate](gate),
+			pluginStatus:        make(map[string]*bldr_plugin.PluginStatus),
+			pluginStatusCtr:     ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+		},
+		le:                      le,
+		pluginID:                "spacewave-core",
+		runningPluginCtr:        ccontainer.NewCContainer[bldr_plugin.RunningPlugin](nil),
+		manifestCopyStatus:      ccontainer.NewCContainer[*manifestCopyStatus](nil),
+		downloadManifestRoutine: routine.NewStateRoutineContainerWithLoggerVT[*bldr_manifest.ManifestSnapshot](le),
+		executePluginRoutine:    routine.NewStateRoutineContainerWithLogger(executePluginArgsEqual, le),
+	}
+	pi.executePluginRoutine.SetState(&executePluginArgs{
+		manifestSnapshot: snapshot,
+		pluginHost:       &testPluginHost{id: "desktop/darwin/arm64"},
+	})
+
+	// The copy publishes only for the routine's currently selected manifest;
+	// establish the selection this test drives directly.
+	pi.downloadManifestRoutine.SetState(snapshot)
+
+	// Bound the test with a timeout.
+	execCtx, execCancel := context.WithCancel(ctx)
+	defer execCancel()
+	copyErrCh := make(chan error, 1)
+	go func() {
+		copyErrCh <- pi.execDownloadManifest(execCtx, snapshot)
+	}()
+
+	// Bound the test with a timeout.
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	status, err := pi.manifestCopyStatus.WaitValueWithValidator(waitCtx, func(status *manifestCopyStatus) (bool, error) {
+		return status != nil && status.phase == manifestCopyPhaseWaitingForStartupGroup, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if status.class != manifestCopyClassAfterStartupGroupReady {
+		t.Fatalf("copy class = %q, want %q", status.class, manifestCopyClassAfterStartupGroupReady)
+	}
+	select {
+	case err := <-copyErrCh:
+		t.Fatalf("copy completed before startup group readiness: %v", err)
+	default:
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors = %v", errs)
+	}
+	if len(got) != 0 {
+		t.Fatalf("manifest count before startup group readiness = %d, want 0", len(got))
+	}
+
+	// Open the readiness gate.
+	gate.readyCtr.SetValue(true)
+	select {
+	case err := <-copyErrCh:
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+	case <-waitCtx.Done():
+		t.Fatal(waitCtx.Err().Error())
+	}
+	status = pi.manifestCopyStatus.GetValue()
+	if status == nil || status.phase != manifestCopyPhaseDone {
+		t.Fatalf("copy status = %#v, want done", status)
+	}
+	if status.stats.BlocksSeen == 0 ||
+		status.stats.BlocksCopied != status.stats.BlocksWritten+status.stats.BlocksExisting ||
+		status.stats.LogicalSourceBytes == 0 {
+		t.Fatalf("copy accounting = %#v, want complete logical copy totals", status.stats)
+	}
+	if status.sourceBucketID != remoteBucketID ||
+		status.sourceIdentity != manifestCopyIdentityExternal ||
+		status.destinationBucketID == "" ||
+		status.destinationIdentity != manifestCopyIdentityLocal {
+		t.Fatalf("copy identity = %#v, want external source and local destination", status)
+	}
+	if status.stats.DestinationDurableBytesKnown &&
+		status.stats.DestinationDurableBytes != status.stats.LogicalSourceBytes {
+		t.Fatalf("durable bytes = %#v, want logical source bytes", status.stats)
+	}
+}
+
+func TestDownloadManifestCopiesTransformedRemoteDAGAndStoresLocalWorldRef(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const remoteBucketID = "remote-transformed-manifest-bucket"
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, &bucket.Config{
+		Id:  remoteBucketID,
+		Rev: 1,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	transformConf, err := block_transform.NewConfig([]config.Config{&transform_gzip.Config{}})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	ref := newTestStoredManifestRefWithDistInBucketAndTransform(
+		t,
+		ctx,
+		tb,
+		remoteBucketID,
+		"spacewave-core",
+		"desktop/darwin/arm64",
+		2,
+		transformConf,
+	)
+	var worldBucketID string
+	if err := ws.AccessWorldState(ctx, nil, func(cursor *bucket_lookup.Cursor) error {
+		worldBucketID = cursor.GetOpArgs().GetBucketId()
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	if ref.GetManifestRef().GetBucketId() == worldBucketID {
+		t.Fatal("test manifest must start in a non-local bucket")
+	}
+
+	// Declare the fixture state.
+	var remoteManifest *bldr_manifest.Manifest
+	if err := bldr_manifest_world.AccessManifest(ctx, le, ws.AccessWorldState, ref.GetManifestRef(), func(
+		ctx context.Context,
+		bls *bucket_lookup.Cursor,
+		bcs *block.Cursor,
+		manifest *bldr_manifest.Manifest,
+		distFS *unixfs.FSHandle,
+		assetsFS *unixfs.FSHandle,
+	) error {
+		// Record the served remote manifest.
+		remoteManifest = manifest.CloneVT()
+		file, _, err := distFS.LookupPath(ctx, manifest.GetEntrypoint())
+		if err != nil {
+			return err
+		}
+		_, err = unixfs.ReadFile(ctx, file)
+		return err
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	if remoteManifest == nil {
+		t.Fatal("expected remote manifest to be decoded")
+	}
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:             tb.Bus,
+			conf:            &Config{},
+			objKey:          objKey,
+			peerID:          peer.ID("test"),
+			worldStateCtr:   ccontainer.NewCContainer(wsv),
+			pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+			pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+		},
+		le:       le,
+		pluginID: "spacewave-core",
+	}
+	if err := pi.execDownloadManifest(ctx, &bldr_manifest.ManifestSnapshot{
+		ManifestRef: ref.GetManifestRef(),
+		Manifest:    remoteManifest,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Exactly one manifest must be collected without errors.
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors = %v", errs)
+	}
+	if len(got) != 1 {
+		t.Fatalf("manifest count = %d, want 1", len(got))
+	}
+
+	// The stored local manifest must keep its bucket and content.
+	localRef := got[0].ManifestRef
+	if localRef.GetBucketId() != worldBucketID {
+		t.Fatalf("manifest bucket = %q, want local world bucket %q", localRef.GetBucketId(), worldBucketID)
+	}
+	if !localRef.GetRootRef().EqualVT(ref.GetManifestRef().GetRootRef()) {
+		t.Fatal("local manifest root ref changed")
+	}
+	if !localRef.GetTransformConf().EqualVT(transformConf) {
+		t.Fatal("local manifest transform config changed")
+	}
+	if err := bldr_manifest_world.AccessManifest(ctx, le, ws.AccessWorldState, localRef, func(
+		ctx context.Context,
+		bls *bucket_lookup.Cursor,
+		bcs *block.Cursor,
+		manifest *bldr_manifest.Manifest,
+		distFS *unixfs.FSHandle,
+		assetsFS *unixfs.FSHandle,
+	) error {
+		// Look up the plugin file in the filesystem.
+		file, _, err := distFS.LookupPath(ctx, manifest.GetEntrypoint())
+		if err != nil {
+			return err
+		}
+		data, err := unixfs.ReadFile(ctx, file)
+		if err != nil {
+			return err
+		}
+		if string(data) != "console.log('startup')\n" {
+			t.Fatalf("entrypoint bytes = %q", data)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func TestDownloadManifestRejectsMissingSnapshotMetadataBeforeStore(t *testing.T) {
+	// Bound the test with a timeout.
+	ctx := context.Background()
+	le := logrus.NewEntry(logrus.New())
+
+	// Start the World testbed.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Build an empty cursor for the World state.
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ocs.Release()
+
+	// Build the mock World state.
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Use the plugin host object key for the store.
+	const objKey = "plugin-host"
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Name the buckets used by the fixture.
+	const remoteBucketID = "remote-manifest-bucket"
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, &bucket.Config{
+		Id:  remoteBucketID,
+		Rev: 1,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	ref := newTestStoredManifestRefWithDistInBucket(t, ctx, tb, remoteBucketID, "spacewave-core", "desktop/darwin/arm64", 2)
+
+	// Declare the world state wrapper.
+	var wsv world.WorldState = ws
+	pi := &pluginInstance{
+		c: &Controller{
+			bus:             tb.Bus,
+			conf:            &Config{},
+			objKey:          objKey,
+			peerID:          peer.ID("test"),
+			worldStateCtr:   ccontainer.NewCContainer(wsv),
+			pluginStatus:    make(map[string]*bldr_plugin.PluginStatus),
+			pluginStatusCtr: ccontainer.NewCContainer(&bldr_plugin.PluginStatusSnapshot{}),
+		},
+		le:       le,
+		pluginID: "spacewave-core",
+	}
+	err = pi.execDownloadManifest(ctx, &bldr_manifest.ManifestSnapshot{
+		ManifestRef: ref.GetManifestRef(),
+	})
+	if err == nil {
+		t.Fatal("expected missing manifest metadata to fail")
+	}
+	if !strings.Contains(err.Error(), "manifest snapshot metadata") {
+		t.Fatalf("error = %q, want manifest snapshot metadata", err.Error())
+	}
+
+	// Collect the manifests for the controller.
+	got, errs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		"spacewave-core",
+		[]string{"desktop/darwin/arm64"},
+		objKey,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(errs) != 0 {
+		t.Fatalf("manifest errors = %v", errs)
+	}
+	if len(got) != 0 {
+		t.Fatalf("manifest count = %d, want 0", len(got))
+	}
+}
+
+func newTestManifestRef(manifestID, platformID string, rev uint64, bucketID string) *bldr_manifest.ManifestRef {
+	return bldr_manifest.NewManifestRef(
+		bldr_manifest.NewManifestMeta(manifestID, bldr_manifest.BuildType_DEV, platformID, rev),
+		&bucket.ObjectRef{BucketId: bucketID},
+	)
+}
+
+func newTestStoredManifestRef(
+	t *testing.T,
+	ctx context.Context,
+	tb *testbed.Testbed,
+	manifestID,
+	platformID string,
+	rev uint64,
+) *bldr_manifest.ManifestRef {
+	t.Helper()
+	return newTestStoredManifestRefInBucket(t, ctx, tb, tb.BucketId, manifestID, platformID, rev)
+}
+
+func newTestStoredManifestRefInBucket(
+	t *testing.T,
+	ctx context.Context,
+	tb *testbed.Testbed,
+	bucketID,
+	manifestID,
+	platformID string,
+	rev uint64,
+) *bldr_manifest.ManifestRef {
+	// Mark the helper.
+	t.Helper()
+
+	// Build the manifest meta fixture.
+	meta := bldr_manifest.NewManifestMeta(manifestID, bldr_manifest.BuildType_RELEASE, platformID, rev)
+	if _, _, _, err := tb.Volume.ApplyBucketConfig(ctx, &bucket.Config{
+		Id:  bucketID,
+		Rev: 1,
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+	oc, _, err := bucket_lookup.BuildEmptyCursor(
+		ctx,
+		tb.Bus,
+		tb.Logger,
+		tb.StepFactorySet,
+		bucketID,
+		tb.Volume.GetID(),
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer oc.Release()
+
+	// Write the manifest block in a transaction.
+	btx, bcs := oc.BuildTransaction(nil)
+	bcs.SetBlock(bldr_manifest.NewManifest(meta, "entrypoint"), true)
+	rootRef, _, err := btx.Write(ctx, true)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	ref := oc.GetRef()
+	ref.RootRef = rootRef
+	return bldr_manifest.NewManifestRef(meta, ref)
+}
+
+func storeTestWorldManifest(
+	t *testing.T,
+	ctx context.Context,
+	ws world.WorldState,
+	manifestID,
+	platformID string,
+	rev uint64,
+) (*bldr_manifest.ManifestRef, string) {
+	// Mark the helper.
+	t.Helper()
+
+	// Build the manifest meta fixture.
+	meta := bldr_manifest.NewManifestMeta(manifestID, bldr_manifest.BuildType_RELEASE, platformID, rev)
+	var ref *bucket.ObjectRef
+	err := ws.AccessWorldState(ctx, nil, func(bls *bucket_lookup.Cursor) error {
+		// Write the manifest block in a transaction.
+		btx, bcs := bls.BuildTransaction(nil)
+		bcs.SetBlock(bldr_manifest.NewManifest(meta, "entrypoint"), true)
+		rootRef, _, err := btx.Write(ctx, true)
+		if err != nil {
+			return err
+		}
+		ref = &bucket.ObjectRef{
+			BucketId: bls.GetOpArgs().GetBucketId(),
+			RootRef:  rootRef,
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Build the manifest object key.
+	objKey := "plugin-host/manifest/" + manifestID + "/" + platformID
+	if _, _, err := bldr_manifest_world.SetManifest(ctx, ws, peer.ID("test"), objKey, ref); err != nil {
+		t.Fatal(err.Error())
+	}
+	return bldr_manifest.NewManifestRef(meta, ref), objKey
+}
+
+func newTestStoredManifestRefWithDistInBucket(
+	t *testing.T,
+	ctx context.Context,
+	tb *testbed.Testbed,
+	bucketID,
+	manifestID,
+	platformID string,
+	rev uint64,
+) *bldr_manifest.ManifestRef {
+	t.Helper()
+	return newTestStoredManifestRefWithDistInBucketAndTransform(t, ctx, tb, bucketID, manifestID, platformID, rev, nil)
+}
+
+func newTestStoredManifestRefWithDistInBucketAndTransform(
+	t *testing.T,
+	ctx context.Context,
+	tb *testbed.Testbed,
+	bucketID,
+	manifestID,
+	platformID string,
+	rev uint64,
+	transformConf *block_transform.Config,
+) *bldr_manifest.ManifestRef {
+	// Mark the helper.
+	t.Helper()
+	entrypoint := "plugin.js"
+	distFS := memfs.New()
+	f, err := distFS.Create(entrypoint)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, err := f.Write([]byte("console.log('startup')\n")); err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Build the manifest meta fixture.
+	meta := bldr_manifest.NewManifestMeta(manifestID, bldr_manifest.BuildType_RELEASE, platformID, rev)
+	oc, _, err := bucket_lookup.BuildEmptyCursor(
+		ctx,
+		tb.Bus,
+		tb.Logger,
+		tb.StepFactorySet,
+		bucketID,
+		tb.Volume.GetID(),
+		transformConf,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer oc.Release()
+
+	// Write the manifest block in a transaction.
+	btx, bcs := oc.BuildTransaction(nil)
+	if err := bldr_manifest.CreateManifestWithBilly(ctx, bcs, bldr_manifest.NewManifest(meta, entrypoint), distFS, nil, timestamppb.Now()); err != nil {
+		t.Fatal(err.Error())
+	}
+	rootRef, _, err := btx.Write(ctx, true)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	ref := oc.GetRef()
+	ref.RootRef = rootRef
+	return bldr_manifest.NewManifestRef(meta, ref)
+}
+
+type failAfterRootBlockStore struct {
+	block.StoreOps
+	getCalls *atomic.Int32
+	failed   *atomic.Bool
+}
+
+func (s *failAfterRootBlockStore) BeginReadOperation(ctx context.Context) (block.StoreOps, func(), error) {
+	store, release, err := s.StoreOps.BeginReadOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &failAfterRootBlockStore{
+		StoreOps: store,
+		getCalls: s.getCalls,
+		failed:   s.failed,
+	}, release, nil
+}
+
+func (s *failAfterRootBlockStore) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	if s.getCalls.Add(1) == 2 && s.failed.CompareAndSwap(false, true) {
+		return nil, false, errors.New("injected descendant failure")
+	}
+	return s.StoreOps.GetBlock(ctx, ref)
+}
+
+type testExternalManifestRef struct {
+	ref      *bldr_manifest.ManifestRef
+	manifest *bldr_manifest.Manifest
+	store    *countingBlockStore
+}
+
+func newTestExternalManifestRefWithDistAssets(
+	t *testing.T,
+	ctx context.Context,
+	bucketID,
+	manifestID,
+	platformID string,
+	rev uint64,
+) *testExternalManifestRef {
+	// Mark the helper.
+	t.Helper()
+
+	// Name the fixture constants.
+	const entrypoint = "plugin.js"
+	distFS := memfs.New()
+	f, err := distFS.Create(entrypoint)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, err := f.Write([]byte("console.log('release cdn')\n")); err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the in-memory assets filesystem.
+	assetsFS := memfs.New()
+	f, err = assetsFS.Create("asset.txt")
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, err := f.Write([]byte("release asset\n")); err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Build the kv key for the store.
+	kvk, err := store_kvkey.NewKVKey(nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	ops := block_store_kvtx.NewKVTxBlock(kvk, store_kvtx_inmem.NewStore(), 0, true)
+	store := &countingBlockStore{store: ops, gets: &atomic.Uint32{}}
+
+	// Create the manifest block in the store.
+	meta := bldr_manifest.NewManifestMeta(manifestID, bldr_manifest.BuildType_RELEASE, platformID, rev)
+	btx, bcs := block.NewTransaction(store, nil, nil, nil)
+	manifest := bldr_manifest.NewManifest(meta, entrypoint)
+	if err := bldr_manifest.CreateManifestWithBilly(ctx, bcs, manifest, distFS, assetsFS, timestamppb.Now()); err != nil {
+		t.Fatal(err.Error())
+	}
+	rootRef, _, err := btx.Write(ctx, true)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Return the external manifest ref fixture.
+	ref := &bucket.ObjectRef{
+		BucketId: bucketID,
+		RootRef:  rootRef,
+	}
+	return &testExternalManifestRef{
+		ref:      bldr_manifest.NewManifestRef(meta, ref),
+		manifest: manifest.CloneVT(),
+		store:    store,
+	}
+}
+
+type accessCountingWorldState struct {
+	world.WorldState
+	active atomic.Int32
+	total  atomic.Int32
+}
+
+func (s *accessCountingWorldState) AccessWorldState(
+	ctx context.Context,
+	ref *bucket.ObjectRef,
+	cb func(*bucket_lookup.Cursor) error,
+) error {
+	s.total.Add(1)
+	s.active.Add(1)
+	defer s.active.Add(-1)
+	return s.WorldState.AccessWorldState(ctx, ref, cb)
+}
+
+type manifestCopyObservation struct {
+	manifestID string
+	active     int32
+	// copyBlocked reports whether the read still waits on release,
+	// observed with a nonblocking select at emission time.
+	copyBlocked bool
+}
+
+type blockingLookupBlockStore struct {
+	block.StoreOps
+	activeAccess *atomic.Int32
+	observed     chan<- manifestCopyObservation
+	release      <-chan struct{}
+	once         *sync.Once
+	manifestID   string
+}
+
+func (s *blockingLookupBlockStore) BeginReadOperation(ctx context.Context) (block.StoreOps, func(), error) {
+	// Open a read operation on the store.
+	store, release, err := s.StoreOps.BeginReadOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	once := s.once
+	if once == nil {
+		once = &sync.Once{}
+	}
+	return &blockingLookupBlockStore{
+		StoreOps:     store,
+		activeAccess: s.activeAccess,
+		observed:     s.observed,
+		release:      s.release,
+		once:         once,
+		manifestID:   s.manifestID,
+	}, release, nil
+}
+
+func (s *blockingLookupBlockStore) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	s.once.Do(func() {
+		var copyBlocked bool
+		select {
+		case <-s.release:
+		default:
+			copyBlocked = true
+		}
+		s.observed <- manifestCopyObservation{
+			manifestID:  s.manifestID,
+			active:      s.activeAccess.Load(),
+			copyBlocked: copyBlocked,
+		}
+	})
+	select {
+	case <-ctx.Done():
+		return nil, false, context.Canceled
+	case <-s.release:
+	}
+	return s.StoreOps.GetBlock(ctx, ref)
+}
+
+type startupDemandLookupObserver struct {
+	waiting chan struct{}
+}
+
+func (c *startupDemandLookupObserver) Execute(ctx context.Context) error {
+	<-ctx.Done()
+	return context.Canceled
+}
+
+func (c *startupDemandLookupObserver) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(
+		"test/startup-demand-lookup-observer",
+		controller.MustParseVersion("0.0.1"),
+		"",
+	)
+}
+
+func (c *startupDemandLookupObserver) HandleDirective(
+	_ context.Context,
+	di directive.Instance,
+) ([]directive.Resolver, error) {
+	if _, ok := di.GetDirective().(dex.LookupBlockFromNetwork); ok {
+		select {
+		case c.waiting <- struct{}{}:
+		default:
+		}
+		return directive.R(startupDemandLookupObserverResolver{}, nil)
+	}
+	return nil, nil
+}
+
+func (startupDemandLookupObserverResolver) Resolve(
+	ctx context.Context,
+	_ directive.ResolverHandler,
+) error {
+	<-ctx.Done()
+	return context.Canceled
+}
+
+func (c *startupDemandLookupObserver) Close() error {
+	return nil
+}
+
+type startupDemandLookupObserverResolver struct{}
+
+type testSchedulerStaticLookup struct {
+	store block.StoreOps
+}
+
+// BeginReadOperation retains the fixture lookup for a bounded read.
+func (l *testSchedulerStaticLookup) BeginReadOperation(context.Context) (bucket_lookup.Lookup, func(), error) {
+	return l, func() {}, nil
+}
+
+func (l *testSchedulerStaticLookup) LookupBlock(
+	ctx context.Context,
+	ref *block.BlockRef,
+	_ ...bucket_lookup.LookupBlockOption,
+) ([]byte, bool, error) {
+	return l.store.GetBlock(ctx, ref)
+}
+
+// LookupStoredBlock reads the block without refs because this test lookup
+// keeps no ref graph.
+func (l *testSchedulerStaticLookup) LookupStoredBlock(ctx context.Context, ref *block.BlockRef, opts ...bucket_lookup.LookupBlockOption) (*block.StoredBlock, error) {
+	data, found, err := l.LookupBlock(ctx, ref, opts...)
+	if err != nil || !found {
+		return nil, err
+	}
+	return &block.StoredBlock{Data: data}, nil
+}
+
+func (l *testSchedulerStaticLookup) LookupBlockExistsBatch(
+	ctx context.Context,
+	refs []*block.BlockRef,
+	_ ...bucket_lookup.LookupBlockOption,
+) ([]bool, error) {
+	return l.store.GetBlockExistsBatch(ctx, refs)
+}
+
+func (l *testSchedulerStaticLookup) PutBlock(
+	context.Context,
+	[]byte,
+	*block.PutOpts,
+) ([]*bucket.ObjectRef, bool, error) {
+	return nil, false, bucket_lookup.ErrNotImplemented
+}
+
+type testSchedulerStaticLookupHandle struct {
+	conf   *bucket.Config
+	lookup bucket_lookup.Lookup
+}
+
+func (h *testSchedulerStaticLookupHandle) GetDisposed() bool {
+	return false
+}
+
+func (h *testSchedulerStaticLookupHandle) GetBucketConfig() *bucket.Config {
+	return h.conf
+}
+
+func (h *testSchedulerStaticLookupHandle) GetLookup(context.Context) (bucket_lookup.Lookup, error) {
+	return h.lookup, nil
+}
+
+type testSchedulerStaticLookupController struct {
+	bucketID string
+	handle   bucket_lookup.Handle
+}
+
+func (c *testSchedulerStaticLookupController) Execute(ctx context.Context) error {
+	<-ctx.Done()
+	return context.Canceled
+}
+
+func (c *testSchedulerStaticLookupController) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(
+		"test/scheduler-static-lookup",
+		controller.MustParseVersion("0.0.1"),
+		"",
+	)
+}
+
+func (c *testSchedulerStaticLookupController) HandleDirective(
+	_ context.Context,
+	di directive.Instance,
+) ([]directive.Resolver, error) {
+	d, ok := di.GetDirective().(bucket_lookup.BuildBucketLookup)
+	if !ok || d.BuildBucketLookupBucketID() != c.bucketID {
+		return nil, nil
+	}
+	return directive.R(
+		directive.NewValueResolver([]bucket_lookup.BuildBucketLookupValue{c.handle}),
+		nil,
+	)
+}
+
+func (c *testSchedulerStaticLookupController) Close() error {
+	return nil
+}
+
+type writebackLookupBlockStore struct {
+	block.StoreOps
+	cache       block.StoreOps
+	networkGets *atomic.Uint32
+}
+
+func (s *writebackLookupBlockStore) BeginReadOperation(ctx context.Context) (block.StoreOps, func(), error) {
+	// Open a read operation on the store.
+	source, sourceRel, err := s.StoreOps.BeginReadOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	cache, cacheRel, err := s.cache.BeginReadOperation(ctx)
+	if err != nil {
+		sourceRel()
+		return nil, nil, err
+	}
+	return &writebackLookupBlockStore{
+			StoreOps:    source,
+			cache:       cache,
+			networkGets: s.networkGets,
+		},
+		func() {
+			cacheRel()
+			sourceRel()
+		},
+		nil
+}
+
+func (s *writebackLookupBlockStore) GetBlock(
+	ctx context.Context,
+	ref *block.BlockRef,
+) ([]byte, bool, error) {
+	stored, err := s.GetStoredBlock(ctx, ref)
+	if err != nil || stored == nil {
+		return nil, false, err
+	}
+	return stored.Data, true, nil
+}
+
+func (s *writebackLookupBlockStore) GetStoredBlock(
+	ctx context.Context,
+	ref *block.BlockRef,
+) (*block.StoredBlock, error) {
+	// Read the stored block from the cache.
+	stored, err := s.cache.GetStoredBlock(ctx, ref)
+	if err != nil || stored != nil {
+		return stored, err
+	}
+	s.networkGets.Add(1)
+	stored, err = s.StoreOps.GetStoredBlock(ctx, ref)
+	if err != nil || stored == nil {
+		return stored, err
+	}
+	_, _, err = s.cache.PutBlock(ctx, stored.Data, stored.PutOpts(ref))
+	return stored, err
+}
+
+var _ block.StoreOps = (*writebackLookupBlockStore)(nil)
+
+type countingBlockStore struct {
+	store block.StoreOps
+	gets  *atomic.Uint32
+}
+
+// GetRoot reads the root from the inner store.
+func (s *countingBlockStore) GetRoot(ctx context.Context, name string) (*block.BlockRef, error) {
+	return s.store.GetRoot(ctx, name)
+}
+
+// ListRoots lists the inner store's roots.
+func (s *countingBlockStore) ListRoots(ctx context.Context, prefix string, fn func(block.NamedRoot) error) error {
+	return s.store.ListRoots(ctx, prefix, fn)
+}
+
+// SetRoots moves the roots on the inner store.
+func (s *countingBlockStore) SetRoots(ctx context.Context, entries []*block.PutBatchEntry, roots []block.NamedRoot) error {
+	return s.store.SetRoots(ctx, entries, roots)
+}
+
+func (s *countingBlockStore) GetHashType() hash.HashType {
+	return s.store.GetHashType()
+}
+
+func (s *countingBlockStore) GetSupportedFeatures() block.StoreFeature {
+	return s.store.GetSupportedFeatures()
+}
+
+func (s *countingBlockStore) BeginReadOperation(ctx context.Context) (block.StoreOps, func(), error) {
+	store, release, err := s.store.BeginReadOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &countingBlockStore{store: store, gets: s.gets}, release, nil
+}
+
+func (s *countingBlockStore) PutBlock(
+	ctx context.Context,
+	data []byte,
+	opts *block.PutOpts,
+) (*block.BlockRef, bool, error) {
+	return s.store.PutBlock(ctx, data, opts)
+}
+
+func (s *countingBlockStore) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	return s.store.PutBlockBatch(ctx, entries)
+}
+
+func (s *countingBlockStore) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	s.gets.Add(1)
+	return s.store.GetBlock(ctx, ref)
+}
+
+// GetStoredBlock serves the block without refs because this test store
+// keeps block bytes without their refs.
+func (s *countingBlockStore) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	return block.GetBlockWithoutRefs(ctx, s, ref)
+}
+
+func (s *countingBlockStore) GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error) {
+	return s.store.GetBlockExists(ctx, ref)
+}
+
+func (s *countingBlockStore) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	return s.store.GetBlockExistsBatch(ctx, refs)
+}
+
+func (s *countingBlockStore) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	return s.store.RmBlock(ctx, ref)
+}
+
+func (s *countingBlockStore) StatBlock(ctx context.Context, ref *block.BlockRef) (*block.BlockStat, error) {
+	return s.store.StatBlock(ctx, ref)
+}
+
+func (s *countingBlockStore) Sync(ctx context.Context) (bool, error) {
+	return s.store.Sync(ctx)
+}
+
+var _ block.StoreOps = (*countingBlockStore)(nil)
+
+func storeTestManifestRefObject(
+	t *testing.T,
+	ctx context.Context,
+	ws world.WorldState,
+	objKey string,
+	ref *bldr_manifest.ManifestRef,
+) {
+	t.Helper()
+
+	if _, _, err := world.AccessWorldObject(ctx, ws, objKey, true, func(bcs *block.Cursor) error {
+		bcs.SetBlock(ref.CloneVT(), true)
+		return nil
+	}); err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func corruptTestWorldObjectRoot(
+	t *testing.T,
+	ctx context.Context,
+	ws world.WorldState,
+	objKey string,
+) {
+	// Mark the helper.
+	t.Helper()
+
+	// Fetch the object from the World state.
+	obj, ok, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ok {
+		t.Fatalf("expected object %q", objKey)
+	}
+
+	// Read the object's root ref.
+	ref, _, err := obj.GetRootRef(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if ref == nil || ref.GetRootRef().GetEmpty() {
+		t.Fatalf("expected object %q root ref", objKey)
+	}
+
+	// Corrupt the root ref hash and store it.
+	corruptRef := ref.CloneVT()
+	corruptRef.RootRef.Hash.Hash[0] ^= 0xff
+	if _, err := obj.SetRootRef(ctx, corruptRef); err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func webPlatformAllowlistConfig(pluginIDs ...string) *Config {
+	return &Config{
+		PlatformSelectionPolicies: []*PlatformSelectionPolicy{
+			{
+				PlatformId:       "web/js/wasm",
+				AllowedPluginIds: pluginIDs,
+			},
+		},
+	}
+}
+
+type testPluginHost struct {
+	id string
+}
+
+func (h *testPluginHost) GetPlatformId() string {
+	return h.id
+}
+
+func (h *testPluginHost) Execute(ctx context.Context) error {
+	return nil
+}
+
+func (h *testPluginHost) ListPlugins(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (h *testPluginHost) ExecutePlugin(
+	ctx context.Context,
+	pluginID,
+	instanceKey,
+	executionKey,
+	manifestRoot,
+	entrypoint string,
+	pluginDist *unixfs.FSHandle,
+	pluginAssets *unixfs.FSHandle,
+	hostRpcMux srpc.Mux,
+	rpcInit bldr_plugin_host.PluginRpcInitCb,
+) error {
+	return nil
+}
+
+func (h *testPluginHost) DeletePlugin(ctx context.Context, pluginID string) error {
+	return nil
+}
+
+type releaseCDNRuntimePluginHost struct {
+	testPluginHost
+	distData   []byte
+	assetsData []byte
+}
+
+func (h *releaseCDNRuntimePluginHost) Execute(ctx context.Context) error {
+	<-ctx.Done()
+	return context.Canceled
+}
+
+func (h *releaseCDNRuntimePluginHost) ExecutePlugin(
+	ctx context.Context,
+	pluginID,
+	instanceKey,
+	executionKey,
+	manifestRoot,
+	entrypoint string,
+	pluginDist *unixfs.FSHandle,
+	pluginAssets *unixfs.FSHandle,
+	hostRpcMux srpc.Mux,
+	rpcInit bldr_plugin_host.PluginRpcInitCb,
+) error {
+	// Look up the dist entrypoint file.
+	distFile, _, err := pluginDist.LookupPath(ctx, entrypoint)
+	if err != nil {
+		if distFile != nil {
+			distFile.Release()
+		}
+		return err
+	}
+	defer distFile.Release()
+	h.distData, err = unixfs.ReadFile(ctx, distFile)
+	if err != nil {
+		return err
+	}
+
+	// Look up the plugin file in the filesystem.
+	assetFile, _, err := pluginAssets.LookupPath(ctx, "asset.txt")
+	if err != nil {
+		if assetFile != nil {
+			assetFile.Release()
+		}
+		return err
+	}
+	defer assetFile.Release()
+	h.assetsData, err = unixfs.ReadFile(ctx, assetFile)
+	return err
+}

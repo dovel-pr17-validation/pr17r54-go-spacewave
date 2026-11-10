@@ -1,0 +1,219 @@
+package sobject
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"slices"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/hash"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// BuildSOLeaveRequest signs consent to remove each supplied identity at one held configuration.
+func BuildSOLeaveRequest(sharedObjectID string, configHash []byte, keys ...crypto.PrivKey) (*SOLeaveRequest, error) {
+	// Every signature binds its own removal to this object and admission generation.
+	request := &SOLeaveRequest{SharedObjectId: sharedObjectID, ConfigHash: bytes.Clone(configHash)}
+	data, err := request.MarshalVT()
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		signature, err := peer.NewSignature("sobject leave", key, hash.RecommendedHashType, data, true)
+		if err != nil {
+			return nil, err
+		}
+		request.Signatures = append(request.Signatures, signature)
+	}
+
+	// Apply the same bounds and duplicate checks as the receiving owner.
+	if _, err := request.Verify(); err != nil {
+		return nil, err
+	}
+	return request, nil
+}
+
+// Verify authenticates departing identities without conferring authority over another participant.
+func (r *SOLeaveRequest) Verify() ([]string, error) {
+	// Bound proof work before parsing keys or verifying signatures.
+	if r.GetSharedObjectId() == "" || len(r.GetSharedObjectId()) > 256 {
+		return nil, errors.New("leave requires a bounded shared object ID")
+	}
+	if len(r.GetConfigHash()) != 32 || len(r.GetSignatures()) == 0 || r.SizeVT() > MaxSyncStateSize {
+		return nil, errors.New("leave requires a configuration hash and bounded identity proofs")
+	}
+	unsigned := r.CloneVT()
+	unsigned.Signatures = nil
+	data, err := unsigned.MarshalVT()
+	if err != nil {
+		return nil, err
+	}
+
+	// Each independently verified key authorizes only its own removal.
+	var peers []string
+	seen := make(map[string]struct{}, len(r.GetSignatures()))
+	for _, signature := range r.GetSignatures() {
+		id, err := verifySignature(signature, "sobject leave", data)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[id.String()]; ok {
+			return nil, errors.New("duplicate leave proof")
+		}
+		seen[id.String()] = struct{}{}
+		peers = append(peers, id.String())
+	}
+	return peers, nil
+}
+
+// LeaveSOParticipants commits a proven voluntary removal under the owner's existing signing authority.
+// The committing owner re-signs the departed peers' proofs, so it must remain while anyone remains.
+// Retries return only the original removal proof; an old request cannot remove a rejoined participant.
+func LeaveSOParticipants(ctx context.Context, host *SOHost, owner crypto.PrivKey, request *SOLeaveRequest) (*SOLeaveResponse, error) {
+	return leaveSOParticipants(ctx, host, owner, request, nil)
+}
+
+// leaveSOParticipants is LeaveSOParticipants that also raises each remaining
+// participant in promote to OWNER in the removal.
+func leaveSOParticipants(ctx context.Context, host *SOHost, owner crypto.PrivKey, request *SOLeaveRequest, promote []string) (*SOLeaveResponse, error) {
+	// Consent is bound to the selected host before its state can be read or changed.
+	peers, err := request.Verify()
+	if err != nil {
+		return nil, err
+	}
+	if request.GetSharedObjectId() != host.GetSharedObjectID() {
+		return nil, errors.New("leave request addresses a different shared object")
+	}
+	data, err := request.MarshalVT()
+	if err != nil {
+		return nil, err
+	}
+	requestHash := sha256.Sum256(data)
+
+	// Index the departing and promoted peers once for every rebase attempt.
+	targets := peerIDSet(peers)
+	promoted := peerIDSet(promote)
+	departs := func(peerID string) bool {
+		_, ok := targets[peerID]
+		return ok
+	}
+
+	// Rebase the removal onto the current configuration until it applies.
+	for {
+		state, err := host.GetHostState(ctx)
+		if err != nil {
+			return nil, err
+		}
+		current := state.GetConfig()
+		var changes []*SOConfigChange
+
+		// A completed request remains retryable without revealing subsequent membership changes.
+		if !bytes.Equal(current.GetConfigChainHash(), request.GetConfigHash()) {
+			changes, err = host.ReadConfigHistory(ctx, request.GetConfigHash(), current.GetConfigChainHash())
+			if err != nil {
+				return nil, err
+			}
+			for i, change := range changes {
+				if bytes.Equal(change.GetRevocationInfo().GetLeaveRequestHash(), requestHash[:]) {
+					return &SOLeaveResponse{Changes: changes[:i+1]}, nil
+				}
+			}
+			if !carriesLeaveRequest(changes, request) {
+				signed, err := host.ReadConfigEntry(ctx, request.GetConfigHash())
+				if err != nil {
+					return nil, err
+				}
+				if !leaveProofsRemainCurrent(peers, signed.GetConfig(), changes) {
+					return nil, errors.New("leave configuration changed before removal")
+				}
+			}
+		}
+
+		// Preserve every other participant and remove the proven grants in the same commit.
+		next := current.CloneVT()
+		next.Participants = slices.DeleteFunc(next.Participants, func(p *SOParticipantConfig) bool { return departs(p.GetPeerId()) })
+		if len(next.Participants) == len(current.GetParticipants()) {
+			return nil, errors.New("leave proofs name no current participant")
+		}
+
+		// A departed writer leaves the trimming roster's drops in the same
+		// change, so no roster change follows the departure.
+		next.RosterDroppedPeerIds = slices.DeleteFunc(next.RosterDroppedPeerIds, departs)
+		for _, p := range next.Participants {
+			if _, ok := promoted[p.GetPeerId()]; ok {
+				p.Role = SOParticipantRole_SOParticipantRole_OWNER
+			}
+		}
+		if err := pinRemovedAuthors(host.GetSharedObjectID(), state, next, peers, nil); err != nil {
+			return nil, err
+		}
+		change, err := BuildSOConfigChange(host.GetSharedObjectID(), current, next, SOConfigChangeType_SO_CONFIG_CHANGE_TYPE_REMOVE_PARTICIPANT, owner, &SORevocationInfo{LeaveRequestHash: requestHash[:]})
+		if err != nil {
+			return nil, err
+		}
+		err = host.ApplyConfigChange(ctx, change, func(state *SOState) error {
+			return pruneRemovedParticipants(host.GetSharedObjectID(), state, targets, owner)
+		})
+		if err == nil {
+			return &SOLeaveResponse{Changes: append(changes, change)}, nil
+		}
+
+		// A concurrent owner change invalidates only this optimistic attempt. Re-read
+		// retained history and apply the same consent if its identities stayed admitted.
+		latest, latestErr := host.GetHostState(ctx)
+		if latestErr != nil || bytes.Equal(latest.GetConfig().GetConfigChainHash(), current.GetConfigChainHash()) {
+			return nil, err
+		}
+	}
+}
+
+// peerIDSet returns the set of ids.
+func peerIDSet(ids []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	return set
+}
+
+// carriesLeaveRequest reports whether changes is the single ownership transfer
+// that carries request from the configuration it was signed at. Its owner
+// already checked the consent there, so the departure commits without reading
+// the entry that produced that configuration, which a replica that joined at
+// it does not hold.
+func carriesLeaveRequest(changes []*SOConfigChange, request *SOLeaveRequest) bool {
+	return len(changes) == 1 &&
+		isSODepartureTransfer(changes[0]) &&
+		bytes.Equal(changes[0].GetPreviousHash(), request.GetConfigHash()) &&
+		changes[0].GetLeaveRequest().EqualVT(request)
+}
+
+// leaveProofsRemainCurrent permits rebasing consent only when every signer was
+// admitted at the signed head and remained admitted through each later transition.
+// A signer absent from any of those configurations must consent again.
+func leaveProofsRemainCurrent(peers []string, signed *SharedObjectConfig, changes []*SOConfigChange) bool {
+	// Require at least one later transition to rebase against.
+	if len(changes) == 0 {
+		return false
+	}
+
+	// Rebuild the configuration chain from the signed head forward.
+	configs := []*SharedObjectConfig{signed}
+	for _, change := range changes {
+		configs = append(configs, change.GetConfig())
+	}
+
+	// Require every signer to remain admitted through the whole chain.
+	for _, config := range configs {
+		for _, peerID := range peers {
+			if !slices.ContainsFunc(config.GetParticipants(), func(p *SOParticipantConfig) bool {
+				return p.GetPeerId() == peerID
+			}) {
+				return false
+			}
+		}
+	}
+	return true
+}

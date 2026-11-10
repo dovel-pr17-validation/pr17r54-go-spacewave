@@ -1,0 +1,79 @@
+package s4wave_apt
+
+import (
+	"testing"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+)
+
+func TestAptBuildSpecTypeIDAndBlock(t *testing.T) {
+	// Verify the build specification type identifier.
+	if AptBuildSpecTypeID != "spacewave-vm/apt/build-spec" {
+		t.Fatalf("AptBuildSpecTypeID = %q", AptBuildSpecTypeID)
+	}
+
+	// Prepare the source reference and build configuration and verify the record.
+	sourceRef, err := block.BuildBlockRef([]byte("busybox-source"), nil)
+	if err != nil {
+		t.Fatalf("BuildBlockRef: %v", err)
+	}
+	spec := &AptBuildSpec{
+		SourcePackage: "busybox",
+		SourceRef:     &bucket.ObjectRef{RootRef: sourceRef},
+		BuildConfig: &AptBuildConfig{
+			Env: map[string]string{
+				"DEB_HOST_ARCH": "i386",
+			},
+			CrossCompilePrefix: "i686-linux-gnu-",
+		},
+		Architectures: []string{"i386"},
+		BuildDeps:     []string{"zlib"},
+	}
+	if err := spec.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	// Verify the build specification survives binary encoding and decoding.
+	data, err := spec.MarshalVT()
+	if err != nil {
+		t.Fatalf("MarshalVT: %v", err)
+	}
+	var decoded AptBuildSpec
+	if err := decoded.UnmarshalVT(data); err != nil {
+		t.Fatalf("UnmarshalVT: %v", err)
+	}
+	if !decoded.EqualVT(spec) {
+		t.Fatalf("decoded build spec does not match original: got=%s want=%s", decoded.String(), spec.String())
+	}
+}
+
+func TestAptBuildSpecValidateRejectsMissingCoreFields(t *testing.T) {
+	// Verify incomplete source and build configuration fields are rejected.
+	sourceRef, err := block.BuildBlockRef([]byte("busybox-source"), nil)
+	if err != nil {
+		t.Fatalf("BuildBlockRef: %v", err)
+	}
+	if err := (&AptBuildSpec{}).Validate(); err == nil {
+		t.Fatal("expected missing source_package error")
+	}
+	if err := (&AptBuildSpec{SourcePackage: "busybox"}).Validate(); err == nil {
+		t.Fatal("expected missing source_ref error")
+	}
+	if err := (&AptBuildSpec{
+		SourcePackage: "busybox",
+		SourceRef:     &bucket.ObjectRef{RootRef: sourceRef},
+	}).Validate(); err == nil {
+		t.Fatal("expected missing architectures error")
+	}
+	if err := (&AptBuildSpec{
+		SourcePackage: "busybox",
+		SourceRef:     &bucket.ObjectRef{RootRef: sourceRef},
+		Architectures: []string{"i386"},
+		BuildConfig: &AptBuildConfig{
+			Env: map[string]string{"": "i386"},
+		},
+	}).Validate(); err == nil {
+		t.Fatal("expected missing build_config env key error")
+	}
+}

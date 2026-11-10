@@ -1,0 +1,393 @@
+package sobject
+
+import (
+	"context"
+	"slices"
+	"strings"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/ulid"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/core/bstore"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// ProcessOpsFunc applies decoded operations to the state of a shared object
+// folded without a Body. Replay calls it with one operation at a time.
+// If rawNextStateData is nil, the state is unchanged.
+type ProcessOpsFunc = func(
+	ctx context.Context,
+	snap SharedObjectStateSnapshot,
+	currentStateData []byte,
+	ops []*SOOperationInner,
+) (rawNextStateData *[]byte, opResults []*SOOperationResult, err error)
+
+// SharedObject is the shared object handle interface.
+//
+// This is the interface exposed by the provider on the "client side."
+type SharedObject interface {
+	// GetBus returns the bus used by the session.
+	GetBus() bus.Bus
+
+	// GetPeerID returns the peer ID attached to this SharedObject handle.
+	GetPeerID() peer.ID
+
+	// GetSharedObjectID returns the shared object id.
+	GetSharedObjectID() string
+
+	// GetBlockStore returns the block store mounted along with the SharedObject.
+	GetBlockStore() bstore.BlockStore
+
+	// AccessLocalStateStore accesses a kvtx ops for a local state store with the given ID.
+	// This state store is stored along with the local SharedObject state.
+	AccessLocalStateStore(ctx context.Context, storeID string, released func()) (kvtx.Store, func(), error)
+
+	// GetSharedObjectState returns a snapshot of the shared object state.
+	GetSharedObjectState(ctx context.Context) (SharedObjectStateSnapshot, error)
+
+	// AccessSharedObjectState adds a reference to the state and returns the state container.
+	// Returns a release function. Accepts a function that is called if the Watchable becomes invalid.
+	AccessSharedObjectState(ctx context.Context, released func()) (ccontainer.Watchable[SharedObjectStateSnapshot], func(), error)
+
+	// QueueOperation signs op as the local peer and adds it to the operation
+	// set. Returns the local operation id once the local state holds it
+	// durably.
+	QueueOperation(ctx context.Context, op []byte) (string, error)
+
+	// SetBody waits until no body is attached, then attaches body until
+	// release, so the SharedObject has one owner at a time: a body attaches
+	// only after the previous one was released, which its owner does once it
+	// stopped. The SharedObject replays its agreed order into the body through
+	// a BodyDriver while the body is attached, and a host that signs
+	// checkpoints asks the body for the state each one carries. Returns ctx's
+	// error if it ends before the body attaches.
+	SetBody(ctx context.Context, body Body) (release func(), err error)
+}
+
+// SharedObjectHealthAccessor exposes SharedObject health directly from a mounted object.
+type SharedObjectHealthAccessor interface {
+	// AccessSharedObjectHealth adds a reference to SharedObject health and returns the state container.
+	// Returns a release function. Accepts a function that is called if the Watchable becomes invalid.
+	AccessSharedObjectHealth(ctx context.Context, released func()) (ccontainer.Watchable[*SharedObjectHealth], func(), error)
+}
+
+// InviteHost is an optional interface on SharedObject implementations that
+// hold the state on this device and support invite creation and management.
+// Both local and spacewave providers implement this.
+type InviteHost interface {
+	InviteMutator
+
+	// GetSOHost returns the SOHost holding the state.
+	GetSOHost() *SOHost
+	// GetPrivKey returns the private key of the local participant.
+	GetPrivKey() crypto.PrivKey
+
+	// GetProviderID returns the provider identifier for the invite message.
+	GetProviderID() string
+}
+
+// JoinRequestHost is an optional interface on SharedObject implementations
+// that hold the join requests queued by invites requiring approval.
+type JoinRequestHost interface {
+	// GetJoinRequestsCtr returns the pending join requests, at most one per peer.
+	GetJoinRequestsCtr() ccontainer.Watchable[*SOJoinRequestList]
+	// RemoveJoinRequest removes the pending request of peerID.
+	RemoveJoinRequest(ctx context.Context, peerID string) error
+}
+
+// InviteMutator mutates shared-object invite state.
+type InviteMutator interface {
+	// CreateSOInviteOp creates a new invite and returns the signed invite message.
+	CreateSOInviteOp(
+		ctx context.Context,
+		ownerPrivKey crypto.PrivKey,
+		providerID string,
+		terms *SOInvite,
+	) (*SOInviteMessage, error)
+	// RevokeInvite revokes an invite by ID.
+	RevokeInvite(ctx context.Context, signerPrivKey crypto.PrivKey, inviteID string) error
+	// IncrementInviteUses increments the use counter for an invite by ID.
+	IncrementInviteUses(ctx context.Context, signerPrivKey crypto.PrivKey, inviteID string) error
+}
+
+// Validate checks bootstrap structure or a retained configuration, including a terminal empty audience.
+// A nonempty configuration must keep an OWNER so later changes remain authorizable.
+func (c *SharedObjectConfig) Validate() error {
+	// The participant list has no count of its own; the encoded config bounds
+	// it, and so bounds the voting weight sums and the work below.
+	if c.SizeVT() > MaxStateDataSize {
+		return ErrMaxCountExceeded
+	}
+
+	// Pinned operations of removed authors outlive the final departure too.
+	if err := validateAuthorHeads("removed_authors", c.GetRemovedAuthors()); err != nil {
+		return err
+	}
+
+	// The roster drops each peer once, in order.
+	for i, peerID := range c.GetRosterDroppedPeerIds() {
+		if _, err := parsePeerIDField(peerID); err != nil {
+			return errors.Wrapf(err, "roster_dropped_peer_ids[%d]", i)
+		}
+		if i > 0 && strings.Compare(c.GetRosterDroppedPeerIds()[i-1], peerID) >= 0 {
+			return errors.New("roster_dropped_peer_ids must be strictly sorted")
+		}
+	}
+
+	// An appointed sequencer names a key and a real start.
+	if err := c.GetSequencer().Validate(); err != nil {
+		return err
+	}
+
+	// The control setting matches its voting weights.
+	if err := c.validateControl(); err != nil {
+		return err
+	}
+
+	// A signed history head can retain the final departure; an empty bootstrap cannot grant authority.
+	participants := c.GetParticipants()
+	if len(participants) == 0 {
+		if len(c.GetConfigChainHash()) != 32 {
+			return ErrEmptyParticipants
+		}
+		return nil
+	}
+
+	// Each remaining peer has one unambiguous role in this configuration.
+	seenPeerIDs := make(map[string]struct{}, len(participants))
+	var hasOwner bool
+	for i, participant := range participants {
+		if err := participant.Validate(); err != nil {
+			return errors.Wrapf(err, "participants[%d]", i)
+		}
+		ppID := participant.GetPeerId()
+		if _, ok := seenPeerIDs[ppID]; ok {
+			return errors.Errorf("participants[%d]: duplicate peer id: %v", i, ppID)
+		}
+		seenPeerIDs[ppID] = struct{}{}
+		hasOwner = hasOwner || IsOwner(participant.GetRole())
+	}
+
+	// Remaining participants need an owner to authorize any later change.
+	if !hasOwner {
+		return ErrNoOwner
+	}
+	return nil
+}
+
+// AdmitsOperation reports whether replay under this config applies the
+// operation at nonce in peerID's chain: the author participates, or a removal
+// pinned an operation at or after nonce.
+func (c *SharedObjectConfig) AdmitsOperation(peerID string, nonce uint64) bool {
+	if slices.ContainsFunc(c.GetParticipants(), func(p *SOParticipantConfig) bool { return p.GetPeerId() == peerID }) {
+		return true
+	}
+	i, ok := slices.BinarySearchFunc(c.GetRemovedAuthors(), peerID, func(a *SOOperationPosition, id string) int {
+		return strings.Compare(a.GetPeerId(), id)
+	})
+	return ok && nonce <= c.GetRemovedAuthors()[i].GetNonce()
+}
+
+// Writers returns every participant that can write operations, in
+// participant order.
+func (c *SharedObjectConfig) Writers() []string {
+	var writers []string
+	for _, p := range c.GetParticipants() {
+		if CanWriteOps(p.GetRole()) {
+			writers = append(writers, p.GetPeerId())
+		}
+	}
+	return writers
+}
+
+// TrimRoster returns the trimming roster: every writer the roster does not
+// drop, in participant order.
+func (c *SharedObjectConfig) TrimRoster() []string {
+	return slices.DeleteFunc(c.Writers(), func(peerID string) bool {
+		return slices.Contains(c.GetRosterDroppedPeerIds(), peerID)
+	})
+}
+
+// Checkpointer returns the owner that checkpoints the stable point: the first
+// owner on the trimming roster, in participant order, or empty when none is.
+// One checkpointer keeps owners from signing different checkpoints at one
+// height.
+func (c *SharedObjectConfig) Checkpointer() string {
+	for _, p := range c.GetParticipants() {
+		if IsOwner(p.GetRole()) && !slices.Contains(c.GetRosterDroppedPeerIds(), p.GetPeerId()) {
+			return p.GetPeerId()
+		}
+	}
+	return ""
+}
+
+// Leader returns the owner that both orders and checkpoints the operations,
+// or empty when no owner does both. The leader checkpoints each ordered batch,
+// so the other participants install its checkpoints instead of replaying the
+// operations. Group control decides checkpoints by vote and has no leader.
+func (c *SharedObjectConfig) Leader() string {
+	checkpointer := c.Checkpointer()
+	if checkpointer == "" || c.IsGroupControl() || c.GetSequencer().GetPeerId() != checkpointer {
+		return ""
+	}
+	return checkpointer
+}
+
+// NewSOOperationLocalID constructs a new randomized local ID for a op.
+func NewSOOperationLocalID() string {
+	return ulid.NewULID()
+}
+
+// ParseSOOperationLocalID parses and validates the local id is the correct format.
+func ParseSOOperationLocalID(id string) (ulid.ULID, error) {
+	return ulid.ParseULID(id)
+}
+
+// UnmarshalInner unmarshals and verifies the SOOperationInner.
+func (op *SOOperation) UnmarshalInner() (*SOOperationInner, error) {
+	inner := &SOOperationInner{}
+	if err := inner.UnmarshalVT(op.GetInner()); err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal inner data")
+	}
+	if err := inner.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid inner data")
+	}
+	return inner, nil
+}
+
+// Validate performs cursory checks on the SOOperation.
+func (op *SOOperation) Validate() error {
+	// Bound the inner data size.
+	if len(op.GetInner()) == 0 {
+		return ErrEmptyInnerData
+	}
+	if len(op.GetInner()) > MaxInnerDataSize {
+		return ErrMaxSizeExceeded
+	}
+
+	// Check the signature and the inner data it covers.
+	if err := op.GetSignature().Validate(); err != nil {
+		return err
+	}
+	_, err := op.UnmarshalInner()
+	return err
+}
+
+// Validate performs cursory checks on the SOOperationInner.
+func (i *SOOperationInner) Validate() error {
+	// The author, local ID, and sequence identify the operation.
+	if _, err := i.ParsePeerID(); err != nil {
+		return err
+	}
+	if _, err := ParseSOOperationLocalID(i.GetLocalId()); err != nil {
+		return err
+	}
+	if i.GetNonce() == 0 {
+		return ErrInvalidNonce
+	}
+
+	// The payload is bounded. An acknowledgment carries none.
+	if len(i.GetOpData()) > MaxInnerDataSize {
+		return ErrMaxSizeExceeded
+	}
+
+	// The links place the operation in its chain.
+	return i.validateLinks()
+}
+
+// IsAcknowledgment reports whether the operation is an acknowledgment: it
+// applies nothing and records that its author has built on every operation it
+// names.
+func (i *SOOperationInner) IsAcknowledgment() bool {
+	return len(i.GetOpData()) == 0
+}
+
+// parsePeerIDField parses a peer id string from a proto field. Returns
+// peer.ErrEmptyPeerID when empty so callers do not need to repeat the check.
+func parsePeerIDField(peerID string) (peer.ID, error) {
+	if len(peerID) == 0 {
+		return "", peer.ErrEmptyPeerID
+	}
+	return confparse.ParsePeerID(peerID)
+}
+
+// ParsePeerID parses the peer ID.
+func (r *SOOperationRef) ParsePeerID() (peer.ID, error) {
+	return parsePeerIDField(r.GetPeerId())
+}
+
+// Validate validates the SOOperationRef.
+func (r *SOOperationRef) Validate() error {
+	if _, err := r.ParsePeerID(); err != nil {
+		return err
+	}
+	if r.GetNonce() == 0 {
+		return ErrInvalidNonce
+	}
+	return nil
+}
+
+// ParsePeerID parses the peer ID.
+func (i *SOOperationInner) ParsePeerID() (peer.ID, error) {
+	return parsePeerIDField(i.GetPeerId())
+}
+
+// ParsePeerID parses the peer ID.
+func (g *SOGrant) ParsePeerID() (peer.ID, error) {
+	return parsePeerIDField(g.GetPeerId())
+}
+
+// Validate performs cursory checks on the SOGrant.
+func (g *SOGrant) Validate() error {
+	if _, err := g.ParsePeerID(); err != nil {
+		return err
+	}
+	if len(g.GetInnerData()) == 0 {
+		return ErrEmptyInnerData
+	}
+	if len(g.GetInnerData()) > MaxInnerDataSize {
+		return ErrMaxSizeExceeded
+	}
+	return g.GetSignature().Validate()
+}
+
+// Validate performs cursory checks on the SOGrantInner.
+func (g *SOGrantInner) Validate() error {
+	if g.GetTransformConf().GetEmpty() {
+		return ErrEmptyTransformConfig
+	}
+	if g.GetTransformConf().SizeVT() > MaxBlockRefSize {
+		return ErrMaxSizeExceeded
+	}
+	return g.GetTransformConf().Validate()
+}
+
+// BuildSOOperationResult constructs a new SOOperationResult.
+// If success is false, errorDetails must be non-nil.
+func BuildSOOperationResult(
+	peerID string,
+	nonce uint64,
+	success bool,
+	errorDetails *SOOperationRejectionErrorDetails,
+) *SOOperationResult {
+	result := &SOOperationResult{
+		OpRef: &SOOperationRef{
+			PeerId: peerID,
+			Nonce:  nonce,
+		},
+	}
+	if success {
+		result.Body = &SOOperationResult_Success{
+			Success: true,
+		}
+	} else {
+		result.Body = &SOOperationResult_ErrorDetails{
+			ErrorDetails: errorDetails,
+		}
+	}
+	return result
+}

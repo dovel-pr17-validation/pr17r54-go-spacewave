@@ -1,0 +1,15 @@
+udp:
+  id: bifrost/udp
+  config:
+    dialers:
+      12D3KooWC9dBAEoTHbEXq2aaTeFit7QVdvPcb6Yf76oGQZ6dGf8N:
+        address: 127.0.0.1:50042
+    listenAddr: :50043
+
+listening:
+  id: bifrost/stream/listening
+  config:
+    remotePeerId: 12D3KooWC9dBAEoTHbEXq2aaTeFit7QVdvPcb6Yf76oGQZ6dGf8N
+    protocolId: my/http/forwarding
+    listenMultiaddr: "/ip4/127.0.0.1/tcp/8084"
+

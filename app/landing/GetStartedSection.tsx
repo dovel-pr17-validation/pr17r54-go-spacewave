@@ -1,0 +1,134 @@
+import React, { useCallback, useSyncExternalStore } from 'react'
+
+import type { SessionListEntry } from '@s4wave/core/session/session.pb.js'
+import { useNavigate } from '@s4wave/web/router/router.js'
+import { cn } from '@s4wave/web/style/utils.js'
+
+import AnimatedLogo from './AnimatedLogo.js'
+import { ExternalLink } from './ExternalLink.js'
+import GetStarted from './GetStarted.js'
+import { NavigationLinks } from './NavigationLinks.js'
+
+interface GetStartedSectionProps {
+  homeRef: React.RefObject<HTMLDivElement | null>
+  showScrollIndicator: boolean
+  animateScrollIndicator: boolean
+  scrollDown: () => void
+  sessions?: SessionListEntry[]
+}
+
+const shortHeightQuery = '(max-height: 580px)'
+
+function subscribeShortHeight(onChange: () => void) {
+  const query = window.matchMedia(shortHeightQuery)
+  query.addEventListener('change', onChange)
+  return () => query.removeEventListener('change', onChange)
+}
+
+function getShortHeight() {
+  return window.matchMedia(shortHeightQuery).matches
+}
+
+/** GetStartedSection renders the landing entry and its reachable attribution controls. */
+export function GetStartedSection({
+  homeRef,
+  showScrollIndicator,
+  animateScrollIndicator,
+  scrollDown,
+  sessions,
+}: GetStartedSectionProps) {
+  const navigate = useNavigate()
+  const isShortHeight = useSyncExternalStore(
+    subscribeShortHeight,
+    getShortHeight,
+    () => false,
+  )
+
+  const goToCommunity = useCallback(() => {
+    navigate({ path: '/community' })
+  }, [navigate])
+  return (
+    <div
+      ref={homeRef}
+      className="@2xl:pt-get-started-wide short:shrink-0 relative flex min-h-full w-full flex-col pt-6 @lg:pt-8"
+    >
+      {/* Spacer to center content on tall screens */}
+      <div className="tall:block tall:flex-1 hidden" />
+
+      {/* Logo and Navigation Section */}
+      <div className="tall:flex-initial short:flex-none mb-1 flex min-h-0 flex-1 flex-col items-center gap-2 @lg:gap-3 @2xl:gap-4">
+        <AnimatedLogo
+          followMouse={true}
+          containerClassName="very-short:hidden"
+        />
+        <h1 className="ultra-short:hidden tracking-brand-tight @lg:tracking-brand-lg text-2xl font-semibold whitespace-nowrap @lg:text-3xl">
+          [SPACEWAVE]
+        </h1>
+
+        <NavigationLinks />
+
+        <div className="tall:flex-initial short:flex-none flex min-h-0 w-full max-w-2xl flex-1 flex-col gap-4 px-4 text-sm @lg:gap-6 @lg:px-8">
+          <GetStarted className="relative z-10" sessions={sessions} />
+
+          {/* Description Section */}
+          <div className="text-foreground-alt text-center">
+            <p className="text-xs">
+              local-first, end-to-end encrypted,{' '}
+              <span className="text-white">no account required</span>
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom spacer to center content on tall screens */}
+      <div className="tall:block tall:flex-1 hidden" />
+
+      {/* Footer content follows the entry actions on short screens. */}
+      <div className="mt-auto flex flex-shrink-0 flex-col items-center pt-4 text-center @lg:pt-6">
+        <div className="text-foreground-alt/60 flex flex-wrap items-center justify-center gap-x-1 text-xs">
+          <span>
+            Made by{' '}
+            <button
+              type="button"
+              onClick={goToCommunity}
+              className="hover:text-brand cursor-pointer underline transition-colors [@media(pointer:coarse)]:inline-flex [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11 [@media(pointer:coarse)]:items-center [@media(pointer:coarse)]:justify-center"
+            >
+              the community
+            </button>
+          </span>
+          <span aria-hidden>·</span>
+          <span>Free software</span>
+          <span aria-hidden>·</span>
+          <ExternalLink
+            href="https://spacemacs.org"
+            className="hover:text-brand underline transition-colors [@media(pointer:coarse)]:inline-flex [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11 [@media(pointer:coarse)]:items-center [@media(pointer:coarse)]:justify-center"
+          >
+            Inspired by Spacemacs
+          </ExternalLink>
+        </div>
+
+        {/* Scroll indicator */}
+        <button
+          type="button"
+          tabIndex={showScrollIndicator || isShortHeight ? 0 : -1}
+          aria-label="Scroll down to learn more"
+          className={cn(
+            'short:pointer-events-auto! short:opacity-100! mt-2 mb-3 flex cursor-pointer flex-col items-center gap-0.5 transition-opacity duration-300 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11 [@media(pointer:coarse)]:justify-center',
+            showScrollIndicator
+              ? 'opacity-100'
+              : 'pointer-events-none opacity-0',
+            showScrollIndicator &&
+              animateScrollIndicator &&
+              'animate-logo-medium',
+          )}
+          onClick={scrollDown}
+        >
+          <span className="text-foreground-alt/60 micro-ten tracking-wide uppercase select-none">
+            Learn more
+          </span>
+          <span className="text-foreground-alt/60 text-xs font-bold">▼</span>
+        </button>
+      </div>
+    </div>
+  )
+}

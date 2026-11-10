@@ -1,0 +1,147 @@
+syntax = "proto3";
+package s4wave.command;
+
+
+// CommandFocusContext identifies where a command binding applies.
+enum CommandFocusContext {
+  // COMMAND_FOCUS_CONTEXT_UNSPECIFIED matches the global context.
+  COMMAND_FOCUS_CONTEXT_UNSPECIFIED = 0;
+  // COMMAND_FOCUS_CONTEXT_GLOBAL matches the shell globally.
+  COMMAND_FOCUS_CONTEXT_GLOBAL = 1;
+  // COMMAND_FOCUS_CONTEXT_SHELL_TAB matches the active shell tab.
+  COMMAND_FOCUS_CONTEXT_SHELL_TAB = 2;
+  // COMMAND_FOCUS_CONTEXT_EDITOR matches an editor surface.
+  COMMAND_FOCUS_CONTEXT_EDITOR = 3;
+  // COMMAND_FOCUS_CONTEXT_LIST matches list and tree surfaces.
+  COMMAND_FOCUS_CONTEXT_LIST = 4;
+  // COMMAND_FOCUS_CONTEXT_CANVAS matches canvas surfaces.
+  COMMAND_FOCUS_CONTEXT_CANVAS = 5;
+  // COMMAND_FOCUS_CONTEXT_MODAL matches modal dialogs.
+  COMMAND_FOCUS_CONTEXT_MODAL = 6;
+  // COMMAND_FOCUS_CONTEXT_TEXT_INPUT matches editable text controls.
+  COMMAND_FOCUS_CONTEXT_TEXT_INPUT = 7;
+}
+
+// CommandSurface identifies the command front door for one registration.
+enum CommandSurface {
+  // COMMAND_SURFACE_UNKNOWN is not a usable command surface.
+  COMMAND_SURFACE_UNKNOWN = 0;
+  // COMMAND_SURFACE_WEB selects the web command surface.
+  COMMAND_SURFACE_WEB = 1;
+  // COMMAND_SURFACE_TUI selects the terminal command surface.
+  COMMAND_SURFACE_TUI = 2;
+}
+
+// KeyCombo stores one key event plus modifiers.
+message KeyCombo {
+  // Combo is the canonical combo string.
+  string combo = 1;
+}
+
+// KeySequence stores ordered key steps.
+message KeySequence {
+  // Steps are canonical key step strings; "Leader" is the virtual leader step.
+  repeated string steps = 1;
+}
+
+// CommandBinding stores one default command input binding.
+message CommandBinding {
+  // Id is stable within a command's default bindings.
+  string id = 1;
+  oneof binding {
+    // Combo stores a one-event key binding.
+    KeyCombo combo = 2;
+    // Sequence stores an ordered key sequence.
+    KeySequence sequence = 3;
+  }
+  // When limits the binding to a focus context.
+  CommandFocusContext when = 4;
+  // SourceLabel is an optional display label for the binding source.
+  string source_label = 5;
+  // Surface selects the explicit WEB or TUI default partition.
+  CommandSurface surface = 6;
+}
+
+// KeybindingDisplayMode identifies how bindings are displayed.
+enum KeybindingDisplayMode {
+  // KEYBINDING_DISPLAY_MODE_UNSPECIFIED uses the default display mode.
+  KEYBINDING_DISPLAY_MODE_UNSPECIFIED = 0;
+  // KEYBINDING_DISPLAY_MODE_SYMBOLS displays platform symbols.
+  KEYBINDING_DISPLAY_MODE_SYMBOLS = 1;
+  // KEYBINDING_DISPLAY_MODE_TEXT displays plain text modifier names.
+  KEYBINDING_DISPLAY_MODE_TEXT = 2;
+}
+
+// KeybindingDisplaySettings stores display preferences for one override layer.
+message KeybindingDisplaySettings {
+  // Mode selects how bindings are displayed.
+  KeybindingDisplayMode mode = 1;
+}
+
+// KeybindingOverrideSettings stores non-command-specific keybinding preferences.
+message KeybindingOverrideSettings {
+  // LeaderCombo is the layer's virtual Leader binding.
+  string leader_combo = 1;
+  // WhichKeyDelayMs is the delay before showing which-key discovery.
+  uint32 which_key_delay_ms = 2;
+  // Display contains binding display preferences.
+  KeybindingDisplaySettings display = 3;
+}
+
+// KeybindingCommandOverride stores one command's override in a keybinding layer.
+message KeybindingCommandOverride {
+  // CommandId is the command identifier this override applies to.
+  string command_id = 1;
+  // ReplaceBindings indicates bindings replace lower-layer bindings.
+  bool replace_bindings = 2;
+  // Disabled indicates the command has no effective bindings in this layer.
+  bool disabled = 3;
+  // ClearedBindingIds lists lower-layer binding IDs removed by this layer.
+  repeated string cleared_binding_ids = 4;
+  // Bindings are bindings added by this layer.
+  repeated CommandBinding bindings = 5;
+}
+
+// KeybindingOverrideSet stores one persisted keybinding override layer.
+message KeybindingOverrideSet {
+  reserved 1, 2, 3;
+  // WebOverrides is the browser partition.
+  repeated KeybindingCommandOverride web_overrides = 4;
+  // TuiOverrides is the terminal partition.
+  repeated KeybindingCommandOverride tui_overrides = 5;
+  // WebSettings is the version-2 browser settings partition.
+  KeybindingOverrideSettings web_settings = 6;
+  // TuiSettings is the version-2 terminal settings partition.
+  KeybindingOverrideSettings tui_settings = 7;
+}
+
+// Command is the metadata for a registered command.
+message Command {
+  // CommandId is the unique reverse-domain command identifier.
+  // e.g. "spacewave.file.save", "notes.new-note"
+  string command_id = 1;
+  // Label is the human-readable display name.
+  string label = 2;
+  reserved 3;
+  reserved "keybinding";
+  // MenuPath is the menu placement path.
+  // Format: "File/Save", "File/Export/PDF", "View/Toggle Sidebar"
+  // Empty means the command is not in any menu.
+  string menu_path = 4;
+  // MenuGroup controls separator placement within a menu level.
+  // Commands with the same group are visually grouped together.
+  uint32 menu_group = 5;
+  // MenuOrder controls ordering within a group.
+  uint32 menu_order = 6;
+  // Icon is an optional icon identifier.
+  string icon = 7;
+  // Description is an optional longer description for the palette.
+  string description = 8;
+  // HasSubItems indicates the command has a sub-item list in the palette.
+  // When selected, the palette replaces the command list with sub-items.
+  bool has_sub_items = 9;
+  // DefaultBindings are the typed default input bindings for the command.
+  repeated CommandBinding default_bindings = 10;
+  // SearchAliases adds discovery terms without creating alternate command IDs.
+  repeated string search_aliases = 11;
+}

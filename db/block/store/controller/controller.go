@@ -1,0 +1,170 @@
+package block_store_controller
+
+import (
+	"context"
+	"slices"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/promise"
+	"github.com/aperturerobotics/util/refcount"
+	"github.com/s4wave/spacewave/db/block"
+	block_store "github.com/s4wave/spacewave/db/block/store"
+	"github.com/s4wave/spacewave/db/dex"
+	"github.com/sirupsen/logrus"
+)
+
+// Controller resolves LookupBlockStore with a block_store.Store.
+type Controller struct {
+	// info is the controller info
+	info *controller.Info
+	// storeCtr contains the block store
+	storeCtr *ccontainer.CContainer[block_store.Store]
+	// errCtr contains any error building the handler
+	errCtr *ccontainer.CContainer[*error]
+	// rc is the refcount container
+	rc *refcount.RefCount[block_store.Store]
+	// blockStoreIds is the list of block store ids to match
+	// ignores if empty
+	blockStoreIds []string
+	// bucketIDs is a list of bucket ids to resolve LookupBlockFromNetwork directives.
+	bucketIDs []string
+	// skipNotFound returns no value if not found. otherwise returns found=false
+	skipNotFound bool
+	// verbose wraps the block store with a verbose logger
+	verbose bool
+}
+
+// NewController constructs a new controller.
+//
+// blockStoreIds is the list of block store ids to match LookupBlockStore.
+// buildOnStart adds a reference on startup & always runs the block store.
+// bucketIDs is a list of bucket ids to resolve LookupBlockFromNetwork directives.
+func NewController(
+	le *logrus.Entry,
+	info *controller.Info,
+	resolver BlockStoreBuilder,
+	blockStoreIds []string,
+	buildOnStart bool,
+	bucketIDs []string,
+	skipNotFound,
+	verbose bool,
+) *Controller {
+	// Construct the controller with the block store containers and match lists.
+	h := &Controller{
+		info:          info,
+		storeCtr:      ccontainer.NewCContainer[block_store.Store](nil),
+		errCtr:        ccontainer.NewCContainer[*error](nil),
+		blockStoreIds: blockStoreIds,
+		bucketIDs:     bucketIDs,
+		skipNotFound:  skipNotFound,
+		verbose:       verbose,
+	}
+
+	// Wrap the resolver with a verbose logger when requested.
+	if verbose && resolver != nil {
+		resolver = WrapVerboseBlockStoreBuilder(le, resolver)
+	}
+
+	// Build the refcount around the store container and resolver.
+	keepUnref := buildOnStart // never unreferenced if true, but set anyway.
+	h.rc = refcount.NewRefCount(nil, keepUnref, h.storeCtr, h.errCtr, resolver)
+
+	// Hold a reference on startup so the store always builds.
+	if buildOnStart {
+		_ = h.rc.AddRef(nil)
+	}
+	return h
+}
+
+// GetControllerInfo returns information about the controller.
+func (c *Controller) GetControllerInfo() *controller.Info {
+	return c.info.Clone()
+}
+
+// GetHeldStore returns the built block store, or nil while none is built.
+func (c *Controller) GetHeldStore() block.StoreOps {
+	if store := c.storeCtr.GetValue(); store != nil {
+		return store
+	}
+	return nil
+}
+
+// WaitBlockStore adds a reference to the block store and waits for it to be constructed.
+func (c *Controller) WaitBlockStore(ctx context.Context) (block_store.Store, *refcount.Ref[block_store.Store], error) {
+	// Add a reference and wait for the store promise.
+	storePromise, storeRef := c.AddBlockStoreRef()
+	store, err := storePromise.Await(ctx)
+	if err != nil {
+		storeRef.Release()
+		return nil, nil, err
+	}
+	return store, storeRef, nil
+}
+
+// AddBlockStoreRef adds a reference to the block store.
+func (c *Controller) AddBlockStoreRef() (promise.PromiseLike[block_store.Store], *refcount.Ref[block_store.Store]) {
+	return c.rc.AddRefPromise()
+}
+
+// Execute executes the controller.
+func (c *Controller) Execute(ctx context.Context) error {
+	c.rc.SetContext(ctx)
+	return nil
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+func (c *Controller) HandleDirective(
+	ctx context.Context,
+	inst directive.Instance,
+) ([]directive.Resolver, error) {
+	// Match LookupBlockStore and LookupBlockFromNetwork directives.
+	switch d := inst.GetDirective().(type) {
+	case block_store.LookupBlockStore:
+		// Check whether the requested store ID matches the configured list.
+		storeID := d.LookupBlockStoreId()
+
+		var matched bool
+		// matches all store ids
+		if storeID == "" {
+			matched = true
+		} else {
+			if slices.Contains(c.blockStoreIds, storeID) {
+				matched = true
+			}
+		}
+		if !matched {
+			return nil, nil
+		}
+
+		// Resolve the directive with a refcount resolver over the store.
+		return directive.R(
+			directive.NewRefCountResolverWithXfrm(
+				c.rc,
+				func(ctx context.Context, store block_store.Store) (directive.Value, error) {
+					if store == nil {
+						return nil, nil
+					}
+					return store, nil
+				},
+			),
+			nil,
+		)
+	case dex.LookupBlockFromNetwork:
+		return c.resolveLookupBlockFromNetwork(ctx, inst, d)
+	}
+	return nil, nil
+}
+
+// Close releases any resources used by the controller.
+func (c *Controller) Close() error {
+	c.rc.ClearContext()
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ controller.Controller = (*Controller)(nil)
+	_ block.StoreHolder     = (*Controller)(nil)
+)

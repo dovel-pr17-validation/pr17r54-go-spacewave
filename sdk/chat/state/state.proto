@@ -1,0 +1,31 @@
+syntax = "proto3";
+package spacewave.chat;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/chat/state;spacewave_chat_state";
+
+// ChatReadPosition is a person's monotonic position in a channel's retained history.
+message ChatReadPosition {
+  // NextIndex is the first unread message index; zero means nothing has been read.
+  uint64 next_index = 1;
+  // UpdatedAt records when this position last advanced.
+  .google.protobuf.Timestamp updated_at = 2;
+  // ThreadPositions are positions that cover only one timeline, keyed by thread
+  // root message key. The empty key is the main timeline: every message outside
+  // a thread. Each advances independently of NextIndex, which covers every
+  // timeline.
+  map<string, ChatThreadReadPosition> thread_positions = 3;
+  // Author is the agent or tool that holds this position for its person, empty
+  // when the person holds it. A person and each of its authors hold separate
+  // positions, keyed by the person ID followed by "." and the author.
+  string author = 4;
+}
+
+// ChatThreadReadPosition is a person's monotonic position within one timeline.
+message ChatThreadReadPosition {
+  // NextIndex is the first unread channel message index within the timeline.
+  uint64 next_index = 1;
+  // UpdatedAt records when this position last advanced.
+  .google.protobuf.Timestamp updated_at = 2;
+}

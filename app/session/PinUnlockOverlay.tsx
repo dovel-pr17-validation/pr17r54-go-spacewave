@@ -1,0 +1,253 @@
+import { useCallback, useId, useState } from 'react'
+import { LuLock, LuLockOpen } from 'react-icons/lu'
+
+import { useNavigate } from '@s4wave/web/router/router.js'
+import { cn } from '@s4wave/web/style/utils.js'
+import AnimatedLogo from '@s4wave/app/landing/AnimatedLogo.js'
+import { BackButton } from '@s4wave/web/ui/BackButton.js'
+import { useSessionIndex } from '@s4wave/web/contexts/contexts.js'
+import { CredentialProofInput } from '@s4wave/web/ui/credential/CredentialProofInput.js'
+import { useCredentialProof } from '@s4wave/web/ui/credential/useCredentialProof.js'
+import {
+  SessionRecoveryState,
+  type EntityCredential,
+  type SessionMetadata,
+} from '@s4wave/core/session/session.pb.js'
+
+export interface PinUnlockOverlayProps {
+  metadata: SessionMetadata
+  onUnlock: (pin: Uint8Array) => Promise<void>
+  onReset: (sessionIdx: number, credential: EntityCredential) => Promise<void>
+}
+
+// PinUnlockOverlay renders the PIN unlock gate for PIN-locked sessions.
+export function PinUnlockOverlay({
+  metadata,
+  onUnlock,
+  onReset,
+}: PinUnlockOverlayProps) {
+  const sessionIdx = useSessionIndex()
+  const navigate = useNavigate()
+  const [pin, setPin] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [unlocking, setUnlocking] = useState(false)
+  const [showRecovery, setShowRecovery] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  const [recoveryError, setRecoveryError] = useState<string | null>(null)
+  const cred = useCredentialProof()
+  const pinInputId = useId()
+  const handlePinInputRef = useCallback((node: HTMLInputElement | null) => {
+    node?.focus()
+  }, [])
+  const recoveryUnavailable =
+    metadata.providerId === 'local' &&
+    metadata.recoveryState === SessionRecoveryState.UNAVAILABLE
+
+  const handleUnlock = useCallback(async () => {
+    if (pin.length === 0) {
+      setError('Please enter your PIN')
+      return
+    }
+    setError(null)
+    setUnlocking(true)
+    try {
+      await onUnlock(new TextEncoder().encode(pin))
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Wrong PIN. Please try again.',
+      )
+      setUnlocking(false)
+    }
+  }, [pin, onUnlock])
+
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent) => {
+      if (event.key === 'Enter') {
+        void handleUnlock()
+      }
+    },
+    [handleUnlock],
+  )
+
+  const handleReset = useCallback(async () => {
+    if (!cred.hasCredential) return
+    setResetting(true)
+    setRecoveryError(null)
+    try {
+      const credential: EntityCredential = cred.credential!
+      await onReset(sessionIdx, credential)
+      navigate({ path: '/sessions' })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Recovery failed'
+      if (msg.includes('unknown_keypair')) {
+        setRecoveryError('Incorrect password or unrecognized key.')
+      } else {
+        setRecoveryError(msg)
+      }
+    } finally {
+      setResetting(false)
+    }
+  }, [cred.credential, cred.hasCredential, onReset, sessionIdx, navigate])
+
+  return (
+    <div
+      role="group"
+      data-testid="pin-unlock-overlay"
+      className="bg-background-landing relative flex flex-1 flex-col items-center justify-center gap-6 overflow-y-auto p-6 outline-none md:p-10"
+      onKeyDown={handleKeyDown}
+      tabIndex={-1}
+    >
+      <BackButton floating onClick={() => navigate({ path: '/sessions' })}>
+        Sessions
+      </BackButton>
+      <div className="relative z-10 flex w-full max-w-sm flex-col gap-6">
+        <div className="flex flex-col items-center gap-2">
+          <AnimatedLogo followMouse={false} />
+        </div>
+
+        <div className="border-foreground/20 bg-background-get-started relative overflow-hidden rounded-lg border shadow-lg backdrop-blur-sm">
+          <div className="space-y-4 p-6">
+            <div className="flex flex-col items-center gap-2">
+              <div className="bg-brand/10 flex size-12 items-center justify-center rounded-full">
+                <LuLock className="text-brand size-6" />
+              </div>
+              <h2 className="text-foreground text-lg font-medium">
+                {metadata.displayName || 'Locked Session'}
+              </h2>
+              {metadata.providerDisplayName && (
+                <p className="text-foreground-alt text-xs">
+                  {metadata.providerDisplayName}
+                </p>
+              )}
+            </div>
+
+            {!showRecovery ? (
+              <>
+                <div>
+                  <label
+                    htmlFor={pinInputId}
+                    className="text-foreground-alt mb-1.5 block text-xs select-none"
+                  >
+                    Enter PIN to unlock
+                  </label>
+                  <input
+                    ref={handlePinInputRef}
+                    id={pinInputId}
+                    data-testid="pin-unlock-input"
+                    type="password"
+                    value={pin}
+                    onChange={(e) => setPin(e.target.value)}
+                    placeholder="PIN"
+                    disabled={unlocking}
+                    className={cn(
+                      'border-foreground/20 bg-background/30 text-foreground placeholder:text-foreground-alt/50 w-full rounded-md border px-3 py-2 text-center text-lg tracking-widest transition-colors outline-none',
+                      'focus:border-brand/50',
+                      error && 'border-destructive/50',
+                      'disabled:opacity-50',
+                    )}
+                  />
+                </div>
+
+                {error && (
+                  <p className="text-destructive text-center text-xs">
+                    {error}
+                  </p>
+                )}
+
+                <button
+                  type="button"
+                  data-testid="pin-unlock-submit"
+                  onClick={() => void handleUnlock()}
+                  disabled={unlocking || pin.length === 0}
+                  className={cn(
+                    'group w-full rounded-md border transition-all duration-300',
+                    'border-brand/30 bg-brand/10 hover:bg-brand/20',
+                    'disabled:cursor-not-allowed disabled:opacity-50',
+                    'flex h-10 items-center justify-center gap-2',
+                  )}
+                >
+                  <LuLockOpen className="size-4" />
+                  <span className="text-foreground text-sm">
+                    {unlocking ? 'Unlocking…' : 'Unlock'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowRecovery(true)}
+                  className="text-foreground-alt hover:text-foreground w-full text-center text-xs transition-colors"
+                >
+                  Forgot PIN?
+                </button>
+              </>
+            ) : recoveryUnavailable ? (
+              <>
+                <div className="space-y-2">
+                  <p className="text-foreground-alt text-xs leading-relaxed">
+                    This local session has no recovery password or backup key.
+                  </p>
+                  <p className="text-foreground-alt text-xs leading-relaxed">
+                    Your PIN is the only unlock method. Try the PIN again, or
+                    return to Sessions and remove this local session to create a
+                    new one. Local-only data that only this session can access
+                    may not be recoverable.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setShowRecovery(false)}
+                  className="text-foreground-alt hover:text-foreground w-full text-center text-xs transition-colors"
+                >
+                  Back to PIN entry
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="text-foreground-alt text-xs leading-relaxed">
+                  Re-authenticate with your account password or backup key to
+                  reset this session. This generates a new session key.
+                </p>
+
+                <CredentialProofInput
+                  password={cred.password}
+                  onPasswordChange={cred.setPassword}
+                  pemFileName={cred.pemFileName}
+                  onFileChange={cred.handleFileChange}
+                  fileInputRef={cred.fileInputRef}
+                  pemLabel="Backup key file"
+                  error={recoveryError}
+                  focusOnMount
+                />
+
+                <button
+                  type="button"
+                  onClick={() => void handleReset()}
+                  disabled={resetting || !cred.hasCredential}
+                  className={cn(
+                    'group w-full rounded-md border transition-all duration-300',
+                    'border-brand/30 bg-brand/10 hover:bg-brand/20',
+                    'disabled:cursor-not-allowed disabled:opacity-50',
+                    'flex h-10 items-center justify-center gap-2',
+                  )}
+                >
+                  <span className="text-foreground text-sm">
+                    {resetting ? 'Resetting…' : 'Reset session'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowRecovery(false)}
+                  className="text-foreground-alt hover:text-foreground w-full text-center text-xs transition-colors"
+                >
+                  Back to PIN entry
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

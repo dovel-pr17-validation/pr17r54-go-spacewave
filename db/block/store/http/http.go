@@ -1,0 +1,413 @@
+package block_store_http
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/url"
+
+	httplog "github.com/aperturerobotics/util/httplog"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	block_store "github.com/s4wave/spacewave/db/block/store"
+	"github.com/s4wave/spacewave/net/hash"
+	"github.com/sirupsen/logrus"
+)
+
+// HTTPBlock is a block store on top of a HTTP client and base URL prefix.
+type HTTPBlock struct {
+	le       *logrus.Entry
+	write    bool
+	client   *http.Client
+	baseURL  *url.URL
+	hashType hash.HashType
+	verbose  bool
+}
+
+const (
+	// GetPath is the path of the get endpoint.
+	GetPath = "get"
+	// PutPath is the path of the put endpoint.
+	PutPath = "put"
+	// ExistsPath is the path of the exists endpoint.
+	ExistsPath = "exists"
+	// RmPath is the path of the rm endpoint.
+	RmPath = "rm"
+	// RefsQuery is the get endpoint query parameter that requests the
+	// block's refs with its data.
+	RefsQuery = "refs"
+)
+
+// NewHTTPBlock builds a new block store on top of a HTTP service.
+// The lookup path /block/{cid} will be appended to the URL path.
+//
+// baseURL cannot be nil
+// client can be nil to use the default client
+// hashType can be 0 to use the default hash type.
+// if write=false, supports read operations only.
+// if verbose=true logs successful cases as well as failures.
+// le can be nil to disable logging entirely
+func NewHTTPBlock(le *logrus.Entry, write bool, client *http.Client, baseURL *url.URL, hashType hash.HashType, verbose bool) *HTTPBlock {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if baseURL == nil {
+		// this won't work, and nil url is not supported,
+		// at least make sure it's not nil.
+		baseURL = &url.URL{}
+	}
+	return &HTTPBlock{
+		le:       le,
+		write:    write,
+		client:   client,
+		baseURL:  baseURL,
+		hashType: hashType,
+		verbose:  verbose,
+	}
+}
+
+// GetHashType returns the preferred hash type for the store.
+// This should return as fast as possible (called frequently).
+// If 0 is returned, uses a default defined by Hydra.
+func (b *HTTPBlock) GetHashType() hash.HashType {
+	return b.hashType
+}
+
+// GetSupportedFeatures returns the native feature bitmask for the store.
+func (b *HTTPBlock) GetSupportedFeatures() block.StoreFeature {
+	return block.StoreFeature_STORE_FEATURE_UNKNOWN
+}
+
+// BeginReadOperation returns the HTTP block store as the scoped read handle.
+func (b *HTTPBlock) BeginReadOperation(context.Context) (block.StoreOps, func(), error) {
+	return b, func() {}, nil
+}
+
+// PutBlock puts a block into the store.
+// Stores should check if the block already exists if possible.
+func (b *HTTPBlock) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (ref *block.BlockRef, exists bool, err error) {
+	// Require HTTPBlock write access before sending a block.
+	if !b.write {
+		return nil, false, block_store.ErrReadOnly
+	}
+
+	// many stores cannot handle empty values
+	// add a blanket check here to be sure
+	if len(data) == 0 {
+		return nil, false, block.ErrEmptyBlock
+	}
+
+	// Creating a block: /put
+	putURL := b.baseURL.JoinPath(PutPath)
+	body := &PutRequest{
+		Data:    data,
+		PutOpts: opts,
+	}
+	bodyDat, err := body.MarshalVT()
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Send the block PUT request and read its HTTP response.
+	req, err := http.NewRequestWithContext(ctx, "POST", putURL.String(), bytes.NewReader(bodyDat))
+	if err != nil {
+		return nil, false, err
+	}
+	resp, err := httplog.DoRequest(b.le, b.client, req, b.verbose)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false, err
+	}
+	if resp.StatusCode == 401 || resp.StatusCode == 405 {
+		if len(respBody) != 0 {
+			errStr := string(respBody)
+			return nil, false, errors.New(errStr)
+		}
+		return nil, false, errors.Errorf("server returned error %v", resp.StatusCode)
+	}
+
+	// handle 404 not found
+	if resp.StatusCode != 200 {
+		contentType := resp.Header.Get("content-type")
+		if contentType != "application/vnd.google.protobuf" {
+			return nil, false, errors.New("block put endpoint: " + resp.Status)
+		}
+	}
+
+	// Decode and validate the block PUT response.
+	putResp := &PutResponse{}
+	if err := putResp.UnmarshalVT(respBody); err != nil {
+		return nil, false, err
+	}
+	if err := putResp.Validate(); err != nil {
+		return nil, false, err
+	}
+
+	// Propagate the block service failure from the PUT response.
+	if errStr := putResp.GetErr(); errStr != "" {
+		return nil, false, errors.Wrap(errors.New(errStr), "service error")
+	}
+
+	// double-check ref if ForceBlockRef if set.
+	ref = putResp.GetRef()
+	if ref.GetEmpty() {
+		return nil, false, errors.Wrap(block.ErrEmptyBlockRef, "service error")
+	}
+	if !opts.GetForceBlockRef().GetEmpty() && !ref.EqualsRef(opts.GetForceBlockRef()) {
+		return nil, false, errors.Wrapf(
+			block.ErrBlockRefMismatch,
+			"service error: %s != expected %s",
+			ref.MarshalString(), opts.GetForceBlockRef().MarshalString(),
+		)
+	}
+	return ref, putResp.GetExists(), nil
+}
+
+// PutBlockBatch loops calling PutBlock or RmBlock per entry.
+func (b *HTTPBlock) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	existed := make([]bool, len(entries))
+	for i, entry := range entries {
+		if entry.Tombstone {
+			if err := b.RmBlock(ctx, entry.Ref); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		var ref *block.BlockRef
+		if entry.Ref != nil {
+			ref = entry.Ref.Clone()
+		}
+		_, entryExisted, err := b.PutBlock(ctx, entry.Data, &block.PutOpts{
+			ForceBlockRef: ref,
+			Refs:          block.CloneBlockRefs(entry.Refs),
+			RefsKnown:     entry.RefsKnown,
+		})
+		if err != nil {
+			return nil, err
+		}
+		existed[i] = entryExisted
+	}
+	return existed, nil
+}
+
+// GetBlock looks up a block in the store.
+// Returns data, found, and any unexpected error.
+func (b *HTTPBlock) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	stored, err := b.get(ctx, ref, false)
+	if err != nil || stored == nil {
+		return nil, false, err
+	}
+	return stored.Data, true, nil
+}
+
+// GetStoredBlock looks up a block and its outgoing refs.
+func (b *HTTPBlock) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	return b.get(ctx, ref, true)
+}
+
+// get fetches and verifies a block from /get/{ref}, asking for its refs when
+// withRefs is set. Returns nil when the block is not found.
+func (b *HTTPBlock) get(ctx context.Context, ref *block.BlockRef, withRefs bool) (*block.StoredBlock, error) {
+	// Require a block reference before fetching its content.
+	if ref.GetEmpty() {
+		return nil, block.ErrEmptyBlockRef
+	}
+
+	// Address the block GET endpoint with the requested reference mode.
+	getURL := b.baseURL.JoinPath(GetPath, ref.MarshalString())
+	if withRefs {
+		getURL.RawQuery = RefsQuery
+	}
+
+	// Fetch the block response and retain its body for decoding.
+	req, err := http.NewRequestWithContext(ctx, "GET", getURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httplog.DoRequest(b.le, b.client, req, b.verbose)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// A non-200 status still carries a GetResponse, such as not found.
+	if resp.StatusCode != 200 {
+		contentType := resp.Header.Get("content-type")
+		if contentType != "application/vnd.google.protobuf" {
+			return nil, errors.New("block get endpoint: " + resp.Status)
+		}
+	}
+
+	// Decode the block GET response and resolve errors or missing content.
+	getResp := &GetResponse{}
+	if err := getResp.UnmarshalVT(respBody); err != nil {
+		return nil, err
+	}
+	if errStr := getResp.GetErr(); errStr != "" {
+		return nil, errors.Wrap(errors.New(errStr), "service returned error")
+	}
+	if getResp.GetNotFound() {
+		return nil, nil
+	}
+	data := getResp.GetData()
+	if len(data) == 0 {
+		return nil, errors.New("service returned empty data but not found was not set")
+	}
+
+	// Verify the data matches the block ref.
+	dlRef, err := block.BuildBlockRef(
+		data,
+		&block.PutOpts{HashType: ref.GetHash().GetHashType(), ForceBlockRef: ref},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !dlRef.EqualsRef(ref) {
+		return nil, errors.Wrapf(block.ErrBlockRefMismatch, "service returned %s but expected %s", dlRef.MarshalString(), ref.MarshalString())
+	}
+
+	return &block.StoredBlock{
+		Data:      data,
+		Refs:      getResp.GetRefs(),
+		RefsKnown: getResp.GetRefsKnown(),
+	}, nil
+}
+
+// GetBlockExists checks if a block exists in the store.
+// Returns found, and any unexpected error.
+func (b *HTTPBlock) GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error) {
+	// Require a block reference before checking its existence.
+	if ref.GetEmpty() {
+		return false, block.ErrEmptyBlockRef
+	}
+
+	// Checking if a block exists: /exists/{ref}
+	refB58 := ref.MarshalString()
+	existsURL := b.baseURL.JoinPath(ExistsPath, refB58)
+
+	// Query block existence and read the HTTP response.
+	req, err := http.NewRequestWithContext(ctx, "GET", existsURL.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := httplog.DoRequest(b.le, b.client, req, b.verbose)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+
+	// handle 404 not found
+	if resp.StatusCode != 200 {
+		contentType := resp.Header.Get("content-type")
+		if contentType != "application/vnd.google.protobuf" {
+			return false, errors.New("block exists endpoint: " + resp.Status)
+		}
+	}
+
+	// Decode the block existence result and propagate service errors.
+	existsResp := &ExistsResponse{}
+	if err := existsResp.UnmarshalVT(respBody); err != nil {
+		return false, err
+	}
+	if errStr := existsResp.GetErr(); errStr != "" {
+		return false, errors.Wrap(errors.New(errStr), "service returned error")
+	}
+	if existsResp.GetNotFound() {
+		return false, nil
+	}
+	return existsResp.GetExists(), nil
+}
+
+// GetBlockExistsBatch loops calling GetBlockExists per ref.
+func (b *HTTPBlock) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	out := make([]bool, len(refs))
+	for i, ref := range refs {
+		found, err := b.GetBlockExists(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = found
+	}
+	return out, nil
+}
+
+// StatBlock returns metadata about a block without reading its data.
+// Falls back to GetBlockExists and returns Size=-1 (unknown).
+// Returns nil, nil if the block does not exist.
+func (b *HTTPBlock) StatBlock(ctx context.Context, ref *block.BlockRef) (*block.BlockStat, error) {
+	found, err := b.GetBlockExists(ctx, ref)
+	if err != nil || !found {
+		return nil, err
+	}
+	return &block.BlockStat{Ref: ref, Size: -1}, nil
+}
+
+// RmBlock deletes a block from the store.
+// Should not return an error if the block did not exist.
+func (b *HTTPBlock) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	// Require a block reference and write access before deletion.
+	if ref.GetEmpty() {
+		return block.ErrEmptyBlockRef
+	}
+	if !b.write {
+		return block_store.ErrReadOnly
+	}
+
+	// Deleting a block: /rm/{ref}
+	refB58 := ref.MarshalString()
+	rmURL := b.baseURL.JoinPath(RmPath, refB58)
+
+	// Send the block DELETE request and read its HTTP response.
+	req, err := http.NewRequestWithContext(ctx, "DELETE", rmURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httplog.DoRequest(b.le, b.client, req, b.verbose)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// handle 404 not found
+	if resp.StatusCode != 200 {
+		contentType := resp.Header.Get("content-type")
+		if contentType != "application/vnd.google.protobuf" {
+			return errors.New("block rm endpoint: " + resp.Status)
+		}
+	}
+
+	// Decode the block deletion result and propagate service errors.
+	rmResp := &RmResponse{}
+	if err := rmResp.UnmarshalVT(respBody); err != nil {
+		return err
+	}
+	if errStr := rmResp.GetErr(); errStr != "" {
+		return errors.Wrap(errors.New(errStr), "service returned error")
+	}
+	return nil
+}
+
+// Sync reports always-durable: HTTPBlock writes commit synchronously per PUT.
+func (b *HTTPBlock) Sync(context.Context) (bool, error) {
+	return true, nil
+}
+
+// _ is a type assertion
+var _ block.StoreOps = (*HTTPBlock)(nil)

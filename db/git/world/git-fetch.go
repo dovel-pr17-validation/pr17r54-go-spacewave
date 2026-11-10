@@ -1,0 +1,102 @@
+package git_world
+
+import (
+	"context"
+
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing/client"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
+	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/bucket"
+	git_block "github.com/s4wave/spacewave/db/git/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// GitFetch performs a git fetch operation against an existing repo in the world.
+// Fetches new objects from the remote into the existing world object repo and
+// returns the repo's root reference after the fetch.
+// authMethod and progress can be empty.
+func GitFetch(
+	ctx context.Context,
+	ws world.WorldState,
+	objKey string,
+	fetchOpts *git_block.FetchOpts,
+	authMethod client.SSHAuth,
+	progress sideband.Progress,
+) (*bucket.ObjectRef, error) {
+	// Build the remote fetch options with authentication and progress reporting.
+	fetchArgs := fetchOpts.BuildFetchOpts()
+	if authMethod != nil {
+		fetchArgs.ClientOptions = append(fetchArgs.ClientOptions, client.WithSSHAuth(authMethod))
+	}
+	fetchArgs.Progress = progress
+
+	// Fetch remote objects into the World repository.
+	repoRef, _, err := AccessWorldObjectRepo(
+		ctx,
+		ws,
+		objKey,
+		true,
+		&memory.IndexStorage{},
+		nil,
+		nil,
+		func(repo *git.Repository) error {
+			err := repo.FetchContext(ctx, fetchArgs)
+			if errors.Is(err, git.NoErrAlreadyUpToDate) {
+				return nil
+			}
+			return err
+		},
+	)
+	return repoRef, err
+}
+
+// NewGitFetchOp constructs a new GitFetchOp.
+func NewGitFetchOp(objKey string, fetchOpts *git_block.FetchOpts) *GitFetchOp {
+	return &GitFetchOp{
+		ObjectKey: objKey,
+		FetchOpts: fetchOpts,
+	}
+}
+
+// Validate checks the fetch operation.
+func (o *GitFetchOp) Validate() error {
+	if o.GetObjectKey() == "" {
+		return world.ErrEmptyObjectKey
+	}
+	if err := o.GetFetchOpts().Validate(); err != nil {
+		return errors.Wrap(err, "fetch_opts")
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *GitFetchOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Select the World repository whose remote objects will be fetched.
+	objKey := o.GetObjectKey()
+
+	// Confirm that the target repository object exists before fetching.
+	objectState, exists, err := worldHandle.GetObject(ctx, objKey)
+	world.ReleaseObjectState(objectState)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, errors.Wrap(world.ErrObjectNotFound, objKey)
+	}
+
+	// Fetch remote objects into the existing repository.
+	_, err = GitFetch(ctx, worldHandle, objKey, o.GetFetchOpts(), nil, nil)
+	return false, err
+}
+
+// _ is a type assertion
+var _ world.Operation = (*GitFetchOp)(nil)

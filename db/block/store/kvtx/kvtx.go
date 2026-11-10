@@ -1,0 +1,644 @@
+package block_store_kvtx
+
+import (
+	"context"
+	"errors"
+	"sync"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/kvtx"
+	store_kvkey "github.com/s4wave/spacewave/db/store/kvkey"
+	trace "github.com/s4wave/spacewave/db/traceutil"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+// KVTxBlock implements a block store on top of a kvtx store.
+type KVTxBlock struct {
+	// kvkey namespaces the block keys in the store.
+	kvkey *store_kvkey.KVKey
+	// store is the underlying kvtx store.
+	store kvtx.Store
+	// hashType is the preferred block hash type.
+	hashType hash.HashType
+	// hashGet hashes Get responses for integrity.
+	hashGet bool
+	// durable marks found reads durable for the decoded-block cache and
+	// reports removals to it. Set only when store holds committed data and
+	// every removal of its blocks goes through this KVTxBlock.
+	durable bool
+}
+
+// NewKVTxBlock constructs a new block store on top of a kvtx store.
+//
+// hashType can be 0 to use a default value.
+// hashGet hashes Get requests for integrity, use if the storage is unreliable or untrusted.
+func NewKVTxBlock(
+	kvkey *store_kvkey.KVKey,
+	store kvtx.Store,
+	hashType hash.HashType,
+	hashGet bool,
+) *KVTxBlock {
+	return &KVTxBlock{
+		kvkey:    kvkey,
+		store:    store,
+		hashType: hashType,
+		hashGet:  hashGet,
+	}
+}
+
+// NewDurableKVTxBlock constructs a block store on top of a kvtx store whose
+// transactions read committed data, such as an in-memory or on-disk store
+// itself, never a view of an open write transaction. Its reads may enter the
+// shared decoded-block cache, so every removal of its blocks must go through
+// it.
+func NewDurableKVTxBlock(
+	kvkey *store_kvkey.KVKey,
+	store kvtx.Store,
+	hashType hash.HashType,
+	hashGet bool,
+) *KVTxBlock {
+	k := NewKVTxBlock(kvkey, store, hashType, hashGet)
+	k.durable = true
+	return k
+}
+
+// GetHashType returns the preferred hash type for the store.
+// This should return as fast as possible (called frequently).
+// If 0 is returned, uses a default defined by Hydra.
+func (k *KVTxBlock) GetHashType() hash.HashType {
+	return k.hashType
+}
+
+// GetSupportedFeatures returns the native feature bitmask for the store.
+func (k *KVTxBlock) GetSupportedFeatures() block.StoreFeature {
+	return block.StoreFeatureNativeBatchPut | block.StoreFeatureNativeBatchExists
+}
+
+// BeginReadOperation opens one read-only kvtx transaction for a bounded read scope.
+// Retry classification: external to RunTransaction. The returned scope spans
+// multiple caller operations, so reopening it cannot replay one logical
+// operation without changing the StoreOps lifetime contract.
+func (k *KVTxBlock) BeginReadOperation(ctx context.Context) (block.StoreOps, func(), error) {
+	// Record the removal generation before the snapshot opens.
+	gen := block.DurableReadGeneration()
+	tx, err := k.store.NewTransaction(ctx, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	scope := &readOperation{
+		parent: k,
+		tx:     tx,
+		gen:    gen,
+	}
+	return scope, scope.release, nil
+}
+
+// PutBlock puts a block into the store.
+// Stores should check if the block already exists if possible.
+func (k *KVTxBlock) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (ref *block.BlockRef, exists bool, err error) {
+	// Trace the block write through reference construction and storage.
+	ctx, task := trace.NewTask(ctx, "hydra/block-store/kvtx/put-block")
+	defer task.End()
+
+	// Copy the block options and select the store hash type.
+	if opts == nil {
+		opts = &block.PutOpts{}
+	} else {
+		opts = opts.CloneVT()
+	}
+	opts.HashType = opts.SelectHashType(k.hashType)
+
+	// Build the block reference and enforce any requested reference.
+	_, subtask := trace.NewTask(ctx, "hydra/block-store/kvtx/put-block/build-block-ref")
+	ref, err = block.BuildBlockRef(data, opts)
+	subtask.End()
+	if err != nil {
+		return nil, false, err
+	}
+	if forceBlockRef := opts.GetForceBlockRef(); !forceBlockRef.GetEmpty() {
+		if !ref.EqualsRef(forceBlockRef) {
+			return ref, false, block.ErrBlockRefMismatch
+		}
+	}
+
+	// Encode the block reference in the store key namespace.
+	rm, err := ref.MarshalKey()
+	if err != nil {
+		return nil, false, err
+	}
+	key := k.kvkey.GetBlockKey(rm)
+
+	// Write the block through a replayable kvtx transaction that reads
+	// without the writer lock: the existence read of a cold block waits on
+	// the disk, and only a commit to the same block key conflicts with it.
+	err = kvtx.RunOptimisticTransaction(ctx,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			taskCtx, subtask := trace.NewTask(ctx, "hydra/block-store/kvtx/put-block/new-transaction")
+			tx, err := k.store.NewTransaction(taskCtx, true)
+			subtask.End()
+			return tx, err
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			// Keep an existing block without writing its bytes again.
+			attemptExists, err := tx.Exists(ctx, key)
+			if err != nil {
+				return err
+			}
+			exists = attemptExists
+			if attemptExists {
+				return nil
+			}
+
+			// many stores cannot handle empty values
+			// add a blanket check here to be sure
+			if len(data) == 0 {
+				return block.ErrEmptyBlock
+			}
+
+			return tx.Set(ctx, key, data)
+		},
+		kvtx.RetryInvalidSnapshot,
+	)
+	return ref, exists, err
+}
+
+// PutBlockBatch writes all entries in one lower kvtx transaction, starting
+// another where the store reports the transaction full. Blocks are
+// independent, so a batch split across transactions is safe. Reports whether
+// each block was stored before the write, from the same Exists read the write
+// makes. The transactions read without the writer lock, as PutBlock's do; a
+// tombstone reads nothing, so it never conflicts.
+func (k *KVTxBlock) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	// Trace the batch.
+	ctx, task := trace.NewTask(ctx, "hydra/block-store/kvtx/put-block-batch")
+	defer task.End()
+
+	// Report the tombstones as removals once the batch returns, committed or
+	// partly committed.
+	if k.durable {
+		defer block.InvalidateRemovedTombstones(entries)
+	}
+
+	// Prepare every entry before writing any.
+	ops := make([]putBlockBatchOp, 0, len(entries))
+	for _, entry := range entries {
+		op, err := k.preparePutBlockBatchOp(entry)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
+	}
+
+	// Write the ops, committing each transaction once it is full.
+	existed := make([]bool, 0, len(ops))
+	for remaining := ops; len(remaining) != 0; {
+		var written int
+		var attempt []bool
+		err := kvtx.RunOptimisticTransaction(ctx,
+			func(ctx context.Context) (kvtx.Tx, error) {
+				taskCtx, subtask := trace.NewTask(ctx, "hydra/block-store/kvtx/put-block-batch/new-transaction")
+				tx, err := k.store.NewTransaction(taskCtx, true)
+				subtask.End()
+				return tx, err
+			},
+			func(ctx context.Context, tx kvtx.Tx) error {
+				// Prefetch the stored state of every block the writes check.
+				if err := prefetchPutBlockBatchOps(ctx, tx, remaining); err != nil {
+					return err
+				}
+
+				// Write the ops until the transaction is full.
+				written, attempt = 0, attempt[:0]
+				for _, op := range remaining {
+					opExisted, err := applyPutBlockBatchOp(ctx, tx, op)
+					if errors.Is(err, kvtx.ErrTxTooBig) && written != 0 {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					attempt = append(attempt, opExisted)
+					written++
+				}
+				return nil
+			},
+			kvtx.RetryInvalidSnapshot,
+		)
+		if err != nil {
+			return nil, err
+		}
+		existed = append(existed, attempt...)
+		remaining = remaining[written:]
+	}
+	return existed, nil
+}
+
+// GetBlock looks up a block in the store.
+// Returns data, found, and error.
+func (k *KVTxBlock) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	// Record the removal generation before the read transaction opens.
+	gen := block.DurableReadGeneration()
+	var data []byte
+	var found bool
+	err := kvtx.RunTransaction(ctx, false,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return k.store.NewTransaction(ctx, false)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			attemptData, attemptFound, err := k.getBlock(ctx, tx, ref)
+			data, found = attemptData, attemptFound
+			return err
+		},
+	)
+	if err == nil && found && k.durable {
+		block.MarkDurableRead(ctx, ref, gen)
+	}
+	return data, found, err
+}
+
+// GetStoredBlock serves the block without refs because this store keeps
+// block bytes without their refs.
+func (k *KVTxBlock) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	return block.GetBlockWithoutRefs(ctx, k, ref)
+}
+
+// getBlock reads a block through the given tx ops, verifying the hash
+// when hashGet is set.
+func (k *KVTxBlock) getBlock(ctx context.Context, tx kvtx.TxOps, ref *block.BlockRef) ([]byte, bool, error) {
+	// Validate the block reference before reading stored bytes.
+	if err := ref.Validate(false); err != nil {
+		return nil, false, err
+	}
+
+	// Encode the block reference in the store key namespace.
+	key, err := k.blockKey(ref)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Read the stored block bytes through the transaction.
+	data, found, err := tx.Get(ctx, key)
+	if err != nil || !found {
+		return nil, found, err
+	}
+
+	// Re-hash the block reference if configured.
+	// This significantly reduces performance but improves security.
+	// Otherwise, an attacker could place any data at /h/b/{block-ref}.
+	if !k.hashGet {
+		return data, found, nil
+	}
+
+	// Verify the stored bytes against the requested block reference.
+	err = ref.VerifyData(data, true)
+
+	// Return the data and the error with the hash mismatch.
+	// All callers to GetBlock should check the error return value.
+	// We return the data here for cases where we want to report the invalid data.
+	return data, found, err
+}
+
+type readOperation struct {
+	parent *KVTxBlock
+	tx     kvtx.Tx
+	// gen is the removal generation recorded before tx opened.
+	gen    uint64
+	mtx    sync.Mutex
+	closed bool
+}
+
+// GetHashType returns the hash type of the parent store.
+func (r *readOperation) GetHashType() hash.HashType {
+	return r.parent.GetHashType()
+}
+
+// GetSupportedFeatures returns the features of the parent store.
+func (r *readOperation) GetSupportedFeatures() block.StoreFeature {
+	return r.parent.GetSupportedFeatures()
+}
+
+// BeginReadOperation returns the operation itself: it already holds one
+// read transaction.
+func (r *readOperation) BeginReadOperation(context.Context) (block.StoreOps, func(), error) {
+	return r, func() {}, nil
+}
+
+// PutBlock rejects writes: a read operation is read-only.
+func (r *readOperation) PutBlock(context.Context, []byte, *block.PutOpts) (*block.BlockRef, bool, error) {
+	return nil, false, ErrReadOperationReadOnly
+}
+
+// PutBlockBatch rejects writes: a read operation is read-only.
+func (r *readOperation) PutBlockBatch(context.Context, []*block.PutBatchEntry) ([]bool, error) {
+	return nil, ErrReadOperationReadOnly
+}
+
+// GetBlock reads the block in the operation's read transaction.
+func (r *readOperation) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	// Read in the open transaction, marking a found block durable when this
+	// store commits what it holds.
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	if r.closed {
+		return nil, false, ErrReadOperationClosed
+	}
+	data, found, err := r.parent.getBlock(ctx, r.tx, ref)
+	if err == nil && found && r.parent.durable {
+		block.MarkDurableRead(ctx, ref, r.gen)
+	}
+	return data, found, err
+}
+
+// GetStoredBlock serves the block without refs because this store keeps
+// block bytes without their refs.
+func (r *readOperation) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	return block.GetBlockWithoutRefs(ctx, r, ref)
+}
+
+// GetBlockExists checks the block in the operation's read transaction.
+func (r *readOperation) GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	if r.closed {
+		return false, ErrReadOperationClosed
+	}
+	return r.parent.getBlockExists(ctx, r.tx, ref)
+}
+
+// GetBlockExistsBatch checks the blocks in the operation's read transaction.
+func (r *readOperation) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	if r.closed {
+		return nil, ErrReadOperationClosed
+	}
+	return r.parent.getBlockExistsBatch(ctx, r.tx, refs)
+}
+
+// StatBlock stats the block in the operation's read transaction.
+func (r *readOperation) StatBlock(ctx context.Context, ref *block.BlockRef) (*block.BlockStat, error) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	if r.closed {
+		return nil, ErrReadOperationClosed
+	}
+	return r.parent.statBlock(ctx, r.tx, ref)
+}
+
+// RmBlock rejects removals: a read operation is read-only.
+func (r *readOperation) RmBlock(context.Context, *block.BlockRef) error {
+	return ErrReadOperationReadOnly
+}
+
+// Sync does nothing: a read operation has no writes to flush.
+func (r *readOperation) Sync(context.Context) (bool, error) {
+	return true, nil
+}
+
+func (r *readOperation) release() {
+	r.mtx.Lock()
+	if !r.closed {
+		r.closed = true
+		r.tx.Discard()
+	}
+	r.mtx.Unlock()
+}
+
+// GetBlockExists checks if a block exists in the store.
+// Returns found, and any exceptional error.
+func (k *KVTxBlock) GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error) {
+	var found bool
+	err := kvtx.RunTransaction(ctx, false,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return k.store.NewTransaction(ctx, false)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			var err error
+			found, err = k.getBlockExists(ctx, tx, ref)
+			return err
+		},
+	)
+	return found, err
+}
+
+// getBlockExists checks for the block's key through the given tx ops.
+func (k *KVTxBlock) getBlockExists(ctx context.Context, tx kvtx.TxOps, ref *block.BlockRef) (bool, error) {
+	key, err := k.blockKey(ref)
+	if err != nil {
+		return false, err
+	}
+
+	return tx.Exists(ctx, key)
+}
+
+// GetBlockExistsBatch checks all refs in one lower kvtx transaction.
+func (k *KVTxBlock) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	if len(refs) == 0 {
+		return []bool{}, nil
+	}
+
+	var found []bool
+	err := kvtx.RunTransaction(ctx, false,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return k.store.NewTransaction(ctx, false)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			attemptFound, err := k.getBlockExistsBatch(ctx, tx, refs)
+			if err == nil {
+				found = attemptFound
+			}
+			return err
+		},
+	)
+	return found, err
+}
+
+// getBlockExistsBatch prefetches every ref's key through the given tx ops,
+// then checks each.
+func (k *KVTxBlock) getBlockExistsBatch(ctx context.Context, tx kvtx.TxOps, refs []*block.BlockRef) ([]bool, error) {
+	// Prefetch the keys.
+	keys := make([][]byte, len(refs))
+	for i, ref := range refs {
+		key, err := k.blockKey(ref)
+		if err != nil {
+			return nil, err
+		}
+		keys[i] = key
+	}
+	if err := kvtx.Prefetch(ctx, tx, keys); err != nil {
+		return nil, err
+	}
+
+	// Check each key.
+	out := make([]bool, len(keys))
+	for i, key := range keys {
+		found, err := tx.Exists(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = found
+	}
+	return out, nil
+}
+
+// StatBlock returns metadata about a block without reading its data.
+// Returns nil, nil if the block does not exist.
+func (k *KVTxBlock) StatBlock(ctx context.Context, ref *block.BlockRef) (*block.BlockStat, error) {
+	var stat *block.BlockStat
+	err := kvtx.RunTransaction(ctx, false,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return k.store.NewTransaction(ctx, false)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			var err error
+			stat, err = k.statBlock(ctx, tx, ref)
+			return err
+		},
+	)
+	return stat, err
+}
+
+// statBlock reads the block stat through the given tx ops.
+func (k *KVTxBlock) statBlock(ctx context.Context, tx kvtx.TxOps, ref *block.BlockRef) (*block.BlockStat, error) {
+	// Encode the block reference for the metadata lookup.
+	key, err := k.blockKey(ref)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check block presence before reading its size.
+	exists, err := tx.Exists(ctx, key)
+	if err != nil || !exists {
+		return nil, err
+	}
+
+	// Read the stored bytes to determine the block size.
+	data, found, err := tx.Get(ctx, key)
+	if err != nil || !found {
+		return nil, err
+	}
+
+	return &block.BlockStat{Ref: ref, Size: int64(len(data))}, nil
+}
+
+// RmBlock deletes a block from the store.
+// Should not return an error if the block did not exist.
+func (k *KVTxBlock) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	// Resolve the key for the block.
+	key, err := k.blockKey(ref)
+	if err != nil {
+		return err
+	}
+
+	// Delete the key in its own write transaction.
+	err = kvtx.RunTransaction(ctx, true,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return k.store.NewTransaction(ctx, true)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			return tx.Delete(ctx, key)
+		},
+	)
+
+	// Report the removal after it commits, or after a failure that may have
+	// committed it.
+	if k.durable {
+		block.InvalidateRemovedBlock(ref)
+	}
+	return err
+}
+
+// Sync reports always-durable: KVTxBlock writes commit synchronously.
+func (k *KVTxBlock) Sync(context.Context) (bool, error) {
+	return true, nil
+}
+
+type putBlockBatchOp struct {
+	key       []byte
+	data      []byte
+	tombstone bool
+}
+
+// applyPutBlockBatchOp writes one prepared op unless its block is stored.
+// Returns whether the block was stored before the write; a tombstone is false.
+func applyPutBlockBatchOp(ctx context.Context, tx kvtx.Tx, op putBlockBatchOp) (bool, error) {
+	if op.tombstone {
+		return false, tx.Delete(ctx, op.key)
+	}
+	exists, err := tx.Exists(ctx, op.key)
+	if err != nil || exists {
+		return exists, err
+	}
+	return false, tx.Set(ctx, op.key, op.data)
+}
+
+// prefetchPutBlockBatchOps prefetches the keys of the ops that check whether
+// their block is stored.
+func prefetchPutBlockBatchOps(ctx context.Context, tx kvtx.Tx, ops []putBlockBatchOp) error {
+	keys := make([][]byte, 0, len(ops))
+	for _, op := range ops {
+		if !op.tombstone {
+			keys = append(keys, op.key)
+		}
+	}
+	return kvtx.Prefetch(ctx, tx, keys)
+}
+
+// preparePutBlockBatchOp marshals one batch entry into its stored form.
+func (k *KVTxBlock) preparePutBlockBatchOp(entry *block.PutBatchEntry) (putBlockBatchOp, error) {
+	// Encode tombstones as block-key deletions.
+	if entry.Tombstone {
+		key, err := k.blockKey(entry.Ref)
+		if err != nil {
+			return putBlockBatchOp{}, err
+		}
+		return putBlockBatchOp{key: key, tombstone: true}, nil
+	}
+
+	// Prepare the batch entry reference and hash options.
+	var ref *block.BlockRef
+	if entry.Ref != nil {
+		ref = entry.Ref.Clone()
+	}
+	opts := &block.PutOpts{
+		ForceBlockRef: ref,
+		Refs:          block.CloneBlockRefs(entry.Refs),
+	}
+	opts.HashType = opts.SelectHashType(k.hashType)
+
+	// Build and validate the batch entry reference and data.
+	actual, err := block.BuildBlockRef(entry.Data, opts)
+	if err != nil {
+		return putBlockBatchOp{}, err
+	}
+	if forceBlockRef := opts.GetForceBlockRef(); !forceBlockRef.GetEmpty() {
+		if !actual.EqualsRef(forceBlockRef) {
+			return putBlockBatchOp{}, block.ErrBlockRefMismatch
+		}
+	}
+	if len(entry.Data) == 0 {
+		return putBlockBatchOp{}, block.ErrEmptyBlock
+	}
+
+	// Encode the prepared block entry in the store key namespace.
+	key, err := k.blockKey(actual)
+	if err != nil {
+		return putBlockBatchOp{}, err
+	}
+	return putBlockBatchOp{key: key, data: entry.Data}, nil
+}
+
+// blockKey marshals the ref into its store key.
+func (k *KVTxBlock) blockKey(ref *block.BlockRef) ([]byte, error) {
+	rm, err := ref.MarshalKey()
+	if err != nil {
+		return nil, err
+	}
+	return k.kvkey.GetBlockKey(rm), nil
+}
+
+// _ is a type assertion
+var (
+	_ block.StoreOps = (*KVTxBlock)(nil)
+	_ block.StoreOps = (*readOperation)(nil)
+)

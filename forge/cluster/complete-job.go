@@ -1,0 +1,131 @@
+package forge_cluster
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	forge_job "github.com/s4wave/spacewave/forge/job"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// NewClusterCompleteJobOp constructs a new ClusterCompleteJobOp block.
+func NewClusterCompleteJobOp(clusterKey, jobKey string) *ClusterCompleteJobOp {
+	return &ClusterCompleteJobOp{
+		ClusterKey: clusterKey,
+		JobKey:     jobKey,
+	}
+}
+
+// CompleteJob completes an existing Job linked to the Cluster.
+// Returns seqno, sysErr, error.
+func CompleteJob(
+	ctx context.Context,
+	w world.WorldState,
+	clusterKey, jobKey string,
+	sender peer.ID,
+) (uint64, bool, error) {
+	op := NewClusterCompleteJobOp(clusterKey, jobKey)
+	return w.ApplyWorldOp(ctx, op, sender)
+}
+
+// Validate performs cursory validation of the operation.
+// Should not block.
+func (o *ClusterCompleteJobOp) Validate() error {
+	if o.GetClusterKey() == "" {
+		return errors.Wrap(world.ErrEmptyObjectKey, "cluster_key")
+	}
+	if o.GetJobKey() == "" {
+		return errors.Wrap(world.ErrEmptyObjectKey, "job_key")
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *ClusterCompleteJobOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Identify the Cluster and Job records involved in completion.
+	clusterKey, jobKey := o.GetClusterKey(), o.GetJobKey()
+
+	// check the <type> of the cluster and job objects
+	if err := CheckClusterType(ctx, worldHandle, clusterKey); err != nil {
+		return false, err
+	}
+
+	// Require a Job record before collecting its task results.
+	if err := forge_job.CheckJobType(ctx, worldHandle, jobKey); err != nil {
+		return false, err
+	}
+
+	// check if the job is assigned to the cluster
+	hasJob, err := CheckClusterHasJob(ctx, worldHandle, clusterKey, jobKey)
+	if err != nil {
+		return false, err
+	}
+	if !hasJob {
+		return false, errors.Errorf("cluster %s not linked to job %s", clusterKey, jobKey)
+	}
+
+	// Read the current Job before deriving its aggregate result.
+	var job *forge_job.Job
+	_, _, err = world.AccessWorldObject(ctx, worldHandle, jobKey, false, func(bcs *block.Cursor) error {
+		job, err = forge_job.UnmarshalJob(ctx, bcs)
+		if err == nil {
+			err = job.Validate()
+		}
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	if job.GetResult().GetCanceled() {
+		return false, nil
+	}
+
+	// The job result aggregates the linked task results: the job completes
+	// successfully only when every linked task completed successfully.
+	tasks, taskKeys, err := forge_job.CollectJobTasks(ctx, worldHandle, jobKey)
+	if err != nil {
+		return false, err
+	}
+	jobResult := forge_job.CompletionResult(tasks, taskKeys)
+	if jobResult == nil {
+		// A watched input can restart a Task after the controller's read.
+		// Its watcher schedules reconciliation when the new result is ready.
+		return false, nil
+	}
+
+	// A repeated reconciliation of the same result must not write another
+	// Job revision and wake its own tracker again.
+	if job.IsComplete() && job.GetResult().EqualVT(jobResult) {
+		return false, nil
+	}
+
+	// transition job to complete with the result
+	_, _, err = world.AccessWorldObject(ctx, worldHandle, jobKey, true, func(bcs *block.Cursor) error {
+		// Complete the Job with the aggregate task result and validate its record.
+		job.JobState = forge_job.State_JobState_COMPLETE
+		job.Result = jobResult
+		if err := job.Validate(); err != nil {
+			return err
+		}
+
+		// Persist the completed Job record in its World object.
+		bcs.SetBlock(job, true)
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+// _ is a type assertion
+var _ world.Operation = (*ClusterCompleteJobOp)(nil)

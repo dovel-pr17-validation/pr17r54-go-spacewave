@@ -1,0 +1,22 @@
+syntax = "proto3";
+package volume.controller;
+
+// Config configures the generic volume controller.
+message Config {
+  // DisableEventBlockRm disables the block removed event.
+  //
+  // Optimization: skips exists() before delete.
+  bool disable_event_block_rm = 1;
+  // VolumeIdAlias matches LookupVolume and LookupBlockStore calls for the given ids.
+  repeated string volume_id_alias = 2;
+  // DisablePeer disables loading the peer controller from the volume.
+  bool disable_peer = 4;
+  // DisableLookupBlockStore disables resolving LookupBlockStore when using the
+  // volume ID for the store_id field.
+  bool disable_lookup_block_store = 7;
+
+  // GcIntervalDur is the interval between GC sweeps.
+  // Default: 1m. Set to 0s to disable periodic GC.
+  // Example: 1m
+  string gc_interval_dur = 10;
+}

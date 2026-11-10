@@ -1,0 +1,353 @@
+package plugin_host_web
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/pkg/errors"
+	web_document "github.com/s4wave/spacewave/bldr/web/document"
+)
+
+func TestWaitForWebWorkerReadyReturnsWhenReady(t *testing.T) {
+	ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+	ctr.SetValue(&web_document.WebDocumentStatus{
+		WebWorkers: []*web_document.WebWorkerStatus{{
+			Id:    "plugin/test",
+			Ready: true,
+		}},
+	})
+
+	if err := waitForWebWorkerReady(context.Background(), ctr, "plugin/test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitForWebWorkerReadyReturnsWhenWorkerDeleted(t *testing.T) {
+	ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+	ctr.SetValue(&web_document.WebDocumentStatus{
+		WebWorkers: []*web_document.WebWorkerStatus{{
+			Id:      "plugin/test",
+			Deleted: true,
+		}},
+	})
+
+	if err := waitForWebWorkerReady(context.Background(), ctr, "plugin/test"); err == nil {
+		t.Fatal("expected deleted worker error")
+	}
+}
+
+func TestWaitForWebWorkerReadyReturnsWhenWorkerFailed(t *testing.T) {
+	// Publish a deleted, failed worker status.
+	ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+	ctr.SetValue(&web_document.WebDocumentStatus{
+		WebWorkers: []*web_document.WebWorkerStatus{{
+			Id:            "plugin/test",
+			Deleted:       true,
+			Failed:        true,
+			FailureReason: "fatal wasm exit",
+		}},
+	})
+
+	// Wait for readiness and check the failure error and its classification.
+	err := waitForWebWorkerReady(context.Background(), ctr, "plugin/test")
+	if err == nil {
+		t.Fatal("expected failed worker error")
+	}
+	if got, want := err.Error(), "web worker failed before becoming ready: fatal wasm exit"; got != want {
+		t.Fatalf("unexpected error: got %q want %q", got, want)
+	}
+	if !isWebWorkerFailureError(errors.Wrap(err, "track web document")) {
+		t.Fatal("expected wrapped failure to retain worker failure classification")
+	}
+}
+
+func TestWaitForWebWorkerReadyConsumesGenerationState(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		state         web_document.WebWorkerGenerationState
+		failureReason string
+		wantErr       string
+		wantFailure   bool
+	}{
+		{
+			name:          "terminal failure",
+			state:         web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_TERMINAL_FAILURE,
+			failureReason: "fatal wasm exit",
+			wantErr:       "web worker terminal failure before becoming ready: fatal wasm exit",
+			wantFailure:   true,
+		},
+		{
+			name:        "startup timeout",
+			state:       web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_STARTUP_TIMEOUT,
+			wantErr:     "web worker startup timed out before becoming ready",
+			wantFailure: true,
+		},
+		{
+			name:    "hidden document lifecycle",
+			state:   web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_LIFECYCLE_HIDDEN,
+			wantErr: "web document hidden before worker became ready",
+		},
+		{
+			name:    "controlled stream reset",
+			state:   web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_CONTROLLED_STREAM_RESET,
+			wantErr: "web worker stream reset before becoming ready",
+		},
+		{
+			name:    "normal stop",
+			state:   web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_NORMAL_STOP,
+			wantErr: "web worker stopped before becoming ready",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Publish the worker status for this generation state.
+			ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+			ctr.SetValue(&web_document.WebDocumentStatus{
+				WebWorkers: []*web_document.WebWorkerStatus{{
+					Id:              "plugin/test",
+					Failed:          tc.wantFailure,
+					GenerationState: tc.state,
+					FailureReason:   tc.failureReason,
+				}},
+			})
+
+			// Check the readiness error and its failure classification.
+			err := waitForWebWorkerReady(context.Background(), ctr, "plugin/test")
+			if err == nil {
+				t.Fatal("expected generation state error")
+			}
+			if got := err.Error(); got != tc.wantErr {
+				t.Fatalf("unexpected error: got %q want %q", got, tc.wantErr)
+			}
+			if isWebWorkerFailureError(errors.Wrap(err, "track web document")) != tc.wantFailure {
+				t.Fatalf("unexpected failure classification for %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestWaitForWebWorkerReadyReturnsForCapabilityReadyGeneration(t *testing.T) {
+	ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+	ctr.SetValue(&web_document.WebDocumentStatus{
+		WebWorkers: []*web_document.WebWorkerStatus{{
+			Id:              "plugin/test",
+			GenerationState: web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_CAPABILITY_READY,
+		}},
+	})
+
+	if err := waitForWebWorkerReady(context.Background(), ctr, "plugin/test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitForWebWorkerReadyReturnsWhenDocumentClosed(t *testing.T) {
+	ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+	ctr.SetValue(&web_document.WebDocumentStatus{Closed: true})
+
+	if err := waitForWebWorkerReady(context.Background(), ctr, "plugin/test"); err == nil {
+		t.Fatal("expected closed document error")
+	}
+}
+
+func TestWaitForCreatedWebWorkerReadyRemovesUnreadyWorker(t *testing.T) {
+	// Publish an unready worker status and a test worker.
+	ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+	ctr.SetValue(&web_document.WebDocumentStatus{
+		WebWorkers: []*web_document.WebWorkerStatus{{
+			Id: "plugin/test",
+		}},
+	})
+	worker := &testWebWorker{id: "plugin/test"}
+
+	// Wait with a short timeout and expect the worker to be removed.
+	ready, err := waitForCreatedWebWorkerReadyWithTimeout(context.Background(), ctr, worker, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready {
+		t.Fatal("expected unready worker to be recreated")
+	}
+	if !worker.removed {
+		t.Fatal("expected unready worker to be removed")
+	}
+}
+
+func TestWaitForCreatedWebWorkerReadyRecreatesTransientStartupInterruptions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status *web_document.WebDocumentStatus
+	}{
+		{
+			name:   "closed document",
+			status: &web_document.WebDocumentStatus{Closed: true},
+		},
+		{
+			name: "deleted worker",
+			status: &web_document.WebDocumentStatus{
+				WebWorkers: []*web_document.WebWorkerStatus{{
+					Id:      "plugin/test",
+					Deleted: true,
+				}},
+			},
+		},
+		{
+			name: "hidden document lifecycle",
+			status: &web_document.WebDocumentStatus{
+				WebWorkers: []*web_document.WebWorkerStatus{{
+					Id:              "plugin/test",
+					GenerationState: web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_LIFECYCLE_HIDDEN,
+				}},
+			},
+		},
+		{
+			name: "controlled stream reset",
+			status: &web_document.WebDocumentStatus{
+				WebWorkers: []*web_document.WebWorkerStatus{{
+					Id:              "plugin/test",
+					GenerationState: web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_CONTROLLED_STREAM_RESET,
+				}},
+			},
+		},
+		{
+			name: "normal stop",
+			status: &web_document.WebDocumentStatus{
+				WebWorkers: []*web_document.WebWorkerStatus{{
+					Id:              "plugin/test",
+					GenerationState: web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_NORMAL_STOP,
+				}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Publish the interrupted startup status and a test worker.
+			ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+			ctr.SetValue(tc.status)
+			worker := &testWebWorker{id: "plugin/test"}
+
+			// Wait and expect the worker to be removed for recreation.
+			ready, err := waitForCreatedWebWorkerReadyWithTimeout(context.Background(), ctr, worker, time.Second)
+			if err != nil {
+				t.Fatalf("transient startup interruption should recreate worker without closing plugin runtime: %v", err)
+			}
+			if ready {
+				t.Fatal("transient startup interruption should not report a ready worker")
+			}
+			if !worker.removed {
+				t.Fatal("expected interrupted startup worker to be removed for recreation")
+			}
+		})
+	}
+}
+
+func TestWaitForCreatedWebWorkerReadyDoesNotRemoveReadyWorker(t *testing.T) {
+	// Publish a ready worker status and a test worker.
+	ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+	ctr.SetValue(&web_document.WebDocumentStatus{
+		WebWorkers: []*web_document.WebWorkerStatus{{
+			Id:    "plugin/test",
+			Ready: true,
+		}},
+	})
+	worker := &testWebWorker{id: "plugin/test"}
+
+	// Wait and expect the ready worker to be kept.
+	ready, err := waitForCreatedWebWorkerReadyWithTimeout(context.Background(), ctr, worker, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ready {
+		t.Fatal("expected ready worker")
+	}
+	if worker.removed {
+		t.Fatal("did not expect ready worker to be removed")
+	}
+}
+
+func TestWaitForCreatedWebWorkerReadyReturnsWorkerFailureWithoutRemovingWorker(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		worker  *web_document.WebWorkerStatus
+		wantErr string
+	}{
+		{
+			name: "failed flag",
+			worker: &web_document.WebWorkerStatus{
+				Id:            "plugin/test",
+				Failed:        true,
+				FailureReason: "fatal wasm exit",
+			},
+			wantErr: "web worker failed before becoming ready: fatal wasm exit",
+		},
+		{
+			name: "terminal failure generation",
+			worker: &web_document.WebWorkerStatus{
+				Id:              "plugin/test",
+				GenerationState: web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_TERMINAL_FAILURE,
+				FailureReason:   "fatal wasm exit",
+			},
+			wantErr: "web worker terminal failure before becoming ready: fatal wasm exit",
+		},
+		{
+			name: "startup timeout generation",
+			worker: &web_document.WebWorkerStatus{
+				Id:              "plugin/test",
+				GenerationState: web_document.WebWorkerGenerationState_WEB_WORKER_GENERATION_STATE_STARTUP_TIMEOUT,
+			},
+			wantErr: "web worker startup timed out before becoming ready",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Publish the failed worker status and a test worker.
+			ctr := ccontainer.NewCContainer[*web_document.WebDocumentStatus](nil)
+			ctr.SetValue(&web_document.WebDocumentStatus{
+				WebWorkers: []*web_document.WebWorkerStatus{tc.worker},
+			})
+			worker := &testWebWorker{id: "plugin/test"}
+
+			// Wait and check the failure error, readiness, and classification.
+			ready, err := waitForCreatedWebWorkerReadyWithTimeout(context.Background(), ctr, worker, time.Second)
+			if err == nil {
+				t.Fatal("expected failed worker error")
+			}
+			if got := err.Error(); got != tc.wantErr {
+				t.Fatalf("unexpected error: got %q want %q", got, tc.wantErr)
+			}
+			if ready {
+				t.Fatal("failed worker should not be ready")
+			}
+			if !isWebWorkerFailureError(errors.Wrap(err, "track web document")) {
+				t.Fatal("expected worker failure classification")
+			}
+			if worker.removed {
+				t.Fatal("failed worker should be reported to the tracker instead of removed as unready")
+			}
+		})
+	}
+}
+
+type testWebWorker struct {
+	id      string
+	removed bool
+}
+
+func (w *testWebWorker) GetId() string {
+	return w.id
+}
+
+func (w *testWebWorker) GetDocumentId() string {
+	return ""
+}
+
+func (w *testWebWorker) GetGeneration() string {
+	return ""
+}
+
+func (w *testWebWorker) GetShared() bool {
+	return false
+}
+
+func (w *testWebWorker) Remove(ctx context.Context) (bool, error) {
+	w.removed = true
+	return true, nil
+}

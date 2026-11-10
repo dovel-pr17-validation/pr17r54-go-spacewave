@@ -1,0 +1,147 @@
+syntax = "proto3";
+package s4wave.objecttype.registry;
+
+service ObjectTypeRegistryResourceService {
+  rpc RegisterObjectType(RegisterObjectTypeRequest)
+    returns (RegisterObjectTypeResponse);
+  rpc WatchObjectTypes(WatchObjectTypesRequest)
+    returns (stream WatchObjectTypesResponse);
+}
+
+service ObjectTypeHandlerService {
+  rpc InvokeObjectType(InvokeObjectTypeRequest)
+    returns (InvokeObjectTypeResponse);
+}
+
+// ObjectTypeBodyService renders a plugin's object bodies as JSON. A plugin
+// serves it on its handler root beside ObjectTypeHandlerService; the host
+// leaves the bodies of a plugin that does not serve it without JSON.
+service ObjectTypeBodyService {
+  // MarshalBodiesJSON renders root block bodies of one ObjectType as JSON.
+  rpc MarshalBodiesJSON(MarshalBodiesJSONRequest)
+    returns (MarshalBodiesJSONResponse);
+}
+
+// ObjectTypeVisibility controls where an ObjectType should appear.
+enum ObjectTypeVisibility {
+  // OBJECT_TYPE_VISIBILITY_UNSPECIFIED uses the default visible behavior.
+  OBJECT_TYPE_VISIBILITY_UNSPECIFIED = 0;
+  // OBJECT_TYPE_VISIBILITY_VISIBLE makes the ObjectType visible in browsers and links.
+  OBJECT_TYPE_VISIBILITY_VISIBLE = 1;
+  // OBJECT_TYPE_VISIBILITY_HIDDEN hides the ObjectType from routine browsing.
+  OBJECT_TYPE_VISIBILITY_HIDDEN = 2;
+  // OBJECT_TYPE_VISIBILITY_INTERNAL is for implementation-owned objects.
+  OBJECT_TYPE_VISIBILITY_INTERNAL = 3;
+}
+
+// ObjectTypePortDirection selects the end of a connection an ObjectType port is.
+enum ObjectTypePortDirection {
+  // OBJECT_TYPE_PORT_DIRECTION_UNKNOWN is unset.
+  OBJECT_TYPE_PORT_DIRECTION_UNKNOWN = 0;
+  // OBJECT_TYPE_PORT_DIRECTION_INPUT accepts data or an activation.
+  OBJECT_TYPE_PORT_DIRECTION_INPUT = 1;
+  // OBJECT_TYPE_PORT_DIRECTION_OUTPUT supplies data or an activation.
+  OBJECT_TYPE_PORT_DIRECTION_OUTPUT = 2;
+}
+
+// ObjectTypePort declares a connection endpoint of every object of an ObjectType.
+message ObjectTypePort {
+  // Name is unique among the ObjectType's ports.
+  string name = 1;
+  // Direction selects whether the port accepts or supplies.
+  ObjectTypePortDirection direction = 2;
+  // TypeId is the data contract of the port, such as stream or activation.
+  string type_id = 3;
+}
+
+// ObjectTypeMetadata is user-facing metadata for an ObjectType.
+message ObjectTypeMetadata {
+  // DisplayName is the readable label for the ObjectType.
+  string display_name = 1;
+  // IconName is a stable icon key understood by Spacewave UI.
+  string icon_name = 2;
+  // Visibility controls where the ObjectType appears.
+  ObjectTypeVisibility visibility = 3;
+  // Description is optional supporting copy for browsers and links.
+  string description = 4;
+  // Ports declares the connection endpoints of the ObjectType's objects.
+  repeated ObjectTypePort ports = 5;
+}
+
+// ObjectTypeRegistration is a registered ObjectType.
+message ObjectTypeRegistration {
+  // TypeId is the ObjectType ID (e.g. "notes/notebook").
+  string type_id = 1;
+  // RegistrationId is the server-assigned ID for this registration.
+  uint32 registration_id = 2;
+  // PluginId is the source plugin.
+  string plugin_id = 3;
+  // Metadata is user-facing display metadata for the ObjectType.
+  ObjectTypeMetadata metadata = 4;
+}
+
+// RegisterObjectTypeRequest is the request for RegisterObjectType.
+message RegisterObjectTypeRequest {
+  // TypeId is the ObjectType ID to register.
+  string type_id = 1;
+  // PluginId is the registering plugin's ID.
+  string plugin_id = 2;
+  // Metadata is user-facing display metadata for the ObjectType.
+  ObjectTypeMetadata metadata = 3;
+  // AttachedHandlerResourceId identifies a nonzero caller-owned attached
+  // ResourceService mux. It is valid only for the caller generation that registers
+  // it and is never persisted.
+  uint32 attached_handler_resource_id = 4;
+}
+
+// RegisterObjectTypeResponse is the response for RegisterObjectType.
+message RegisterObjectTypeResponse {
+  // ResourceId is the registration resource. Releasing it unregisters the type.
+  uint32 resource_id = 1;
+}
+
+// WatchObjectTypesRequest is the request for WatchObjectTypes.
+message WatchObjectTypesRequest {
+  // InstanceKey selects a logical installation; empty lists global registrations.
+  string instance_key = 1;
+}
+
+// WatchObjectTypesResponse is the response for WatchObjectTypes.
+message WatchObjectTypesResponse {
+  // Registrations is the current set of registered ObjectTypes.
+  repeated ObjectTypeRegistration registrations = 1;
+  // BuiltInTypeIds lists the ObjectTypes compiled into the host, which have
+  // no registration, sorted.
+  repeated string built_in_type_ids = 2;
+}
+
+// InvokeObjectTypeRequest is the request for InvokeObjectType.
+message InvokeObjectTypeRequest {
+  // TypeId is the ObjectType ID.
+  string type_id = 1;
+  // ObjectKey is the world object key.
+  string object_key = 2;
+  // AttachedEngineResourceId gives World Engine access to the handler.
+  uint32 attached_engine_resource_id = 3;
+}
+
+// InvokeObjectTypeResponse is the response for InvokeObjectType.
+message InvokeObjectTypeResponse {
+  // ResourceId is the child resource serving the ObjectType's RPCs.
+  uint32 resource_id = 1;
+}
+
+// MarshalBodiesJSONRequest is the request for MarshalBodiesJSON.
+message MarshalBodiesJSONRequest {
+  // TypeId is the ObjectType ID of every body.
+  string type_id = 1;
+  // Bodies are root block bodies as World stores them.
+  repeated bytes bodies = 2;
+}
+
+// MarshalBodiesJSONResponse is the response for MarshalBodiesJSON.
+message MarshalBodiesJSONResponse {
+  // BodiesJson preserves the request body order. An empty string marks a
+  // body the plugin could not render.
+  repeated string bodies_json = 1;
+}

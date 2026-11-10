@@ -1,0 +1,52 @@
+package core_all
+
+import (
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller/resolver/static"
+	block_store_bucket "github.com/s4wave/spacewave/db/block/store/bucket"
+	block_store_http "github.com/s4wave/spacewave/db/block/store/http"
+	http_lookup "github.com/s4wave/spacewave/db/block/store/http/lookup"
+	http_server "github.com/s4wave/spacewave/db/block/store/http/server"
+	block_store_kvfile_http "github.com/s4wave/spacewave/db/block/store/kvfile/http"
+	block_store_redis "github.com/s4wave/spacewave/db/block/store/redis"
+	block_store_s3 "github.com/s4wave/spacewave/db/block/store/s3"
+	block_store_s3_lookup "github.com/s4wave/spacewave/db/block/store/s3/lookup"
+	"github.com/s4wave/spacewave/db/core"
+	api_controller "github.com/s4wave/spacewave/db/daemon/api/controller"
+	unixfs_access_http "github.com/s4wave/spacewave/db/unixfs/access/http"
+	unixfs_world_access "github.com/s4wave/spacewave/db/unixfs/world/access"
+	volume_world "github.com/s4wave/spacewave/db/volume/world"
+	world_block_engine "github.com/s4wave/spacewave/db/world/block/engine"
+)
+
+// AddFactories adds all factories (including World Graph) to the static resolver.
+// This is intended to keep the default Core as minimal as possible.
+func AddFactories(b bus.Bus, sr *static.Resolver) {
+	// Register the minimal database core controllers.
+	core.AddFactories(b, sr)
+
+	// Add the daemon API controller.
+	sr.AddFactory(api_controller.NewFactory(b))
+
+	// Register the World engine controller.
+	sr.AddFactory(world_block_engine.NewFactory(b))
+
+	// Register the World object volume backend.
+	sr.AddFactory(volume_world.NewFactory(b))
+
+	// Register UnixFS access controllers.
+	sr.AddFactory(unixfs_access_http.NewFactory(b))
+	sr.AddFactory(unixfs_world_access.NewFactory(b))
+
+	// Register HTTP block-store lookup and server controllers.
+	sr.AddFactory(http_lookup.NewFactory(b))
+	sr.AddFactory(http_server.NewFactory(b))
+
+	// Register the supported block-store factories.
+	sr.AddFactory(block_store_bucket.NewFactory(b))
+	sr.AddFactory(block_store_kvfile_http.NewFactory(b))
+	sr.AddFactory(block_store_http.NewFactory(b))
+	sr.AddFactory(block_store_s3.NewFactory(b))
+	sr.AddFactory(block_store_s3_lookup.NewFactory(b))
+	sr.AddFactory(block_store_redis.NewFactory(b))
+}

@@ -1,0 +1,466 @@
+//go:build !js
+
+package goscriptbench
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/util/gitroot"
+	trace_service "github.com/s4wave/spacewave/core/trace/service"
+	wasm "github.com/s4wave/spacewave/e2e/wasm"
+	"github.com/sirupsen/logrus"
+)
+
+const projectedImageSmokeEnv = "E2E_GOSCRIPT_STORAGE_BENCH"
+
+// TestProjectedImageCacheDisabledRebuildsStartupModule proves that
+// E2E_WASM_STARTUP_BUILD_CACHE=false rebuilds changed app/prerender sources.
+//
+// The devtool shell served at / never embeds app/prerender/index.html; the
+// startup module graph does reach served output. boot-status.ts contributes
+// the loading detail literal, which lands verbatim in the compiled
+// entrypoint/startup-*.mjs chunk referenced by entrypoint.mjs.
+func TestProjectedImageCacheDisabledRebuildsStartupModule(t *testing.T) {
+	// Skip unless the retained-OPFS browser smoke is enabled.
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv(projectedImageSmokeEnv)), "true") {
+		t.Skipf("set %s=true to run the retained-OPFS browser smoke", projectedImageSmokeEnv)
+	}
+
+	// Locate the prerender source whose literal lands in the startup chunk.
+	repoRoot, err := gitroot.FindRepoRoot()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	bootStatusPath := filepath.Join(repoRoot, "app", "prerender", "boot-status.ts")
+	bootStatusInfo, err := os.Stat(bootStatusPath)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	originalMode := bootStatusInfo.Mode()
+	original, err := os.ReadFile(bootStatusPath)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Save the original source and require the served literal to be present.
+	const servedDetail = "Loading application..."
+	const rebuiltDetail = "cache-disabled rebuild proof"
+	if !strings.Contains(string(original), servedDetail) {
+		t.Fatalf("%s does not contain %q", bootStatusPath, servedDetail)
+	}
+	defer func() {
+		if err := os.WriteFile(bootStatusPath, original, originalMode); err != nil {
+			t.Errorf("restore web source: %v", err)
+		}
+	}()
+
+	// Seed a known baseline through the preserved startup build cache and
+	// verify the served startup module before mutating any source.
+	t.Setenv("E2E_WASM_STARTUP_BUILD_CACHE", "true")
+	first := bootProjectedImageHarness(t, wasm.WithStartupBuildCache(true))
+	t.Cleanup(first.Release)
+	assertServedStartupModuleContains(t, first.BaseURL(), servedDetail)
+
+	// Mutate the source and require a cache-disabled rebuild to serve it.
+	updated := strings.Replace(string(original), servedDetail, rebuiltDetail, 1)
+	if err := os.WriteFile(bootStatusPath, []byte(updated), 0o644); err != nil {
+		t.Fatal(err.Error())
+	}
+	t.Setenv("E2E_WASM_STARTUP_BUILD_CACHE", "false")
+	second := bootProjectedImageHarness(t)
+	defer second.Release()
+	assertServedStartupModuleContains(t, second.BaseURL(), rebuiltDetail)
+}
+
+// assertServedStartupModuleContains fetches the compiled startup module the
+// way the browser does: through entrypoint.mjs and its startup chunk import.
+func assertServedStartupModuleContains(t *testing.T, baseURL, want string) {
+	// Mark this helper so failures point at the caller.
+	t.Helper()
+
+	// Fetch entrypoint.mjs and resolve its startup chunk reference.
+	entrypointBody := fetchBody(t, baseURL+"/entrypoint/entrypoint.mjs")
+	chunkRef := startupChunkRegexp.FindString(entrypointBody)
+	if chunkRef == "" {
+		t.Fatalf("entrypoint.mjs references no startup chunk")
+	}
+
+	// Fetch the startup chunk and require the expected literal.
+	body := fetchBody(t, baseURL+"/entrypoint/"+chunkRef)
+	if !strings.Contains(body, want) {
+		t.Fatalf("served startup module %s does not contain %q", chunkRef, want)
+	}
+}
+
+var startupChunkRegexp = regexp.MustCompile(`startup-[A-Za-z0-9_-]+\.mjs`)
+
+func fetchBody(t *testing.T, url string) string {
+	// Mark this helper so failures point at the caller.
+	t.Helper()
+
+	// Fetch a URL and require an HTTP 200 response.
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s: status %d", url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	return string(body)
+}
+
+func bootProjectedImageHarness(t *testing.T, extra ...wasm.Option) *wasm.Harness {
+	// Mark this helper so failures point at the caller.
+	t.Helper()
+
+	// Boot a GoScript browser harness with the fixed worker settings.
+	options := []wasm.Option{
+		wasm.WithSessionHarness(),
+		wasm.WithGoScriptBrowserStartup(),
+		wasm.WithWorkerMode(wasm.WorkerModeDedicated),
+		wasm.WithBrowserName("chromium"),
+		wasm.WithManifestBuildTimeout(20 * time.Minute),
+	}
+	options = append(options, extra...)
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+	harness, err := wasm.Boot(t.Context(), logrus.NewEntry(logger), options...)
+	if err != nil {
+		t.Fatalf("boot GoScript browser harness: %v", err)
+	}
+	return harness
+}
+
+func TestProjectedImageSetupScriptCompiles(t *testing.T) {
+	// Compile the setup and measure scripts and require both outputs.
+	scripts, err := wasm.CompileTestScripts(".", t.TempDir())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if scripts[projectedImageSetupScript] == "" {
+		t.Fatalf("compiled scripts omit %s", projectedImageSetupScript)
+	}
+	if scripts[projectedImageMeasureScript] == "" {
+		t.Fatalf("compiled scripts omit %s", projectedImageMeasureScript)
+	}
+}
+
+func TestProjectedImageFixtureProofRequiresActionIdentity(t *testing.T) {
+	fixture := Fixture{
+		// Require the fixture proof to bind the action to the fixture identity.
+		Path:         ProjectedImageFixturePath,
+		SHA256:       "3470475e663fab4c571c4c1f3857c5bcad4902ad1058ed4cfae96b3bf5127724",
+		EncodedBytes: 4_198_217,
+	}
+	proof := projectedImageFixtureProof{
+		action:       "upload",
+		path:         fixture.Path,
+		sha256:       fixture.SHA256,
+		encodedBytes: fixture.EncodedBytes,
+	}
+	if err := proof.validate("upload", fixture); err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := proof.validate("verify", fixture); err == nil {
+		t.Fatal("fixture proof accepted a different action")
+	}
+}
+
+func TestProjectedImageSetupVerifiesUpload(t *testing.T) {
+	// Upload the fixture and require the recorded setup metadata.
+	workload := newProjectedImageSmoke(t)
+	metadata, err := workload.Setup(t.Context())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := metadata.Validate(); err != nil {
+		t.Fatal(err.Error())
+	}
+	if metadata.Fixture.EncodedBytes != 4_198_217 || metadata.Fixture.SHA256 != "3470475e663fab4c571c4c1f3857c5bcad4902ad1058ed4cfae96b3bf5127724" {
+		t.Fatalf("stored fixture identity = %d/%s", metadata.Fixture.EncodedBytes, metadata.Fixture.SHA256)
+	}
+	if len(workload.priorWorkers) == 0 {
+		t.Fatal("setup recorded no dedicated worker")
+	}
+}
+
+func TestProjectedImageRestartRetainsFixture(t *testing.T) {
+	// Upload the fixture, then restart the workload and compare browser and
+	// worker identities.
+	workload := newProjectedImageSmoke(t)
+	metadata, err := workload.Setup(t.Context())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	priorContext := workload.session.BrowserContext()
+	priorPage := workload.session.Page()
+	priorWorkers := slices.Clone(workload.priorWorkers)
+
+	// Restart the workload and require the browser context to be retained.
+	if err := workload.Restart(t.Context(), SampleRequest{Kind: SampleKindWarmup, Number: 1}); err != nil {
+		t.Fatal(err.Error())
+	}
+	if workload.session.BrowserContext() != priorContext {
+		t.Fatal("restart replaced the retained BrowserContext")
+	}
+	if workload.session.Page() == priorPage {
+		t.Fatal("restart retained the prior page")
+	}
+	if len(workload.priorWorkers) == 0 {
+		t.Fatal("restart recorded no dedicated worker")
+	}
+	for _, worker := range workload.priorWorkers {
+		if slices.Contains(priorWorkers, worker) {
+			t.Fatal("restart retained a prior dedicated worker")
+		}
+	}
+
+	// Require the complete cache boundary published for every sample.
+	wantRetained := []string{
+		"browser-process",
+		"browser-context",
+		"service-worker-state",
+		"module-cache",
+		"opfs-files",
+		"operating-system-page-cache",
+	}
+	if !slices.Equal(metadata.State.Retained, wantRetained) {
+		t.Fatalf("retained state = %v, want %v", metadata.State.Retained, wantRetained)
+	}
+	wantRecreated := []string{
+		"page",
+		"dedicated-worker",
+		"go-runtime",
+		"decoded-block-cache",
+		"opfs-segment-cache",
+		"world-state",
+		"response-cache-key",
+		"resource-sdk-connection",
+		"decoded-image-entry",
+	}
+	if !slices.Equal(metadata.State.Recreated, wantRecreated) {
+		t.Fatalf("recreated state = %v, want %v", metadata.State.Recreated, wantRecreated)
+	}
+}
+
+func TestProjectedImageMeasureUntracedProjectedFile(t *testing.T) {
+	// Upload the fixture into a fresh smoke workload.
+	workload := newProjectedImageSmoke(t)
+	if _, err := workload.Setup(t.Context()); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Upload a corrupt image and require the first measurement to fail.
+	corruptPath := uploadCorruptProjectedImage(t, workload)
+	request := SampleRequest{Kind: SampleKindWarmup, Number: 1}
+	if _, err := workload.MeasureUntraced(t.Context(), request); err == nil {
+		t.Fatal("sample was measured before a runtime restart")
+	}
+	if err := workload.Restart(t.Context(), request); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Measure after the restart and validate the warmup sample.
+	sample, err := workload.MeasureUntraced(t.Context(), request)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if sample.ID != "warmup-1" {
+		t.Fatalf("sample ID = %q, want warmup-1", sample.ID)
+	}
+	if err := workload.ValidateUntraced(t.Context(), request, sample); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Restart the runtime again and require reused identities and traced
+	// scalar requests to be rejected.
+	if err := workload.Restart(t.Context(), request); err != nil {
+		t.Fatal(err.Error())
+	}
+	if _, err := workload.MeasureUntraced(t.Context(), request); err == nil {
+		t.Fatal("reused sample identity was measured")
+	}
+	if _, err := workload.MeasureUntraced(t.Context(), SampleRequest{
+		Kind:   SampleKindWarmup,
+		Number: 1,
+		Trace:  true,
+	}); err == nil {
+		t.Fatal("traced scalar request was measured")
+	}
+
+	// Require each invalid projected image to fail measurement.
+	for _, invalid := range []struct {
+		name   string
+		path   string
+		width  int
+		height int
+	}{
+		{
+			name:   "missing",
+			path:   "goscriptbench-missing-image.png",
+			width:  workload.metadata.Fixture.Width,
+			height: workload.metadata.Fixture.Height,
+		},
+		{
+			name:   "corrupt",
+			path:   corruptPath,
+			width:  workload.metadata.Fixture.Width,
+			height: workload.metadata.Fixture.Height,
+		},
+		{
+			name:   "dimensions",
+			path:   workload.metadata.Fixture.Path,
+			width:  workload.metadata.Fixture.Width + 1,
+			height: workload.metadata.Fixture.Height,
+		},
+	} {
+
+		// Require each invalid projected image to fail measurement.
+		projectedURL := workload.harness.BaseURL() +
+			projectedImageFileURL(workload.sessionIndex, workload.spaceID, invalid.path) +
+			"&sample=" + invalid.name
+		if _, err := workload.measureProjectedImageURL(
+			t.Context(),
+			invalid.name,
+			projectedURL,
+			invalid.width,
+			invalid.height,
+		); err == nil {
+			t.Fatalf("%s projected image was measured", invalid.name)
+		}
+	}
+}
+
+func TestProjectedImageCapturesDiagnosticEvidence(t *testing.T) {
+	// Upload the fixture into a diagnostic smoke workload.
+	workload := newProjectedImageDiagnosticSmoke(t)
+	metadata, err := workload.Setup(t.Context())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Restart, measure, and validate the diagnostic sample.
+	request := SampleRequest{Kind: SampleKindDiagnostic, Number: 1, Trace: true}
+	if err := workload.Restart(t.Context(), request); err != nil {
+		t.Fatal(err.Error())
+	}
+	measurement, err := workload.Measure(t.Context(), request)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := workload.Validate(t.Context(), request, measurement.Sample); err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := measurement.Validate(request, metadata); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Require both the runtime trace and the Chromium CPU profile.
+	if len(measurement.RuntimeTrace) == 0 {
+		t.Fatal("diagnostic runtime trace is empty")
+	}
+	if len(measurement.BrowserCPUProfile) == 0 {
+		t.Fatal("diagnostic Chromium CPU profile is empty")
+	}
+}
+
+func uploadCorruptProjectedImage(t *testing.T, workload *ProjectedImage) string {
+	// Mark this helper so failures point at the caller.
+	t.Helper()
+
+	// Upload a corrupt fixture through the browser fixture script.
+	data := []byte("corrupt projected image")
+	digest := sha256.Sum256(data)
+	fixture := Fixture{
+		Path:         "goscriptbench-corrupt-image.png",
+		SHA256:       hex.EncodeToString(digest[:]),
+		EncodedBytes: int64(len(data)),
+	}
+	proof, err := workload.runFixtureScript(
+		"upload",
+		base64.StdEncoding.EncodeToString(data),
+		fixture,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := proof.validate("upload", fixture); err != nil {
+		t.Fatal(err.Error())
+	}
+	return fixture.Path
+}
+
+func newProjectedImageSmoke(t *testing.T) *ProjectedImage {
+	t.Helper()
+	return newProjectedImageSmokeMode(t, false)
+}
+
+func newProjectedImageDiagnosticSmoke(t *testing.T) *ProjectedImage {
+	t.Helper()
+	return newProjectedImageSmokeMode(t, true)
+}
+
+func newProjectedImageSmokeMode(t *testing.T, diagnostic bool) *ProjectedImage {
+	// Mark this helper so failures point at the caller.
+	t.Helper()
+
+	// Skip unless the smoke gate is enabled, then boot the workload.
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv(projectedImageSmokeEnv)), "true") {
+		t.Skipf("set %s=true to run the retained-OPFS browser smoke", projectedImageSmokeEnv)
+	}
+
+	// Build the projected-image workload against the booted harness.
+	harness := newProjectedImageHarness(t, "chromium", diagnostic)
+	workload, err := NewProjectedImage(t, harness, ProjectedImageConfig{
+		RunID:             "projected-image-smoke",
+		Engine:            "chromium",
+		SpacewaveRevision: "test-spacewave-revision",
+		GoScriptRevision:  "test-goscript-revision",
+		UnavailableFields: []string{},
+		BrowserCPUProfile: diagnostic,
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	return workload
+}
+
+func newProjectedImageHarness(t *testing.T, engine string, trace bool) *wasm.Harness {
+	// Mark this helper so failures point at the caller.
+	t.Helper()
+
+	// Configure the GoScript browser environment and boot the harness.
+	t.Setenv(wasm.E2EWasmCompilerEnv, string(wasm.E2EWasmCompilerGoScript))
+	t.Setenv(wasm.E2EWasmWorkerModeEnv, string(wasm.WorkerModeDedicated))
+
+	// Add the trace mutator when the caller requested diagnostic evidence.
+	options := []wasm.Option{wasm.WithBrowserName(engine)}
+	if trace {
+		t.Setenv(wasm.E2EWasmGoScriptRuntimeTraceEnv, "true")
+		options = append(options, wasm.WithConfigMutator(trace_service.InjectTraceConfig))
+	}
+
+	// Launch the selected browser and return the harness.
+	harness := bootProjectedImageHarness(t, options...)
+	t.Cleanup(harness.Release)
+	if err := harness.LaunchBrowser(); err != nil {
+		t.Fatalf("launch %s: %v", engine, err)
+	}
+	return harness
+}

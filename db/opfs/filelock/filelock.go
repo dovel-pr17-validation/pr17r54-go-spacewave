@@ -1,0 +1,127 @@
+//go:build js
+
+// Package filelock provides per-file WebLock coordination for OPFS file
+// access. Acquires an exclusive WebLock per file, then opens either a sync
+// access handle (DedicatedWorker) or an async file handle (SharedWorker,
+// main thread) depending on context.
+package filelock
+
+import (
+	"sync/atomic"
+	"syscall/js"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/opfs"
+)
+
+// File is the interface returned by AcquireFile. Callers use this for
+// both sync and async OPFS access transparently.
+type File interface {
+	ReadAt(p []byte, off int64) (int, error)
+	WriteAt(p []byte, off int64) (int, error)
+	Size() (int64, error)
+	Truncate(size int64) error
+	Flush() error
+}
+
+// AcquireFile acquires an exclusive per-file WebLock and opens the named
+// file for read/write access.
+//
+// The WebLock name is lockPrefix + "/" + name. If create is true the file
+// is created when it does not exist.
+//
+// In standard Go DedicatedWorker contexts, uses a sync access handle
+// (~40% faster). In TinyGo, SharedWorker, and main-thread contexts, uses async
+// file access so promise-backed I/O remains JS-owned.
+//
+// The returned release function closes the file and releases the WebLock.
+// It is safe to call more than once.
+func AcquireFile(dir js.Value, name, lockPrefix string, create bool) (File, func(), error) {
+	lockName := lockPrefix + "/" + name
+
+	// Acquire exclusive WebLock.
+	lockRelease, err := AcquireWebLock(lockName, true)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "acquire WebLock")
+	}
+
+	if opfs.PreferSyncAccessHandles() {
+		handle, err := openHandle(dir, name, create)
+		if err != nil {
+			lockRelease()
+			return nil, nil, err
+		}
+		var once atomic.Bool
+		release := func() {
+			if once.CompareAndSwap(false, true) {
+				_ = handle.Close()
+				lockRelease()
+			}
+		}
+		return handle, release, nil
+	}
+
+	// Async path for SharedWorker/main thread.
+	var af *opfs.AsyncFile
+	if create {
+		af, err = opfs.CreateAsyncFile(dir, name)
+	} else {
+		af, err = opfs.OpenAsyncFile(dir, name)
+	}
+	if err != nil {
+		lockRelease()
+		return nil, nil, err
+	}
+	var once atomic.Bool
+	release := func() {
+		if once.CompareAndSwap(false, true) {
+			lockRelease()
+		}
+	}
+	return &asyncAdapter{af}, release, nil
+}
+
+// WriteFile replaces the named file under its per-file WebLock.
+func WriteFile(dir js.Value, name, lockPrefix string, data []byte) error {
+	lockRelease, err := AcquireWebLock(lockPrefix+"/"+name, true)
+	if err != nil {
+		return errors.Wrap(err, "acquire WebLock")
+	}
+	defer lockRelease()
+
+	if !opfs.PreferSyncAccessHandles() {
+		return opfs.WriteFile(dir, name, data)
+	}
+
+	handle, err := opfs.CreateSyncFile(dir, name)
+	if err != nil {
+		return errors.Wrap(err, "open sync file")
+	}
+	defer handle.Close()
+	if err := handle.Truncate(0); err != nil {
+		return errors.Wrap(err, "truncate sync file")
+	}
+	if _, err := handle.WriteAt(data, 0); err != nil {
+		return errors.Wrap(err, "write sync file")
+	}
+	return errors.Wrap(handle.Flush(), "flush sync file")
+}
+
+// openHandle opens or creates a sync access handle.
+func openHandle(dir js.Value, name string, create bool) (*opfs.SyncFile, error) {
+	if create {
+		return opfs.CreateSyncFile(dir, name)
+	}
+	return opfs.OpenSyncFile(dir, name)
+}
+
+// asyncAdapter wraps an AsyncFile to implement File.
+type asyncAdapter struct {
+	f *opfs.AsyncFile
+}
+
+func (a *asyncAdapter) ReadAt(p []byte, off int64) (int, error)  { return a.f.ReadAt(p, off) }
+func (a *asyncAdapter) WriteAt(p []byte, off int64) (int, error) { return a.f.WriteAt(p, off) }
+func (a *asyncAdapter) Size() (int64, error)                     { return a.f.Size() }
+func (a *asyncAdapter) Truncate(size int64) error                { return a.f.Truncate(size) }
+func (a *asyncAdapter) Flush() error                             { return nil }

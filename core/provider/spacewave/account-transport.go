@@ -1,0 +1,425 @@
+package provider_spacewave
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/core/sobject"
+	sharedobject_dexaccess "github.com/s4wave/spacewave/core/sobject/dexaccess"
+	"github.com/s4wave/spacewave/core/transport"
+	dex_solicit "github.com/s4wave/spacewave/db/dex/solicit"
+	"github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// sessionTransportState holds a running SessionTransport for one Session.
+type sessionTransportState struct {
+	sessionID string
+	transport *transport.SessionTransport
+	rc        *routine.RoutineContainer
+	readyRc   *routine.RoutineContainer
+
+	bcast  broadcast.Broadcast
+	ready  bool
+	exited bool
+	err    error
+}
+
+// sessionTransportStatusError exposes the HTTP status of a cloud response.
+type sessionTransportStatusError interface {
+	// StatusCode returns the HTTP status code.
+	StatusCode() int
+}
+
+// sessionTransportUnauthorized reports whether the cloud rejected the Session
+// credential, which the Session repairs by registering again.
+func sessionTransportUnauthorized(err error) bool {
+	var statusErr sessionTransportStatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode() == http.StatusUnauthorized
+}
+
+func sessionTransportCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	// Build a cleanup context that survives cancellation with a bounded deadline.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) > 0 {
+		return context.WithDeadline(cleanupCtx, deadline)
+	}
+	timeout := time.Duration(providerBackoff.GetExponential().GetMaxInterval()) * time.Millisecond
+	return context.WithTimeout(cleanupCtx, timeout)
+}
+
+func newSessionTransportState(
+	a *ProviderAccount,
+	sessionID string,
+	st *transport.SessionTransport,
+) *sessionTransportState {
+	// Build the transport state with its run and readiness routines.
+	sts := &sessionTransportState{
+		sessionID: sessionID,
+		transport: st,
+	}
+	sts.rc = routine.NewRoutineContainerWithLogger(
+		a.le.WithField("routine", "session-transport"),
+		routine.WithRetry(providerBackoff),
+		routine.WithExitCb(func(err error) {
+			a.handleSessionTransportExit(sessionID, sts, err)
+		}),
+	)
+	sts.rc.SetRoutine(st.Execute)
+	sts.readyRc = routine.NewRoutineContainerWithLogger(
+		a.le.WithField("routine", "session-transport-ready"),
+	)
+	sts.readyRc.SetRoutine(sts.watchReady)
+	return sts
+}
+
+func (a *ProviderAccount) handleSessionTransportExit(
+	sessionID string,
+	sts *sessionTransportState,
+	err error,
+) {
+	// A failed transport stops the retry with a nil result.
+	if err == nil {
+		err = sts.transport.Err()
+	}
+	var ready bool
+	sts.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		ready = sts.ready
+	})
+	if !ready {
+		if !errors.Is(err, context.Canceled) {
+			a.le.WithError(err).WithField("session-id", sessionID).Warn("session transport startup attempt failed")
+		}
+		return
+	}
+	sts.setExited(err)
+	sts.readyRc.ClearContext()
+	a.transportBcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		if a.sessionTransports[sessionID] == sts {
+			delete(a.sessionTransports, sessionID)
+			broadcast()
+		}
+	})
+}
+
+// Start binds both routines to ctx.
+func (s *sessionTransportState) Start(ctx context.Context) {
+	s.readyRc.SetContext(ctx, false)
+	s.rc.SetContext(ctx, false)
+}
+
+// Stop stops both routines and waits for them to exit or ctx to end.
+func (s *sessionTransportState) Stop(ctx context.Context) error {
+	// Stop both routines and mark the transport exited.
+	readyWaitCh, _ := s.readyRc.SetRoutine(nil)
+	runWaitCh, _ := s.rc.SetRoutine(nil)
+	s.readyRc.ClearContext()
+	s.rc.ClearContext()
+	s.setExited(context.Canceled)
+
+	// Wait for both routines to exit before returning.
+	if readyWaitCh != nil {
+		select {
+		case <-readyWaitCh:
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait for session transport readiness routine exit")
+		}
+	}
+	if runWaitCh != nil {
+		select {
+		case <-runWaitCh:
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait for session transport routine exit")
+		}
+	}
+	return nil
+}
+
+// WaitStarted waits until the transport is ready, exits, or ctx ends.
+func (s *sessionTransportState) WaitStarted(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		var ready bool
+		var exited bool
+		var exitErr error
+		var waitCh <-chan struct{}
+		s.bcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+			ready = s.ready
+			exited = s.exited
+			exitErr = s.err
+			waitCh = getWaitCh()
+		})
+		if ready {
+			return nil
+		}
+		if exited {
+			if exitErr == nil {
+				exitErr = errors.New("session transport exited before ready")
+			}
+			return errors.Wrap(exitErr, "session transport failed to start")
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-waitCh:
+		}
+	}
+}
+
+func (s *sessionTransportState) watchReady(ctx context.Context) error {
+	if err := s.transport.AwaitReady(ctx); err != nil {
+		s.setExited(err)
+		return err
+	}
+	s.setReady()
+	return nil
+}
+
+func (s *sessionTransportState) setReady() {
+	s.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		if s.ready || s.exited {
+			return
+		}
+		s.ready = true
+		broadcast()
+	})
+}
+
+func (s *sessionTransportState) setExited(err error) {
+	s.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		if s.exited {
+			if s.err == nil || errors.Is(s.err, context.Canceled) && !errors.Is(err, context.Canceled) {
+				s.err = err
+				broadcast()
+			}
+			return
+		}
+		s.exited = true
+		s.err = err
+		broadcast()
+	})
+}
+
+// CreateSessionTransport creates and starts the legacy default session transport.
+func (a *ProviderAccount) CreateSessionTransport(
+	ctx context.Context,
+	sessionKey crypto.PrivKey,
+	signalingURL string,
+) error {
+	return a.createSessionTransportForSession(ctx, "", sessionKey, signalingURL)
+}
+
+func (a *ProviderAccount) createSessionTransportForSession(
+	ctx context.Context,
+	sessionID string,
+	sessionKey crypto.PrivKey,
+	signalingURL string,
+) error {
+	// Acquire replacement cleanup scope and serialize transport changes.
+	cleanupCtx, cleanupCancel := sessionTransportCleanupContext(ctx)
+	rel, err := a.transportReplaceMtx.Lock(cleanupCtx)
+	if err != nil {
+		cleanupCancel()
+		return err
+	}
+
+	// Stop the previous session transport before constructing its replacement.
+	if err := a.stopSessionTransportLocked(cleanupCtx, sessionID, nil); err != nil {
+		rel()
+		cleanupCancel()
+		return err
+	}
+
+	// Construct the replacement transport with its bridge policy.
+	options := append([]transport.SessionTransportOption{}, a.p.transportOptions...)
+	options = append(options,
+		transport.WithStartupRetry(),
+		transport.WithPeerAuthorizer(a.authorizeAccountSession),
+		transport.WithPeerAuthorizationWatch(a.watchAccountSessions),
+		transport.WithDEXRequestAuthorizer(a.authorizeDEXRequest),
+		transport.WithBridgeDirectiveFilter(func(di directive.Instance) (bool, error) {
+			_, isMount := di.GetDirective().(sobject.MountSharedObject)
+			return !isMount, nil
+		}),
+	)
+	st, err := transport.NewSessionTransport(a.le, a.p.b, sessionKey, signalingURL, a.p.signingEnvPfx, options...)
+	if err != nil {
+		rel()
+		cleanupCancel()
+		return errors.Wrap(err, "create session transport")
+	}
+
+	// Publish the replacement transport state.
+	sts := newSessionTransportState(a, sessionID, st)
+	a.transportBcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		if a.sessionTransports == nil {
+			a.sessionTransports = make(map[string]*sessionTransportState)
+		}
+		a.sessionTransports[sessionID] = sts
+		broadcast()
+	})
+
+	// Start the transport and release replacement locks.
+	sts.Start(ctx)
+	rel()
+	cleanupCancel()
+
+	// Await readiness and clean up failed startup.
+	if err := sts.WaitStarted(ctx); err != nil {
+		if stopErr := a.stopSessionTransportForSession(ctx, sessionID, sts); stopErr != nil {
+			return errors.Wrap(stopErr, "cleanup failed session transport startup")
+		}
+		return err
+	}
+	return nil
+}
+
+// authorizeDEXRequest retains the SharedObject authority source for one peer.
+func (a *ProviderAccount) authorizeDEXRequest(ctx context.Context, config *dex_solicit.Config, requester peer.ID) (dex_solicit.RequestAccess, error) {
+	// Mount only the SharedObject named by this DEX protocol context.
+	ref := a.buildSharedObjectRef(string(config.GetProtocolContext()))
+	object, releaseObject, err := a.MountSharedObject(ctx, ref, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Keep the cloud SharedObject watch so an authorized successor can backfill.
+	swObject, ok := object.(*SharedObject)
+	if !ok {
+		releaseObject()
+		return nil, errors.New("DEX protocol context did not mount a cloud SharedObject")
+	}
+	return sharedobject_dexaccess.NewSharedObjectRequestAccess(ctx, swObject.ctx, swObject.GetSOHost(), requester, releaseObject)
+}
+
+// GetSessionTransport returns the legacy default session transport, or nil.
+func (a *ProviderAccount) GetSessionTransport() *transport.SessionTransport {
+	return a.getSessionTransportForSession("")
+}
+
+func (a *ProviderAccount) getSessionTransportForSession(sessionID string) *transport.SessionTransport {
+	var st *transport.SessionTransport
+	a.transportBcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		if state := a.sessionTransports[sessionID]; state != nil {
+			st = state.transport
+		}
+	})
+	return st
+}
+
+// getSessionChildBusForSession returns the live child bus, or nil when the
+// Session transport is absent, disabled, or already exited.
+func (a *ProviderAccount) getSessionChildBusForSession(sessionID string) bus.Bus {
+	// Return the live transport's child bus, or nil when it is gone.
+	var state *sessionTransportState
+	a.transportBcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		state = a.sessionTransports[sessionID]
+	})
+	if state == nil {
+		return nil
+	}
+	var exited bool
+	state.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		exited = state.exited
+	})
+	if exited || state.transport == nil {
+		return nil
+	}
+	return state.transport.GetChildBus()
+}
+
+// getSessionBusForSession returns the live child bus and falls back to the
+// account parent bus when direct transport is absent or has exited.
+func (a *ProviderAccount) getSessionBusForSession(sessionID string) bus.Bus {
+	if child := a.getSessionChildBusForSession(sessionID); child != nil {
+		return child
+	}
+	if a.p != nil {
+		return a.p.b
+	}
+	return nil
+}
+
+// GetTransportBroadcast returns the transport state broadcast.
+func (a *ProviderAccount) GetTransportBroadcast() *broadcast.Broadcast {
+	return &a.transportBcast
+}
+
+// GetTransportSnapshotWithWait returns the legacy default transport state.
+func (a *ProviderAccount) GetTransportSnapshotWithWait() (bool, <-chan struct{}) {
+	return a.getTransportSnapshotWithWaitForSession("")
+}
+
+func (a *ProviderAccount) getTransportSnapshotWithWaitForSession(sessionID string) (bool, <-chan struct{}) {
+	// Snapshot the transport presence and wait channel under the lock.
+	var running bool
+	var ch <-chan struct{}
+	a.transportBcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+		ch = getWaitCh()
+		running = a.sessionTransports[sessionID] != nil
+	})
+	return running, ch
+}
+
+// StopSessionTransport stops the legacy default session transport.
+func (a *ProviderAccount) StopSessionTransport() {
+	if err := a.stopSessionTransportForSession(nil, "", nil); err != nil {
+		a.le.WithError(err).Warn("failed to stop session transport")
+	}
+}
+
+func (a *ProviderAccount) stopSessionTransportForSession(
+	ctx context.Context,
+	sessionID string,
+	target *sessionTransportState,
+) error {
+	// Serialize transport replacement and stop under the cleanup context.
+	cleanupCtx, cleanupCancel := sessionTransportCleanupContext(ctx)
+	defer cleanupCancel()
+	rel, err := a.transportReplaceMtx.Lock(cleanupCtx)
+	if err != nil {
+		return err
+	}
+	defer rel()
+	return a.stopSessionTransportLocked(cleanupCtx, sessionID, target)
+}
+
+func (a *ProviderAccount) stopSessionTransportLocked(
+	ctx context.Context,
+	sessionID string,
+	target *sessionTransportState,
+) error {
+	// Stop only the targeted transport state.
+	var sts *sessionTransportState
+	a.transportBcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		sts = a.sessionTransports[sessionID]
+	})
+	if sts == nil || target != nil && sts != target {
+		return nil
+	}
+	if err := sts.Stop(ctx); err != nil {
+		return err
+	}
+
+	// Remove the stopped transport from the account map.
+	a.transportBcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		if a.sessionTransports[sessionID] == sts {
+			delete(a.sessionTransports, sessionID)
+			broadcast()
+		}
+	})
+	return nil
+}

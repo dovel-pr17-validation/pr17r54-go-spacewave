@@ -1,0 +1,248 @@
+import { pipe } from 'it-pipe'
+import { pushable } from 'it-pushable'
+import type { PacketStream } from 'starpc'
+import type { BackendAPI, BackendEntrypointLifecycle } from '@aptre/bldr-sdk'
+import { PluginStartInfo } from '../../../plugin/plugin.pb.js'
+import { messagePortPacketStream } from '../../entrypoint/browser/message-port-packet-stream.js'
+
+type GoPushableSink = {
+  push: (message: Uint8Array) => void
+  end: () => void
+}
+
+export type GoScriptPluginMain = () => void | Promise<void>
+export type GoScriptPluginMainLoader = () => Promise<GoScriptPluginMain>
+
+declare global {
+  var BLDR_BASE_URL: string
+  var BLDR_PLUGIN_START_INFO: string | undefined
+  var BLDR_PLUGIN_OPEN_STREAM_TO_WEB_RUNTIME:
+    | ((
+        onMessage: (message: Uint8Array) => void,
+        onClose: (errMsg?: string) => void,
+        onResolve: (sink: GoPushableSink) => void,
+        onReject: (errMsg: string) => void,
+      ) => void)
+    | undefined
+  var BLDR_PLUGIN_MARK_READY: (() => void) | undefined
+  var BLDR_PLUGIN_SET_ACCEPT_STREAM:
+    | ((acceptStream?: (localPort: MessagePort) => void) => void)
+    | undefined
+}
+
+const globalScope = globalThis
+// goScriptHost is the process shape GoScript's os package reads its env from.
+const goScriptHost: { process?: { env?: Record<string, string | undefined> } } =
+  globalThis
+const baseURL = import.meta?.url
+globalScope.BLDR_BASE_URL = baseURL
+
+class GoScriptPluginGeneration {
+  private readonly activeAcceptedStreams = new Set<PacketStream>()
+  private readonly startup = Promise.withResolvers<void>()
+  private readonly done = Promise.withResolvers<void>()
+  private terminalError?: Error
+
+  public constructor(private readonly api: BackendAPI) {
+    void this.startup.promise.catch(() => {})
+    void this.done.promise.catch(() => {})
+  }
+
+  // start runs the plugin's Go main once its host configuration is installed.
+  // GoScript's os.Getenv reads process.env, so env is merged there first.
+  public start(
+    startInfo: PluginStartInfo,
+    loadPluginMain: GoScriptPluginMainLoader,
+    env: Record<string, string> | undefined,
+  ): BackendEntrypointLifecycle {
+    const pluginStartInfoJsonB64 = btoa(PluginStartInfo.toJsonString(startInfo))
+    globalScope.BLDR_PLUGIN_START_INFO = pluginStartInfoJsonB64
+    if (env) {
+      const host = (goScriptHost.process ??= {})
+      host.env = { ...host.env, ...env }
+    }
+
+    void Promise.resolve()
+      .then(() => loadPluginMain())
+      .then((pluginMain) => pluginMain())
+      .then(
+        () => this.fail(new Error('GoScript plugin process exited')),
+        (err) => this.fail(err),
+      )
+
+    return {
+      startup: this.startup.promise,
+      done: this.done.promise,
+    }
+  }
+
+  public markReady() {
+    if (this.terminalError) {
+      return
+    }
+    this.startup.resolve()
+  }
+
+  public setAcceptStream(acceptStrm?: (localPort: MessagePort) => void) {
+    if (this.terminalError) {
+      this.installTerminalAcceptHandler(this.terminalError)
+      return
+    }
+    if (!acceptStrm) {
+      this.api.handleStreamCtr.set(undefined)
+      return
+    }
+
+    this.api.handleStreamCtr.set(async (channel: PacketStream) => {
+      if (this.terminalError) {
+        throw this.terminalError
+      }
+
+      const messageChannel = new MessageChannel()
+      let accepted = false
+      try {
+        acceptStrm(messageChannel.port1)
+        accepted = true
+      } finally {
+        if (!accepted) {
+          messageChannel.port1.close()
+          messageChannel.port2.close()
+        }
+      }
+
+      // The Go reader ends only on the null write EOF, so close through the
+      // shared stream, which sends it before releasing the port.
+      const stream = messagePortPacketStream(messageChannel.port2)
+      this.activeAcceptedStreams.add(stream)
+      try {
+        await pipe(channel, stream, channel)
+      } finally {
+        this.activeAcceptedStreams.delete(stream)
+        void stream.close()
+      }
+    })
+    this.markReady()
+  }
+
+  private fail(err: unknown) {
+    if (this.terminalError) {
+      return
+    }
+
+    const terminalError = castToError(err, 'GoScript plugin process failed')
+    this.terminalError = terminalError
+    this.startup.reject(terminalError)
+    this.done.reject(terminalError)
+    console.warn(
+      'plugin-goscript: GoScript plugin process exited',
+      terminalError,
+    )
+    this.closeActiveAcceptedStreams()
+    this.installTerminalAcceptHandler(terminalError)
+  }
+
+  private closeActiveAcceptedStreams() {
+    for (const stream of this.activeAcceptedStreams) {
+      void stream.close()
+    }
+    this.activeAcceptedStreams.clear()
+  }
+
+  private installTerminalAcceptHandler(err: Error) {
+    this.api.handleStreamCtr.set(async () => {
+      throw err
+    })
+  }
+}
+
+export default function main(
+  api: BackendAPI,
+  loadPluginMain: GoScriptPluginMainLoader,
+  env?: Record<string, string>,
+): BackendEntrypointLifecycle {
+  const generation = new GoScriptPluginGeneration(api)
+
+  globalScope.BLDR_PLUGIN_OPEN_STREAM_TO_WEB_RUNTIME = (
+    onMessage,
+    onClose,
+    onResolve,
+    onReject,
+  ): void => {
+    void (async () => {
+      const packetStream = await api.openStream()
+      const packetSource = packetStream.source
+      const push = pushable<Uint8Array>({ objectMode: true })
+      let callbacksClosed = false
+      const closeCallbacks = (errMsg?: string) => {
+        if (callbacksClosed) {
+          return
+        }
+        callbacksClosed = true
+        onClose(errMsg)
+      }
+      const deliverMessage = async (msg: Uint8Array): Promise<boolean> => {
+        if (callbacksClosed) {
+          return false
+        }
+        onMessage(msg)
+        return true
+      }
+      queueMicrotask(async () => {
+        try {
+          for await (const msg of packetSource) {
+            if (!(await deliverMessage(msg))) {
+              push.end()
+              return
+            }
+          }
+          closeCallbacks()
+        } catch (err) {
+          closeCallbacks(castToError(err).toString())
+        }
+      })
+
+      queueMicrotask(() => {
+        void packetStream.sink(push).catch((err) => {
+          closeCallbacks(castToError(err).toString())
+        })
+      })
+      return {
+        push: (message: Uint8Array) => {
+          push.push(message)
+        },
+        end: () => {
+          push.end()
+        },
+      }
+    })().then(
+      (sink) => {
+        onResolve(sink)
+      },
+      (err) => {
+        onReject(castToError(err).toString())
+      },
+    )
+  }
+
+  globalScope.BLDR_PLUGIN_MARK_READY = () => {
+    generation.markReady()
+  }
+
+  globalScope.BLDR_PLUGIN_SET_ACCEPT_STREAM = (
+    acceptStrm?: (localPort: MessagePort) => void,
+  ) => {
+    generation.setAcceptStream(acceptStrm)
+  }
+
+  return generation.start(api.startInfo, loadPluginMain, env)
+}
+
+function castToError(err: unknown, fallback = 'unknown error'): Error {
+  if (err instanceof Error) {
+    return err
+  }
+  if (typeof err === 'string') {
+    return new Error(err)
+  }
+  return new Error(fallback)
+}

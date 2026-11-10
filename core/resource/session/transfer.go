@@ -1,0 +1,660 @@
+package resource_session
+
+import (
+	"context"
+	"sync"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/core/provider"
+	provider_local "github.com/s4wave/spacewave/core/provider/local"
+	provider_spacewave "github.com/s4wave/spacewave/core/provider/spacewave"
+	provider_transfer "github.com/s4wave/spacewave/core/provider/transfer"
+	"github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/core/sobject"
+	"github.com/s4wave/spacewave/core/space"
+	"github.com/s4wave/spacewave/db/volume"
+	"github.com/s4wave/spacewave/net/crypto"
+	s4wave_provider_spacewave "github.com/s4wave/spacewave/sdk/provider/spacewave"
+	s4wave_session "github.com/s4wave/spacewave/sdk/session"
+	"github.com/sirupsen/logrus"
+)
+
+// transferManager tracks an active transfer operation on a session resource.
+type transferManager struct {
+	mtx      sync.Mutex
+	transfer *provider_transfer.Transfer
+	rc       *routine.RoutineContainer
+	running  bool
+}
+
+// GetActiveTransfer returns the currently active transfer, or nil if none.
+func (r *SessionResource) GetActiveTransfer() *provider_transfer.Transfer {
+	r.transferMgr.mtx.Lock()
+	defer r.transferMgr.mtx.Unlock()
+	return r.transferMgr.transfer
+}
+
+// GetTransferInventory returns the list of spaces on a session for transfer planning.
+func (r *SessionResource) GetTransferInventory(
+	ctx context.Context,
+	req *s4wave_session.GetTransferInventoryRequest,
+) (*s4wave_session.GetTransferInventoryResponse, error) {
+	// Require a session index.
+	sessionIdx := req.GetSessionIndex()
+	if sessionIdx == 0 {
+		return nil, errors.New("session_index is required")
+	}
+
+	// Look up the target session by index.
+	sessionCtrl, sessionCtrlRef, err := session.ExLookupSessionController(ctx, r.b, "", false, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "lookup session controller")
+	}
+	defer sessionCtrlRef.Release()
+
+	// Load the session entry for that index.
+	sessInfo, err := sessionCtrl.GetSessionByIdx(ctx, sessionIdx)
+	if err != nil {
+		return nil, errors.Wrap(err, "get session by index")
+	}
+	if sessInfo == nil {
+		return nil, session.ErrSessionNotFound
+	}
+
+	// Access the provider account for that session.
+	provRef := sessInfo.GetSessionRef().GetProviderResourceRef()
+	provAcc, provAccRef, err := provider.ExAccessProviderAccount(
+		ctx, r.b,
+		provRef.GetProviderId(),
+		provRef.GetProviderAccountId(),
+		false, nil,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "access provider account")
+	}
+	defer provAccRef.Release()
+
+	// Get the shared object list.
+	soFeature, err := sobject.GetSharedObjectProviderAccountFeature(ctx, provAcc)
+	if err != nil {
+		return nil, errors.Wrap(err, "get shared object feature")
+	}
+
+	// Watch the account's SharedObject list.
+	soListWatchable, relSoList, err := soFeature.AccessSharedObjectList(ctx, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "access shared object list")
+	}
+	defer relSoList()
+
+	// Wait for the SharedObject list value.
+	soList, err := soListWatchable.WaitValue(ctx, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "wait for shared object list")
+	}
+
+	// Filter to spaces.
+	spaces, err := space.FilterSharedObjectList(soList.GetSharedObjects(), func(_ *sobject.SharedObjectListEntry, _ error) error {
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "filter shared object list")
+	}
+
+	// The well-known CDN Space is not a transferable resource.
+	spaces = filterOutCdnSpace(spaces)
+
+	return &s4wave_session.GetTransferInventoryResponse{Spaces: spaces}, nil
+}
+
+// StartTransfer starts a transfer operation between two sessions.
+func (r *SessionResource) StartTransfer(
+	ctx context.Context,
+	req *s4wave_session.StartTransferRequest,
+) (*s4wave_session.StartTransferResponse, error) {
+	// Require a transfer mode and two different session indexes.
+	mode := req.GetMode()
+	if mode == provider_transfer.TransferMode_TransferMode_UNKNOWN {
+		return nil, errors.New("transfer mode is required")
+	}
+	srcIdx := req.GetSourceSessionIndex()
+	tgtIdx := req.GetTargetSessionIndex()
+	if srcIdx == 0 || tgtIdx == 0 {
+		return nil, errors.New("source and target session indexes are required")
+	}
+	if srcIdx == tgtIdx {
+		return nil, errors.New("source and target sessions must be different")
+	}
+
+	// Check for existing active transfer.
+	r.transferMgr.mtx.Lock()
+	if r.transferMgr.running {
+		r.transferMgr.mtx.Unlock()
+		return nil, errors.New("a transfer is already in progress")
+	}
+	r.transferMgr.mtx.Unlock()
+
+	// Look up session controller.
+	sessionCtrl, sessionCtrlRef, err := session.ExLookupSessionController(ctx, r.b, "", false, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "lookup session controller")
+	}
+	defer sessionCtrlRef.Release()
+
+	// Look up source and target sessions.
+	srcEntry, err := sessionCtrl.GetSessionByIdx(ctx, srcIdx)
+	if err != nil {
+		return nil, errors.Wrap(err, "get source session")
+	}
+	if srcEntry == nil {
+		return nil, errors.New("source session not found")
+	}
+	tgtEntry, err := sessionCtrl.GetSessionByIdx(ctx, tgtIdx)
+	if err != nil {
+		return nil, errors.Wrap(err, "get target session")
+	}
+	if tgtEntry == nil {
+		return nil, errors.New("target session not found")
+	}
+
+	// Build source and target transfer adapters.
+	source, cleanup, err := buildTransferSource(ctx, r.b, srcEntry)
+	if err != nil {
+		return nil, errors.Wrap(err, "build transfer source")
+	}
+	target, err := buildTransferTarget(ctx, r.b, tgtEntry)
+	if err != nil {
+		return nil, errors.Wrap(err, "build transfer target")
+	}
+
+	// Build checkpoint store on source account.
+	checkpoint, err := buildCheckpointStore(ctx, r.b, srcEntry)
+	if err != nil {
+		return nil, errors.Wrap(err, "build checkpoint store")
+	}
+
+	// Log the transfer with its source and target sessions.
+	le := r.le.WithFields(logrus.Fields{
+		"transfer-src":  srcIdx,
+		"transfer-tgt":  tgtIdx,
+		"transfer-mode": mode.String(),
+	})
+
+	// Sign the transferred Spaces as the peer the target holds after the transfer.
+	owner, err := transferOwnerKey(ctx, mode, source, target)
+	if err != nil {
+		return nil, errors.Wrap(err, "load transfer owner key")
+	}
+
+	// Migrate gives the target the source's identity before deleting the source.
+	var copyIdentity func(context.Context) error
+	if mode == provider_transfer.TransferMode_TransferMode_MIGRATE {
+		srcVol, tgtVol := getTransferSourceVolume(source), getTransferTargetVolume(target)
+		if srcVol == nil || tgtVol == nil {
+			return nil, errors.New("migrate needs source and target volumes")
+		}
+		copyIdentity = func(ctx context.Context) error {
+			return provider_transfer.TransferKeypair(ctx, srcVol, tgtVol)
+		}
+	}
+
+	// Build the transfer from the source, target, and checkpoint store.
+	xfer := provider_transfer.NewTransfer(
+		le,
+		mode,
+		source,
+		target,
+		owner,
+		srcIdx,
+		tgtIdx,
+		&provider_transfer.TransferOptions{
+			Cleanup:        cleanup,
+			Checkpoint:     checkpoint,
+			FilterSpaceIDs: req.GetSpaceIds(),
+			CopyIdentity:   copyIdentity,
+		},
+	)
+
+	// Read the linked-cloud account ID before the transfer starts, because the
+	// cleanup phase will delete the source volume (making the ObjectStore
+	// inaccessible).
+	var srcLinkedCloudAccountID string
+	if mode == provider_transfer.TransferMode_TransferMode_MERGE || mode == provider_transfer.TransferMode_TransferMode_MIGRATE {
+		srcLinkedCloudAccountID, err = readLinkedCloudAccountID(ctx, r.b, srcEntry, source)
+		if err != nil {
+			return nil, errors.Wrap(err, "read linked-cloud account id")
+		}
+	}
+
+	// Run the transfer on a routine owned by this resource.
+	var rc *routine.RoutineContainer
+	rc = routine.NewRoutineContainerWithLogger(
+		le.WithField("routine", "transfer"),
+		routine.WithExitCb(func(_ error) {
+			r.transferMgr.mtx.Lock()
+			if r.transferMgr.rc == rc {
+				r.transferMgr.running = false
+			}
+			r.transferMgr.mtx.Unlock()
+		}),
+	)
+	rc.SetRoutine(func(ctx context.Context) error {
+		// Execute the transfer and log a failure.
+		err := xfer.Execute(ctx)
+		if err != nil {
+			return err
+		}
+
+		// After merge or migrate, clean up linked-cloud ref and delete the source session.
+		if mode == provider_transfer.TransferMode_TransferMode_MERGE || mode == provider_transfer.TransferMode_TransferMode_MIGRATE {
+			sessCtrl, sessCtrlRef, lerr := session.ExLookupSessionController(ctx, r.b, "", false, nil)
+			if lerr != nil {
+				return xfer.Fail(errors.Wrap(lerr, "lookup session controller for cleanup"))
+			}
+			defer sessCtrlRef.Release()
+			if srcLinkedCloudAccountID != "" {
+				if lerr := cleanupLinkedCloudRef(ctx, le, r.b, sessCtrl, srcLinkedCloudAccountID); lerr != nil {
+					return xfer.Fail(errors.Wrap(lerr, "cleanup linked-cloud ref"))
+				}
+			}
+			if lerr := sessCtrl.DeleteSession(ctx, srcEntry.GetSessionRef()); lerr != nil {
+				return xfer.Fail(errors.Wrap(lerr, "delete source session"))
+			}
+		}
+		return nil
+	})
+
+	// Publish the running transfer and wait for its routine to exit.
+	r.transferMgr.mtx.Lock()
+	r.transferMgr.transfer = xfer
+	r.transferMgr.rc = rc
+	r.transferMgr.running = true
+	r.transferMgr.mtx.Unlock()
+	rc.SetContext(r.ctx, false)
+	for {
+		state, ch := xfer.WatchState()
+		if state.GetPhase() != provider_transfer.TransferPhase_TransferPhase_IDLE {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			rc.ClearContext()
+			return nil, ctx.Err()
+		case <-ch:
+		}
+	}
+
+	return &s4wave_session.StartTransferResponse{}, nil
+}
+
+// WatchTransferProgress streams transfer state updates for an active transfer.
+func (r *SessionResource) WatchTransferProgress(
+	req *s4wave_session.WatchTransferProgressRequest,
+	strm s4wave_session.SRPCSessionResourceService_WatchTransferProgressStream,
+) error {
+	// Use the stream context for the progress watch.
+	ctx := strm.Context()
+
+	// Read the active transfer under the manager lock.
+	r.transferMgr.mtx.Lock()
+	xfer := r.transferMgr.transfer
+	r.transferMgr.mtx.Unlock()
+
+	// Report that no transfer is active.
+	if xfer == nil {
+		return errors.New("no transfer in progress")
+	}
+
+	// Send progress whenever the transfer state changes.
+	var prev *provider_transfer.TransferState
+	for {
+		state, ch := xfer.WatchState()
+
+		if prev == nil || !state.EqualVT(prev) {
+			if err := strm.Send(&s4wave_session.WatchTransferProgressResponse{
+				State: state,
+			}); err != nil {
+				return err
+			}
+			prev = state
+		}
+
+		// If transfer is complete or failed, send final state and return.
+		phase := state.GetPhase()
+		if phase == provider_transfer.TransferPhase_TransferPhase_COMPLETE ||
+			phase == provider_transfer.TransferPhase_TransferPhase_FAILED {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		}
+	}
+}
+
+// CancelTransfer stops an in-progress transfer.
+func (r *SessionResource) CancelTransfer(
+	ctx context.Context,
+	req *s4wave_session.CancelTransferRequest,
+) (*s4wave_session.CancelTransferResponse, error) {
+	// Read the running transfer routine under the manager lock.
+	r.transferMgr.mtx.Lock()
+	rc := r.transferMgr.rc
+	running := r.transferMgr.running
+	r.transferMgr.mtx.Unlock()
+
+	// Report that no transfer is running.
+	if rc == nil || !running {
+		return nil, errors.New("no transfer in progress")
+	}
+
+	// Stop the routine and clear it if it is still current.
+	waitCh, _ := rc.SetRoutine(nil)
+	if waitCh != nil {
+		select {
+		case <-waitCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	r.transferMgr.mtx.Lock()
+	if r.transferMgr.rc == rc {
+		r.transferMgr.running = false
+	}
+	r.transferMgr.mtx.Unlock()
+
+	return &s4wave_session.CancelTransferResponse{}, nil
+}
+
+// GetTransferStatus returns whether a transfer is active or a checkpoint exists.
+func (r *SessionResource) GetTransferStatus(
+	ctx context.Context,
+	req *s4wave_session.GetTransferStatusRequest,
+) (*s4wave_session.GetTransferStatusResponse, error) {
+	// Check for active in-memory transfer.
+	r.transferMgr.mtx.Lock()
+	xfer := r.transferMgr.transfer
+	r.transferMgr.mtx.Unlock()
+
+	// Return the active transfer when one is in memory.
+	if xfer != nil {
+		state := xfer.GetState()
+		phase := state.GetPhase()
+		if phase != provider_transfer.TransferPhase_TransferPhase_COMPLETE &&
+			phase != provider_transfer.TransferPhase_TransferPhase_FAILED {
+			return &s4wave_session.GetTransferStatusResponse{
+				Active: true,
+				State:  state,
+			}, nil
+		}
+	}
+
+	// Check for checkpoint from interrupted transfer on the current session.
+	// Only local providers support checkpoints.
+	localAcc, ok := r.session.GetProviderAccount().(*provider_local.ProviderAccount)
+	if !ok {
+		return &s4wave_session.GetTransferStatusResponse{}, nil
+	}
+
+	// Open the checkpoint store for this local account.
+	provRef := r.session.GetSessionRef().GetProviderResourceRef()
+	objStoreID := provider_local.SobjectObjectStoreID(provRef.GetProviderId(), provRef.GetProviderAccountId())
+	volID := localAcc.GetVolume().GetID()
+	cpStore := provider_transfer.NewObjectStoreCheckpointLazy(r.b, objStoreID, volID)
+
+	// Return no checkpoint when none is stored.
+	cp, err := cpStore.LoadCheckpoint(ctx)
+	if err != nil || cp == nil {
+		return &s4wave_session.GetTransferStatusResponse{}, nil
+	}
+
+	return &s4wave_session.GetTransferStatusResponse{
+		HasCheckpoint: true,
+		State:         cp.GetState(),
+	}, nil
+}
+
+// buildTransferSource creates a TransferSource and optional CleanupSource from a session entry.
+func buildTransferSource(
+	ctx context.Context,
+	b bus.Bus,
+	entry *session.SessionListEntry,
+) (provider_transfer.TransferSource, provider_transfer.CleanupSource, error) {
+	// Read the source session's provider and account IDs.
+	provRef := entry.GetSessionRef().GetProviderResourceRef()
+	provID := provRef.GetProviderId()
+	accountID := provRef.GetProviderAccountId()
+
+	// Open that provider account.
+	provAcc, provAccRef, err := provider.ExAccessProviderAccount(ctx, b, provID, accountID, false, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer provAccRef.Release()
+
+	// Build a transfer source for the account type.
+	switch acc := provAcc.(type) {
+	case *provider_local.ProviderAccount:
+		src := provider_transfer.NewLocalTransferSource(acc, b)
+		return src, src, nil
+	case *provider_spacewave.ProviderAccount:
+		src := provider_transfer.NewSpacewaveTransferSource(acc, provID, accountID, b)
+		return src, nil, nil
+	default:
+		return nil, nil, errors.New("unsupported provider type for transfer source")
+	}
+}
+
+// buildTransferTarget creates a TransferTarget from a session entry.
+func buildTransferTarget(
+	ctx context.Context,
+	b bus.Bus,
+	entry *session.SessionListEntry,
+) (provider_transfer.TransferTarget, error) {
+	// Read the target session's provider and account IDs.
+	provRef := entry.GetSessionRef().GetProviderResourceRef()
+	provID := provRef.GetProviderId()
+	accountID := provRef.GetProviderAccountId()
+
+	// Open that provider account.
+	provAcc, provAccRef, err := provider.ExAccessProviderAccount(ctx, b, provID, accountID, false, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer provAccRef.Release()
+
+	// Build a transfer target for the account type.
+	switch acc := provAcc.(type) {
+	case *provider_local.ProviderAccount:
+		return provider_transfer.NewLocalTransferTarget(acc, provID, accountID, b), nil
+	case *provider_spacewave.ProviderAccount:
+		// Cloud targets require a write-eligible subscription for block store writes.
+		subStatus, err := acc.GetSubscriptionStatus(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "check target subscription status")
+		}
+		if !s4wave_provider_spacewave.BillingStatusFromString(subStatus).IsWriteAllowed() {
+			return nil, errors.Errorf("target cloud account subscription is %q: an active subscription is required to transfer data", subStatus)
+		}
+		return provider_transfer.NewSpacewaveTransferTarget(acc, provID, accountID), nil
+	default:
+		return nil, errors.New("unsupported provider type for transfer target")
+	}
+}
+
+// buildCheckpointStore creates a CheckpointStore from a session entry.
+func buildCheckpointStore(
+	ctx context.Context,
+	b bus.Bus,
+	entry *session.SessionListEntry,
+) (provider_transfer.CheckpointStore, error) {
+	// Read the checkpoint session's provider and account IDs.
+	provRef := entry.GetSessionRef().GetProviderResourceRef()
+	provID := provRef.GetProviderId()
+	accountID := provRef.GetProviderAccountId()
+
+	// Open that provider account.
+	provAcc, provAccRef, err := provider.ExAccessProviderAccount(ctx, b, provID, accountID, false, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer provAccRef.Release()
+
+	// Build a checkpoint store for the account type.
+	switch acc := provAcc.(type) {
+	case *provider_local.ProviderAccount:
+		objStoreID := provider_local.SobjectObjectStoreID(provID, accountID)
+		volID := acc.GetVolume().GetID()
+		return provider_transfer.NewObjectStoreCheckpointLazy(b, objStoreID, volID), nil
+	case *provider_spacewave.ProviderAccount:
+		return nil, nil
+	default:
+		return nil, errors.New("unsupported provider type for checkpoint")
+	}
+}
+
+// transferOwnerKey returns the key of the peer that owns the transferred
+// Spaces: the source peer for MIGRATE, which copies the source keypair to the
+// target, and the target peer otherwise.
+func transferOwnerKey(
+	ctx context.Context,
+	mode provider_transfer.TransferMode,
+	source provider_transfer.TransferSource,
+	target provider_transfer.TransferTarget,
+) (crypto.PrivKey, error) {
+	// Pick the volume whose peer owns the transfer.
+	vol := getTransferTargetVolume(target)
+	if mode == provider_transfer.TransferMode_TransferMode_MIGRATE {
+		vol = getTransferSourceVolume(source)
+	}
+	if vol == nil {
+		return nil, errors.New("transfer account has no volume")
+	}
+	p, err := vol.GetPeer(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	return p.GetPrivKey(ctx)
+}
+
+// getTransferSourceVolume extracts the volume from a transfer source.
+func getTransferSourceVolume(source provider_transfer.TransferSource) volume.Volume {
+	switch s := source.(type) {
+	case *provider_transfer.LocalTransferSource:
+		return s.GetAccount().GetVolume()
+	case *provider_transfer.SpacewaveTransferSource:
+		return s.GetAccount().GetVolume()
+	}
+	return nil
+}
+
+// getTransferTargetVolume extracts the volume from a transfer target.
+func getTransferTargetVolume(target provider_transfer.TransferTarget) volume.Volume {
+	switch t := target.(type) {
+	case *provider_transfer.LocalTransferTarget:
+		return t.GetAccount().GetVolume()
+	case *provider_transfer.SpacewaveTransferTarget:
+		return t.GetAccount().GetVolume()
+	}
+	return nil
+}
+
+// readLinkedCloudAccountID reads the linked-cloud account ID from a local
+// session's ObjectStore. Returns empty string if the session is not local or
+// has no cloud link. Uses the transfer source's volume ID to avoid the raw
+// StorageVolumeID which may not match the proxy volume on the plugin bus.
+func readLinkedCloudAccountID(ctx context.Context, b bus.Bus, entry *session.SessionListEntry, source provider_transfer.TransferSource) (string, error) {
+	// Read a linked-cloud account only from a local session.
+	provRef := entry.GetSessionRef().GetProviderResourceRef()
+	provID := provRef.GetProviderId()
+	if provID != provider_local.ProviderID {
+		return "", nil
+	}
+
+	// Require a local transfer source.
+	localSrc, ok := source.(*provider_transfer.LocalTransferSource)
+	if !ok {
+		return "", nil
+	}
+
+	// Locate the local session object store.
+	accountID := provRef.GetProviderAccountId()
+	sessionID := provRef.GetId()
+	objectStoreID := provider_local.SessionObjectStoreID(provID, accountID)
+	volID := localSrc.GetAccount().GetVolume().GetID()
+
+	// Open that object store.
+	objStoreHandle, _, diRef, err := volume.ExBuildObjectStoreAPI(ctx, b, false, objectStoreID, volID, nil)
+	if err != nil {
+		return "", errors.Wrap(err, "mount session object store")
+	}
+	defer diRef.Release()
+
+	// Open a read transaction on the object store.
+	otx, err := objStoreHandle.GetObjectStore().NewTransaction(ctx, false)
+	if err != nil {
+		return "", errors.Wrap(err, "new read transaction")
+	}
+	defer otx.Discard()
+
+	// Return the linked-cloud account ID, or empty when none is stored.
+	key := provider_local.LinkedCloudKey(sessionID)
+	data, found, err := otx.Get(ctx, key)
+	if err != nil {
+		return "", errors.Wrap(err, "read linked-cloud key")
+	}
+	if !found {
+		return "", nil
+	}
+	return string(data), nil
+}
+
+// cleanupLinkedCloudRef removes the cloud-side linked-local reference for a
+// source session being merged or migrated away. The cloudAccountID must be
+// read before the transfer starts (since the source volume is deleted during
+// the cleanup phase).
+func cleanupLinkedCloudRef(ctx context.Context, le *logrus.Entry, b bus.Bus, sessCtrl session.SessionController, cloudAccountID string) error {
+	// Log the linked-cloud cleanup.
+	le.Info("cleaning up linked-cloud reference")
+
+	// List sessions on the controller.
+	sessions, err := sessCtrl.ListSessions(ctx)
+	if err != nil {
+		return errors.Wrap(err, "list sessions")
+	}
+
+	// Clear the linked-cloud key on each matching local session.
+	for _, entry := range sessions {
+		provRef := entry.GetSessionRef().GetProviderResourceRef()
+		if provRef.GetProviderId() != "spacewave" {
+			continue
+		}
+		if provRef.GetProviderAccountId() != cloudAccountID {
+			continue
+		}
+
+		// Access the spacewave account and delete the linked-local reference.
+		swAcc, swAccRef, aerr := provider.ExAccessProviderAccount(ctx, b, "spacewave", cloudAccountID, false, nil)
+		if aerr != nil {
+			return errors.Wrap(aerr, "access spacewave account")
+		}
+		defer swAccRef.Release()
+
+		cloudSessionID := provRef.GetId()
+		swAccTyped, ok := swAcc.(*provider_spacewave.ProviderAccount)
+		if !ok {
+			return errors.New("spacewave account is not the expected type")
+		}
+		if derr := swAccTyped.DeleteLinkedLocalSession(ctx, cloudSessionID); derr != nil {
+			return errors.Wrap(derr, "delete linked-local reference")
+		}
+		le.Info("cleaned up linked-local reference on cloud side")
+		return nil
+	}
+
+	return errors.New("no spacewave session found for linked cloud account")
+}

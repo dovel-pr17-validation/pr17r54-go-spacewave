@@ -1,0 +1,66 @@
+syntax = "proto3";
+package s4wave.cdn;
+
+option go_package = "github.com/s4wave/spacewave/sdk/cdn;s4wave_cdn";
+
+service CdnResourceService {
+  rpc GetCdnSpaceId(GetCdnSpaceIdRequest) returns (GetCdnSpaceIdResponse);
+
+  rpc MountCdnSpace(MountCdnSpaceRequest) returns (MountCdnSpaceResponse);
+
+  rpc CopyV86ImageToSpace(CopyV86ImageToSpaceRequest)
+      returns (stream CopyV86ImageToSpaceProgress);
+}
+
+// GetCdnSpaceIdRequest is the request type for GetCdnSpaceId.
+message GetCdnSpaceIdRequest {}
+
+// GetCdnSpaceIdResponse is the response type for GetCdnSpaceId.
+message GetCdnSpaceIdResponse {
+  // SpaceId is the CDN Space ULID.
+  string space_id = 1;
+}
+
+// MountCdnSpaceRequest is the request type for MountCdnSpace.
+message MountCdnSpaceRequest {}
+
+// MountCdnSpaceResponse is the response type for MountCdnSpace.
+message MountCdnSpaceResponse {
+  // ResourceId is the client resource id of the mounted SpaceResource.
+  uint32 resource_id = 1;
+}
+
+// CopyV86ImageToSpaceRequest is the request type for CopyV86ImageToSpace.
+message CopyV86ImageToSpaceRequest {
+  // SessionIdx is the caller's session index; used to resolve the
+  // destination user Space via the standard session-aware mount path.
+  uint32 session_idx = 1;
+  // DstSpaceId is the ULID of the user Space the V86Image will land in.
+  string dst_space_id = 2;
+  // SrcObjectKey is the V86Image object key in the CDN Space.
+  string src_object_key = 3;
+  // DstObjectKey is the object key in the destination Space.
+  string dst_object_key = 4;
+}
+
+
+// CopyV86ImageToSpaceStage is the server-owned CDN image-copy stage.
+enum CopyV86ImageToSpaceStage {
+  CopyV86ImageToSpaceStage_FETCHING = 0;
+  CopyV86ImageToSpaceStage_COPYING = 1;
+  CopyV86ImageToSpaceStage_DONE = 2;
+}
+
+// CopyV86ImageToSpaceProgress reports cumulative logical copy accounting.
+message CopyV86ImageToSpaceProgress {
+  // Stage is the current server-owned image-copy stage.
+  CopyV86ImageToSpaceStage stage = 1;
+  // BlocksSeen counts unique eligible source blocks encountered.
+  uint64 blocks_seen = 2;
+  // BlocksCopied counts source blocks processed by the destination store.
+  uint64 blocks_copied = 3;
+  // BlocksWritten counts source blocks newly written to the destination.
+  uint64 blocks_written = 4;
+  // LogicalSourceBytes counts eligible source bytes before destination dedupe.
+  uint64 logical_source_bytes = 5;
+}

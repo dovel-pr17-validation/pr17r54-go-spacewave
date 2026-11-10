@@ -1,0 +1,395 @@
+//go:build !js
+
+package wasm
+
+import (
+	stderrors "errors"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"strings"
+
+	playwright "github.com/mxschmitt/playwright-go"
+	"github.com/pkg/errors"
+	e2eharness "github.com/s4wave/spacewave/e2e/harness"
+	"github.com/sirupsen/logrus"
+)
+
+// LaunchBrowser starts a Playwright-managed browser instance. The browser
+// process is shared across all test sessions. NewClean* helpers create a fresh
+// BrowserContext; NewRetainedState* helpers reuse the harness context.
+//
+// Call this after Boot returns. Headless mode is the default; pass
+// WithHeadless(false) at Boot time to see the browser.
+func (h *Harness) LaunchBrowser() error {
+	// Start Playwright.
+	pw, err := playwright.Run()
+	if err != nil {
+		return errors.Wrap(err, "start playwright")
+	}
+	h.pw = pw
+
+	// Launch the browser.
+	browser, err := h.launchBrowser(pw)
+	if err != nil {
+		pw.Stop()
+		h.pw = nil
+		return err
+	}
+	h.browser = browser
+
+	return nil
+}
+
+// launchBrowser launches the configured Playwright browser type. Chromium
+// launches run through the shared sticky E2E_CHROMIUM_GPU launch policy.
+func (h *Harness) launchBrowser(pw *playwright.Playwright) (playwright.Browser, error) {
+	switch h.browserName {
+	case "chromium":
+		return e2eharness.LaunchChromium(h.ctx, h.chromiumPolicy, func(gpu bool) (playwright.Browser, error) {
+			return pw.Chromium.Launch(e2eharness.ChromiumLaunchOptions(h.headless, gpu))
+		})
+	case "firefox":
+		browser, err := pw.Firefox.Launch(playwright.BrowserTypeLaunchOptions{
+			Headless: new(h.headless),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "launch firefox")
+		}
+		return browser, nil
+	case "webkit":
+		browser, err := pw.WebKit.Launch(playwright.BrowserTypeLaunchOptions{
+			Headless: new(h.headless),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "launch webkit")
+		}
+		return browser, nil
+	case "android":
+		// The device reaches both loopback servers through adb reverse.
+		server, err := url.Parse(h.baseURL)
+		if err != nil {
+			return nil, err
+		}
+		cloud, err := url.Parse(h.cloudEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		device, err := e2eharness.ConnectAndroidChrome(pw, server.Port(), cloud.Port())
+		if err != nil {
+			return nil, err
+		}
+		h.device = device
+		return device.Browser, nil
+	default:
+		return nil, errors.Errorf("unknown e2e wasm browser %q", h.browserName)
+	}
+}
+
+// Browser returns the raw Playwright Browser handle, or nil if not launched.
+func (h *Harness) Browser() playwright.Browser { return h.browser }
+
+// BrowserName returns the Playwright browser type selected for this harness.
+func (h *Harness) BrowserName() string { return h.browserName }
+
+// newBrowserContext creates a fresh BrowserContext on the shared browser and
+// wires up console/error forwarding. The context and page are stored on the
+// provided TestSession.
+func (h *Harness) newBrowserContext(s *TestSession) (playwright.Page, error) {
+	// Require a launched browser.
+	if h.browser == nil {
+		return nil, errors.New("browser not launched")
+	}
+
+	// Open a storage context for the session.
+	ctx, baseURL, err := h.newStorageContext()
+	if err != nil {
+		return nil, errors.Wrap(err, "new browser context")
+	}
+	s.browserCtx = ctx
+	s.baseURL = baseURL
+	s.ownsBrowserCtx = true
+
+	// Open a page in that context.
+	page, err := h.newBrowserPage(s)
+	if err != nil {
+		ctx.Close()
+		s.browserCtx = nil
+		s.ownsBrowserCtx = false
+		return nil, err
+	}
+	return page, nil
+}
+
+func (h *Harness) newRetainedStateBrowserPage(s *TestSession) (playwright.Page, error) {
+	// Require a launched browser.
+	if h.browser == nil {
+		return nil, errors.New("browser not launched")
+	}
+
+	// Lock the retained browser context.
+	h.retainedStateCtxMu.Lock()
+	defer h.retainedStateCtxMu.Unlock()
+
+	// Create the retained context when it is missing.
+	if h.retainedStateCtx == nil {
+		ctx, baseURL, err := h.newStorageContext()
+		if err != nil {
+			return nil, errors.Wrap(err, "new retained-state browser context")
+		}
+		h.retainedStateCtx = ctx
+		h.retainedStateBaseURL = baseURL
+	}
+
+	// Open a page that shares the retained context.
+	s.browserCtx = h.retainedStateCtx
+	s.baseURL = h.retainedStateBaseURL
+	s.ownsBrowserCtx = false
+	page, err := h.newBrowserPage(s)
+	if err != nil {
+		s.browserCtx = nil
+		return nil, err
+	}
+	return page, nil
+}
+
+// newStorageContext keeps each fixture isolated while providing real durable
+// storage. WebKit's ephemeral contexts reject OPFS; its macOS persistent
+// profiles share OPFS by origin, so each fixture also owns a loopback origin.
+func (h *Harness) newStorageContext() (playwright.BrowserContext, string, error) {
+	// Prepare a WebKit profile and parse the app URL.
+	if h.device != nil {
+		return h.device.Context(), h.baseURL, nil
+	}
+	if h.browserName != "webkit" {
+		ctx, err := h.browser.NewContext(playwright.BrowserNewContextOptions{AcceptDownloads: new(true)})
+		return ctx, h.baseURL, err
+	}
+	profile, err := os.MkdirTemp("", "spacewave-e2e-webkit-")
+	if err != nil {
+		return nil, "", err
+	}
+	target, err := url.Parse(h.baseURL)
+	if err != nil {
+		os.RemoveAll(profile)
+		return nil, "", err
+	}
+
+	// Proxy the app through a persistent WebKit context.
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/__e2e_storage_cleanup" {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("<!doctype html><title>Fixture cleanup</title>"))
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	ctx, err := h.pw.WebKit.LaunchPersistentContext(profile, playwright.BrowserTypeLaunchPersistentContextOptions{
+		Headless: new(h.headless), AcceptDownloads: new(true),
+	})
+	if err != nil {
+		origin.Close()
+		os.RemoveAll(profile)
+		return nil, "", err
+	}
+	ctx.OnClose(func(playwright.BrowserContext) {
+		origin.Close()
+		os.RemoveAll(profile)
+	})
+	return ctx, origin.URL, nil
+}
+
+// closeStorageContext removes only the fixture origin after its workers stop.
+// WebKit's macOS OPFS directory is outside its explicit profile directory.
+// The Android device's context is its user profile, so it stays open.
+func (h *Harness) closeStorageContext(ctx playwright.BrowserContext, baseURL string) {
+	// Close the storage context, clearing WebKit storage outside a device run.
+	if h.device != nil {
+		if err := h.device.ClearOrigin(baseURL); err != nil {
+			h.le.WithError(err).Warn("remove device fixture storage")
+		}
+		return
+	}
+	defer ctx.Close()
+	if h.browserName != "webkit" {
+		return
+	}
+	for _, page := range ctx.Pages() {
+		page.Close()
+	}
+	page, err := ctx.NewPage()
+	if err == nil {
+		_, err = page.Goto(baseURL + "/__e2e_storage_cleanup")
+	}
+	if err == nil {
+		_, err = page.Evaluate(`async () => {
+			const root = await navigator.storage.getDirectory()
+			for await (const [name] of root.entries()) await root.removeEntry(name, { recursive: true })
+		}`)
+	}
+	if err != nil {
+		h.le.WithError(err).Warn("remove WebKit fixture storage")
+	}
+}
+
+func (h *Harness) newBrowserPage(s *TestSession) (playwright.Page, error) {
+	// Require a browser context and open a page.
+	if s.browserCtx == nil {
+		return nil, errors.New("browser context not initialized")
+	}
+	page, err := s.browserCtx.NewPage()
+	if err != nil {
+		return nil, errors.Wrap(err, "new page")
+	}
+
+	// Forward browser console output to the test log.
+	page.On("console", func(msg playwright.ConsoleMessage) {
+		text := msg.Text()
+		s.emitConsole(text)
+		if !shouldLogBrowserConsole(msg.Type(), text) {
+			return
+		}
+		s.h.le.WithFields(logrus.Fields{
+			"type":    msg.Type(),
+			"browser": true,
+		}).Info(text)
+	})
+
+	// Forward worker console output (SharedWorkers, dedicated workers).
+	page.OnWorker(func(w playwright.Worker) {
+		// Record the worker and forward its console.
+		url := w.URL()
+		s.addWorker(w)
+		s.h.le.WithField("worker", url).Debug("worker spawned")
+		w.OnConsole(func(msg playwright.ConsoleMessage) {
+			// Emit the console message and log it when it is not suppressed.
+			text := msg.Text()
+			s.emitConsole(text)
+			if !shouldLogBrowserConsole(msg.Type(), text) {
+				return
+			}
+			le := s.h.le.WithFields(logrus.Fields{
+				"type":   msg.Type(),
+				"worker": url,
+			})
+			switch msg.Type() {
+			case "error":
+				le.Error(text)
+			case "warning":
+				le.Warn(text)
+			default:
+				le.Info(text)
+			}
+		})
+		w.OnClose(func(_ playwright.Worker) {
+			s.removeWorker(w)
+			s.h.le.WithField("worker", url).Debug("worker closed")
+		})
+	})
+
+	// Forward page errors and responses into the session log.
+	page.On("pageerror", func(err error) {
+		msg := pageErrorMessage(err)
+		s.emitConsole(msg)
+		s.h.le.WithField("browser", true).Error(msg)
+	})
+	page.On("response", func(resp playwright.Response) {
+		if resp.Status() >= 400 {
+			s.h.le.WithFields(logrus.Fields{
+				"url":     resp.URL(),
+				"status":  resp.Status(),
+				"browser": true,
+			}).Warn("HTTP error response")
+		}
+	})
+
+	return page, nil
+}
+
+func pageErrorMessage(err error) string {
+	msg := "page error: " + err.Error()
+	if pwErr, ok := stderrors.AsType[*playwright.Error](err); ok {
+		stack := strings.TrimSpace(pwErr.Stack)
+		if stack != "" && stack != pwErr.Message {
+			msg += "\n" + stack
+		}
+	}
+	return msg
+}
+
+func shouldLogBrowserConsole(msgType, text string) bool {
+	// Honor explicit full browser logging.
+	v := strings.ToLower(os.Getenv("E2E_WASM_BROWSER_LOGS"))
+	if v == "true" || v == "1" {
+		return true
+	}
+
+	// Preserve browser failures regardless of the full-log setting.
+	switch msgType {
+	case "error", "warning":
+		return true
+	}
+
+	// Retain structured runtime failures.
+	return strings.Contains(text, "level=error") || strings.Contains(text, "level=warning")
+}
+
+func (h *Harness) loadAppPageURL(s *TestSession, targetURL string) error {
+	// Reject a missing page and rewrite a harness-relative URL.
+	if s.page == nil {
+		return errors.New("session page not initialized")
+	}
+	if s.baseURL != "" && strings.HasPrefix(targetURL, h.baseURL+"/") {
+		targetURL = s.baseURL + strings.TrimPrefix(targetURL, h.baseURL)
+	}
+
+	// Record the peer sequence before navigation.
+	s.peerAfterSeq = h.getPeerWatcher().LatestSequence()
+
+	// Navigate and wait for DOM content.
+	waitUntil := playwright.WaitUntilStateDomcontentloaded
+	timeout := float64(120000)
+	resp, err := s.page.Goto(targetURL, playwright.PageGotoOptions{
+		WaitUntil: waitUntil,
+		Timeout:   &timeout,
+	})
+	if err != nil {
+		return errors.Wrap(err, "load app")
+	}
+	if resp != nil && resp.Status() >= 400 {
+		return errors.Errorf("app returned HTTP %d", resp.Status())
+	}
+	return nil
+}
+
+// closeRetainedStateContext tears down the warm retained-state context owned by
+// the harness. Individual retained-state sessions close only their own pages.
+func (h *Harness) closeRetainedStateContext() {
+	h.retainedStateCtxMu.Lock()
+	defer h.retainedStateCtxMu.Unlock()
+
+	if h.retainedStateCtx != nil {
+		h.closeStorageContext(h.retainedStateCtx, h.retainedStateBaseURL)
+		h.retainedStateCtx = nil
+	}
+}
+
+// closeBrowser tears down the shared Playwright browser process.
+func (h *Harness) closeBrowser() {
+	if h.device != nil {
+		h.device.Close()
+		h.device = nil
+		h.browser = nil
+	}
+	if h.browser != nil {
+		h.browser.Close()
+		h.browser = nil
+	}
+	if h.pw != nil {
+		h.pw.Stop()
+		h.pw = nil
+	}
+}

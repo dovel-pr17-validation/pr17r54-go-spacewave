@@ -1,0 +1,855 @@
+//go:build !js
+
+package spacewave_cli
+
+import (
+	"context"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	devtool_store "github.com/s4wave/spacewave/bldr/devtool/store"
+	"github.com/s4wave/spacewave/db/block"
+
+	"github.com/aperturerobotics/cli"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/pkg/errors"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+	s4wave_git_core "github.com/s4wave/spacewave/core/git"
+	"github.com/s4wave/spacewave/core/sobject"
+	space_world "github.com/s4wave/spacewave/core/space/world"
+	space_world_ops "github.com/s4wave/spacewave/core/space/world/ops"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	transform_gzip "github.com/s4wave/spacewave/db/block/transform/gzip"
+	git_block "github.com/s4wave/spacewave/db/git/block"
+	git_world "github.com/s4wave/spacewave/db/git/world"
+	unixfs_block "github.com/s4wave/spacewave/db/unixfs/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/sdk/cli/runner"
+	s4wave_session "github.com/s4wave/spacewave/sdk/session"
+	s4wave_space "github.com/s4wave/spacewave/sdk/space"
+	"github.com/sirupsen/logrus"
+)
+
+// newSpaceCommand builds the space command group.
+func newSpaceCommand(getBus func() cli_entrypoint.CliBus) *cli.Command {
+	var statePath string
+	var sessionIdx uint
+	flags := clientFlags(&statePath, &sessionIdx)
+	return &cli.Command{
+		Name:    "space",
+		Aliases: []string{"spaces"},
+		Usage:   "manage spaces",
+		Flags:   flags,
+		Subcommands: []*cli.Command{
+			newSpaceListCommand(&statePath, &sessionIdx),
+			newSpaceCreateCommand(&statePath, &sessionIdx),
+			newSpaceDeleteCommand(&statePath, &sessionIdx),
+			newSpaceRenameCommand(&statePath, &sessionIdx),
+			newSpaceInfoCommand(&statePath, &sessionIdx),
+			newSpaceResolveCommand(&statePath, &sessionIdx),
+			newSpaceSettingsCommand(&statePath, &sessionIdx),
+			newSpaceInviteCommand(&statePath, &sessionIdx),
+			newSpaceJoinCommand(&statePath, &sessionIdx),
+			newSpaceBackfillCommand(&statePath, &sessionIdx),
+			newSpaceRosterCommand(&statePath, &sessionIdx),
+			newSpaceTrimCommand(&statePath, &sessionIdx),
+			newSpaceMembersCommand(&statePath, &sessionIdx),
+			newSpaceMoveStorageCommand(&statePath, &sessionIdx),
+			newSpaceImportGitCommand(&statePath, &sessionIdx),
+			newSpaceDeployCommand(&statePath, &sessionIdx),
+			newSpaceOriginCommand(&statePath, &sessionIdx),
+			newSpacePublicCommand(&statePath, &sessionIdx),
+			newSpaceWorldCommand(&statePath, &sessionIdx),
+			newSpaceSecretCommand(&statePath, &sessionIdx),
+			newObjectCommand(&statePath, &sessionIdx),
+		},
+	}
+}
+
+// newSpaceListCommand builds the space list subcommand.
+func newSpaceListCommand(_ *string, sessionIdx *uint) *cli.Command {
+	return runner.NewSpaceListCommand(nativeRunnerConfig(), sessionIdx)
+}
+
+// newSpaceCreateCommand builds the space create subcommand.
+func newSpaceCreateCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	var storage string
+	var accountStorage bool
+	return &cli.Command{
+		Name:      "create",
+		Usage:     "create a new space",
+		ArgsUsage: "<name>",
+		Flags: []cli.Flag{
+			outputFlag(),
+			&cli.StringFlag{
+				Name:        "storage",
+				Usage:       "store the space's blocks on this storage backend",
+				Destination: &storage,
+			},
+			&cli.BoolFlag{
+				Name:        "account-storage",
+				Usage:       "store the space's blocks on the account's own storage",
+				Destination: &accountStorage,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			// Require a Space name and reject both storage flags together.
+			name := c.Args().First()
+			if name == "" {
+				return errors.New("space name required")
+			}
+			if storage != "" && accountStorage {
+				return errors.New("choose --storage or --account-storage, not both")
+			}
+
+			// Take the command context.
+			ctx := c.Context
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Build the create request, resolving a named storage backend when one was given.
+			req := &s4wave_session.CreateSpaceRequest{SpaceName: name, AccountStorage: accountStorage}
+			if storage != "" {
+				backend, err := findStorageBackend(ctx, sess, storage)
+				if err != nil {
+					return err
+				}
+				req.StorageBackendId = backend.GetId()
+			}
+			resp, err := sess.CreateSpace(ctx, req)
+			if err != nil {
+				return errors.Wrap(err, "create space")
+			}
+
+			// Print the created Space ID, or the response as JSON or YAML.
+			id := resp.GetSharedObjectRef().GetProviderResourceRef().GetId()
+			switch c.String("output") {
+			case "json", "yaml":
+				// Drop the mounted resource handles, which end with this command.
+				created := &s4wave_session.CreateSpaceResponse{
+					SharedObjectRef:  resp.GetSharedObjectRef(),
+					SharedObjectMeta: resp.GetSharedObjectMeta(),
+				}
+				data, err := created.MarshalJSON()
+				if err != nil {
+					return err
+				}
+				return formatOutput(data, c.String("output"))
+			default:
+				os.Stdout.WriteString(id + "\n")
+				return nil
+			}
+		},
+	}
+}
+
+// newSpaceDeleteCommand builds the space delete subcommand.
+func newSpaceDeleteCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	return &cli.Command{
+		Name:      "delete",
+		Usage:     "delete a space by ID",
+		ArgsUsage: "<space-id>",
+		Action: func(c *cli.Context) error {
+			// Require a Space ID.
+			spaceID := c.Args().First()
+			if spaceID == "" {
+				return errors.New("space ID required")
+			}
+
+			// Take the command context.
+			ctx := c.Context
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Delete the Space.
+			if _, err := sess.DeleteSpace(ctx, spaceID); err != nil {
+				return errors.Wrap(err, "delete space")
+			}
+
+			// Report that the Space was deleted.
+			os.Stdout.WriteString("space deleted\n")
+			return nil
+		},
+	}
+}
+
+// newSpaceRenameCommand builds the space rename subcommand.
+func newSpaceRenameCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	return &cli.Command{
+		Name:      "rename",
+		Usage:     "rename a space by ID",
+		ArgsUsage: "<space-id> <name>",
+		Action: func(c *cli.Context) error {
+			// Require a Space ID and a new name.
+			spaceID := c.Args().Get(0)
+			if spaceID == "" {
+				return errors.New("space ID required")
+			}
+			name := c.Args().Get(1)
+			if name == "" {
+				return errors.New("space name required")
+			}
+
+			// Take the command context.
+			ctx := c.Context
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Rename the Space.
+			_, err = sess.RenameSpace(ctx, spaceID, name)
+			if err != nil {
+				return errors.Wrap(err, "rename space")
+			}
+
+			// Report that the Space was renamed.
+			os.Stdout.WriteString("space renamed\n")
+			return nil
+		},
+	}
+}
+
+// newSpaceInfoCommand builds the space info subcommand.
+func newSpaceInfoCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	return &cli.Command{
+		Name:      "info",
+		Usage:     "show space details",
+		ArgsUsage: "<space-id>",
+		Flags:     []cli.Flag{outputFlag()},
+		Action: func(c *cli.Context) error {
+			// Take the command context.
+			ctx := c.Context
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Resolve the Space ID from the argument.
+			spaceID, err := client.resolveSpaceID(ctx, sess, c.Args().First())
+			if err != nil {
+				return err
+			}
+
+			// Mount the Space service.
+			spaceSvc, spaceCleanup, err := client.mountSpace(ctx, sess, spaceID)
+			if err != nil {
+				return err
+			}
+			defer spaceCleanup()
+
+			// Watch the Space state.
+			strm, err := spaceSvc.WatchSpaceState(ctx, &s4wave_space.WatchSpaceStateRequest{})
+			if err != nil {
+				return errors.Wrap(err, "watch space state")
+			}
+			defer strm.Close()
+
+			// Read the current Space state.
+			state, err := strm.Recv()
+			if err != nil {
+				return errors.Wrap(err, "recv space state")
+			}
+
+			// Print the Space state, or emit it as JSON or YAML.
+			switch c.String("output") {
+			case "json", "yaml":
+				data, err := state.MarshalJSON()
+				if err != nil {
+					return err
+				}
+				return formatOutput(data, c.String("output"))
+			default:
+				storage := readSpaceStorage(ctx, sess, spaceID)
+				health := readSpaceHealth(ctx, sess, spaceID)
+				printSpaceState(spaceID, state, storage, readSpaceBackfill(ctx, spaceSvc), health)
+				return nil
+			}
+		},
+	}
+}
+
+// newSpaceResolveCommand builds the space resolve subcommand.
+func newSpaceResolveCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	return &cli.Command{
+		Name:      "resolve",
+		Usage:     "resolve a space name to its ID",
+		ArgsUsage: "<name>",
+		Action: func(c *cli.Context) error {
+			// Require a Space name.
+			name := c.Args().First()
+			if name == "" {
+				return errors.New("space name required")
+			}
+
+			// Take the command context.
+			ctx := c.Context
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Look up the Space ID by name.
+			id, err := client.getSpaceByName(ctx, sess, name)
+			if err != nil {
+				return err
+			}
+
+			// Print the Space ID.
+			os.Stdout.WriteString(id + "\n")
+			return nil
+		},
+	}
+}
+
+// newSpaceSettingsCommand builds the space settings subcommand.
+func newSpaceSettingsCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	return &cli.Command{
+		Name:      "settings",
+		Usage:     "show or change space settings",
+		ArgsUsage: "[space-id]",
+		Flags: []cli.Flag{
+			outputFlag(),
+			&cli.StringFlag{
+				Name:  "changelog",
+				Usage: "keep a changelog of World changes: on or off",
+			},
+		},
+		Action: func(c *cli.Context) error {
+			// Take the command context and check a requested change.
+			ctx := c.Context
+			changelog := c.String("changelog")
+			if changelog != "" && changelog != "on" && changelog != "off" {
+				return errors.Errorf("--changelog must be on or off, got %q", changelog)
+			}
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Resolve the Space ID from the argument.
+			spaceID, err := client.resolveSpaceID(ctx, sess, c.Args().First())
+			if err != nil {
+				return err
+			}
+
+			// Mount the Space service.
+			spaceSvc, spaceCleanup, err := client.mountSpace(ctx, sess, spaceID)
+			if err != nil {
+				return err
+			}
+			defer spaceCleanup()
+
+			// Apply a requested changelog setting.
+			if changelog != "" {
+				if err := setSpaceChangelog(ctx, client, spaceSvc, changelog == "on"); err != nil {
+					return err
+				}
+				os.Stdout.WriteString("Changelog " + changelog + ".\n")
+				return nil
+			}
+
+			// Watch the Space state.
+			strm, err := spaceSvc.WatchSpaceState(ctx, &s4wave_space.WatchSpaceStateRequest{})
+			if err != nil {
+				return errors.Wrap(err, "watch space state")
+			}
+			defer strm.Close()
+
+			// Read the current Space state.
+			state, err := strm.Recv()
+			if err != nil {
+				return errors.Wrap(err, "recv space state")
+			}
+
+			// Print the Space settings, or emit them as JSON or YAML.
+			settings := state.GetSettings()
+			switch c.String("output") {
+			case "json", "yaml":
+				data, err := settings.MarshalJSON()
+				if err != nil {
+					return err
+				}
+				return formatOutput(data, c.String("output"))
+			default:
+				printSpaceSettings(settings)
+				return nil
+			}
+		},
+	}
+}
+
+// setSpaceChangelog writes the Space settings with the changelog setting,
+// which switches the Space World's changelog in the same transaction.
+func setSpaceChangelog(
+	ctx context.Context,
+	client *sdkClient,
+	spaceSvc s4wave_space.SRPCSpaceResourceServiceClient,
+	enabled bool,
+) error {
+	// Open a write transaction on the Space World.
+	engine, engineCleanup, err := client.accessWorldEngine(ctx, spaceSvc)
+	if err != nil {
+		return err
+	}
+	defer engineCleanup()
+	tx, err := engine.NewTransaction(ctx, true)
+	if err != nil {
+		return errors.Wrap(err, "new transaction")
+	}
+	defer tx.Discard()
+
+	// Rewrite the current settings with the changelog setting.
+	settings, err := space_world.LookupSpaceSettingsBody(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if settings == nil {
+		settings = &space_world.SpaceSettings{}
+	}
+	settings = settings.CloneVT()
+	settings.ChangelogEnabled = enabled
+	_, _, err = space_world_ops.SetSpaceSettings(ctx, tx, "", space_world.SpaceSettingsObjectKey, settings, true, time.Now())
+	if err != nil {
+		return errors.Wrap(err, "set space settings")
+	}
+	return errors.Wrap(tx.Commit(ctx), "commit transaction")
+}
+
+// newSpaceImportGitCommand builds the space import-git subcommand.
+func newSpaceImportGitCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	var spaceID, objectKey, ref string
+	var singleBranch, recursive, disableCheckout bool
+	return &cli.Command{
+		Name:      "import-git",
+		Usage:     "import a git repository into a space's world",
+		ArgsUsage: "<git-url>",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "space",
+				Usage:       "space ID (auto-detected if only one space)",
+				EnvVars:     []string{"SPACEWAVE_SPACE"},
+				Destination: &spaceID,
+			},
+			&cli.StringFlag{
+				Name:        "object-key",
+				Usage:       "world object key for the repo",
+				EnvVars:     []string{"SPACEWAVE_OBJECT_KEY"},
+				Required:    true,
+				Destination: &objectKey,
+			},
+			&cli.BoolFlag{
+				Name:        "disable-checkout",
+				Usage:       "skip creating a worktree after clone",
+				EnvVars:     []string{"SPACEWAVE_DISABLE_CHECKOUT"},
+				Value:       true,
+				Destination: &disableCheckout,
+			},
+			&cli.StringFlag{
+				Name:        "ref",
+				Usage:       "git reference to clone (branch/tag)",
+				EnvVars:     []string{"SPACEWAVE_GIT_REF"},
+				Destination: &ref,
+			},
+			&cli.BoolFlag{
+				Name:        "single-branch",
+				Usage:       "only fetch the specified ref",
+				EnvVars:     []string{"SPACEWAVE_SINGLE_BRANCH"},
+				Destination: &singleBranch,
+			},
+			&cli.BoolFlag{
+				Name:        "recursive",
+				Aliases:     []string{"r"},
+				Usage:       "recursively clone submodules",
+				EnvVars:     []string{"SPACEWAVE_RECURSIVE"},
+				Destination: &recursive,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			// Require a git URL.
+			url := c.Args().First()
+			if url == "" {
+				return errors.New("git URL required as first argument")
+			}
+
+			// Take the command context.
+			ctx := c.Context
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Resolve the Space ID.
+			sid, err := client.resolveSpaceID(ctx, sess, spaceID)
+			if err != nil {
+				return err
+			}
+
+			// Mount the Space service.
+			spaceSvc, spaceCleanup, err := client.mountSpace(ctx, sess, sid)
+			if err != nil {
+				return err
+			}
+			defer spaceCleanup()
+
+			// Open the World engine through the Space service.
+			engine, engineCleanup, err := client.accessWorldEngine(ctx, spaceSvc)
+			if err != nil {
+				return err
+			}
+			defer engineCleanup()
+
+			// Check whether the object key already exists.
+			w := os.Stdout
+			readTx, err := engine.NewTransaction(ctx, false)
+			if err != nil {
+				return errors.Wrap(err, "new transaction")
+			}
+			objectState, exists, err := readTx.GetObject(ctx, objectKey)
+			world.ReleaseObjectState(objectState)
+			if err != nil {
+				readTx.Discard()
+				return errors.Wrap(err, "check object")
+			}
+			readTx.Discard()
+
+			// Fetch into the existing object when it is already present.
+			if exists {
+				tx, err := engine.NewTransaction(ctx, true)
+				if err != nil {
+					return errors.Wrap(err, "new transaction")
+				}
+				defer tx.Discard()
+				w.WriteString("object " + objectKey + " exists, fetching...\n")
+				fetchOp := git_world.NewGitFetchOp(objectKey, &git_block.FetchOpts{
+					RemoteUrl: url,
+				})
+				_, _, err = tx.ApplyWorldOp(ctx, fetchOp, "")
+				if err != nil {
+					return errors.Wrap(err, "fetch")
+				}
+				w.WriteString("fetched " + url + " into " + objectKey + "\n")
+				return tx.Commit(ctx)
+			}
+
+			// Clone the remote into a repo ref staged until the publish commits.
+			w.WriteString("cloning " + url + " as " + objectKey + "...\n")
+			stage, err := engine.StageWorldState(ctx)
+			if err != nil {
+				return err
+			}
+			defer stage.Release()
+			repoRef, err := s4wave_git_core.CloneGitRepoToRef(ctx, stage, &git_block.CloneOpts{
+				Url:             url,
+				Ref:             ref,
+				SingleBranch:    singleBranch,
+				Recursive:       recursive,
+				DisableCheckout: disableCheckout && !recursive,
+			}, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			// Publish the cloned repo under the object key and commit it.
+			tx, err := engine.NewTransaction(ctx, true)
+			if err != nil {
+				return errors.Wrap(err, "new transaction")
+			}
+			defer tx.Discard()
+			cloneOp := git_world.NewGitInitOp(
+				objectKey,
+				repoRef,
+				disableCheckout && !recursive,
+				nil,
+				unixfs_block.ToTimestamp(time.Now(), false),
+			)
+			_, _, err = tx.ApplyWorldOp(ctx, cloneOp, "")
+			if err != nil {
+				return errors.Wrap(err, "publish git repo")
+			}
+			w.WriteString("cloned " + url + " as " + objectKey + "\n")
+			return tx.Commit(ctx)
+		},
+	}
+}
+
+// newSpaceDeployCommand builds the space deploy subcommand.
+func newSpaceDeployCommand(statePath *string, sessionIdx *uint) *cli.Command {
+	var spaceID, dbPath, manifestID, objectKey, platformID string
+	return &cli.Command{
+		Name:  "deploy",
+		Usage: "deploy a manifest set from a .bldr devtool DB into a space",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "space",
+				Usage:       "space ID (auto-detected if only one space)",
+				EnvVars:     []string{"SPACEWAVE_SPACE"},
+				Destination: &spaceID,
+			},
+			&cli.StringFlag{
+				Name:        "db",
+				Usage:       "path to .bldr/ directory containing the devtool DB",
+				EnvVars:     []string{"SPACEWAVE_DB"},
+				Required:    true,
+				Destination: &dbPath,
+			},
+			&cli.StringFlag{
+				Name:        "manifest-id",
+				Usage:       "manifest identifier (e.g., spacewave-core)",
+				EnvVars:     []string{"SPACEWAVE_MANIFEST_ID"},
+				Required:    true,
+				Destination: &manifestID,
+			},
+			&cli.StringFlag{
+				Name:        "platform",
+				Usage:       "deploy only this platform (e.g., desktop/darwin/arm64; default: all built platforms)",
+				Destination: &platformID,
+			},
+			&cli.StringFlag{
+				Name:        "object-key",
+				Usage:       "object key to store the manifest set under (default: plugin-host)",
+				EnvVars:     []string{"SPACEWAVE_OBJECT_KEY"},
+				Destination: &objectKey,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			// Take the command context for the deploy.
+			ctx := c.Context
+
+			// Resolve the destination object key and output contract.
+			key := objectKey
+			if key == "" {
+				key = "plugin-host"
+			}
+
+			// Open the source volume.
+			le := logrus.NewEntry(logrus.New())
+			vol, err := devtool_store.OpenVolume(ctx, le, dbPath)
+			if err != nil {
+				return errors.Wrap(err, "open devtool storage")
+			}
+			defer vol.Close()
+
+			// Construct the source block factories and transform configuration.
+			transformConf, err := block_transform.NewConfig([]config.Config{&transform_gzip.Config{}})
+			if err != nil {
+				return errors.Wrap(err, "build transform config")
+			}
+
+			// Collect and canonicalize one complete deterministic set.
+			refs, err := devtool_store.LookupManifestSet(ctx, le, vol, manifestID)
+			if err != nil {
+				return errors.Wrap(err, "lookup manifest set")
+			}
+			if platformID != "" {
+				available := make([]string, 0, len(refs))
+				selected := -1
+				for i, ref := range refs {
+					id := ref.GetMeta().GetPlatformId()
+					available = append(available, id)
+					if id == platformID {
+						selected = i
+					}
+				}
+				if selected == -1 {
+					return errors.Errorf("platform %q not built for %s (available: %s)", platformID, manifestID, strings.Join(available, ", "))
+				}
+				refs = refs[selected : selected+1]
+			}
+			for _, ref := range refs {
+				ref.ManifestRef.TransformConf = transformConf
+			}
+
+			// Connect to the daemon, mount the selected session and Space resource.
+			client, err := connectDaemonFromContext(ctx, c, *statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the session and Space service.
+			sess, err := client.mountSession(ctx, sessionIndex32(*sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+			sid, err := client.resolveSpaceID(ctx, sess, spaceID)
+			if err != nil {
+				return err
+			}
+			spaceSvc, spaceCleanup, err := client.mountSpace(ctx, sess, sid)
+			if err != nil {
+				return err
+			}
+			defer spaceCleanup()
+
+			// Print the sorted set rows before sending the request.
+			w := os.Stdout
+			w.WriteString("deploying manifest set " + manifestID + " to space " + sid + " (key=" + key + ")\n")
+			w.WriteString("source: " + dbPath + "\n")
+			for _, ref := range refs {
+				w.WriteString("platform=" + ref.GetMeta().GetPlatformId() + " rev=" + strconv.FormatUint(ref.GetMeta().GetRev(), 10) + " ref=" + ref.GetManifestRef().GetRootRef().MarshalString() + "\n")
+			}
+
+			// Deploy the set, answering block requests from the devtool volume.
+			err = s4wave_space.DeployManifests(ctx, spaceSvc, key, refs, vol.GetBlock, func(ref *block.BlockRef) {
+				w.WriteString("server requested block: " + ref.MarshalString() + "\n")
+			})
+			if err != nil {
+				return err
+			}
+			w.WriteString("deploy complete\n")
+			return nil
+		},
+	}
+}
+
+// printSpaceState prints space state details to stdout.
+func printSpaceState(
+	spaceID string,
+	state *s4wave_space.SpaceState,
+	storage *s4wave_session.WatchSpaceStorageResponse,
+	backfill *s4wave_space.SpaceBackfillState,
+	health *sobject.SharedObjectHealth,
+) {
+	// Write the Space state, storage, sync peers, and plugin list.
+	w := os.Stdout
+	stateStr := "loading"
+	if state.GetReady() {
+		stateStr = "ready"
+	}
+	fields := [][2]string{
+		{"Space", spaceID},
+		{"State", stateStr},
+	}
+	if storage != nil {
+		fields = append(fields, [2]string{"Storage", formatSpaceStorage(storage)})
+	}
+	if backfill != nil {
+		fields = append(fields, [2]string{"Backfill", formatBackfill(backfill.GetBackfill())})
+	}
+	if health != nil {
+		fields = append(fields, [2]string{"Sync", formatSyncPeerCount(health.GetSyncPeers())})
+	}
+	writeFields(w, fields)
+	writeSyncPeers(w, health.GetSyncPeers())
+	if state.GetReady() {
+		if settings := state.GetSettings(); settings != nil {
+			plugins := settings.GetPluginIds()
+			if len(plugins) > 0 {
+				w.WriteString("\nPlugins (" + strconv.Itoa(len(plugins)) + ")\n")
+				for _, pid := range plugins {
+					w.WriteString("  " + pid + "\n")
+				}
+			}
+		}
+	}
+}
+
+// printSpaceSettings prints space settings to stdout.
+func printSpaceSettings(settings *space_world.SpaceSettings) {
+	// Write the settings fields and plugin list, or say there are none.
+	w := os.Stdout
+	if settings == nil {
+		w.WriteString("no settings\n")
+		return
+	}
+	var fields [][2]string
+	if idx := settings.GetIndexPath(); idx != "" {
+		fields = append(fields, [2]string{"Index Path", idx})
+	}
+	if settings.GetChangelogEnabled() {
+		fields = append(fields, [2]string{"Changelog", "on"})
+	}
+	if len(fields) > 0 {
+		writeFields(w, fields)
+	}
+	plugins := settings.GetPluginIds()
+	if len(plugins) > 0 {
+		if len(fields) > 0 {
+			w.WriteString("\n")
+		}
+		w.WriteString("Plugins (" + strconv.Itoa(len(plugins)) + ")\n")
+		for _, pid := range plugins {
+			w.WriteString("  " + pid + "\n")
+		}
+	} else if len(fields) == 0 {
+		w.WriteString("no settings\n")
+	}
+}

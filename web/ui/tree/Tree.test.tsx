@@ -1,0 +1,429 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { Tree, type TreeProps } from './Tree.js'
+import { useTreeState } from './TreeState.js'
+import type { TreeNode } from './TreeNode.js'
+
+interface TestData {
+  value: number
+}
+
+const mockNodes: TreeNode<TestData>[] = [
+  {
+    id: 'root',
+    name: 'Root',
+    data: { value: 1 },
+    children: [
+      {
+        id: 'child1',
+        name: 'Child 1',
+        data: { value: 2 },
+        children: [
+          { id: 'grandchild1', name: 'Grandchild 1', data: { value: 3 } },
+          { id: 'grandchild2', name: 'Grandchild 2', data: { value: 4 } },
+        ],
+      },
+      { id: 'child2', name: 'Child 2', data: { value: 5 } },
+    ],
+  },
+  { id: 'sibling', name: 'Sibling', data: { value: 6 } },
+]
+
+// TestTree owns the tree state the way an application component does.
+function TestTree<T>({
+  expandedIds,
+  ...props
+}: Omit<TreeProps<T>, 'state'> & { expandedIds?: Set<string> }) {
+  const state = useTreeState(null, 'tree', expandedIds && { expandedIds })
+  return <Tree {...props} state={state} />
+}
+
+describe('Tree', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('should render the tree container', () => {
+    render(<TestTree nodes={mockNodes} />)
+    expect(screen.getByRole('tree')).toBeTruthy()
+  })
+
+  it('should render tree nodes', async () => {
+    render(<TestTree nodes={mockNodes} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    expect(screen.getByText('Sibling')).toBeTruthy()
+  })
+
+  it('should not pull focus out of an input elsewhere on the page', async () => {
+    render(<input aria-label="Name" />)
+    const input = screen.getByLabelText('Name')
+    input.focus()
+
+    render(<TestTree nodes={mockNodes} />)
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+    await new Promise((resolve) => requestAnimationFrame(resolve))
+
+    expect(document.activeElement).toBe(input)
+  })
+
+  it('should show placeholder when no nodes', () => {
+    render(<TestTree nodes={[]} placeholder="No items available" />)
+    expect(screen.getByText('No items available')).toBeTruthy()
+  })
+
+  it('should show default placeholder when empty', () => {
+    render(<TestTree nodes={[]} />)
+    expect(screen.getByText('No items')).toBeTruthy()
+  })
+
+  it('should expand nodes in the initial state', async () => {
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Child 1')).toBeTruthy()
+      expect(screen.getByText('Child 2')).toBeTruthy()
+    })
+  })
+
+  it('should not show children when node is collapsed', async () => {
+    render(<TestTree nodes={mockNodes} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    expect(screen.queryByText('Child 1')).toBeNull()
+    expect(screen.queryByText('Child 2')).toBeNull()
+  })
+
+  it('should handle single click selection', async () => {
+    const user = userEvent.setup()
+    render(<TestTree nodes={mockNodes} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const rootNode = screen.getByText('Root').closest('[role="treeitem"]')
+    expect(rootNode).toBeTruthy()
+
+    await user.click(rootNode!)
+
+    await waitFor(() => {
+      expect(rootNode?.getAttribute('aria-selected')).toBe('true')
+    })
+  })
+
+  it('should handle double click to trigger default action', async () => {
+    const user = userEvent.setup()
+    const onAction = vi.fn()
+    render(<TestTree nodes={mockNodes} onRowDefaultAction={onAction} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Sibling')).toBeTruthy()
+    })
+
+    const siblingNode = screen.getByText('Sibling').closest('[role="treeitem"]')
+    await user.dblClick(siblingNode!)
+
+    await waitFor(() => {
+      expect(onAction).toHaveBeenCalledOnce()
+      expect(onAction.mock.calls[0]?.[0]).toHaveLength(1)
+      expect(
+        (onAction.mock.calls[0]?.[0] as { name: string }[])?.[0]?.name,
+      ).toBe('Sibling')
+    })
+  })
+
+  it('should expand/collapse on chevron click', async () => {
+    const user = userEvent.setup()
+    render(<TestTree nodes={mockNodes} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    expect(screen.queryByText('Child 1')).toBeNull()
+
+    const expandButton = screen.getByLabelText('Expand Root')
+    await user.click(expandButton)
+
+    await waitFor(() => {
+      expect(screen.getByText('Child 1')).toBeTruthy()
+      expect(screen.getByText('Child 2')).toBeTruthy()
+    })
+
+    const collapseButton = screen.getByLabelText('Collapse Root')
+    await user.click(collapseButton)
+
+    await waitFor(() => {
+      expect(screen.queryByText('Child 1')).toBeNull()
+    })
+  })
+
+  it('should handle keyboard navigation with ArrowDown', async () => {
+    const user = userEvent.setup()
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const tree = screen.getByRole('tree')
+    tree.focus()
+
+    await user.keyboard('{ArrowDown}')
+
+    await waitFor(() => {
+      const items = screen.getAllByRole('treeitem')
+      const hasSelection = items.some(
+        (item) => item.getAttribute('aria-selected') === 'true',
+      )
+      expect(hasSelection).toBe(true)
+    })
+  })
+
+  it('should handle keyboard navigation with j/k', async () => {
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const tree = screen.getByRole('tree')
+    tree.focus()
+
+    // j moves down from Root (initially focused) to Child 1
+    fireEvent.keyDown(tree, { key: 'j' })
+
+    await waitFor(() => {
+      const child1Item = screen
+        .getByText('Child 1')
+        .closest('[role="treeitem"]')
+      expect(child1Item?.getAttribute('aria-selected')).toBe('true')
+    })
+
+    // Second j moves to Child 2
+    fireEvent.keyDown(tree, { key: 'j' })
+
+    await waitFor(() => {
+      const child2Item = screen
+        .getByText('Child 2')
+        .closest('[role="treeitem"]')
+      expect(child2Item?.getAttribute('aria-selected')).toBe('true')
+    })
+
+    // k moves back up to Child 1
+    fireEvent.keyDown(tree, { key: 'k' })
+
+    await waitFor(() => {
+      const child1Item = screen
+        .getByText('Child 1')
+        .closest('[role="treeitem"]')
+      expect(child1Item?.getAttribute('aria-selected')).toBe('true')
+    })
+  })
+
+  it('should handle expand with ArrowRight', async () => {
+    render(<TestTree nodes={mockNodes} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const rootItem = screen.getByText('Root').closest('[role="treeitem"]')
+    fireEvent.click(rootItem!)
+
+    await waitFor(() => {
+      expect(rootItem?.getAttribute('aria-selected')).toBe('true')
+    })
+
+    fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' })
+
+    await waitFor(() => {
+      expect(screen.getByText('Child 1')).toBeTruthy()
+    })
+  })
+
+  it('should handle collapse with ArrowLeft', async () => {
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Child 1')).toBeTruthy()
+    })
+
+    const rootItem = screen.getByText('Root').closest('[role="treeitem"]')
+    fireEvent.click(rootItem!)
+
+    fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowLeft' })
+
+    await waitFor(() => {
+      expect(screen.queryByText('Child 1')).toBeNull()
+    })
+  })
+
+  it('should navigate to parent with ArrowLeft when collapsed', async () => {
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Child 1')).toBeTruthy()
+    })
+
+    const child1Item = screen.getByText('Child 1').closest('[role="treeitem"]')
+    fireEvent.click(child1Item!)
+
+    await waitFor(() => {
+      expect(child1Item?.getAttribute('aria-selected')).toBe('true')
+    })
+
+    fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowLeft' })
+
+    await waitFor(() => {
+      const rootItem = screen.getByText('Root').closest('[role="treeitem"]')
+      expect(rootItem?.getAttribute('aria-selected')).toBe('true')
+    })
+  })
+
+  it('should handle range selection with Shift+Arrow', async () => {
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const rootItem = screen.getByText('Root').closest('[role="treeitem"]')
+    fireEvent.click(rootItem!)
+
+    await waitFor(() => {
+      expect(rootItem?.getAttribute('aria-selected')).toBe('true')
+    })
+
+    fireEvent.keyDown(screen.getByRole('tree'), {
+      key: 'ArrowDown',
+      shiftKey: true,
+    })
+    fireEvent.keyDown(screen.getByRole('tree'), {
+      key: 'ArrowDown',
+      shiftKey: true,
+    })
+
+    await waitFor(() => {
+      const selectedItems = screen
+        .getAllByRole('treeitem')
+        .filter((item) => item.getAttribute('aria-selected') === 'true')
+      expect(selectedItems.length).toBeGreaterThan(1)
+    })
+  })
+
+  it('should handle toggle selection with Ctrl+click', async () => {
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const rootItem = screen.getByText('Root').closest('[role="treeitem"]')
+    fireEvent.click(rootItem!)
+
+    await waitFor(() => {
+      expect(rootItem?.getAttribute('aria-selected')).toBe('true')
+    })
+
+    const child1Item = screen.getByText('Child 1').closest('[role="treeitem"]')
+    fireEvent.click(child1Item!, { ctrlKey: true })
+
+    await waitFor(() => {
+      expect(rootItem?.getAttribute('aria-selected')).toBe('true')
+      expect(child1Item?.getAttribute('aria-selected')).toBe('true')
+    })
+  })
+
+  it('should handle Space to toggle expand on parent node', async () => {
+    render(<TestTree nodes={mockNodes} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const rootItem = screen.getByText('Root').closest('[role="treeitem"]')
+    fireEvent.click(rootItem!)
+
+    fireEvent.keyDown(screen.getByRole('tree'), { key: ' ' })
+
+    await waitFor(() => {
+      expect(screen.getByText('Child 1')).toBeTruthy()
+    })
+  })
+
+  it('should handle Enter to trigger default action', async () => {
+    const onAction = vi.fn()
+    render(
+      <TestTree
+        nodes={mockNodes}
+        onRowDefaultAction={onAction}
+        expandedIds={new Set(['root'])}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Child 2')).toBeTruthy()
+    })
+
+    const child2Item = screen.getByText('Child 2').closest('[role="treeitem"]')
+    fireEvent.click(child2Item!)
+
+    fireEvent.keyDown(screen.getByRole('tree'), { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(onAction).toHaveBeenCalledOnce()
+      expect(
+        (onAction.mock.calls[0]?.[0] as { name: string }[])?.[0]?.name,
+      ).toBe('Child 2')
+    })
+  })
+
+  it('renders only the rows near the visible part of a large tree', () => {
+    const nodes = Array.from({ length: 1000 }, (_, i) => ({
+      id: `node-${i}`,
+      name: `Node ${i}`,
+    }))
+    render(<TestTree nodes={nodes} />)
+
+    const rows = screen.getAllByRole('treeitem')
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows.length).toBeLessThan(100)
+  })
+
+  it('should have proper ARIA attributes', async () => {
+    render(<TestTree nodes={mockNodes} expandedIds={new Set(['root'])} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Root')).toBeTruthy()
+    })
+
+    const tree = screen.getByRole('tree')
+    expect(tree.getAttribute('aria-multiselectable')).toBe('true')
+    expect(tree.getAttribute('aria-orientation')).toBe('vertical')
+
+    const rootItem = screen.getByText('Root').closest('[role="treeitem"]')
+    expect(rootItem?.getAttribute('aria-expanded')).toBe('true')
+    expect(rootItem?.getAttribute('aria-level')).toBe('1')
+
+    const child1Item = screen.getByText('Child 1').closest('[role="treeitem"]')
+    expect(child1Item?.getAttribute('aria-expanded')).toBe('false')
+    expect(child1Item?.getAttribute('aria-level')).toBe('2')
+  })
+})

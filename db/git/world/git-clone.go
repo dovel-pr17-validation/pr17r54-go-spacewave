@@ -1,0 +1,98 @@
+package git_world
+
+import (
+	"context"
+
+	timestamppb "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing/client"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
+	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	bucket "github.com/s4wave/spacewave/db/bucket"
+	git_block "github.com/s4wave/spacewave/db/git/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// GitClone performs a git clone operation against a world.
+// Clones the repo directly into a bulk-mode hydra Store. Objects stream
+// to KV via per-object mini-transactions during the clone, and the IAVL
+// tree is built bottom-up at commit time.
+// If DisableCheckout is set, disables creating the worktree.
+// Returns the object ref to the Repo.
+// authMethod, progress, worktreeArgs, ts can be empty.
+func GitClone(
+	ctx context.Context,
+	ws world.WorldState,
+	objKey string,
+	sender peer.ID,
+	cloneOpts *git_block.CloneOpts,
+	authMethod client.SSHAuth,
+	progress sideband.Progress,
+	worktreeArgs *GitCreateWorktreeOp,
+	ts *timestamppb.Timestamp,
+) (*bucket.ObjectRef, error) {
+	// Build clone options and defer checkout until the world operation completes.
+	cloneArgs := cloneOpts.BuildCloneOpts()
+	enableCheckout := !cloneOpts.GetDisableCheckout()
+
+	// Skip checkout during clone. Phase 2 (CreateWorldObjectWorktree)
+	// handles the real checkout on the hydra-backed filesystem.
+	// Cloning with checkout builds a git index in the Store that leaks
+	// into Phase 2 and confuses the MergeReset diff logic.
+	cloneArgs.NoCheckout = true
+
+	// Pass progress output and optional SSH authentication to the clone client.
+	cloneArgs.Progress = progress
+	if authMethod != nil {
+		cloneArgs.ClientOptions = append(cloneArgs.ClientOptions, client.WithSSHAuth(authMethod))
+	}
+
+	// Clone directly into hydra storage through a stage held until the init
+	// op adopts the repo. The bulk-mode Store streams objects to KV via
+	// mini-transactions, then builds the IAVL tree bottom-up at Commit.
+	stage, err := ws.StageWorldState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stage.Release()
+	repoRef, err := world.AccessObject(
+		ctx,
+		stage.AccessWorldState,
+		nil,
+		func(bcs *block.Cursor) error {
+			// Initialize the repository block and storage adapter.
+			root := git_block.NewRepo()
+			bcs.SetBlock(root, true)
+			store, err := git_block.NewStore(ctx, nil, bcs, &memory.IndexStorage{}, nil)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			// Clone objects into the world-backed store without creating a worktree.
+			worktree := memfs.New()
+			_, err = git.CloneContext(ctx, store, worktree, cloneArgs)
+			if err != nil {
+				return errors.Wrap(err, "clone")
+			}
+
+			// Commit the streamed objects into the repository root.
+			return store.Commit()
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Register the cloned repository and optionally create its worktree.
+	initOp := NewGitInitOp(objKey, repoRef, !enableCheckout, worktreeArgs, ts)
+	_, _, err = ws.ApplyWorldOp(ctx, initOp, sender)
+	if err != nil {
+		return nil, err
+	}
+	return repoRef, nil
+}

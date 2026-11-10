@@ -1,0 +1,319 @@
+package web_runtime_controller
+
+import (
+	"context"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/util/broadcast"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	web_document "github.com/s4wave/spacewave/bldr/web/document"
+	web_entrypoint_index "github.com/s4wave/spacewave/bldr/web/entrypoint/index"
+	fetch "github.com/s4wave/spacewave/bldr/web/fetch"
+	web_runtime "github.com/s4wave/spacewave/bldr/web/runtime"
+	web_runtime_http "github.com/s4wave/spacewave/bldr/web/runtime/http"
+	"github.com/sirupsen/logrus"
+)
+
+// Constructor constructs a runtime with common parameters.
+type Constructor func(
+	ctx context.Context,
+	le *logrus.Entry,
+	handler web_runtime.WebRuntimeHandler,
+) (web_runtime.WebRuntime, error)
+
+// Controller implements a common bldr web runtime controller.
+// Tracks attached WebRuntime state and manages RPC calls in/out.
+type Controller struct {
+	// le is the logger
+	le *logrus.Entry
+	// bus is the controller bus
+	bus bus.Bus
+	// ctor is the constructor
+	ctor Constructor
+
+	// runtimeID is the controller id to use
+	runtimeID string
+	// runtimeVersion is the version
+	runtimeVersion controller.Version
+
+	// bldrHTTP serves the /b/ frontend, package, and plugin file routes.
+	bldrHTTP *web_runtime_http.Handler
+
+	// bcast guards below fields
+	bcast broadcast.Broadcast
+	// rt is the runtime
+	rt web_runtime.WebRuntime
+}
+
+// NewController constructs a new runtime controller.
+func NewController(
+	le *logrus.Entry,
+	bus bus.Bus,
+	ctor Constructor,
+	runtimeID string,
+	runtimeVersion controller.Version,
+) *Controller {
+	return &Controller{
+		le:   le,
+		bus:  bus,
+		ctor: ctor,
+
+		runtimeID:      runtimeID,
+		runtimeVersion: runtimeVersion,
+
+		bldrHTTP: web_runtime_http.NewHandler(le, bus),
+	}
+}
+
+// GetControllerID returns the controller ID.
+func (c *Controller) GetControllerID() string {
+	return strings.Join([]string{
+		"bldr",
+		"runtime",
+		c.runtimeID,
+		c.runtimeVersion.String(),
+	}, "/")
+}
+
+// GetControllerInfo returns information about the controller.
+func (c *Controller) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(
+		c.GetControllerID(),
+		c.runtimeVersion,
+		"bldr runtime controller "+c.runtimeID+"@"+c.runtimeVersion.String(),
+	)
+}
+
+// Execute executes the runtime controller and the runtime itself.
+// Returning nil ends execution.
+// Returning an error triggers a retry with backoff.
+func (c *Controller) Execute(rctx context.Context) error {
+	// Derive a cancellable context for the runtime lifecycle.
+	ctx, ctxCancel := context.WithCancel(rctx)
+	defer ctxCancel()
+
+	// Construct the web runtime.
+	rt, err := c.ctor(
+		ctx,
+		c.le,
+		c,
+	)
+	if err != nil {
+		return err
+	}
+	defer c.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		if c.rt == rt {
+			c.rt = nil
+			broadcast()
+		}
+	})
+
+	// Publish the runtime before starting its execution loop.
+	c.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		c.rt = rt
+		broadcast()
+	})
+
+	// Start runtime execution and retain its error channel.
+	c.le.Debug("executing bldr web runtime")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.Execute(ctx)
+	}()
+
+	// Wait for runtime cancellation or execution failure.
+	for {
+		// note: will add case to re-sync when needed
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// GetWebRuntime returns the controlled runtime, waiting for it to be non-nil.
+func (c *Controller) GetWebRuntime(ctx context.Context) (web_runtime.WebRuntime, error) {
+	for {
+		var trig <-chan struct{}
+		var rt web_runtime.WebRuntime
+
+		// Read the runtime and wait channel under one broadcast lock.
+		c.bcast.HoldLock(func(broadcast func(), getWaitCh func() <-chan struct{}) {
+			rt = c.rt
+			if rt == nil {
+				trig = getWaitCh()
+			}
+		})
+		if rt != nil {
+			return rt, nil
+		}
+
+		// Wait for publication or caller cancellation.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-trig:
+		}
+	}
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+// If it can, it returns a resolver. If not, returns nil.
+// Any unexpected errors are returned for logging.
+// It is safe to add a reference to the directive during this call.
+func (c *Controller) HandleDirective(ctx context.Context, di directive.Instance) ([]directive.Resolver, error) {
+	// Inspect the requested web runtime directive.
+	switch dir := di.GetDirective().(type) {
+	case web_runtime.LookupWebRuntime:
+		// Resolve the runtime when the requested ID matches this controller.
+		if dir.LookupWebRuntimeID() == c.runtimeID {
+			return directive.R(directive.NewGetterResolver(c.GetWebRuntime), nil)
+		}
+	}
+
+	// Leave unrelated runtime directives unresolved.
+	return nil, nil
+}
+
+// HandleFetch handles an incoming Fetch request from the web runtime.
+// The Client ID can be used to distinguish between windows / browser tabs.
+func (c *Controller) HandleFetch(strm fetch.SRPCFetchService_FetchStream) error {
+	return fetch.HandleFetch(strm, c.ServeServiceWorkerHTTP)
+}
+
+// ServeServiceWorkerHTTP serves a ServiceWorker HTTP request.
+func (c *Controller) ServeServiceWorkerHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Read the ServiceWorker request path for runtime routing.
+	rurl := req.URL
+	rpath := rurl.Path
+
+	// /b/ is for bldr internals
+	if strings.HasPrefix(rpath, "/b/") {
+		// COEP + CORP headers are required for resources loaded under
+		// Cross-Origin-Embedder-Policy: require-corp. Module worker scripts
+		// need COEP on their own response (the worker is a separate execution
+		// context). CORP marks the resource as same-origin accessible.
+		rw.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
+		rw.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		c.le.Debugf("serve /b/ path: %s", rpath)
+
+		// Serve frontend modules, web packages, and plugin files.
+		if c.bldrHTTP.ServeBldrHTTP(rw, req) {
+			return
+		}
+
+		if rpath == "/b/__index.html" {
+			c.ServeBrowserIndexHTML(rw, req)
+			return
+		}
+
+		// other /b/ paths are not found
+		rw.WriteHeader(404)
+		_, _ = rw.Write([]byte("404 not found"))
+		return
+	}
+
+	// /p/ is for plugin handlers
+	// /p/{plugin-id}/... will be forwarded to the loaded plugin.
+	if strings.HasPrefix(rpath, bldr_plugin.PluginHttpPrefix) {
+		pluginID, suffix, err := bldr_plugin.ParseHTTPPathPluginID(rpath[len(bldr_plugin.PluginHttpPrefix):])
+		if err != nil {
+			http.Error(rw, "bldr: invalid plugin id: "+err.Error(), http.StatusNotFound)
+			return
+		}
+
+		req.URL.Path = suffix
+		c.ServePluginHTTP(pluginID, rw, req)
+		return
+	}
+
+	// Reject ServiceWorker requests outside the supported runtime routes.
+	http.Error(rw, "bldr: unhandled path: "+rpath, http.StatusNotFound)
+}
+
+// ServePluginHTTP serves a ServiceWorker HTTP request for a plugin.
+func (c *Controller) ServePluginHTTP(pluginID string, rw http.ResponseWriter, req *http.Request) {
+	// call LoadPlugin to get a handle to the desired plugin.
+	ctx := req.Context()
+	c.le.
+		WithField("plugin-id", pluginID).
+		WithField("path", req.URL.Path).
+		Debug("forwarding http call to plugin")
+	rpcClient, rpcClientRef, err := bldr_plugin.ExPluginLoadWaitClient(ctx, c.bus, pluginID, nil)
+	if err != nil {
+		http.Error(rw, "bldr: load plugin failed: "+pluginID+": "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if rpcClient == nil {
+		http.Error(rw, "bldr: plugin not found: "+pluginID, http.StatusNotFound)
+		return
+	}
+	defer rpcClientRef.Release()
+
+	// Forward the HTTP request through the loaded plugin fetch service.
+	fetchClient := fetch.NewSRPCFetchServiceClient(rpcClient)
+	err = fetch.Fetch(ctx, fetchClient.Fetch, req, rw)
+	if err != nil && err != context.Canceled {
+		http.Error(rw, "bldr: request failed: plugin "+pluginID+": "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+// ServeBrowserIndexHTML serves the browser root document from the Go runtime.
+func (c *Controller) ServeBrowserIndexHTML(rw http.ResponseWriter, req *http.Request) {
+	// Require a browser index request that reads the document or its headers.
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Render the browser index document with the boot module entrypoint.
+	indexHTML, err := web_entrypoint_index.RenderIndexHTML(web_entrypoint_index.IndexData{
+		ImportMap:      web_entrypoint_index.ImportMap{Imports: map[string]string{}},
+		EntrypointPath: "/boot.mjs",
+	})
+	if err != nil {
+		http.Error(rw, "bldr: render browser index failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Send the browser index headers and the document body when requested.
+	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+	rw.Header().Set("Content-Length", strconv.Itoa(len(indexHTML)))
+	rw.WriteHeader(http.StatusOK)
+	if req.Method != http.MethodHead {
+		if _, err := rw.Write([]byte(indexHTML)); err != nil && c.le != nil {
+			c.le.WithError(err).Debug("write browser index response failed")
+		}
+	}
+}
+
+// HandleWebDocument handles an incoming WebDocument.
+func (c *Controller) HandleWebDocument(wv web_document.WebDocument) {
+	// no-op
+}
+
+// Close releases any resources used by the controller.
+// Error indicates any issue encountered releasing.
+func (c *Controller) Close() error {
+	c.bcast.HoldLock(func(broadcast func(), getWaitCh func() <-chan struct{}) {
+		c.rt = nil
+		broadcast()
+	})
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ web_runtime.WebRuntimeController = (*Controller)(nil)
+	_ web_runtime.WebRuntimeHandler    = (*Controller)(nil)
+)

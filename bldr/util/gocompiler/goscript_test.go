@@ -1,0 +1,373 @@
+package gocompiler
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/sirupsen/logrus"
+)
+
+func TestExecGoScriptCompileIgnoresExternalCommandEnv(t *testing.T) {
+	// Write a module and point BLDR_GOSCRIPT at a missing compiler binary.
+	dir := t.TempDir()
+	writeGoScriptModule(t, dir, "example.com/goscriptcmd", map[string]string{
+		"main.go": "package goscriptcmd\nconst Value = 1\n",
+	})
+	t.Setenv("BLDR_GOSCRIPT", filepath.Join(dir, "missing-goscript"))
+	err := ExecGoScriptCompile(context.Background(), logrus.NewEntry(logrus.New()), GoScriptCompileOptions{
+		WorkDir:    dir,
+		OutputPath: filepath.Join(dir, "out"),
+		Packages:   []string{"."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGoScriptOutputContains(t, filepath.Join(dir, "out"), "example.com/goscriptcmd", "Value")
+}
+
+func TestExecGoScriptCompilePreservesBuildFlags(t *testing.T) {
+	// Write a module with a tagged file compiled only under customtag.
+	dir := t.TempDir()
+	writeGoScriptModule(t, dir, "example.com/goscripttags", map[string]string{
+		"default.go": "package goscripttags\nconst DefaultValue = 1\n",
+		"tagged.go":  "//go:build customtag\n\npackage goscripttags\nconst TaggedValue = 2\n",
+	})
+	err := ExecGoScriptCompile(context.Background(), logrus.NewEntry(logrus.New()), GoScriptCompileOptions{
+		WorkDir:    dir,
+		OutputPath: filepath.Join(dir, "out"),
+		Packages:   []string{"."},
+		BuildFlags: []string{"-tags=customtag"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGoScriptOutputContains(t, filepath.Join(dir, "out"), "example.com/goscripttags", "TaggedValue")
+}
+
+func TestExecGoScriptCompileUsesJsWasmTarget(t *testing.T) {
+	// Write a module with generic, js/wasm, and linux-only files.
+	dir := t.TempDir()
+	writeGoScriptModule(t, dir, "example.com/goscripttarget", map[string]string{
+		"generic.go": "package goscripttarget\nconst GenericValue = 1\n",
+		"js.go":      "//go:build js && wasm\n\npackage goscripttarget\nconst JsWasmValue = 2\n",
+		"linux.go":   "//go:build linux\n\npackage goscripttarget\nconst LinuxValue = 3\n",
+	})
+	err := ExecGoScriptCompile(context.Background(), logrus.NewEntry(logrus.New()), GoScriptCompileOptions{
+		WorkDir:    dir,
+		OutputPath: filepath.Join(dir, "out"),
+		Packages:   []string{"."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := readGoScriptOutput(t, filepath.Join(dir, "out"), "example.com/goscripttarget")
+	for _, want := range []string{"GenericValue", "JsWasmValue"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "LinuxValue") {
+		t.Fatalf("output should not include linux-only file:\n%s", output)
+	}
+}
+
+func TestExecGoScriptCompileUsesCompilerCacheRoot(t *testing.T) {
+	// Compile with an explicit cache root under the .bldr state root.
+	dir := t.TempDir()
+	cacheRoot := filepath.Join(dir, ".bldr", "cache", "gs")
+	writeGoScriptModule(t, dir, "example.com/goscriptcache", map[string]string{
+		"main.go": "package goscriptcache\nconst Value = 1\n",
+	})
+	err := ExecGoScriptCompile(context.Background(), logrus.NewEntry(logrus.New()), GoScriptCompileOptions{
+		WorkDir:    dir,
+		OutputPath: filepath.Join(dir, "out"),
+		CacheRoot:  cacheRoot,
+		Packages:   []string{"."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := countGoScriptCacheManifests(t, cacheRoot); got == 0 {
+		t.Fatal("compiler cache root did not receive cache manifests")
+	}
+}
+
+func TestGoScriptCompilerCacheRootFromEnvDefaultsToUserCacheDir(t *testing.T) {
+	// Configure an unset primary root and a relative fallback root.
+	stateRoot := filepath.Join(t.TempDir(), ".bldr")
+	buildPath := filepath.Join(stateRoot, "build", "web", "spacewave-core")
+	userCacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(GoScriptCompilerCacheRootEnv, "")
+	t.Setenv("GOSCRIPT_COMPILER_CACHE_ROOT", filepath.Join("cache", "gs"))
+
+	// Verify the fallback root resolves to the user cache dir.
+	got, err := GoScriptCompilerCacheRootFromEnv(buildPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(userCacheDir, "goscript"); got != want {
+		t.Fatalf("cache root = %q, want %q", got, want)
+	}
+}
+
+func TestGoScriptCompilerCacheRootFromEnvOffDisablesCache(t *testing.T) {
+	// Verify the off value disables the compiler cache.
+	buildPath := filepath.Join(t.TempDir(), ".bldr", "build", "web", "spacewave-core")
+	t.Setenv(GoScriptCompilerCacheRootEnv, "off")
+	got, err := GoScriptCompilerCacheRootFromEnv(buildPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("cache root = %q, want empty", got)
+	}
+}
+
+func TestGoScriptCompilerCacheRootFromEnvResolvesRelativeUnderBldrStateRoot(t *testing.T) {
+	// Verify a relative root resolves under the .bldr state root.
+	stateRoot := filepath.Join(t.TempDir(), ".bldr")
+	buildPath := filepath.Join(stateRoot, "build", "web", "spacewave-core")
+	t.Setenv(GoScriptCompilerCacheRootEnv, filepath.Join("cache", "gs"))
+	got, err := GoScriptCompilerCacheRootFromEnv(buildPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(stateRoot, "cache", "gs")
+	if got != want {
+		t.Fatalf("cache root = %q, want %q", got, want)
+	}
+}
+
+func TestGoScriptCompilerCacheRootFromEnvResolvesRelativeUnderReleaseStateRoot(t *testing.T) {
+	// Verify a relative root resolves under the .bldr-dist release root.
+	stateRoot := filepath.Join(t.TempDir(), ".bldr-dist")
+	buildPath := filepath.Join(stateRoot, "build", "web", "js", "wasm", "spacewave-core")
+	t.Setenv(GoScriptCompilerCacheRootEnv, filepath.Join("cache", "gs"))
+	got, err := GoScriptCompilerCacheRootFromEnv(buildPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(stateRoot, "cache", "gs")
+	if got != want {
+		t.Fatalf("cache root = %q, want %q", got, want)
+	}
+}
+
+func TestResolveGoScriptCompilerCacheRootAcceptsAbsoluteRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "cache", "gs")
+	got, err := ResolveGoScriptCompilerCacheRoot(filepath.Join(t.TempDir(), "work"), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root {
+		t.Fatalf("cache root = %q, want %q", got, root)
+	}
+}
+
+func TestResolveGoScriptCompilerCacheRootRejectsEscapingRelativeRoot(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".bldr")
+	buildPath := filepath.Join(stateRoot, "build", "web", "spacewave-core")
+	_, err := ResolveGoScriptCompilerCacheRoot(buildPath, filepath.Join("..", "cache"))
+	if err == nil || !strings.Contains(err.Error(), "escapes .bldr state root") {
+		t.Fatalf("resolve escaping cache root error = %v, want escape error", err)
+	}
+}
+
+func TestExecGoScriptCompileMapsBindingRoots(t *testing.T) {
+	// Write a root module that depends on a module with protobuf siblings.
+	dir := t.TempDir()
+	depDir := filepath.Join(dir, "dep")
+	if err := os.MkdirAll(depDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeGoScriptModule(t, dir, "example.com/root", map[string]string{
+		"main.go": "package root\nimport \"example.com/dep\"\nvar Value dep.Message\n",
+	})
+	writeGoScriptModule(t, depDir, "example.com/dep", map[string]string{
+		"msg.pb.go": "package dep\ntype Message struct { Value string `protobuf:\"bytes,1,opt,name=value,proto3\"` }\n",
+		"msg.pb.ts": "export const Message = {}\n",
+	})
+
+	// Write the replace directive that points the root module at the dependency.
+	goMod := `module example.com/root
+
+go 1.25.3
+
+require example.com/dep v0.0.0
+
+replace example.com/dep => ./dep
+`
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := GoScriptBindingRoots(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compile with the binding roots and verify the protobuf binding is emitted.
+	out := filepath.Join(dir, "out")
+	err = ExecGoScriptCompile(context.Background(), logrus.NewEntry(logrus.New()), GoScriptCompileOptions{
+		WorkDir:                   dir,
+		OutputPath:                out,
+		Packages:                  []string{"."},
+		BindingRoots:              roots,
+		ProtobufTypeScriptBinding: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "@goscript", "example.com", "dep", "msg.pb.ts")); err != nil {
+		t.Fatalf("protobuf TypeScript binding was not emitted: %v", err)
+	}
+}
+
+func TestGoScriptBindingRootsFiltersModuleSources(t *testing.T) {
+	// Write modules with and without qualifying protobuf TypeScript siblings.
+	dir := t.TempDir()
+	withPB := filepath.Join(dir, "with-pb")
+	withoutPB := filepath.Join(dir, "without-pb")
+	if err := os.MkdirAll(withPB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(withoutPB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeGoScriptModule(t, dir, "example.com/root", map[string]string{
+		"main.pb.ts": "export {}\n",
+	})
+	writeGoScriptModule(t, withPB, "example.com/with-pb", map[string]string{
+		"types.pb.ts": "export {}\n",
+	})
+	writeGoScriptModule(t, withoutPB, "example.com/without-pb", map[string]string{
+		"node_modules/generated.pb.ts": "export {}\n",
+		"a/b/c/d/e/f/g/types.pb.ts":    "export {}\n",
+	})
+
+	// Write the go.mod requiring both modules with vendor mode.
+	goMod := `module example.com/root
+
+go 1.25.3
+
+require (
+	example.com/with-pb v0.0.0
+	example.com/without-pb v0.0.0
+)
+
+replace example.com/with-pb => ./with-pb
+replace example.com/without-pb => ./without-pb
+`
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := GoScriptBindingRoots(context.Background(), dir, "GOFLAGS=-mod=vendor")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify only the module with qualifying siblings is returned.
+	want, err := filepath.EvalSymlinks(withPB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{want}) {
+		t.Fatalf("binding roots = %v, want [%s]", got, want)
+	}
+}
+
+func TestGoListImportPathPreservesEnv(t *testing.T) {
+	// Write a js/wasm-only module for the environment-scoped go list.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/goscriptenv\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := strings.Join([]string{
+		"//go:build js && wasm",
+		"",
+		"package goscriptenv",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, "browser.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve the import path with the js/wasm environment applied.
+	importPath, err := GoListImportPath(context.Background(), dir, nil, "GOOS=js", "GOARCH=wasm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if importPath != "example.com/goscriptenv" {
+		t.Fatalf("import path = %q, want example.com/goscriptenv", importPath)
+	}
+}
+
+func writeGoScriptModule(t *testing.T, dir, modulePath string, files map[string]string) {
+	// Write the module go.mod and its sorted source files.
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module "+modulePath+"\n\ngo 1.25.3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(files[name]), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertGoScriptOutputContains(t *testing.T, outputRoot, importPath, want string) {
+	// Read the compiled output and check for the expected text.
+	t.Helper()
+	output := readGoScriptOutput(t, outputRoot, importPath)
+	if !strings.Contains(output, want) {
+		t.Fatalf("output missing %q:\n%s", want, output)
+	}
+}
+
+func readGoScriptOutput(t *testing.T, outputRoot, importPath string) string {
+	// Read the emitted index.ts or main.gs.ts for the import path.
+	t.Helper()
+	path := filepath.Join(outputRoot, "@goscript", filepath.FromSlash(importPath), "index.ts")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		path = filepath.Join(outputRoot, "@goscript", filepath.FromSlash(importPath), "main.gs.ts")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func countGoScriptCacheManifests(t *testing.T, cacheRoot string) int {
+	// Count manifest.json files under the cache root.
+	t.Helper()
+	count := 0
+	err := filepath.WalkDir(cacheRoot, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && entry.Name() == "manifest.json" {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count
+}

@@ -1,0 +1,64 @@
+package git_world
+
+import (
+	"context"
+
+	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-git/v6"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// Validate checks the stage operation.
+func (o *GitStageOp) Validate() error {
+	if o.GetObjectKey() == "" {
+		return world.ErrEmptyObjectKey
+	}
+	if o.GetRepoObjectKey() == "" {
+		return errors.New("repo_object_key is required")
+	}
+	if len(o.GetPaths()) == 0 {
+		return errors.New("paths is required")
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *GitStageOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Read the worktree identifiers and paths for the staging operation.
+	objKey := o.GetObjectKey()
+	repoObjKey := o.GetRepoObjectKey()
+	ts := o.GetTimestamp().AsTime()
+	paths := o.GetPaths()
+
+	return false, AccessWorldObjectRepoWithWorktree(
+		ctx,
+		le,
+		worldHandle,
+		repoObjKey, objKey,
+		ts, true,
+		sender,
+		func(repo *git.Repository, workDir billy.Filesystem) error {
+			wt, err := repo.Worktree()
+			if err != nil {
+				return errors.Wrap(err, "worktree")
+			}
+			for _, p := range paths {
+				if _, err := wt.Add(p); err != nil {
+					return errors.Wrap(err, "stage "+p)
+				}
+			}
+			return nil
+		},
+	)
+}
+
+// _ is a type assertion
+var _ world.Operation = (*GitStageOp)(nil)

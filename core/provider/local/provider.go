@@ -1,0 +1,317 @@
+package provider_local
+
+import (
+	"context"
+	"slices"
+	"sync/atomic"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/util/backoff"
+	"github.com/aperturerobotics/util/broadcast"
+	csync "github.com/aperturerobotics/util/csync"
+	"github.com/aperturerobotics/util/keyed"
+	"github.com/aperturerobotics/util/ulid"
+	"github.com/pkg/errors"
+	provider "github.com/s4wave/spacewave/core/provider"
+	"github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/core/transport"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	transform_blockenc "github.com/s4wave/spacewave/db/block/transform/blockenc"
+	transform_gzip "github.com/s4wave/spacewave/db/block/transform/gzip"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/db/volume"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// Provider implements the local provider.
+type Provider struct {
+	// le is the logger
+	le *logrus.Entry
+	// b is the bus
+	b bus.Bus
+	// storageID is the storage controller to use
+	storageID string
+	// signalingURL is the trusted cloud signaling base URL from the
+	// provider configuration. Empty disables standalone-session signaling.
+	signalingURL string
+	// signalingEnvPrefix selects the trusted signaling server signing namespace.
+	signalingEnvPrefix string
+	// packs is the packahead config from the provider Config, read as each
+	// block store mounts. An account's SetPackahead overrides it.
+	packs atomic.Pointer[PackaheadConfig]
+	// info is the provider info
+	info *provider.ProviderInfo
+	// sfs is the step factory set for block transforms
+	sfs *block_transform.StepFactorySet
+
+	// localNetwork connects native sessions within this provider lifetime.
+	localNetwork transport.SessionTransportOption
+	// transportOptions configure each Session before its transport starts.
+	transportOptions []transport.SessionTransportOption
+
+	// accountRc is the keyed refcount for accounts.
+	accountRc *keyed.KeyedRefCount[string, *providerAccountTracker]
+	// sessionBcast is broadcast each time an account or its Session transport
+	// starts or stops.
+	sessionBcast broadcast.Broadcast
+	// peer is the peer instance
+	peer peer.Peer
+	// handler is the provider handler
+	handler provider.ProviderHandler
+	// linkedCloudAccountLoader loads linked cloud account state for a local
+	// account after the account is published.
+	linkedCloudAccountLoader func(context.Context, *ProviderAccount) (string, error)
+
+	// seedKeysMtx guards seedKeys.
+	seedKeysMtx csync.Mutex
+	// seedKeys holds session private key PEMs seeded by
+	// CreateLocalAccountAndSessionWithKey, keyed by
+	// providerID/accountID/sessionID. The account volume can restart before
+	// the caller re-opens the session, and an ephemeral storage backend then
+	// loses the stored key; the seed here keeps the session identity stable
+	// for the provider lifetime.
+	seedKeys map[string][]byte
+}
+
+// providerBackoff is the default backoff for provider services.
+var providerBackoff = &backoff.Backoff{
+	BackoffKind: backoff.BackoffKind_BackoffKind_EXPONENTIAL,
+	Exponential: &backoff.Exponential{
+		InitialInterval: 500,
+		MaxInterval:     1800,
+		Multiplier:      1.4,
+	},
+}
+
+// NewProvider constructs a new Provider.
+//
+// signalingURL is the trusted Spacewave Cloud signaling base URL persisted in
+// the provider configuration. Standalone local sessions without a linked
+// cloud account use it as their WebRTC transport rendezvous. Empty keeps
+// those sessions without signaling.
+func NewProvider(
+	le *logrus.Entry,
+	b bus.Bus,
+	storageID string,
+	signalingURL string,
+	signalingEnvPrefix string,
+	info *provider.ProviderInfo,
+	peer peer.Peer,
+	handler provider.ProviderHandler,
+	transportOptions ...transport.SessionTransportOption,
+) *Provider {
+	// Register the gzip and block-encryption transform factories.
+	sfs := block_transform.NewStepFactorySet()
+	sfs.AddStepFactory(transform_gzip.NewStepFactory())
+	sfs.AddStepFactory(transform_blockenc.NewStepFactory())
+
+	// Build the provider and its retrying account tracker.
+	p := &Provider{
+		le:                 le,
+		b:                  b,
+		storageID:          storageID,
+		signalingURL:       signalingURL,
+		signalingEnvPrefix: signalingEnvPrefix,
+		info:               info,
+		peer:               peer,
+		handler:            handler,
+		sfs:                sfs,
+		localNetwork:       newLocalSessionNetwork(),
+		transportOptions:   slices.Clone(transportOptions),
+	}
+	p.linkedCloudAccountLoader = defaultLinkedCloudAccountLoader
+	p.accountRc = keyed.NewKeyedRefCountWithLogger(
+		p.buildProviderAccountTracker,
+		le,
+		keyed.WithRetry[string, *providerAccountTracker](&backoff.Backoff{}),
+	)
+	return p
+}
+
+// SetPackDir keeps each block store's packahead log in a subdirectory of dir
+// and diverts the new values of the stores in divert to it, for every account
+// that registered no PackaheadConfig of its own. An empty dir opens no log. It
+// applies to stores as they mount.
+func (p *Provider) SetPackDir(dir string, divert []string) {
+	if dir == "" {
+		p.packs.Store(nil)
+		return
+	}
+	p.packs.Store(&PackaheadConfig{Dir: dir, DivertStoreIDs: slices.Clone(divert)})
+}
+
+// getLocalProviderFeatures returns the slice of provider features implemented by the local provider.
+func getLocalProviderFeatures() []provider.ProviderFeature {
+	return []provider.ProviderFeature{
+		provider.ProviderFeature_ProviderFeature_SESSION,
+		provider.ProviderFeature_ProviderFeature_SHARED_OBJECT,
+		provider.ProviderFeature_ProviderFeature_BLOCK_STORE,
+	}
+}
+
+// NewProviderInfo constructs the provider info.
+func NewProviderInfo(providerID string) *provider.ProviderInfo {
+	return &provider.ProviderInfo{
+		ProviderId:       providerID,
+		ProviderFeatures: getLocalProviderFeatures(),
+	}
+}
+
+// GetProviderInfo returns the basic provider information.
+func (p *Provider) GetProviderInfo() *provider.ProviderInfo {
+	return p.info.CloneVT()
+}
+
+// CreateLocalAccountAndSession initializes a local provider account and session.
+// cloudAccountID links this local session to a cloud account (empty for standalone).
+//
+// NOTE: this is a WIP / possibly temporary function.
+func (p *Provider) CreateLocalAccountAndSession(ctx context.Context, cloudAccountID string) (*session.SessionRef, error) {
+	return p.CreateLocalAccountAndSessionWithKey(ctx, cloudAccountID, nil)
+}
+
+// CreateLocalAccountAndSessionWithKey initializes a local provider account and
+// session seeded with the given session private key PEM. The key is used only
+// when the session has no stored key yet; an existing stored key wins so the
+// session reopens with its durable identity. An empty keyPEM generates a key.
+func (p *Provider) CreateLocalAccountAndSessionWithKey(ctx context.Context, cloudAccountID string, keyPEM []byte) (*session.SessionRef, error) {
+	return p.createAccountSession(ctx, ulid.NewULID(), ulid.NewULID(), cloudAccountID, keyPEM)
+}
+
+func (p *Provider) createAccountSession(ctx context.Context, localAccountID, localSessionID, cloudAccountID string, keyPEM []byte) (*session.SessionRef, error) {
+	// Create the provider account.
+	// For the local provider, the account is created on first mount.
+	provAcc, relProvAcc, err := p.AccessProviderAccount(ctx, localAccountID, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer relProvAcc()
+
+	// Mount the session. For the local provider this also inits on first run.
+	sessRef := &session.SessionRef{
+		ProviderResourceRef: &provider.ProviderResourceRef{
+			Id:                localSessionID,
+			ProviderAccountId: localAccountID,
+			ProviderId:        p.info.GetProviderId(),
+		},
+	}
+
+	// Retain the seed key for the provider lifetime so a session remount
+	// after an account restart reopens with the same identity even when the
+	// storage backend did not persist the stored key yet.
+	if len(keyPEM) != 0 {
+		p.setSeedKey(p.info.GetProviderId(), localAccountID, localSessionID, keyPEM)
+	}
+
+	// Access the tracker directly to set cloudAccountID before the session
+	// starts executing (the tracker blocks on ref.Await until we set it).
+	localAcc := provAcc.(*ProviderAccount)
+	tkrRef, tkr, _ := localAcc.sessions.AddKeyRef(localSessionID)
+	tkr.cloudAccountID = cloudAccountID
+	tkr.seedPEM = slices.Clone(keyPEM)
+	tkr.ref.SetResult(sessRef, nil)
+
+	// Wait for the session, persist a linked cloud account, and release the tracker.
+	_, err = tkr.sessionProm.Await(ctx)
+	if err != nil {
+		tkrRef.Release()
+		return nil, err
+	}
+	if cloudAccountID != "" {
+		if err := localAcc.writeLinkedCloudAccountID(ctx, localSessionID, cloudAccountID); err != nil {
+			tkrRef.Release()
+			return nil, err
+		}
+	}
+	tkrRef.Release()
+
+	return sessRef, nil
+}
+
+// setSeedKey stores a session seed key PEM in the provider-level map.
+func (p *Provider) setSeedKey(providerID, accountID, sessionID string, keyPEM []byte) {
+	// Store a copy of the seed key under the session's provider-level id.
+	release, err := p.seedKeysMtx.Lock(context.Background())
+	if err != nil {
+		p.le.WithError(err).Warn("provider seed key lock failed")
+		return
+	}
+	defer release()
+	if p.seedKeys == nil {
+		p.seedKeys = make(map[string][]byte)
+	}
+	p.seedKeys[seedKeyID(providerID, accountID, sessionID)] = slices.Clone(keyPEM)
+}
+
+// getSeedKey returns the stored session seed key PEM, or nil when absent.
+func (p *Provider) getSeedKey(providerID, accountID, sessionID string) []byte {
+	release, err := p.seedKeysMtx.Lock(context.Background())
+	if err != nil {
+		p.le.WithError(err).Warn("provider seed key lock failed")
+		return nil
+	}
+	defer release()
+	return p.seedKeys[seedKeyID(providerID, accountID, sessionID)]
+}
+
+// seedKeyID builds the provider-level seed key map ID.
+func seedKeyID(providerID, accountID, sessionID string) string {
+	return providerID + "/" + accountID + "/" + sessionID
+}
+
+func (a *ProviderAccount) writeLinkedCloudAccountID(ctx context.Context, sessionID, cloudAccountID string) error {
+	// Mount the session object store and release it when the write returns.
+	objStoreHandle, _, diRef, err := volume.ExBuildObjectStoreAPI(
+		ctx,
+		a.t.p.b,
+		false,
+		SessionObjectStoreID(a.GetProviderID(), a.GetAccountID()),
+		a.vol.GetID(),
+		nil,
+	)
+	if err != nil {
+		return errors.Wrap(err, "mount session object store")
+	}
+	defer diRef.Release()
+
+	// Write the linked cloud account id under the session key.
+	key := LinkedCloudKey(sessionID)
+	data := []byte(cloudAccountID)
+	err = kvtx.RunTransaction(ctx, true,
+		func(ctx context.Context) (kvtx.Tx, error) {
+			return objStoreHandle.GetObjectStore().NewTransaction(ctx, true)
+		},
+		func(ctx context.Context, tx kvtx.Tx) error {
+			if err := tx.Set(ctx, key, data); err != nil {
+				return errors.Wrap(err, "set linked cloud account id")
+			}
+			return nil
+		},
+	)
+	return errors.Wrap(err, "write linked cloud account id")
+}
+
+// AccessProviderAccount accesses a provider account.
+// If accountID is empty, it will use the default or prompt the user.
+// released may be nil.
+func (p *Provider) AccessProviderAccount(ctx context.Context, accountID string, released func()) (provider.ProviderAccount, func(), error) {
+	ref, providerAccTkr, _ := p.accountRc.AddKeyRef(accountID)
+	providerAcc, err := providerAccTkr.accCtr.WaitValue(ctx, nil)
+	if err != nil {
+		ref.Release()
+		return nil, nil, err
+	}
+
+	return providerAcc, ref.Release, nil
+}
+
+// Execute executes the provider.
+// Return nil for no-op (will not be restarted).
+func (p *Provider) Execute(ctx context.Context) error {
+	p.accountRc.SetContext(ctx, true)
+	return nil
+}
+
+// _ is a type assertion
+var _ provider.Provider = (*Provider)(nil)

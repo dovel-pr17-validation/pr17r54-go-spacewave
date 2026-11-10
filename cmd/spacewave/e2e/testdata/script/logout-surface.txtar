@@ -1,0 +1,9 @@
+# Logout exposes the local-session sign-out command and target selectors.
+spacewave logout --help
+stdout "sign out a local session"
+stdout "--session-index value"
+stdout "--session-id value"
+stdout "--account-id value"
+
+! spacewave logout --state-path $WORK/state --yes
+stderr "no sessions"

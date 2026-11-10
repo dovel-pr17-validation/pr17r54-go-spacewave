@@ -1,0 +1,58 @@
+package kvtx_vlogger
+
+import (
+	"context"
+	"sync/atomic"
+
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/sirupsen/logrus"
+)
+
+// VLoggerStore wraps a KVTx store to verbosely log all operations.
+type VLoggerStore struct {
+	kvtx.Store
+	le    *logrus.Entry
+	txInc atomic.Uint64
+}
+
+// NewVLogger constructs a new VLoggerStore wrapping store.
+func NewVLogger(le *logrus.Entry, store kvtx.Store) *VLoggerStore {
+	return &VLoggerStore{le: le, Store: store}
+}
+
+// Unwrap returns the underlying store.
+func (l *VLoggerStore) Unwrap() kvtx.Store {
+	return l.Store
+}
+
+// NewTransaction returns a new transaction against the store.
+// Indicate write if the transaction will not be read-only.
+// Always call Discard() after you are done with the transaction.
+func (l *VLoggerStore) NewTransaction(ctx context.Context, write bool) (kvtx.Tx, error) {
+	// Open the underlying transaction with a distinct verbose log identifier.
+	txid := l.txInc.Add(1)
+	le := l.le.WithField("kvtx-vlogger-txid", txid)
+	le.Debugf("NewTransaction(%v)", write)
+	ntx, err := l.Store.NewTransaction(ctx, write)
+	if err != nil {
+		le.WithError(err).Warnf("NewTransaction(%v) => error", write)
+		return nil, err
+	}
+	le.Debugf("NewTransaction(%v) => success", write)
+	return NewTx(le, ntx), nil
+}
+
+// SupportsAtomicCommit reports whether the wrapped store commits atomically.
+func (l *VLoggerStore) SupportsAtomicCommit() bool {
+	s, ok := l.Store.(kvtx.AtomicCommitStore)
+	return ok && s.SupportsAtomicCommit()
+}
+
+// WritersWaiting reports whether a writer waits on the wrapped store.
+func (l *VLoggerStore) WritersWaiting() bool {
+	s, ok := l.Store.(kvtx.WriterQueueStore)
+	return ok && s.WritersWaiting()
+}
+
+// _ is a type assertion
+var _ kvtx.WriterQueueStore = (*VLoggerStore)(nil)

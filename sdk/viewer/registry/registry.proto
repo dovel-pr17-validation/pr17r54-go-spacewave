@@ -1,0 +1,76 @@
+syntax = "proto3";
+package s4wave.viewer.registry;
+
+service ViewerRegistryResourceService {
+  rpc RegisterViewer(RegisterViewerRequest) returns (RegisterViewerResponse);
+  rpc ListViewers(ListViewersRequest) returns (ListViewersResponse);
+  rpc WatchViewers(WatchViewersRequest) returns (stream WatchViewersResponse);
+}
+
+// ViewerSurface identifies the host surface that can render a viewer.
+enum ViewerSurface {
+  // VIEWER_SURFACE_UNKNOWN is not a usable viewer surface.
+  VIEWER_SURFACE_UNKNOWN = 0;
+  // VIEWER_SURFACE_WEB identifies browser viewers.
+  VIEWER_SURFACE_WEB = 1;
+  // VIEWER_SURFACE_TUI identifies terminal viewers.
+  VIEWER_SURFACE_TUI = 2;
+}
+
+// ViewerRegistration is a registered viewer.
+message ViewerRegistration {
+  // TypeId is the object type ID this viewer handles (e.g. "unixfs/fs-node").
+  string type_id = 1;
+  // ViewerName is the human-readable name of the viewer.
+  string viewer_name = 2;
+  // ScriptPath is the React module path for React.lazy loading.
+  string script_path = 3;
+  // Category is the UI grouping category for the component selector dropdown.
+  string category = 4;
+  // DevModeOnly indicates this viewer is only shown when dev mode is enabled.
+  bool dev_mode_only = 5;
+  // ComponentId is the stable ID used for persisted viewer selection.
+  string component_id = 6;
+  // Surface is the host surface that can render this viewer.
+  ViewerSurface surface = 7;
+}
+
+// RegisterViewerRequest is the request type for RegisterViewer.
+message RegisterViewerRequest {
+  // Registration is the viewer registration to add.
+  ViewerRegistration registration = 1;
+}
+
+// RegisterViewerResponse is the response type for RegisterViewer.
+message RegisterViewerResponse {
+  // ResourceId is the registration resource. Releasing it unregisters the viewer.
+  uint32 resource_id = 1;
+}
+
+// ListViewersRequest is the request type for ListViewers.
+message ListViewersRequest {
+  // Surface selects the host surface to list.
+  ViewerSurface surface = 1;
+  // InstanceKey selects a logical installation; empty lists global registrations.
+  string instance_key = 2;
+}
+
+// ListViewersResponse is the response type for ListViewers.
+message ListViewersResponse {
+  // Registrations is the list of registered viewers.
+  repeated ViewerRegistration registrations = 1;
+}
+
+// WatchViewersRequest is the request type for WatchViewers.
+message WatchViewersRequest {
+  // Surface selects the host surface to watch.
+  ViewerSurface surface = 1;
+  // InstanceKey selects a logical installation; empty lists global registrations.
+  string instance_key = 2;
+}
+
+// WatchViewersResponse is the response type for WatchViewers.
+message WatchViewersResponse {
+  // Registrations is the current set of registered viewers.
+  repeated ViewerRegistration registrations = 1;
+}

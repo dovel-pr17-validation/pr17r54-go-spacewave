@@ -1,0 +1,380 @@
+package provider_local
+
+import (
+	"context"
+	"time"
+
+	"github.com/aperturerobotics/util/ulid"
+	"github.com/pkg/errors"
+	account_settings "github.com/s4wave/spacewave/core/account/settings"
+	"github.com/s4wave/spacewave/core/sobject"
+	block_store_s3 "github.com/s4wave/spacewave/db/block/store/s3"
+	s4wave_secret "github.com/s4wave/spacewave/sdk/secret"
+)
+
+// AddStorageBackend checks the bucket with the credentials and, when the check
+// passes, keeps the credentials in a storage credential Secret owned by the
+// account and records the backend in the account settings. It returns the new
+// backend id, or an empty id when the check failed.
+func (a *ProviderAccount) AddStorageBackend(
+	ctx context.Context,
+	displayName string,
+	location *account_settings.S3Location,
+	creds *block_store_s3.Credentials,
+	setDefault bool,
+) (string, *block_store_s3.CheckResult, error) {
+	if err := location.Validate(); err != nil {
+		return "", nil, err
+	}
+	return a.addStorageBackend(ctx, &account_settings.StorageBackend{DisplayName: displayName, S3: location.CloneVT()}, creds, setDefault)
+}
+
+// AddSQLStorageBackend checks the database with the credentials, whose access
+// key id is the database user and secret access key the password, and records
+// the backend as AddStorageBackend does. The check creates the blocks table.
+func (a *ProviderAccount) AddSQLStorageBackend(
+	ctx context.Context,
+	displayName string,
+	location *account_settings.SqlLocation,
+	creds *block_store_s3.Credentials,
+	setDefault bool,
+) (string, *block_store_s3.CheckResult, error) {
+	if err := location.Validate(); err != nil {
+		return "", nil, err
+	}
+	return a.addStorageBackend(ctx, &account_settings.StorageBackend{DisplayName: displayName, Sql: location.CloneVT()}, creds, setDefault)
+}
+
+// addStorageBackend checks the location backend names, then keeps the
+// credentials and records the backend with a new id.
+func (a *ProviderAccount) addStorageBackend(
+	ctx context.Context,
+	backend *account_settings.StorageBackend,
+	creds *block_store_s3.Credentials,
+	setDefault bool,
+) (string, *block_store_s3.CheckResult, error) {
+	// Reject a taken name before touching the storage.
+	displayName := backend.GetDisplayName()
+	if displayName == "" {
+		return "", nil, errors.New("display name is required")
+	}
+	settings, err := a.readAccountSettings(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	if settings.FindStorageBackendByName(displayName) != nil {
+		return "", nil, errors.Errorf("a storage backend named %q already exists", displayName)
+	}
+
+	// Save nothing unless the storage accepts a probe.
+	check := checkStorageLocation(ctx, backend, creds)
+	if check.GetOutcome() != block_store_s3.CheckOutcome_CHECK_OUTCOME_OK {
+		return "", check, nil
+	}
+
+	// Keep the credentials in a Secret the account's Sessions can decrypt.
+	credData, err := creds.MarshalVT()
+	if err != nil {
+		return "", nil, err
+	}
+	credential, err := s4wave_secret.CreateSecretObject(ctx, a.t.p.b, a, s4wave_secret.CreateSecretOptions{
+		DisplayName: displayName,
+		Kind:        s4wave_secret.SecretKindStorageCredential,
+		ContentType: s4wave_secret.StorageCredentialContentType,
+		Value:       credData,
+	})
+	if err != nil {
+		return "", nil, errors.Wrap(err, "create storage credential")
+	}
+
+	// Record the backend, and remove the Secret if the settings reject it.
+	backend = backend.CloneVT()
+	backend.Id, backend.Credential = ulid.NewULID(), credential
+	ops := []*account_settings.AccountSettingsOp{{
+		Op: &account_settings.AccountSettingsOp_UpsertStorageBackend{UpsertStorageBackend: backend},
+	}}
+	if setDefault {
+		ops = append(ops, &account_settings.AccountSettingsOp{
+			Op: &account_settings.AccountSettingsOp_SetDefaultStorageBackend{
+				SetDefaultStorageBackend: &account_settings.SetDefaultStorageBackendOp{StorageBackendId: backend.GetId()},
+			},
+		})
+	}
+	if err := a.commitAccountSettingsOps(ctx, ops...); err != nil {
+		if delErr := a.DeleteSharedObject(ctx, credential.GetNestedSharedObjectId()); delErr != nil {
+			a.le.WithError(delErr).Warn("unable to delete unused storage credential")
+		}
+		return "", nil, err
+	}
+	return backend.GetId(), check, nil
+}
+
+// CheckStorageBackend runs the connectivity check against a saved backend.
+func (a *ProviderAccount) CheckStorageBackend(ctx context.Context, backendID string) (*block_store_s3.CheckResult, error) {
+	// Load the saved backend and check it with its decrypted credentials.
+	settings, err := a.readAccountSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	backend := settings.FindStorageBackend(backendID)
+	if backend == nil {
+		return nil, account_settings.ErrStorageBackendNotFound
+	}
+	var creds *block_store_s3.Credentials
+	if backend.GetFtps() == nil {
+		creds, err = a.ReadStorageCredentials(ctx, backend)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return checkStorageLocation(ctx, backend, creds), nil
+}
+
+// checkStorageLocation runs the connectivity check of the backend's bucket or
+// database.
+func checkStorageLocation(
+	ctx context.Context,
+	backend *account_settings.StorageBackend,
+	creds *block_store_s3.Credentials,
+) *block_store_s3.CheckResult {
+	if location := backend.GetSql(); location != nil {
+		return CheckSQLLocation(ctx, location, creds)
+	}
+	if location := backend.GetFtps(); location != nil {
+		return CheckFTPSLocation(ctx, location)
+	}
+	return CheckS3Location(ctx, backend.GetS3(), creds)
+}
+
+// ReadStorageCredentials decrypts the credentials of a storage backend.
+func (a *ProviderAccount) ReadStorageCredentials(
+	ctx context.Context,
+	backend *account_settings.StorageBackend,
+) (*block_store_s3.Credentials, error) {
+	// Decrypt the backend credential and decode it as S3 credentials.
+	credential := backend.GetCredential()
+	if credential.GetKind() != s4wave_secret.SecretKindStorageCredential {
+		return nil, s4wave_secret.ErrSecretKindMismatch
+	}
+	payload, err := s4wave_secret.ReadSecretPayload(ctx, a.t.p.b, credential)
+	if err != nil {
+		return nil, errors.Wrap(err, "read storage credential")
+	}
+	creds := &block_store_s3.Credentials{}
+	if err := creds.UnmarshalVT(payload.GetValue()); err != nil {
+		return nil, errors.Wrap(err, "decode storage credential")
+	}
+	return creds, nil
+}
+
+// RemoveStorageBackend removes a backend that holds no Space and deletes its
+// credential Secret. While Spaces are placed on it, the error names them.
+//
+// It first deletes the objects of the block stores released on the backend,
+// since removal drops the credentials. A failed delete leaves its objects in
+// the bucket.
+func (a *ProviderAccount) RemoveStorageBackend(ctx context.Context, backendID string) error {
+	// Refuse removal while Spaces remain, and delete released stores first.
+	settings, err := a.readAccountSettings(ctx)
+	if err != nil {
+		return err
+	}
+	backend := settings.FindStorageBackend(backendID)
+	if backend == nil {
+		return account_settings.ErrStorageBackendNotFound
+	}
+	if err := settings.CheckStorageBackendUnused(backendID); err != nil {
+		return err
+	}
+	for _, release := range pendingStorageReleases(settings) {
+		if release.backendID != backendID {
+			continue
+		}
+		if err := a.releaseBlockStore(ctx, release); err != nil {
+			a.le.WithError(err).WithField("bstore-id", release.blockStoreID).
+				Warn("unable to delete released block store from the bucket")
+		}
+	}
+
+	// Commit the removal before deleting the Secret so no replica keeps a
+	// backend whose credentials are gone.
+	if err := a.commitAccountSettingsOps(ctx, &account_settings.AccountSettingsOp{
+		Op: &account_settings.AccountSettingsOp_RemoveStorageBackend{
+			RemoveStorageBackend: &account_settings.RemoveStorageBackendOp{StorageBackendId: backendID},
+		},
+	}); err != nil {
+		return err
+	}
+	err = a.DeleteSharedObject(ctx, backend.GetCredential().GetNestedSharedObjectId())
+	if err != nil && !errors.Is(err, sobject.ErrSharedObjectNotFound) {
+		return errors.Wrap(err, "delete storage credential")
+	}
+	return nil
+}
+
+// SetDefaultStorageBackend selects the backend new Spaces use, or the
+// account's own storage when backendID is empty.
+func (a *ProviderAccount) SetDefaultStorageBackend(ctx context.Context, backendID string) error {
+	return a.commitAccountSettingsOps(ctx, &account_settings.AccountSettingsOp{
+		Op: &account_settings.AccountSettingsOp_SetDefaultStorageBackend{
+			SetDefaultStorageBackend: &account_settings.SetDefaultStorageBackendOp{StorageBackendId: backendID},
+		},
+	})
+}
+
+// SetStorageBackendPricing overrides the price list storage reclaim uses for
+// a backend, or returns it to the published prices of the endpoint's service
+// when pricing is nil. The backend's open stores reopen with the new prices.
+func (a *ProviderAccount) SetStorageBackendPricing(
+	ctx context.Context,
+	backendID string,
+	pricing *block_store_s3.Pricing,
+) error {
+	// Find the backend.
+	settings, err := a.readAccountSettings(ctx)
+	if err != nil {
+		return err
+	}
+	backend := settings.FindStorageBackend(backendID)
+	if backend == nil {
+		return account_settings.ErrStorageBackendNotFound
+	}
+
+	// Record it with the new price list. Only a bucket has one.
+	if backend.GetS3() == nil {
+		return errors.New("only a bucket storage backend has a price list")
+	}
+	backend = backend.CloneVT()
+	backend.S3.Pricing = pricing.CloneVT()
+	return a.commitAccountSettingsOps(ctx, &account_settings.AccountSettingsOp{
+		Op: &account_settings.AccountSettingsOp_UpsertStorageBackend{UpsertStorageBackend: backend},
+	})
+}
+
+// ResolveNewSpaceStorageBackend returns the backend a new Space's blocks go
+// on: the requested backend, else the account's default, else none. When
+// accountStorage is set, returns none.
+func (a *ProviderAccount) ResolveNewSpaceStorageBackend(ctx context.Context, requestedID string, accountStorage bool) (string, error) {
+	// Choose the requested backend, the account default, or account storage.
+	if accountStorage {
+		if requestedID != "" {
+			return "", errors.New("choose a storage backend or account storage, not both")
+		}
+		return "", nil
+	}
+	settings, err := a.readAccountSettings(ctx)
+	if err != nil {
+		return "", err
+	}
+	if requestedID == "" {
+		return settings.GetDefaultStorageBackendId(), nil
+	}
+	if settings.FindStorageBackend(requestedID) == nil {
+		return "", errors.Wrap(account_settings.ErrStorageBackendNotFound, requestedID)
+	}
+	return requestedID, nil
+}
+
+// PlaceBlockStore places a block store on a storage backend with its cache
+// settings. An empty backend id returns the store to the account's own
+// storage.
+func (a *ProviderAccount) PlaceBlockStore(ctx context.Context, placement *account_settings.BlockStorePlacement) error {
+	return a.commitAccountSettingsOps(ctx, &account_settings.AccountSettingsOp{
+		Op: &account_settings.AccountSettingsOp_SetBlockStorePlacement{
+			SetBlockStorePlacement: placement,
+		},
+	})
+}
+
+// commitAccountSettingsOps commits each op to the account settings in order.
+func (a *ProviderAccount) commitAccountSettingsOps(ctx context.Context, ops ...*account_settings.AccountSettingsOp) error {
+	// Mount the account settings shared object and release it when the commit returns.
+	ref, err := a.GetAccountSettingsRef(ctx)
+	if err != nil {
+		return err
+	}
+	so, release, err := a.MountSharedObject(ctx, ref, nil)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// Commit each account-settings operation in order.
+	for _, op := range ops {
+		if err := commitAccountSettingsOp(ctx, so, op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WatchUploadStatus calls fn with the storage backend and upload status of a
+// SharedObject's block store, then again after each change, until ctx ends
+// or fn fails.
+func (a *ProviderAccount) WatchUploadStatus(ctx context.Context, sharedObjectID string, fn func(UploadStatus) error) error {
+	// Retain the shared object's block-store tracker and watch its upload status.
+	blockStoreID := a.lookupSharedObjectBlockStoreID(sharedObjectID)
+	if blockStoreID == "" {
+		return sobject.ErrSharedObjectNotFound
+	}
+	tkrRef, tkr, _ := a.bstores.AddKeyRef(blockStoreID)
+	defer tkrRef.Release()
+	return watchTrackerUploadStatus(ctx, tkr, fn)
+}
+
+// UploadedBefore reports whether the storage backend of a SharedObject's
+// mounted block store holds every block written before at, false when the
+// store is not mounted. It mounts nothing.
+func (a *ProviderAccount) UploadedBefore(ctx context.Context, sharedObjectID string, at time.Time) (bool, error) {
+	// Find the mounted block store.
+	tkr, ok := a.bstores.GetKey(a.lookupSharedObjectBlockStoreID(sharedObjectID))
+	if !ok || tkr == nil {
+		return false, nil
+	}
+	bs := tkr.bstoreCtr.GetValue()
+	if bs == nil {
+		return false, nil
+	}
+	return bs.UploadedBefore(ctx, at)
+}
+
+// watchTrackerUploadStatus calls fn with each upload status of the tracker's
+// mounted handle, following the handle across remounts.
+func watchTrackerUploadStatus(ctx context.Context, tkr *bstoreTracker, fn func(UploadStatus) error) error {
+	for {
+		bs, err := tkr.bstoreCtr.WaitValue(ctx, nil)
+		if err != nil {
+			return err
+		}
+
+		// Follow the handle until the tracker replaces it.
+		handleCtx, handleCancel := context.WithCancel(ctx)
+		go func() {
+			_, _ = tkr.bstoreCtr.WaitValueChange(handleCtx, bs, nil)
+			handleCancel()
+		}()
+		err = watchHandleUploadStatus(handleCtx, bs, fn)
+		handleCancel()
+		if ctx.Err() != nil {
+			return context.Canceled
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+	}
+}
+
+// watchHandleUploadStatus calls fn with each upload status of one handle.
+func watchHandleUploadStatus(ctx context.Context, bs *BlockStore, fn func(UploadStatus) error) error {
+	for {
+		status, changed := bs.GetUploadStatus()
+		if err := fn(status); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return context.Canceled
+		case <-changed:
+		}
+	}
+}

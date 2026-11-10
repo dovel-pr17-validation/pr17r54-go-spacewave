@@ -1,0 +1,266 @@
+//go:build !js
+
+package bldr_cli_compiler
+
+import (
+	"strings"
+	"testing"
+
+	gdiff "github.com/sergi/go-diff/diffmatchpatch"
+)
+
+const expectedCodegenWithImports = `package main
+
+import (
+	"embed"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	example_cli "github.com/example/cli-cmds"
+	example_factory "github.com/example/factory"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+)
+
+// configSetFS contains the embedded configset.
+//
+//go:embed configset.bin
+var configSetFS embed.FS
+
+// factories are the factories included in the binary.
+var factories = []cli_entrypoint.AddFactoryFunc{func(b bus.Bus) []controller.Factory {
+	return []controller.Factory{example_factory.NewFactory(b)}
+}}
+
+// configSets are the configuration sets to apply on startup.
+var configSets = []cli_entrypoint.BuildConfigSetFunc{cli_entrypoint.ConfigSetFuncFromFS(configSetFS, "configset.bin")}
+
+// cliCommands are the CLI command builders.
+var cliCommands = []cli_entrypoint.BuildCommandsFunc{example_cli.NewCliCommands}
+
+// main is the main entrypoint.
+func main() { cli_entrypoint.Main("my-app", "", factories, configSets, cliCommands, nil) }
+`
+
+const expectedCodegenMultiple = `package main
+
+import (
+	"embed"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	alpha_cli "github.com/example/alpha/cli"
+	alpha_factory "github.com/example/alpha/factory"
+	beta_cli "github.com/example/beta/cli"
+	beta_factory "github.com/example/beta/factory"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+)
+
+// configSetFS contains the embedded configset.
+//
+//go:embed configset.bin
+var configSetFS embed.FS
+
+// factories are the factories included in the binary.
+var factories = []cli_entrypoint.AddFactoryFunc{func(b bus.Bus) []controller.Factory {
+	return []controller.Factory{alpha_factory.NewFactory(b)}
+}, func(b bus.Bus) []controller.Factory {
+	return []controller.Factory{beta_factory.NewFactory(b)}
+}}
+
+// configSets are the configuration sets to apply on startup.
+var configSets = []cli_entrypoint.BuildConfigSetFunc{cli_entrypoint.ConfigSetFuncFromFS(configSetFS, "configset.bin")}
+
+// cliCommands are the CLI command builders.
+var cliCommands = []cli_entrypoint.BuildCommandsFunc{alpha_cli.NewCliCommands, beta_cli.NewCliCommands}
+
+// main is the main entrypoint.
+func main() { cli_entrypoint.Main("multi-app", "", factories, configSets, cliCommands, nil) }
+`
+
+const expectedCodegenNoBus = `package main
+
+import (
+	"embed"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	example_factory "github.com/example/factory"
+	no_bus_fc "github.com/example/no-bus/fc"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+)
+
+// configSetFS contains the embedded configset.
+//
+//go:embed configset.bin
+var configSetFS embed.FS
+
+// factories are the factories included in the binary.
+var factories = []cli_entrypoint.AddFactoryFunc{func(b bus.Bus) []controller.Factory {
+	return []controller.Factory{example_factory.NewFactory(b)}
+}, func(b bus.Bus) []controller.Factory {
+	return []controller.Factory{no_bus_fc.NewFactory()}
+}}
+
+// configSets are the configuration sets to apply on startup.
+var configSets = []cli_entrypoint.BuildConfigSetFunc{cli_entrypoint.ConfigSetFuncFromFS(configSetFS, "configset.bin")}
+
+// cliCommands are the CLI command builders.
+var cliCommands = []cli_entrypoint.BuildCommandsFunc{}
+
+// main is the main entrypoint.
+func main() { cli_entrypoint.Main("no-bus-app", "", factories, configSets, cliCommands, nil) }
+`
+
+const expectedCodegenEmpty = `package main
+
+import (
+	"embed"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+)
+
+// configSetFS contains the embedded configset.
+//
+//go:embed configset.bin
+var configSetFS embed.FS
+
+// factories are the factories included in the binary.
+var factories = []cli_entrypoint.AddFactoryFunc{}
+
+// configSets are the configuration sets to apply on startup.
+var configSets = []cli_entrypoint.BuildConfigSetFunc{cli_entrypoint.ConfigSetFuncFromFS(configSetFS, "configset.bin")}
+
+// cliCommands are the CLI command builders.
+var cliCommands = []cli_entrypoint.BuildCommandsFunc{}
+
+// main is the main entrypoint.
+func main() { cli_entrypoint.Main("test-empty", "", factories, configSets, cliCommands, nil) }
+`
+
+const expectedCodegenComposed = `package main
+
+import (
+	"embed"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	example_cli "github.com/example/cli-cmds"
+	project_compose "github.com/example/compose"
+	example_factory "github.com/example/factory"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+)
+
+// configSetFS contains the embedded configset.
+//
+//go:embed configset.bin
+var configSetFS embed.FS
+
+// factories are the factories included in the binary.
+var factories = []cli_entrypoint.AddFactoryFunc{func(b bus.Bus) []controller.Factory {
+	return []controller.Factory{example_factory.NewFactory(b)}
+}}
+
+// configSets are the configuration sets to apply on startup.
+var configSets = []cli_entrypoint.BuildConfigSetFunc{cli_entrypoint.ConfigSetFuncFromFS(configSetFS, "configset.bin")}
+
+// cliCommands are the CLI command builders.
+var cliCommands = []cli_entrypoint.BuildCommandsFunc{example_cli.NewCliCommands}
+
+// main is the main entrypoint.
+func main() {
+	composition := project_compose.Compose()
+	cli_entrypoint.Main("my-app", "my-app", append(composition.Factories, factories...), configSets, append(cliCommands, composition.Commands...), composition.Flags)
+}
+`
+
+func TestFormatCliEntrypoint(t *testing.T) {
+	type testcase struct {
+		name           string
+		appName        string
+		projectID      string
+		factoryImports map[string]FactoryImport
+		cliImports     map[string]CliImport
+		composePackage string
+		expected       string
+	}
+	tests := []*testcase{
+		{
+			name:      "with imports",
+			appName:   "my-app",
+			projectID: "",
+			factoryImports: map[string]FactoryImport{
+				"github.com/example/factory": {Alias: "example_factory", PassBus: true},
+			},
+			cliImports: map[string]CliImport{
+				"github.com/example/cli-cmds": {Alias: "example_cli"},
+			},
+			expected: expectedCodegenWithImports,
+		},
+		{
+			name:      "multiple",
+			appName:   "multi-app",
+			projectID: "",
+			factoryImports: map[string]FactoryImport{
+				"github.com/example/beta/factory":  {Alias: "beta_factory", PassBus: true},
+				"github.com/example/alpha/factory": {Alias: "alpha_factory", PassBus: true},
+			},
+			cliImports: map[string]CliImport{
+				"github.com/example/beta/cli":  {Alias: "beta_cli"},
+				"github.com/example/alpha/cli": {Alias: "alpha_cli"},
+			},
+			expected: expectedCodegenMultiple,
+		},
+		{
+			name:      "no-bus",
+			appName:   "no-bus-app",
+			projectID: "",
+			factoryImports: map[string]FactoryImport{
+				"github.com/example/factory":   {Alias: "example_factory", PassBus: true},
+				"github.com/example/no-bus/fc": {Alias: "no_bus_fc", PassBus: false},
+			},
+			cliImports: map[string]CliImport{},
+			expected:   expectedCodegenNoBus,
+		},
+		{
+			name:           "empty",
+			appName:        "test-empty",
+			projectID:      "",
+			factoryImports: map[string]FactoryImport{},
+			cliImports:     map[string]CliImport{},
+			expected:       expectedCodegenEmpty,
+		},
+		{
+			name:      "composed",
+			appName:   "my-app",
+			projectID: "my-app",
+			factoryImports: map[string]FactoryImport{
+				"github.com/example/factory": {Alias: "example_factory", PassBus: true},
+			},
+			cliImports: map[string]CliImport{
+				"github.com/example/cli-cmds": {Alias: "example_cli"},
+			},
+			composePackage: "github.com/example/compose",
+			expected:       expectedCodegenComposed,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Generate the entrypoint code for the test case.
+			dat, err := FormatCliEntrypoint(tc.appName, tc.projectID, tc.factoryImports, tc.cliImports, tc.composePackage)
+			if err != nil {
+				t.Fatal(err.Error())
+			}
+			output := strings.TrimSpace(string(dat))
+			expected := strings.TrimSpace(tc.expected)
+			if output != expected {
+				t.Logf("expected:\n%s", expected)
+				t.Logf("actual:\n%s", output)
+				dmp := gdiff.New()
+				diffs := dmp.DiffMain(expected, output, false)
+				t.Fatal(dmp.DiffPrettyText(diffs))
+			}
+		})
+	}
+}

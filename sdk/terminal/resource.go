@@ -1,0 +1,436 @@
+package s4wave_terminal
+
+import (
+	"context"
+	stderrors "errors"
+	"io"
+	"slices"
+	"sync/atomic"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/pkg/errors"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	"github.com/s4wave/spacewave/core/transport"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/link"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/stream"
+	stream_packet "github.com/s4wave/spacewave/net/stream/packet"
+	s4wave_world "github.com/s4wave/spacewave/sdk/world"
+)
+
+const terminalFrameMaxBytes = 4 * 1024 * 1024
+
+type terminalConnectResult struct {
+	err          error
+	updateState  bool
+	finalState   TerminalSessionState
+	status       string
+	errorMessage string
+}
+
+// TerminalResource implements the TerminalResourceService SRPC interface.
+type TerminalResource struct {
+	b           bus.Bus
+	ws          world.WorldState
+	engine      world.Engine
+	objKey      string
+	sessionPeer peer.ID
+	state       *Terminal
+	bcast       broadcast.Broadcast
+	mux         srpc.Mux
+}
+
+// NewTerminalResource creates a new TerminalResource.
+// sessionPeer is the viewer's Session peer. A Device terminal opens its shell
+// stream on that Session's transport bus, where the Device's link resolves.
+func NewTerminalResource(
+	b bus.Bus,
+	ws world.WorldState,
+	engine world.Engine,
+	objKey string,
+	sessionPeer peer.ID,
+	state *Terminal,
+) *TerminalResource {
+	if state == nil {
+		state = &Terminal{}
+	}
+	r := &TerminalResource{
+		b:           b,
+		ws:          ws,
+		engine:      engine,
+		objKey:      objKey,
+		sessionPeer: sessionPeer,
+		state:       state,
+	}
+	r.mux = resource_server.NewResourceMux(func(mux srpc.Mux) error {
+		return SRPCRegisterTerminalResourceService(mux, r)
+	})
+	return r
+}
+
+// GetMux returns the srpc mux for this resource.
+func (r *TerminalResource) GetMux() srpc.Mux {
+	return r.mux
+}
+
+// WatchTerminalState streams Terminal state changes from world object revisions.
+func (r *TerminalResource) WatchTerminalState(_ *WatchTerminalStateRequest, strm SRPCTerminalResourceService_WatchTerminalStateStream) error {
+	return s4wave_world.WatchWorldObject(strm.Context(), r.ws, r.objKey, readTerminalObject,
+		func(state *Terminal, changed bool) error {
+			r.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+				r.state = state.CloneVT()
+				broadcast()
+			})
+			if changed {
+				return strm.Send(&WatchTerminalStateResponse{State: state.CloneVT()})
+			}
+			return nil
+		})
+}
+
+// ConnectTerminal opens the live stream for this Terminal target.
+func (r *TerminalResource) ConnectTerminal(strm SRPCTerminalResourceService_ConnectTerminalStream) error {
+	// Keep the terminal connection context alive until this stream ends.
+	ctx, cancel := context.WithCancel(strm.Context())
+	defer cancel()
+
+	// Validate the current Terminal before choosing its connection target.
+	current := r.currentState()
+	if err := current.Validate(); err != nil {
+		return err
+	}
+
+	// Connect the Terminal through the protocol for its target kind.
+	switch EffectiveTerminalTargetKind(current) {
+	case TerminalTargetKind_TERMINAL_TARGET_KIND_DEVICE:
+		return r.connectDeviceTerminal(ctx, cancel, strm, current)
+	case TerminalTargetKind_TERMINAL_TARGET_KIND_SSH_HOST:
+		return r.connectSshHostTerminal(ctx, cancel, strm, current)
+	default:
+		return errors.New("terminal target is required")
+	}
+}
+
+func (r *TerminalResource) connectDeviceTerminal(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	strm SRPCTerminalResourceService_ConnectTerminalStream,
+	current *Terminal,
+) error {
+	// Require the bus and decode the terminal Device peer ID.
+	if r.b == nil {
+		return errors.New("terminal resource requires a bus to connect")
+	}
+	remotePeer, err := peer.IDB58Decode(current.GetDevicePeerId())
+	if err != nil {
+		return errors.Wrap(err, "terminal device peer id")
+	}
+
+	// Publish the terminal connection attempt before opening its stream.
+	if err := r.updateState(ctx, TerminalSessionState_TERMINAL_SESSION_STATE_CONNECTING, "connecting", ""); err != nil {
+		return err
+	}
+
+	// Resolve the viewer's Session bus and open the remote shell stream on it,
+	// then release both when the terminal ends.
+	sessionTransport, releaseSession, err := transport.ResolveSessionTransport(ctx, r.b, r.sessionPeer, func() {
+		cancel()
+	})
+	if err != nil {
+		state, status, errMessage := terminalConnectOpenFailureState(ctx, err, "failed to connect")
+		_ = r.updateState(context.Background(), state, status, errMessage)
+		return errors.Wrap(err, "resolve terminal session transport")
+	}
+	defer releaseSession()
+	if sessionTransport == nil {
+		return r.failTerminalConnect("no session transport for the viewer's session")
+	}
+	sessionBus := sessionTransport.GetChildBus()
+	if sessionBus == nil {
+		return r.failTerminalConnect("session transport stopped")
+	}
+	ms, release, err := link.OpenStreamWithPeerEx(
+		ctx,
+		sessionBus,
+		RemoteShellProtocolID,
+		"",
+		remotePeer,
+		0,
+		stream.OpenOpts{},
+	)
+	if err != nil {
+		state, status, errMessage := terminalConnectOpenFailureState(ctx, err, "failed to connect")
+		_ = r.updateState(context.Background(), state, status, errMessage)
+		return err
+	}
+	defer release()
+	defer ms.GetStream().Close()
+
+	// Send the terminal dimensions, command, and environment to the Device.
+	frameSession := stream_packet.NewSession(ms.GetStream(), terminalFrameMaxBytes)
+	cols, rows := NormalizeTerminalFrameSize(current.GetCols(), current.GetRows())
+	if err := frameSession.SendMsg(&TerminalFrame{
+		Kind:        TerminalFrameKind_TERMINAL_FRAME_KIND_OPEN,
+		Cols:        cols,
+		Rows:        rows,
+		Command:     current.GetCommand(),
+		Environment: slices.Clone(current.GetEnvironment()),
+	}); err != nil {
+		state, status, errMessage := terminalConnectOpenFailureState(ctx, err, "failed to open")
+		_ = r.updateState(context.Background(), state, status, errMessage)
+		return err
+	}
+
+	// Forward terminal frames between the client and Device.
+	errCh := make(chan terminalConnectResult, 2)
+	var clientClosed atomic.Bool
+	go r.forwardClientFrames(ctx, strm, frameSession, &clientClosed, errCh)
+	go r.forwardRemoteFrames(ctx, strm, frameSession, &clientClosed, errCh)
+
+	// Stop both forwarders and publish the terminal connection result.
+	result := <-errCh
+	cancel()
+	if result.err != nil && !stderrors.Is(result.err, context.Canceled) && !stderrors.Is(result.err, io.EOF) {
+		_ = r.updateState(context.Background(), TerminalSessionState_TERMINAL_SESSION_STATE_FAILED, "terminal failed", result.err.Error())
+		return result.err
+	}
+	if result.updateState {
+		return r.updateState(context.Background(), result.finalState, result.status, result.errorMessage)
+	}
+	return nil
+}
+
+// failTerminalConnect publishes the failure state with errMessage.
+func (r *TerminalResource) failTerminalConnect(errMessage string) error {
+	_ = r.updateState(context.Background(), TerminalSessionState_TERMINAL_SESSION_STATE_FAILED, "failed to connect", errMessage)
+	return stderrors.New(errMessage)
+}
+
+func terminalConnectOpenFailureState(ctx context.Context, err error, status string) (TerminalSessionState, string, string) {
+	if ctx.Err() != nil {
+		return TerminalSessionState_TERMINAL_SESSION_STATE_DISCONNECTED, "disconnected", ""
+	}
+	return TerminalSessionState_TERMINAL_SESSION_STATE_FAILED, status, err.Error()
+}
+
+func (r *TerminalResource) forwardClientFrames(
+	ctx context.Context,
+	strm SRPCTerminalResourceService_ConnectTerminalStream,
+	frameSession *stream_packet.Session,
+	clientClosed *atomic.Bool,
+	errCh chan<- terminalConnectResult,
+) {
+	for {
+		frame, err := strm.Recv()
+		if err != nil {
+			_ = frameSession.SendMsg(&TerminalFrame{Kind: TerminalFrameKind_TERMINAL_FRAME_KIND_CLOSE})
+			errCh <- terminalConnectResult{
+				err:         err,
+				updateState: true,
+				finalState:  TerminalSessionState_TERMINAL_SESSION_STATE_DISCONNECTED,
+				status:      "disconnected",
+			}
+			return
+		}
+		if frame == nil {
+			continue
+		}
+		switch frame.GetKind() {
+		case TerminalFrameKind_TERMINAL_FRAME_KIND_INPUT,
+			TerminalFrameKind_TERMINAL_FRAME_KIND_RESIZE,
+			TerminalFrameKind_TERMINAL_FRAME_KIND_CLOSE:
+			if frame.GetKind() == TerminalFrameKind_TERMINAL_FRAME_KIND_CLOSE {
+				clientClosed.Store(true)
+			}
+			if err := frameSession.SendMsg(frame); err != nil {
+				errCh <- terminalConnectResult{err: err}
+				return
+			}
+			if frame.GetKind() == TerminalFrameKind_TERMINAL_FRAME_KIND_CLOSE {
+				return
+			}
+		default:
+			errCh <- terminalConnectResult{err: errors.Errorf("unsupported terminal client frame kind %s", frame.GetKind().String())}
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			errCh <- terminalConnectResult{
+				err:         err,
+				updateState: true,
+				finalState:  TerminalSessionState_TERMINAL_SESSION_STATE_DISCONNECTED,
+				status:      "disconnected",
+			}
+			return
+		}
+	}
+}
+
+func (r *TerminalResource) forwardRemoteFrames(
+	ctx context.Context,
+	strm SRPCTerminalResourceService_ConnectTerminalStream,
+	frameSession *stream_packet.Session,
+	clientClosed *atomic.Bool,
+	errCh chan<- terminalConnectResult,
+) {
+	for {
+		frame := &TerminalFrame{}
+		if err := frameSession.RecvMsg(frame); err != nil {
+			finalState, status, errMessage := terminalConnectDisconnectState(clientClosed.Load())
+			errCh <- terminalConnectResult{
+				err:          err,
+				updateState:  true,
+				finalState:   finalState,
+				status:       status,
+				errorMessage: errMessage,
+			}
+			return
+		}
+		switch frame.GetKind() {
+		case TerminalFrameKind_TERMINAL_FRAME_KIND_READY:
+			if err := r.updateState(ctx, TerminalSessionState_TERMINAL_SESSION_STATE_ACTIVE, "active", ""); err != nil {
+				errCh <- terminalConnectResult{err: err}
+				return
+			}
+		case TerminalFrameKind_TERMINAL_FRAME_KIND_ERROR:
+			errMessage := frame.GetError()
+			if errMessage == "" {
+				errMessage = "terminal failed"
+			}
+			_ = r.updateState(ctx, TerminalSessionState_TERMINAL_SESSION_STATE_FAILED, "terminal failed", errMessage)
+			if err := strm.Send(frame); err != nil {
+				errCh <- terminalConnectResult{err: err}
+				return
+			}
+			errCh <- terminalConnectResult{err: errors.New(errMessage)}
+			return
+		case TerminalFrameKind_TERMINAL_FRAME_KIND_EXIT:
+			finalState, status, errMessage := terminalConnectExitState(clientClosed.Load())
+			if err := r.updateState(ctx, finalState, status, errMessage); err != nil {
+				errCh <- terminalConnectResult{err: err}
+				return
+			}
+		}
+		if err := strm.Send(frame); err != nil {
+			errCh <- terminalConnectResult{err: err}
+			return
+		}
+		if frame.GetKind() == TerminalFrameKind_TERMINAL_FRAME_KIND_EXIT ||
+			frame.GetKind() == TerminalFrameKind_TERMINAL_FRAME_KIND_ERROR {
+			errCh <- terminalConnectResult{}
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			errCh <- terminalConnectResult{
+				err:         err,
+				updateState: true,
+				finalState:  TerminalSessionState_TERMINAL_SESSION_STATE_DISCONNECTED,
+				status:      "disconnected",
+			}
+			return
+		}
+	}
+}
+
+func terminalConnectDisconnectState(clientClosed bool) (TerminalSessionState, string, string) {
+	if clientClosed {
+		return TerminalSessionState_TERMINAL_SESSION_STATE_CLOSED, "closed", ""
+	}
+	return TerminalSessionState_TERMINAL_SESSION_STATE_DISCONNECTED, "disconnected", ""
+}
+
+func terminalConnectExitState(clientClosed bool) (TerminalSessionState, string, string) {
+	if clientClosed {
+		return TerminalSessionState_TERMINAL_SESSION_STATE_CLOSED, "closed", ""
+	}
+	return TerminalSessionState_TERMINAL_SESSION_STATE_DISCONNECTED, "exited", ""
+}
+
+func (r *TerminalResource) currentState() *Terminal {
+	var current *Terminal
+	r.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		current = r.state.CloneVT()
+	})
+	if current == nil {
+		return &Terminal{}
+	}
+	return current
+}
+
+func (r *TerminalResource) updateState(ctx context.Context, state TerminalSessionState, status, errMessage string) error {
+	// Prepare and validate the updated Terminal session record.
+	current := r.currentState()
+	updated := current.CloneVT()
+	updated.State = state
+	updated.Status = status
+	updated.Error = errMessage
+	updated.UpdatedAt = timestamppb.New(time.Now())
+	if err := updated.Validate(); err != nil {
+		return err
+	}
+
+	// Persist the Terminal record before publishing its new state.
+	if err := r.persistState(ctx, updated); err != nil {
+		return errors.Wrap(err, "persist terminal state")
+	}
+
+	// Notify terminal state watchers of the persisted record.
+	r.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		r.state = updated.CloneVT()
+		broadcast()
+	})
+	return nil
+}
+
+func (r *TerminalResource) persistState(ctx context.Context, state *Terminal) error {
+	// Require a World engine and open a terminal write transaction.
+	if r.engine == nil {
+		return errors.New("terminal resource requires a world engine for status updates")
+	}
+	wtx, err := r.engine.NewTransaction(ctx, true)
+	if err != nil {
+		return err
+	}
+
+	// Acquire the terminal object and discard the transaction if it is missing.
+	writeState, found, err := wtx.GetObject(ctx, r.objKey)
+	defer world.ReleaseObjectState(writeState)
+	if err != nil {
+		wtx.Discard()
+		return err
+	}
+	if !found {
+		wtx.Discard()
+		return world.ErrObjectNotFound
+	}
+
+	// Replace the terminal block within the write transaction.
+	_, _, err = world.AccessObjectState(ctx, writeState, true, func(bcs *block.Cursor) error {
+		bcs.SetBlock(state, true)
+		return nil
+	})
+	if err != nil {
+		wtx.Discard()
+		return err
+	}
+
+	return wtx.Commit(ctx)
+}
+
+func readTerminalObject(ctx context.Context, objState world.ObjectState) (*Terminal, error) {
+	state, err := s4wave_world.ReadWorldBlock[Terminal](ctx, objState)
+	if err != nil {
+		return nil, err
+	}
+	if state == nil {
+		state = &Terminal{}
+	}
+	return state, nil
+}
+
+var _ SRPCTerminalResourceServiceServer = (*TerminalResource)(nil)

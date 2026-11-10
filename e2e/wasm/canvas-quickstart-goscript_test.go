@@ -1,0 +1,511 @@
+//go:build !skip_e2e && !js
+
+package wasm
+
+import (
+	"context"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/fastjson"
+	"github.com/aperturerobotics/util/gitroot"
+	playwright "github.com/mxschmitt/playwright-go"
+	"github.com/s4wave/spacewave/e2e/drivebench"
+)
+
+const (
+	canvasQuickstartWaitMS      = 240000
+	canvasQuickstartProbeWaitMS = 120000
+)
+
+func TestGoScriptCanvasQuickstartScenario(t *testing.T) {
+	// Skip the test unless the compiler is GoScript.
+	compiler, err := ResolveE2EWasmCompiler()
+	if err != nil {
+		t.Fatalf("resolve wasm compiler: %v", err)
+	}
+	if compiler != E2EWasmCompilerGoScript {
+		t.Skipf("requires %s", E2EWasmCompilerGoScript)
+	}
+
+	// Open a clean session and capture its console.
+	sess := harness(t).NewCleanSession(t)
+	console, stopConsole := sess.WatchConsole()
+	defer stopConsole()
+	defer func() {
+		report := DrainCrashReport(console)
+		if report.HasCrash() {
+			t.Errorf("unexpected browser/WASM crash report during Canvas create/mutate gate: %+v", report)
+		}
+		if report.HasExitedGoLoop() {
+			t.Errorf("unexpected exited-Go loop during Canvas create/mutate gate: %+v", report)
+		}
+	}()
+
+	// Open the canvas quickstart.
+	page := sess.Page()
+	WaitForApp(t, page)
+	EnableQuickstartTimingLogs(t, page)
+	NavigateHash(t, harness(t), page, "#/quickstart/canvas")
+
+	// Require the canvas route and resource probe.
+	probe := waitForCanvasRouteResourceProbe(t, page)
+	if probe.Timeout {
+		t.Fatalf("Canvas route/resource probe timed out before mutation: %+v", probe)
+	}
+	if !strings.HasSuffix(probe.Hash, "/-/canvas-1") {
+		t.Fatalf("Canvas route = %q, want canonical /-/canvas-1 route; probe: %+v", probe.Hash, probe)
+	}
+
+	// Add a text node and wait for sync.
+	addCanvasTextNode(t, page, "GoScript Canvas Proof")
+	waitForCanvasText(t, page, "GoScript Canvas Proof")
+	waitForCanvasSynced(t, page)
+
+	// Collect three resize samples.
+	artifactDir := canvasResizeArtifactDir(t)
+	measurements := make([]float64, 3)
+	for idx := range measurements {
+		measurements[idx] = float64(resizeCanvasNode(t, page, "unixfs-demo")) / float64(time.Millisecond)
+	}
+
+	// Build the measurement object from those samples.
+	var arena fastjson.Arena
+	measurementObj := arena.NewObject()
+	measurementObj.Set("compiler", arena.NewString(string(compiler)))
+	measurementObj.Set("operation", arena.NewString("canvas-node-resize-applying-to-synced"))
+	measurementSamples := arena.NewArray()
+	for idx, sample := range measurements {
+		measurementSamples.SetArrayItem(idx, arena.NewNumberString(strconv.FormatFloat(sample, 'f', 6, 64)))
+	}
+	measurementObj.Set("samplesMs", measurementSamples)
+
+	// Write the measurement and log the samples.
+	measurementPath := filepath.Join(artifactDir, "benchmark.json")
+	writeMeasurements := func() {
+		measurementData := append(measurementObj.MarshalTo(nil), '\n')
+		if err := WriteTraceArtifact(measurementPath, measurementData); err != nil {
+			t.Fatalf("write Canvas resize measurements: %v", err)
+		}
+	}
+	t.Logf("goscript Canvas resize samples: %.3fms %.3fms %.3fms", measurements[0], measurements[1], measurements[2])
+
+	// Skip tracing when the trace service is disabled.
+	if !E2EWasmTraceServiceEnabled(compiler) {
+		writeMeasurements()
+		return
+	}
+
+	// Capture a traced resize and write the runtime trace.
+	var diagnosticDuration time.Duration
+	traceData, err := sess.CaptureTrace(t.Context(), "goscript-canvas-resize", func(context.Context) error {
+		diagnosticDuration = resizeCanvasNode(t, page, "unixfs-demo")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("capture Canvas resize trace: %v", err)
+	}
+	tracePath := filepath.Join(artifactDir, "runtime.trace")
+	if err := WriteTraceArtifact(tracePath, traceData); err != nil {
+		t.Fatalf("write Canvas resize trace: %v", err)
+	}
+
+	// Attach the trace summary and log the artifacts.
+	summary, _, _, _, _, operationShape := summarizeTrace(t, traceData)
+	if operationShape != nil {
+		measurementObj.Set("operationShape", drivebench.MarshalOperationShapeValue(&arena, *operationShape))
+	}
+	measurementObj.Set("tracedSampleMs", arena.NewNumberString(strconv.FormatFloat(float64(diagnosticDuration)/float64(time.Millisecond), 'f', 6, 64)))
+	writeMeasurements()
+	summaryPath := filepath.Join(artifactDir, "tracetool.txt")
+	if err := WriteTraceArtifact(summaryPath, []byte(summary)); err != nil {
+		t.Fatalf("write Canvas resize trace summary: %v", err)
+	}
+	t.Logf("goscript Canvas traced resize applied and watched in %s", diagnosticDuration)
+	t.Logf("goscript Canvas resize artifacts written to %s", artifactDir)
+}
+
+type canvasRouteResourceProbe struct {
+	Timeout     bool                    `json:"timeout"`
+	Hash        string                  `json:"hash"`
+	TimingState string                  `json:"timingState"`
+	HasViewport bool                    `json:"hasViewport"`
+	HasDemoNode bool                    `json:"hasDemoNode"`
+	AppText     string                  `json:"appText"`
+	RouteProbe  canvasRouteResourceData `json:"routeProbe"`
+}
+
+type canvasRouteResourceData struct {
+	Skipped      bool                   `json:"skipped"`
+	HasDebugRoot bool                   `json:"hasDebugRoot"`
+	Step         string                 `json:"step"`
+	Error        string                 `json:"error"`
+	SpaceState   canvasRouteSpaceState  `json:"spaceState"`
+	CanvasAccess canvasRouteCanvasState `json:"canvasAccess"`
+}
+
+type canvasRouteSpaceState struct {
+	Ready      bool     `json:"ready"`
+	IndexPath  string   `json:"indexPath"`
+	ObjectKeys []string `json:"objectKeys"`
+	ObjectType string   `json:"objectType"`
+}
+
+type canvasRouteCanvasState struct {
+	TypeID     string `json:"typeId"`
+	ResourceID int64  `json:"resourceId"`
+}
+
+func waitForCanvasRouteResourceProbe(t testing.TB, page playwright.Page) canvasRouteResourceProbe {
+	// Wait for the canvas route resource.
+	t.Helper()
+
+	// Poll the page until the canvas object and its route resource appear.
+	raw, err := page.Evaluate(`async (timeoutMS) => {
+		const deadline = Date.now() + timeoutMS
+
+		function firstStreamValue(stream) {
+			return (async () => {
+				for await (const value of stream) {
+					return value
+				}
+				return null
+			})()
+		}
+
+		function collect(timeout, routeProbe) {
+			const timing =
+				globalThis.__s4waveQuickstartTiming ??
+				globalThis.__s4wave_debug?.quickstartTiming ??
+				null
+			const hash = window.location.hash
+			return {
+				timeout,
+				hash,
+				timingState: timing?.state ?? '',
+				hasViewport: !!document.querySelector('[data-testid="canvas-viewport"]'),
+				hasDemoNode: !!document.querySelector('[data-canvas-node="unixfs-demo"]'),
+				appText: document.querySelector('#bldr-root')?.textContent?.replace(/\s+/g, ' ').slice(0, 2200) ?? '',
+				routeProbe,
+			}
+		}
+
+		async function routeProbe() {
+			const match = window.location.hash.match(/^#\/u\/([0-9]+)\/so\/([^/]+)/)
+			const root = globalThis.__s4wave_debug?.root
+			if (!match || !root) {
+				return { skipped: true, hasDebugRoot: !!root, step: 'match-route' }
+			}
+			const sessionIdx = Number(match[1])
+			const sharedObjectId = decodeURIComponent(match[2])
+			const mountSpace = globalThis.__s4wave_debug?.mountSpace
+			const cleanups = []
+			let step = 'mountSessionByIdx'
+			const cleanup = (value) => {
+				if (value?.release) {
+					cleanups.push(() => value.release())
+				}
+				return value
+			}
+			try {
+				const abort = AbortSignal.timeout(15000)
+				const mounted = await root.mountSessionByIdx({ sessionIdx }, abort)
+				const session = cleanup(mounted?.session ?? null)
+				if (!session) return { skipped: false, hasDebugRoot: true, step, error: 'missing session' }
+				if (!mountSpace) return { skipped: false, hasDebugRoot: true, step: 'mountSpace', error: 'missing debug mountSpace helper' }
+				step = 'mountSpace'
+				const space = await mountSpace({
+					session,
+					spaceResp: {
+						sharedObjectRef: {
+							providerResourceRef: {
+								id: sharedObjectId,
+							},
+						},
+					},
+					abortSignal: abort,
+					cleanup,
+				})
+				step = 'watchSpaceState'
+				const state = await firstStreamValue(space.watchSpaceState({}, abort))
+				step = 'accessWorldState'
+				const world = cleanup(await space.accessWorldState(true, abort))
+				const listing = await world.listObjects({ limit: 100 }, abort)
+				const objects = (listing.objects ?? []).filter((obj) => !obj.objectKey?.startsWith('types/'))
+				const canvasObject = objects.find((obj) => obj.objectKey === 'canvas-1') ?? null
+				step = 'accessTypedObject'
+				const access = await world.accessTypedObject('canvas-1', abort)
+				const canvasRef = access?.resourceId
+					? cleanup(world.getResourceRef().createRef(access.resourceId))
+					: null
+				return {
+					skipped: false,
+					hasDebugRoot: true,
+					step,
+					spaceState: {
+						ready: !!state?.ready,
+						indexPath: state?.settings?.indexPath ?? '',
+						objectKeys: objects.map((obj) => obj.objectKey ?? ''),
+						objectType: canvasObject?.typeId ?? '',
+					},
+					canvasAccess: {
+						typeId: access.typeId ?? '',
+						resourceId: canvasRef ? access.resourceId : 0,
+					},
+				}
+			} catch (err) {
+				return {
+					skipped: false,
+					hasDebugRoot: true,
+					step,
+					error: String(err?.stack ?? err),
+				}
+			} finally {
+				for (let i = cleanups.length - 1; i >= 0; i--) {
+					try {
+						cleanups[i]()
+					} catch {}
+				}
+			}
+		}
+
+		let lastProbe = { skipped: true, hasDebugRoot: !!globalThis.__s4wave_debug?.root, step: 'not-started' }
+		while (Date.now() < deadline) {
+			const hash = window.location.hash
+			const canonicalRoute = hash.endsWith('/-/canvas-1')
+			const hasViewport = !!document.querySelector('[data-testid="canvas-viewport"]')
+			const hasDemoNode = !!document.querySelector('[data-canvas-node="unixfs-demo"]')
+			if (canonicalRoute) {
+				lastProbe = await routeProbe()
+				if (
+					lastProbe?.spaceState?.objectType === 'canvas' &&
+					lastProbe?.canvasAccess?.typeId === 'canvas' &&
+					!!lastProbe?.canvasAccess?.resourceId &&
+					hasViewport &&
+					hasDemoNode
+				) {
+					return JSON.stringify(collect(false, lastProbe))
+				}
+			}
+			await new Promise((resolve) => setTimeout(resolve, 250))
+		}
+		if (!lastProbe || lastProbe.skipped) {
+			lastProbe = await routeProbe()
+		}
+		return JSON.stringify(collect(true, lastProbe))
+	}`, canvasQuickstartProbeWaitMS)
+	if err != nil {
+		t.Fatalf("Canvas route/resource probe evaluation failed: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+	text, ok := raw.(string)
+	if !ok {
+		t.Fatalf("unexpected Canvas route/resource probe result %T: %#v", raw, raw)
+	}
+	probe, err := parseCanvasRouteResourceProbe(text)
+	if err != nil {
+		t.Fatalf("decode Canvas route/resource probe: %v\nraw: %s", err, text)
+	}
+	return probe
+}
+
+func parseCanvasRouteResourceProbe(text string) (canvasRouteResourceProbe, error) {
+	var parser fastjson.Parser
+	v, err := parser.Parse(text)
+	if err != nil {
+		return canvasRouteResourceProbe{}, err
+	}
+	return canvasRouteResourceProbe{
+		Timeout:     v.GetBool("timeout"),
+		Hash:        string(v.GetStringBytes("hash")),
+		TimingState: string(v.GetStringBytes("timingState")),
+		HasViewport: v.GetBool("hasViewport"),
+		HasDemoNode: v.GetBool("hasDemoNode"),
+		AppText:     string(v.GetStringBytes("appText")),
+		RouteProbe: canvasRouteResourceData{
+			Skipped:      v.GetBool("routeProbe", "skipped"),
+			HasDebugRoot: v.GetBool("routeProbe", "hasDebugRoot"),
+			Step:         string(v.GetStringBytes("routeProbe", "step")),
+			Error:        string(v.GetStringBytes("routeProbe", "error")),
+			SpaceState: canvasRouteSpaceState{
+				Ready:      v.GetBool("routeProbe", "spaceState", "ready"),
+				IndexPath:  string(v.GetStringBytes("routeProbe", "spaceState", "indexPath")),
+				ObjectKeys: canvasFastJSONStringSlice(v.GetArray("routeProbe", "spaceState", "objectKeys")),
+				ObjectType: string(v.GetStringBytes("routeProbe", "spaceState", "objectType")),
+			},
+			CanvasAccess: canvasRouteCanvasState{
+				TypeID:     string(v.GetStringBytes("routeProbe", "canvasAccess", "typeId")),
+				ResourceID: v.GetInt64("routeProbe", "canvasAccess", "resourceId"),
+			},
+		},
+	}, nil
+}
+
+func canvasFastJSONStringSlice(values []*fastjson.Value) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, string(value.GetStringBytes()))
+	}
+	return out
+}
+
+func addCanvasTextNode(t testing.TB, page playwright.Page, text string) {
+	// Report failures at the caller.
+	t.Helper()
+
+	// Click the text tool.
+	if err := page.Locator("button[aria-label='Text (T)']").First().Click(
+		playwright.LocatorClickOptions{Timeout: playwright.Float(canvasQuickstartWaitMS)},
+	); err != nil {
+		t.Fatalf("select Canvas text tool: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+
+	// Click the viewport to place the text node.
+	viewport := page.Locator("[data-testid='canvas-viewport']").First()
+	box, err := viewport.BoundingBox()
+	if err != nil {
+		t.Fatalf("measure Canvas viewport: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+	x := box.Width - 180
+	if x < 80 {
+		x = box.Width / 2
+	}
+	y := box.Height - 120
+	if y < 80 {
+		y = box.Height / 2
+	}
+	if err := viewport.Click(playwright.LocatorClickOptions{
+		Position: &playwright.Position{X: x, Y: y},
+		Timeout:  playwright.Float(canvasQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("place Canvas text node: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+
+	// Type the text and commit it.
+	editor := page.Locator("[data-testid='canvas-viewport'] textarea").First()
+	if err := editor.Fill(text, playwright.LocatorFillOptions{
+		Timeout: playwright.Float(canvasQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("fill Canvas text node: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+	if err := editor.Press("Control+Enter"); err != nil {
+		t.Fatalf("commit Canvas text node: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+}
+
+func waitForCanvasText(t testing.TB, page playwright.Page, text string) {
+	t.Helper()
+
+	_, err := page.WaitForFunction(`(arg) => {
+		const want = Array.isArray(arg) ? arg[0] : arg
+		const nodes = Array.from(document.querySelectorAll('[data-canvas-node]'))
+		return nodes.some((node) => (node.textContent ?? '').includes(want))
+	}`, []any{text}, playwright.PageWaitForFunctionOptions{
+		Timeout: playwright.Float(canvasQuickstartWaitMS),
+	})
+	if err != nil {
+		t.Fatalf("wait for Canvas text %q: %v\ndebug: %v", text, err, collectCanvasQuickstartDebug(page))
+	}
+}
+
+func canvasResizeArtifactDir(t testing.TB) string {
+	t.Helper()
+
+	repoRoot, err := gitroot.FindRepoRoot()
+	if err != nil {
+		t.Fatalf("find repo root for Canvas resize artifacts: %v", err)
+	}
+	return filepath.Join(repoRoot, ".bldr", "e2e-goscript-canvas-resize")
+}
+
+func waitForCanvasSynced(t testing.TB, page playwright.Page) {
+	t.Helper()
+
+	_, err := page.WaitForFunction(`() => {
+		const text = document.querySelector('[data-testid="canvas-viewport"]')?.textContent ?? ''
+		return text.includes('Synced') || !text.includes('Applying ')
+	}`, nil, playwright.PageWaitForFunctionOptions{
+		Timeout: playwright.Float(canvasQuickstartWaitMS),
+	})
+	if err != nil {
+		t.Fatalf("wait for Canvas sync: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+}
+
+func resizeCanvasNode(t testing.TB, page playwright.Page, nodeID string) time.Duration {
+	// Report failures at the caller.
+	t.Helper()
+
+	// Select the node and its resize handle.
+	node := page.Locator(`[data-canvas-node="` + nodeID + `"]`).First()
+	if err := node.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(canvasQuickstartWaitMS)}); err != nil {
+		t.Fatalf("select Canvas node %q: %v\ndebug: %v", nodeID, err, collectCanvasQuickstartDebug(page))
+	}
+	handle := node.Locator(".cursor-nwse-resize").First()
+	box, err := handle.BoundingBox()
+	if err != nil {
+		t.Fatalf("measure Canvas resize handle: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+
+	// Drag the handle and return the elapsed time.
+	start := time.Now()
+	if err := page.Mouse().Move(box.X+box.Width/2, box.Y+box.Height/2); err != nil {
+		t.Fatalf("move to Canvas resize handle: %v", err)
+	}
+	if err := page.Mouse().Down(); err != nil {
+		t.Fatalf("press Canvas resize handle: %v", err)
+	}
+	if err := page.Mouse().Move(box.X+box.Width/2+32, box.Y+box.Height/2+24); err != nil {
+		t.Fatalf("drag Canvas resize handle: %v", err)
+	}
+	if err := page.Mouse().Up(); err != nil {
+		t.Fatalf("release Canvas resize handle: %v", err)
+	}
+
+	// Wait until the resize is synced.
+	_, err = page.WaitForFunction(`() => {
+		const text = document.querySelector('[data-testid="canvas-viewport"]')?.textContent ?? ''
+		return text.includes('Applying ')
+	}`, nil, playwright.PageWaitForFunctionOptions{
+		Timeout: playwright.Float(canvasQuickstartWaitMS),
+	})
+	if err != nil {
+		t.Fatalf("wait for Canvas resize mutation: %v\ndebug: %v", err, collectCanvasQuickstartDebug(page))
+	}
+	waitForCanvasSynced(t, page)
+	return time.Since(start)
+}
+
+func collectCanvasQuickstartDebug(page playwright.Page) any {
+	debug, err := page.Evaluate(`() => JSON.stringify({
+		url: window.location.href,
+		hash: window.location.hash,
+		timing: globalThis.__s4waveQuickstartTiming ?? globalThis.__s4wave_debug?.quickstartTiming ?? null,
+		startup: globalThis.__swBootStatus ?? null,
+		startupMarks: globalThis.__swStartupMarks ?? [],
+		appText: document.querySelector('#bldr-root')?.textContent?.replace(/\s+/g, ' ').slice(0, 2200) ?? '',
+		canvasNodes: Array.from(document.querySelectorAll('[data-canvas-node]')).map((node) => ({
+			id: node.getAttribute('data-canvas-node'),
+			text: node.textContent?.replace(/\s+/g, ' ').trim().slice(0, 220) ?? '',
+		})),
+		buttons: Array.from(document.querySelectorAll('button')).map((button) => ({
+			text: button.textContent?.replace(/\s+/g, ' ').trim().slice(0, 120) ?? '',
+			ariaLabel: button.getAttribute('aria-label') ?? '',
+			title: button.getAttribute('title') ?? '',
+			disabled: button.disabled,
+		})),
+		testIds: Array.from(document.querySelectorAll('[data-testid]')).map((el) => ({
+			testid: el.getAttribute('data-testid'),
+			text: el.textContent?.replace(/\s+/g, ' ').trim().slice(0, 160) ?? '',
+		})),
+	})`)
+	if err != nil {
+		return "failed to collect Canvas quickstart debug: " + err.Error()
+	}
+	if s, ok := debug.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return debug
+}

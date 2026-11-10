@@ -1,0 +1,92 @@
+package space_migration
+
+import (
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	forge_dashboard "github.com/s4wave/spacewave/core/forge/dashboard"
+	space_world "github.com/s4wave/spacewave/core/space/world"
+	volume_world "github.com/s4wave/spacewave/db/volume/world"
+	forge_cluster "github.com/s4wave/spacewave/forge/cluster"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	forge_job "github.com/s4wave/spacewave/forge/job"
+	forge_pass "github.com/s4wave/spacewave/forge/pass"
+	forge_task "github.com/s4wave/spacewave/forge/task"
+	forge_worker "github.com/s4wave/spacewave/forge/worker"
+	s4wave_appconnector "github.com/s4wave/spacewave/sdk/appconnector"
+	s4wave_appconnector_world "github.com/s4wave/spacewave/sdk/appconnector/world"
+	s4wave_canvas_world "github.com/s4wave/spacewave/sdk/canvas/world"
+	spacewave_chat "github.com/s4wave/spacewave/sdk/chat"
+	spacewave_chat_world "github.com/s4wave/spacewave/sdk/chat/world"
+	s4wave_device "github.com/s4wave/spacewave/sdk/device"
+	s4wave_device_world "github.com/s4wave/spacewave/sdk/device/world"
+	s4wave_flowgraph "github.com/s4wave/spacewave/sdk/flowgraph"
+	s4wave_git_world "github.com/s4wave/spacewave/sdk/git/world"
+	s4wave_kv_world "github.com/s4wave/spacewave/sdk/kv/world"
+	s4wave_layout_world "github.com/s4wave/spacewave/sdk/layout/world"
+	s4wave_org "github.com/s4wave/spacewave/sdk/org"
+	s4wave_org_world "github.com/s4wave/spacewave/sdk/org/world"
+	s4wave_secret_world "github.com/s4wave/spacewave/sdk/secret/world"
+	s4wave_sshhost "github.com/s4wave/spacewave/sdk/sshhost"
+	s4wave_sshhost_world "github.com/s4wave/spacewave/sdk/sshhost/world"
+	s4wave_terminal "github.com/s4wave/spacewave/sdk/terminal"
+	s4wave_terminal_world "github.com/s4wave/spacewave/sdk/terminal/world"
+	s4wave_unixfs_world "github.com/s4wave/spacewave/sdk/unixfs/world"
+	s4wave_vm "github.com/s4wave/spacewave/sdk/vm"
+	s4wave_vm_world "github.com/s4wave/spacewave/sdk/vm/world"
+)
+
+// BuiltInRegistry returns the complete built-in ObjectType classification.
+func BuiltInRegistry() (*Registry, error) {
+	// Classify every built-in payload before exposing the registry to planners.
+	registry := NewRegistry()
+	handlers := []*TypedHandler{
+		NewSchemaHandler(space_world.SpaceSettingsTypeID, ClassificationRewrite, true, false, false, false, false, inspectSpaceSettings, rewriteSpaceSettings),
+		NewSchemaHandler(s4wave_layout_world.ObjectLayoutTypeID, ClassificationRewrite, true, false, false, false, false, inspectObjectLayout, rewriteObjectLayout),
+		NewSchemaHandler(s4wave_unixfs_world.UnixFSTypeID, ClassificationRewrite, false, false, false, false, false, inspectUnixFS, rewriteUnixFS),
+		NewSchemaHandler(s4wave_git_world.GitRepoTypeID, ClassificationRewrite, false, false, false, true, false, inspectGitRepo, rewriteGitRepo),
+		NewSchemaHandler(s4wave_git_world.GitWorktreeTypeID, ClassificationRewrite, true, false, false, true, false, inspectGitWorktree, rewriteGitWorktree),
+		NewSchemaHandler(s4wave_canvas_world.CanvasTypeID, ClassificationRewrite, true, false, true, true, false, inspectCanvas, rewriteCanvas),
+		NewSchemaHandler(s4wave_kv_world.KvStoreTypeID, ClassificationSpaceLocalOpaque, false, false, false, false, false, inspectKV, rewriteKV),
+		NewSchemaRefusalHandler(volume_world.ObjectTypeID, ClassificationNonMigratable, "Volume backing contains installation identity and requires an installation-aware migration"),
+		NewSchemaHandler(forge_cluster.ClusterTypeID, ClassificationRewrite, false, false, false, true, false, inspectForgeCluster, rewriteForgeCluster),
+		NewSchemaHandler(forge_job.JobTypeID, ClassificationRewrite, false, false, false, true, false, inspectForgeJob, rewriteForgeJob),
+		NewSchemaHandler(forge_task.TaskTypeID, ClassificationRewrite, true, false, false, true, true, inspectForgeTask, rewriteForgeTask),
+		NewSchemaHandler(forge_pass.PassTypeID, ClassificationRewrite, true, false, false, true, true, inspectForgePass, rewriteForgePass),
+		NewSchemaHandler(forge_execution.ExecutionTypeID, ClassificationRewrite, true, false, false, true, true, inspectForgeExecution, rewriteForgeExecution),
+		NewSchemaHandler(forge_worker.WorkerTypeID, ClassificationRewrite, false, false, false, true, false, inspectForgeWorker, rewriteForgeWorker),
+		NewSchemaHandler(forge_dashboard.ForgeDashboardTypeID, ClassificationRewrite, false, false, false, true, false, inspectForgeDashboard, rewriteForgeDashboard),
+		NewSchemaHandler(spacewave_chat.ChatChannelTypeID, ClassificationRewrite, false, false, false, true, false, inspectChatChannel, rewriteChatChannel),
+		NewSchemaHandler(spacewave_chat.ChatMessageTypeID, ClassificationRewrite, true, false, false, false, false, inspectChatMessage, rewriteChatMessage),
+		NewSchemaHandler(s4wave_device.DeviceTypeID, ClassificationRewrite, true, false, false, false, false, inspectDevice, rewriteDevice),
+		NewSchemaHandler(s4wave_flowgraph.FlowgraphTypeID, ClassificationRewrite, true, false, false, true, true, inspectFlowgraph, rewriteFlowgraph),
+		NewSchemaHandler(s4wave_flowgraph.FlowgraphRunTypeID, ClassificationRewrite, true, false, false, true, false, inspectFlowgraphRun, rewriteFlowgraphRun),
+		NewSchemaRefusalHandler(s4wave_device.ComputersDashboardTypeID, ClassificationExternalRef, "device dashboard payload is external and not admitted for rewrite"),
+		NewSchemaHandler(s4wave_terminal.TerminalTypeID, ClassificationRewrite, true, false, false, false, false, inspectTerminal, rewriteTerminal),
+		NewSchemaHandler(s4wave_sshhost.SshHostTypeID, ClassificationRewrite, true, false, false, false, false, inspectSSHHost, rewriteSSHHost),
+		NewSchemaHandler(s4wave_appconnector.AppConnectorTypeID, ClassificationRewrite, true, false, false, false, false, inspectAppConnector, rewriteAppConnector),
+		NewSchemaHandler(s4wave_appconnector.AppSnapshotTypeID, ClassificationRewrite, false, false, false, false, false, inspectAppSnapshot, rewriteAppSnapshot),
+		NewSchemaRefusalHandler(s4wave_vm.VmV86TypeID, ClassificationNonMigratable, "V86 runtime state is non-migratable"),
+		NewSchemaRefusalHandler(s4wave_vm.V86ImageTypeID, ClassificationExternalRef, "V86 image payload is external and not admitted for rewrite"),
+		NewSchemaRefusalHandler(s4wave_org.OrgStateTypeID, ClassificationNonMigratable, "organization state is non-migratable"),
+		NewSchemaHandler(s4wave_secret_world.SecretTypeID, ClassificationRewrite, false, true, false, false, true, inspectSecret, rewriteSecret),
+		NewSchemaRefusalHandler(bldr_manifest_world.ManifestTypeID, ClassificationExternalRef, "manifest payload is external and not admitted for rewrite"),
+	}
+
+	// Reject duplicate registrations before returning the complete inventory.
+	for _, handler := range handlers {
+		if err := registry.Register(handler); err != nil {
+			return nil, err
+		}
+	}
+	return registry, nil
+}
+
+// Keep imports for built-in world ObjectType packages visible to the registry.
+var (
+	_ = s4wave_org_world.OrganizationType
+	_ = s4wave_device_world.DeviceType
+	_ = s4wave_terminal_world.TerminalType
+	_ = s4wave_sshhost_world.SshHostType
+	_ = s4wave_appconnector_world.AppConnectorType
+	_ = s4wave_vm_world.VmV86Type
+	_ = spacewave_chat_world.ChatChannelType
+)

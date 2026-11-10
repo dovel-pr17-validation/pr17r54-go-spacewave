@@ -1,0 +1,192 @@
+package resource_account
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	account_settings "github.com/s4wave/spacewave/core/account/settings"
+	provider_local "github.com/s4wave/spacewave/core/provider/local"
+	api "github.com/s4wave/spacewave/core/provider/spacewave/api"
+	s4wave_account "github.com/s4wave/spacewave/sdk/account"
+)
+
+// TestBuildCloudSessionRows verifies cloud session rows normalize timestamps,
+// current-session state, and mirrored metadata onto the shared DTO.
+func TestBuildCloudSessionRows(t *testing.T) {
+	// Prepare cloud Session records and their mirrored presentation metadata.
+	rows := []*api.AccountSessionInfo{
+		{
+			PeerId:     "peer-current",
+			CreatedAt:  time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC).UnixMilli(),
+			LastSeen:   time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).UnixMilli(),
+			DeviceInfo: "macOS",
+		},
+		{
+			PeerId:     "peer-other",
+			CreatedAt:  time.Date(2026, 4, 10, 9, 0, 0, 0, time.UTC).UnixMilli(),
+			LastSeen:   time.Date(2026, 4, 12, 18, 0, 0, 0, time.UTC).UnixMilli(),
+			DeviceInfo: "Windows",
+		},
+	}
+	metadata := map[string]*account_settings.SessionPresentation{
+		"peer-current": {
+			PeerId:     "peer-current",
+			Label:      "Chrome on macOS (Portland, OR)",
+			DeviceType: "web",
+			ClientName: "Chrome",
+			Location:   "Portland, OR",
+		},
+		"peer-other": {
+			PeerId:     "peer-other",
+			Label:      "Alpha desktop on Windows",
+			DeviceType: "desktop",
+			ClientName: "Alpha desktop",
+		},
+	}
+
+	// Build cloud Session rows and verify both Sessions are present.
+	got := buildCloudSessionRows("peer-current", rows, metadata)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(got))
+	}
+
+	// Verify the current cloud Session identity and presentation.
+	current := got[0]
+	if current.GetPeerId() != "peer-current" {
+		t.Fatalf("expected current peer %q, got %q", "peer-current", current.GetPeerId())
+	}
+	if !current.GetCurrentSession() {
+		t.Fatal("expected current cloud row to be marked current")
+	}
+	if current.GetKind() != s4wave_account.AccountSessionKind_AccountSessionKind_ACCOUNT_SESSION_KIND_CLOUD_AUTH_SESSION {
+		t.Fatalf("expected cloud session kind, got %v", current.GetKind())
+	}
+	if current.GetLabel() != "Chrome on macOS (Portland, OR)" {
+		t.Fatalf("expected current label %q, got %q", "Chrome on macOS (Portland, OR)", current.GetLabel())
+	}
+	if current.GetClientName() != "Chrome" {
+		t.Fatalf("expected current client name %q, got %q", "Chrome", current.GetClientName())
+	}
+	if current.GetLocation() != "Portland, OR" {
+		t.Fatalf("expected current location %q, got %q", "Portland, OR", current.GetLocation())
+	}
+	if current.GetOs() != "macOS" {
+		t.Fatalf("expected current os %q, got %q", "macOS", current.GetOs())
+	}
+
+	// Verify that the current cloud Session carries both timestamps.
+	if current.GetCreatedAt() == nil || current.GetLastSeenAt() == nil {
+		t.Fatal("expected current timestamps to be set")
+	}
+
+	// Verify the other cloud Session identity and desktop presentation.
+	other := got[1]
+	if other.GetPeerId() != "peer-other" {
+		t.Fatalf("expected other peer %q, got %q", "peer-other", other.GetPeerId())
+	}
+	if other.GetCurrentSession() {
+		t.Fatal("expected other cloud row to be non-current")
+	}
+	if other.GetLabel() != "Alpha desktop on Windows" {
+		t.Fatalf("expected other label %q, got %q", "Alpha desktop on Windows", other.GetLabel())
+	}
+	if other.GetClientName() != "Alpha desktop" {
+		t.Fatalf("expected other client name %q, got %q", "Alpha desktop", other.GetClientName())
+	}
+	if other.GetDeviceType() != "desktop" {
+		t.Fatalf("expected other device type %q, got %q", "desktop", other.GetDeviceType())
+	}
+	if other.GetOs() != "Windows" {
+		t.Fatalf("expected other os %q, got %q", "Windows", other.GetOs())
+	}
+}
+
+// TestMarshalMultiSigRequestUsesProtoBinary verifies account-resource multi-sig
+// requests stay on the protobuf binary wire format expected by cloud routes.
+func TestMarshalMultiSigRequestUsesProtoBinary(t *testing.T) {
+	// Prepare a multi-signature request with a timestamped entity signature.
+	req := &api.MultiSigRequest{
+		Envelope: []byte("envelope"),
+		Signatures: []*api.EntitySignature{{
+			PeerId:    "12D3KooWPeer",
+			Signature: []byte("signature"),
+			SignedAt:  timestamppb.New(time.Unix(1713571200, 123000000)),
+		}},
+	}
+
+	// Encode the multi-signature request using the cloud wire format.
+	body, err := marshalMultiSigRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Decode the protobuf request and verify every field survives encoding.
+	var decoded api.MultiSigRequest
+	if err := decoded.UnmarshalVT(body); err != nil {
+		t.Fatalf("expected protobuf binary multi-sig request, got decode error: %v", err)
+	}
+	if !decoded.EqualVT(req) {
+		t.Fatal("decoded multi-sig request does not match original")
+	}
+}
+
+// TestCloudOnlyWatchesRejectLocalAccountResource verifies cloud-only dashboard
+// streams get a typed error instead of a nil-pointer panic if mounted against a
+// local account resource.
+func TestCloudOnlyWatchesRejectLocalAccountResource(t *testing.T) {
+	// Prepare a local account Resource for the cloud-only watch check.
+	r := &AccountResource{localAccount: &provider_local.ProviderAccount{}}
+	ctx := context.Background()
+
+	// Verify that the cloud-only authentication watch rejects the local account.
+	err := r.WatchAuthMethods(
+		&s4wave_account.WatchAuthMethodsRequest{},
+		&testWatchAuthMethodsStream{ctx: ctx},
+	)
+	if err == nil {
+		t.Fatal("expected local account resource auth-method watch to fail")
+	}
+	if !strings.Contains(err.Error(), "cloud account") {
+		t.Fatalf("expected cloud account error, got %v", err)
+	}
+}
+
+type testStream struct {
+	ctx context.Context
+}
+
+func (s *testStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *testStream) MsgSend(srpc.Message) error {
+	return nil
+}
+
+func (s *testStream) MsgRecv(srpc.Message) error {
+	return nil
+}
+
+func (s *testStream) CloseSend() error {
+	return nil
+}
+
+func (s *testStream) Close() error {
+	return nil
+}
+
+type testWatchAuthMethodsStream struct {
+	testStream
+}
+
+func (s *testWatchAuthMethodsStream) Send(*s4wave_account.WatchAuthMethodsResponse) error {
+	return nil
+}
+
+func (s *testWatchAuthMethodsStream) SendAndClose(*s4wave_account.WatchAuthMethodsResponse) error {
+	return nil
+}

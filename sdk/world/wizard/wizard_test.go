@@ -1,0 +1,1714 @@
+//go:build !js
+
+package s4wave_wizard_test
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	timestamppb "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	resource "github.com/s4wave/spacewave/bldr/resource"
+	resource_client "github.com/s4wave/spacewave/bldr/resource/client"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	forge_job_ops "github.com/s4wave/spacewave/core/forge/job"
+	forge_task_ops "github.com/s4wave/spacewave/core/forge/task"
+	s4wave_git "github.com/s4wave/spacewave/core/git"
+	resource_testbed "github.com/s4wave/spacewave/core/resource/testbed"
+	"github.com/s4wave/spacewave/db/block"
+	git_block "github.com/s4wave/spacewave/db/git/block"
+	db_testbed "github.com/s4wave/spacewave/db/testbed"
+	"github.com/s4wave/spacewave/db/world"
+	world_block "github.com/s4wave/spacewave/db/world/block"
+	forge_cluster "github.com/s4wave/spacewave/forge/cluster"
+	forge_job "github.com/s4wave/spacewave/forge/job"
+	bifcrypto "github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_testbed "github.com/s4wave/spacewave/sdk/testbed"
+	s4wave_world "github.com/s4wave/spacewave/sdk/world"
+	"github.com/s4wave/spacewave/sdk/world/objecttype"
+	objecttype_controller "github.com/s4wave/spacewave/sdk/world/objecttype/controller"
+	s4wave_wizard "github.com/s4wave/spacewave/sdk/world/wizard"
+	wizard_resource "github.com/s4wave/spacewave/sdk/world/wizard/resource"
+	"github.com/sirupsen/logrus"
+)
+
+func setupWizardRegistryClient(t *testing.T) (context.Context, *resource_client.Client) {
+	// Create the wizard registry and its in-memory RPC connection.
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	r := s4wave_wizard.NewWizardRegistryResource(nil)
+	clientPipe, serverPipe := net.Pipe()
+
+	// Connect the wizard RPC client to the client pipe.
+	clientMp, err := srpc.NewMuxedConn(clientPipe, true, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	srpcClient := srpc.NewClientWithMuxedConn(clientMp)
+
+	// Register the wizard resource service on the server mux.
+	resourceSrv := resource_server.NewResourceServer(r.GetMux())
+	serverMux := srpc.NewMux()
+	if err := resourceSrv.Register(serverMux); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Serve the wizard registry over the server pipe.
+	server := srpc.NewServer(serverMux)
+	serverMp, err := srpc.NewMuxedConn(serverPipe, false, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	go func() {
+		if err := server.AcceptMuxedConn(ctx, serverMp); err != nil && ctx.Err() == nil {
+			panic(err)
+		}
+	}()
+
+	// Create the resource client for wizard RPC calls.
+	resourceSvc := resource.NewSRPCResourceServiceClient(srpcClient)
+	client, err := resource_client.NewClient(ctx, resourceSvc)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Release the wizard client and pipes when the test ends.
+	t.Cleanup(func() {
+		// Wait for wizard client shutdown before closing its transport.
+		client.Release()
+		<-client.Done()
+		cancel()
+		clientPipe.Close()
+		serverPipe.Close()
+	})
+
+	return ctx, client
+}
+
+// setupWizardWorldEngine creates a world engine with the wizard object type
+// controller registered.
+func setupWizardWorldEngine(ctx context.Context, t *testing.T) (*resource_client.Client, *s4wave_world.Engine, func()) {
+	// Start the resource testbed with an RPC client.
+	t.Helper()
+	tb, resClient, tbCleanup := resource_testbed.SetupTestbedWithClient(ctx, t)
+
+	// Register the wizard object type controller on the testbed bus.
+	lookupFunc := func(ctx context.Context, typeID string) (objecttype.ObjectType, error) {
+		return wizard_resource.LookupWizardObjectType(ctx, typeID)
+	}
+	objectTypeCtrl := objecttype_controller.NewController(lookupFunc)
+	objectTypeCtrlRelease, err := tb.Bus.AddController(ctx, objectTypeCtrl, nil)
+	if err != nil {
+		tbCleanup()
+		t.Fatalf("add ObjectType controller: %v", err)
+	}
+
+	// Open the root resource RPC client.
+	rootRef := resClient.AccessRootResource()
+	srpcClient, err := rootRef.GetClient()
+	if err != nil {
+		objectTypeCtrlRelease()
+		rootRef.Release()
+		tbCleanup()
+		t.Fatalf("get root client: %v", err)
+	}
+
+	// Create a World through the testbed resource service.
+	testbedClient := s4wave_testbed.NewSRPCTestbedResourceServiceClient(srpcClient)
+	createResp, err := testbedClient.CreateWorld(ctx, &s4wave_testbed.CreateWorldRequest{})
+	if err != nil {
+		objectTypeCtrlRelease()
+		rootRef.Release()
+		tbCleanup()
+		t.Fatalf("create world: %v", err)
+	}
+
+	// Open the World engine from its resource reference.
+	engineRef := resClient.CreateResourceReference(createResp.ResourceId)
+	engine, err := s4wave_world.NewEngine(resClient, engineRef)
+	if err != nil {
+		engineRef.Release()
+		objectTypeCtrlRelease()
+		rootRef.Release()
+		tbCleanup()
+		t.Fatalf("create engine: %v", err)
+	}
+
+	// Prepare cleanup for the World engine and object type controller.
+	cleanup := func() {
+		// Release the World engine, object type controller, and root resource.
+		engine.Release()
+		objectTypeCtrlRelease()
+		rootRef.Release()
+
+		// Drain the object type lookup before releasing the testbed.
+		_, _, ref, err := bus.ExecOneOffTyped[objecttype.ObjectType](
+			ctx,
+			tb.Bus,
+			objecttype.NewLookupObjectType("wizard/cleanup"),
+			bus.ReturnWhenIdle(),
+			nil,
+		)
+		if err == nil && ref != nil {
+			ref.Release()
+		}
+		tbCleanup()
+	}
+
+	return resClient, engine, cleanup
+}
+
+// setupWizardWatchWorld builds a World holding the wizard state at objKey.
+// It returns the World as a Tx, which is safe for the concurrent watcher.
+func setupWizardWatchWorld(
+	t *testing.T,
+	ctx context.Context,
+	objKey string,
+	state *s4wave_wizard.WizardState,
+) (*world_block.Tx, func()) {
+	// Build an empty World on a testbed.
+	t.Helper()
+	le := logrus.NewEntry(logrus.New())
+	tb, err := db_testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	ocs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		tb.Release()
+		t.Fatal(err.Error())
+	}
+
+	// Build the World state on the cursor.
+	cleanup := func() {
+		ocs.Release()
+		tb.Release()
+	}
+	ws, err := world_block.BuildMockWorldState(ctx, le, true, ocs, false)
+	if err != nil {
+		cleanup()
+		t.Fatal(err.Error())
+	}
+
+	// Create the wizard object and commit it.
+	tx := world_block.NewTx(ws)
+	createdObject, _, err := world.CreateWorldObject(ctx, tx, objKey, func(bcs *block.Cursor) error {
+		bcs.SetBlock(state, true)
+		return nil
+	})
+	world.ReleaseObjectState(createdObject)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if err != nil {
+		cleanup()
+		t.Fatal(err.Error())
+	}
+	return tx, cleanup
+}
+
+// setWizardWatchWorldState writes state to objKey and commits it.
+func setWizardWatchWorldState(
+	t *testing.T,
+	ctx context.Context,
+	tx *world_block.Tx,
+	objKey string,
+	state *s4wave_wizard.WizardState,
+) {
+	// Replace the object state and commit it.
+	t.Helper()
+	_, _, err := world.AccessWorldObject(ctx, tx, objKey, true, func(bcs *block.Cursor) error {
+		bcs.SetBlock(state, true)
+		return nil
+	})
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func requireWizardStateName(t *testing.T, state *s4wave_wizard.WizardState, name string) {
+	t.Helper()
+	if state.GetName() != name {
+		t.Fatalf("expected wizard state name %q, got %q", name, state.GetName())
+	}
+}
+
+func requireWizardStateNameEventually(
+	t *testing.T,
+	ch <-chan *s4wave_wizard.WatchWizardStateResponse,
+	done <-chan error,
+	stream string,
+	name string,
+) {
+	// Consume wizard snapshots until the expected name arrives.
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	var last string
+	for {
+		select {
+		case resp := <-ch:
+			last = resp.GetState().GetName()
+			if last == name {
+				return
+			}
+		case err := <-done:
+			t.Fatalf("%s watch exited before wizard state %q: %v", stream, name, err)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %s wizard state %q, last state %q", stream, name, last)
+		}
+	}
+}
+
+// accessWizardResource opens a wizard object through the typed-object service.
+func accessWizardResource(
+	ctx context.Context,
+	t *testing.T,
+	resClient *resource_client.Client,
+	engine *s4wave_world.Engine,
+	objectKey string,
+) (*s4wave_world.Tx, resource_client.ResourceRef, s4wave_wizard.SRPCWizardResourceServiceClient) {
+	// Open a read transaction for the wizard object.
+	t.Helper()
+	readTx, err := engine.NewTransaction(ctx, false)
+	if err != nil {
+		t.Fatalf("NewTransaction(read): %v", err)
+	}
+
+	// Open the transaction RPC client.
+	srpcClient, err := readTx.GetResourceRef().GetClient()
+	if err != nil {
+		readTx.Release()
+		t.Fatalf("GetClient: %v", err)
+	}
+
+	// Access the wizard through the typed-object service.
+	typedSvc := s4wave_world.NewSRPCTypedObjectResourceServiceClient(srpcClient)
+	resp, err := typedSvc.AccessTypedObject(ctx, &s4wave_world.AccessTypedObjectRequest{
+		ObjectKey: objectKey,
+	})
+	if err != nil {
+		readTx.Release()
+		t.Fatalf("AccessTypedObject: %v", err)
+	}
+	if resp.GetTypeId() != "wizard/test" {
+		readTx.Release()
+		t.Fatalf("expected type wizard/test, got %q", resp.GetTypeId())
+	}
+
+	// Open the wizard resource RPC client.
+	wizardRef := resClient.CreateResourceReference(resp.GetResourceId())
+	wizardClient, err := wizardRef.GetClient()
+	if err != nil {
+		wizardRef.Release()
+		readTx.Release()
+		t.Fatalf("GetClient(wizard): %v", err)
+	}
+
+	return readTx, wizardRef, s4wave_wizard.NewSRPCWizardResourceServiceClient(wizardClient)
+}
+
+// recvWizardState receives one wizard-state snapshot from a watch stream.
+func recvWizardState(
+	ctx context.Context,
+	t *testing.T,
+	wizardSvc s4wave_wizard.SRPCWizardResourceServiceClient,
+) *s4wave_wizard.WizardState {
+	// Bound the wait for a wizard state snapshot.
+	t.Helper()
+	watchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// Start the wizard state watch.
+	stream, err := wizardSvc.WatchWizardState(watchCtx, &s4wave_wizard.WatchWizardStateRequest{})
+	if err != nil {
+		t.Fatalf("WatchWizardState: %v", err)
+	}
+
+	// Receive and verify a populated wizard state snapshot.
+	msg, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("WatchWizardState.Recv: %v", err)
+	}
+	if msg.GetState() == nil {
+		t.Fatal("expected wizard state")
+	}
+
+	return msg.GetState()
+}
+
+func recvWizardTestValue[T any](t *testing.T, ch <-chan T, name string) T {
+	// Bound the wait for a wizard stream value.
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	// Receive the wizard stream value or report its closed or expired wait.
+	select {
+	case val, ok := <-ch:
+		if !ok {
+			t.Fatalf("%s channel closed", name)
+		}
+		return val
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s", name)
+	}
+	var zero T
+	return zero
+}
+
+type wizardRegistryStream struct {
+	ctx  context.Context
+	sent chan *s4wave_wizard.WatchWizardsResponse
+}
+
+func newWizardRegistryStream(ctx context.Context) *wizardRegistryStream {
+	return &wizardRegistryStream{
+		ctx:  ctx,
+		sent: make(chan *s4wave_wizard.WatchWizardsResponse),
+	}
+}
+
+func (s *wizardRegistryStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *wizardRegistryStream) MsgSend(srpc.Message) error {
+	panic("MsgSend should not be called")
+}
+
+func (s *wizardRegistryStream) MsgRecv(srpc.Message) error {
+	panic("MsgRecv should not be called")
+}
+
+func (s *wizardRegistryStream) CloseSend() error {
+	return nil
+}
+
+func (s *wizardRegistryStream) Close() error {
+	return nil
+}
+
+func (s *wizardRegistryStream) Send(resp *s4wave_wizard.WatchWizardsResponse) error {
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case s.sent <- resp.CloneVT():
+		return nil
+	}
+}
+
+func (s *wizardRegistryStream) SendAndClose(resp *s4wave_wizard.WatchWizardsResponse) error {
+	if resp != nil {
+		if err := s.Send(resp); err != nil {
+			return err
+		}
+	}
+	return s.CloseSend()
+}
+
+type wizardStateStream struct {
+	ctx  context.Context
+	sent chan *s4wave_wizard.WatchWizardStateResponse
+}
+
+func newWizardStateStream(ctx context.Context) *wizardStateStream {
+	return &wizardStateStream{
+		ctx:  ctx,
+		sent: make(chan *s4wave_wizard.WatchWizardStateResponse, 8),
+	}
+}
+
+func (s *wizardStateStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *wizardStateStream) MsgSend(srpc.Message) error {
+	panic("MsgSend should not be called")
+}
+
+func (s *wizardStateStream) MsgRecv(srpc.Message) error {
+	panic("MsgRecv should not be called")
+}
+
+func (s *wizardStateStream) CloseSend() error {
+	return nil
+}
+
+func (s *wizardStateStream) Close() error {
+	return nil
+}
+
+func (s *wizardStateStream) Send(resp *s4wave_wizard.WatchWizardStateResponse) error {
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case s.sent <- resp.CloneVT():
+		return nil
+	}
+}
+
+func (s *wizardStateStream) SendAndClose(resp *s4wave_wizard.WatchWizardStateResponse) error {
+	if resp != nil {
+		if err := s.Send(resp); err != nil {
+			return err
+		}
+	}
+	return s.CloseSend()
+}
+
+type gitCloneProgressStream struct {
+	ctx  context.Context
+	sent chan *s4wave_wizard.WatchGitCloneProgressResponse
+}
+
+func newGitCloneProgressStream(ctx context.Context) *gitCloneProgressStream {
+	return &gitCloneProgressStream{
+		ctx:  ctx,
+		sent: make(chan *s4wave_wizard.WatchGitCloneProgressResponse),
+	}
+}
+
+func (s *gitCloneProgressStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *gitCloneProgressStream) MsgSend(srpc.Message) error {
+	panic("MsgSend should not be called")
+}
+
+func (s *gitCloneProgressStream) MsgRecv(srpc.Message) error {
+	panic("MsgRecv should not be called")
+}
+
+func (s *gitCloneProgressStream) CloseSend() error {
+	return nil
+}
+
+func (s *gitCloneProgressStream) Close() error {
+	return nil
+}
+
+func (s *gitCloneProgressStream) Send(resp *s4wave_wizard.WatchGitCloneProgressResponse) error {
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case s.sent <- resp.CloneVT():
+		return nil
+	}
+}
+
+func (s *gitCloneProgressStream) SendAndClose(resp *s4wave_wizard.WatchGitCloneProgressResponse) error {
+	if resp != nil {
+		if err := s.Send(resp); err != nil {
+			return err
+		}
+	}
+	return s.CloseSend()
+}
+
+func TestWizardRegistryRegisterListWatchAndRelease(t *testing.T) {
+	// Connect the wizard client with a bounded registry watch.
+	ctx, client := setupWizardRegistryClient(t)
+	watchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// Open the root wizard registry service.
+	rootRef := client.AccessRootResource()
+	t.Cleanup(rootRef.Release)
+	rootClient, err := rootRef.GetClient()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	svc := s4wave_wizard.NewSRPCObjectWizardRegistryResourceServiceClient(rootClient)
+
+	// Watch the wizard registry and verify its static entries.
+	watch, err := svc.WatchWizards(watchCtx, &s4wave_wizard.WatchWizardsRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	first, err := watch.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	initialCount := len(first.GetWizards())
+	if initialCount == 0 {
+		t.Fatal("expected static object wizards")
+	}
+
+	// Register a persistent project board wizard.
+	resp, err := svc.RegisterWizard(ctx, &s4wave_wizard.RegisterWizardRequest{
+		Wizard: &s4wave_wizard.ObjectWizard{
+			TypeId:             "example/project-board",
+			PluginId:           "example-plugin",
+			DisplayName:        "Project Board",
+			Category:           "Examples",
+			IconName:           "LuPanelTop",
+			DefaultNamePattern: "Project Board",
+			Persistent:         true,
+			WizardTypeId:       "wizard/example/project-board",
+			KeyPrefix:          "example/project-board/",
+		},
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if resp.GetResourceId() == 0 {
+		t.Fatal("expected registration resource id")
+	}
+
+	// Verify the wizard list includes the assigned project board registration.
+	list, err := svc.ListWizards(ctx, &s4wave_wizard.ListWizardsRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(list.GetWizards()) != initialCount+1 {
+		t.Fatalf("expected %d wizards, got %d", initialCount+1, len(list.GetWizards()))
+	}
+	registered := list.GetWizards()[initialCount]
+	if registered.GetTypeId() != "example/project-board" {
+		t.Fatalf("expected example/project-board, got %s", registered.GetTypeId())
+	}
+	if registered.GetRegistrationId() == 0 {
+		t.Fatal("expected assigned registration id")
+	}
+
+	// Verify the registry watch publishes the added wizard.
+	second, err := watch.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(second.GetWizards()) != initialCount+1 {
+		t.Fatalf("expected watched registration, got %d wizards", len(second.GetWizards()))
+	}
+
+	// Release the project board wizard registration.
+	ref := client.CreateResourceReference(resp.GetResourceId())
+	ref.Release()
+
+	// Verify the registry watch removes the released wizard.
+	third, err := watch.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(third.GetWizards()) != initialCount {
+		t.Fatalf("expected release to remove wizard, got %d wizards", len(third.GetWizards()))
+	}
+}
+
+func TestWizardRegistryValidationAndDedupe(t *testing.T) {
+	// Create the registry for wizard validation checks.
+	r := s4wave_wizard.NewWizardRegistryResource(nil)
+
+	// Verify wizard registration requires a wizard record.
+	_, err := r.RegisterWizard(context.Background(), &s4wave_wizard.RegisterWizardRequest{})
+	if err != s4wave_wizard.ErrWizardRequired {
+		t.Fatalf("expected ErrWizardRequired, got %v", err)
+	}
+
+	// Prepare wizard records missing each required field.
+	base := &s4wave_wizard.ObjectWizard{
+		TypeId:      "gizmo/worklist",
+		PluginId:    "gizmo-web",
+		DisplayName: "Worklist",
+	}
+	cases := []struct {
+		name   string
+		wizard *s4wave_wizard.ObjectWizard
+		err    error
+	}{
+		{
+			name:   "type id",
+			wizard: &s4wave_wizard.ObjectWizard{PluginId: base.GetPluginId(), DisplayName: base.GetDisplayName()},
+			err:    s4wave_wizard.ErrWizardTypeIDRequired,
+		},
+		{
+			name:   "plugin id",
+			wizard: &s4wave_wizard.ObjectWizard{TypeId: base.GetTypeId(), DisplayName: base.GetDisplayName()},
+			err:    s4wave_wizard.ErrWizardPluginIDRequired,
+		},
+		{
+			name:   "display name",
+			wizard: &s4wave_wizard.ObjectWizard{TypeId: base.GetTypeId(), PluginId: base.GetPluginId()},
+			err:    s4wave_wizard.ErrWizardNameRequired,
+		},
+	}
+
+	// Verify each incomplete wizard registration is rejected.
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Register the incomplete wizard record.
+			_, err := r.RegisterWizard(context.Background(), &s4wave_wizard.RegisterWizardRequest{Wizard: tc.wizard})
+
+			// Verify the missing wizard field produces its expected error.
+			if err != tc.err {
+				t.Fatalf("expected %v, got %v", tc.err, err)
+			}
+		})
+	}
+
+	// Connect to the root wizard registry service.
+	ctx, client := setupWizardRegistryClient(t)
+	rootRef := client.AccessRootResource()
+	t.Cleanup(rootRef.Release)
+	rootClient, err := rootRef.GetClient()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	svc := s4wave_wizard.NewSRPCObjectWizardRegistryResourceServiceClient(rootClient)
+
+	// Register a complete wizard and retain its resource reference.
+	req := &s4wave_wizard.RegisterWizardRequest{Wizard: base}
+	resp, err := svc.RegisterWizard(ctx, req)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if resp.GetResourceId() == 0 {
+		t.Fatal("expected registration resource id")
+	}
+	ref := client.CreateResourceReference(resp.GetResourceId())
+	t.Cleanup(ref.Release)
+
+	// Verify the registry rejects a duplicate wizard registration.
+	_, err = svc.RegisterWizard(ctx, req)
+	if err != nil {
+		return
+	}
+	t.Fatal("expected duplicate wizard registration error")
+}
+
+func TestWizardRegistryStaticWizardsWinTypeDedupe(t *testing.T) {
+	// Connect to the root wizard registry service.
+	ctx, client := setupWizardRegistryClient(t)
+	rootRef := client.AccessRootResource()
+	t.Cleanup(rootRef.Release)
+	rootClient, err := rootRef.GetClient()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	svc := s4wave_wizard.NewSRPCObjectWizardRegistryResourceServiceClient(rootClient)
+
+	// Verify the wizard registry starts with static entries.
+	before, err := svc.ListWizards(ctx, &s4wave_wizard.ListWizardsRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(before.GetWizards()) == 0 {
+		t.Fatal("expected static object wizards")
+	}
+
+	// Register a dynamic Canvas wizard that overlaps a static type.
+	resp, err := svc.RegisterWizard(ctx, &s4wave_wizard.RegisterWizardRequest{
+		Wizard: &s4wave_wizard.ObjectWizard{
+			TypeId:       "canvas",
+			PluginId:     "gizmo-web",
+			DisplayName:  "Dynamic Canvas",
+			Category:     "Gizmo",
+			Persistent:   true,
+			WizardTypeId: "wizard/gizmo/canvas",
+		},
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if resp.GetResourceId() == 0 {
+		t.Fatal("expected registration resource id")
+	}
+	ref := client.CreateResourceReference(resp.GetResourceId())
+	t.Cleanup(ref.Release)
+
+	// Verify the static Canvas wizard wins type deduplication.
+	after, err := svc.ListWizards(ctx, &s4wave_wizard.ListWizardsRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(after.GetWizards()) != len(before.GetWizards()) {
+		t.Fatalf("expected static duplicate to be deduped, got %d before and %d after", len(before.GetWizards()), len(after.GetWizards()))
+	}
+	for _, wizard := range after.GetWizards() {
+		if wizard.GetTypeId() != "canvas" {
+			continue
+		}
+		if wizard.GetDisplayName() != "Canvas" {
+			t.Fatalf("expected static canvas wizard to win, got %s", wizard.GetDisplayName())
+		}
+		return
+	}
+	t.Fatal("expected canvas wizard")
+}
+
+func TestWizardRegistryStaticAppWizardVisibility(t *testing.T) {
+	expected := map[string]struct {
+		name         string
+		experimental bool
+	}{
+		"spacewave-chat/channel":    {"Chat Channel", false},
+		"forge/worker":              {"Forge Worker", false},
+		"spacewave/forge/dashboard": {"Forge Dashboard", false},
+		"forge/cluster":             {"Forge Cluster", false},
+		"forge/job":                 {"Forge Job", false},
+		"forge/task":                {"Forge Task", false},
+		"vm/v86":                    {"x86 VM", true},
+	}
+	seen := make(map[string]struct{}, len(expected))
+	for _, wizard := range s4wave_wizard.ObjectWizards {
+		want, ok := expected[wizard.GetTypeId()]
+		if !ok {
+			continue
+		}
+		seen[wizard.GetTypeId()] = struct{}{}
+		if wizard.GetDisplayName() != want.name {
+			t.Fatalf("expected %s display name %q, got %q", wizard.GetTypeId(), want.name, wizard.GetDisplayName())
+		}
+		if wizard.GetExperimental() != want.experimental {
+			t.Fatalf("expected %s experimental = %t, got %t", wizard.GetTypeId(), want.experimental, wizard.GetExperimental())
+		}
+	}
+	for typeID := range expected {
+		if _, ok := seen[typeID]; !ok {
+			t.Fatalf("expected static app wizard %s to be registered", typeID)
+		}
+	}
+}
+
+// TestWizardRegistryWatchHidesShadowedWizard checks that a plugin wizard
+// shadowed by a built-in type id changes no snapshot, and that the watch
+// delivers the next visible change.
+func TestWizardRegistryWatchHidesShadowedWizard(t *testing.T) {
+	// Connect the wizard client with a bounded registry watch.
+	ctx, client := setupWizardRegistryClient(t)
+	watchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// Open the root wizard registry service.
+	rootRef := client.AccessRootResource()
+	t.Cleanup(rootRef.Release)
+	rootClient, err := rootRef.GetClient()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	svc := s4wave_wizard.NewSRPCObjectWizardRegistryResourceServiceClient(rootClient)
+
+	// Watch the wizard registry and capture its static entry count.
+	watch, err := svc.WatchWizards(watchCtx, &s4wave_wizard.WatchWizardsRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	initial, err := watch.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	initialCount := len(initial.GetWizards())
+	if initialCount == 0 {
+		t.Fatal("expected static object wizards")
+	}
+
+	// Register a dynamic Canvas wizard shadowed by the static type.
+	resp, err := svc.RegisterWizard(ctx, &s4wave_wizard.RegisterWizardRequest{
+		Wizard: &s4wave_wizard.ObjectWizard{
+			TypeId:       "canvas",
+			PluginId:     "duplicate-plugin",
+			DisplayName:  "Dynamic Canvas",
+			Category:     "Examples",
+			Persistent:   true,
+			WizardTypeId: "wizard/duplicate/canvas",
+		},
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if resp.GetResourceId() == 0 {
+		t.Fatal("expected registration resource id")
+	}
+	ref := client.CreateResourceReference(resp.GetResourceId())
+	t.Cleanup(ref.Release)
+
+	// Register a visible wizard to trigger a registry watch snapshot.
+	visibleResp, err := svc.RegisterWizard(ctx, &s4wave_wizard.RegisterWizardRequest{
+		Wizard: &s4wave_wizard.ObjectWizard{
+			TypeId:      "example/visible",
+			PluginId:    "duplicate-plugin",
+			DisplayName: "Visible",
+		},
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	visibleRef := client.CreateResourceReference(visibleResp.GetResourceId())
+	t.Cleanup(visibleRef.Release)
+
+	// Verify the watch includes the visible wizard and hides the shadowed one.
+	next, err := watch.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if len(next.GetWizards()) != initialCount+1 {
+		t.Fatalf("expected only the visible wizard to be added, got %d before and %d after", initialCount, len(next.GetWizards()))
+	}
+	for _, wizard := range next.GetWizards() {
+		if wizard.GetTypeId() == "canvas" && wizard.GetDisplayName() != "Canvas" {
+			t.Fatalf("expected static canvas wizard to remain visible, got %s", wizard.GetDisplayName())
+		}
+	}
+}
+
+func TestWizardRegistryWatchCancellation(t *testing.T) {
+	// Start a cancellable wizard registry watch.
+	ctx, cancel := context.WithCancel(t.Context())
+	r := s4wave_wizard.NewWizardRegistryResource(nil)
+	strm := newWizardRegistryStream(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- r.WatchWizards(&s4wave_wizard.WatchWizardsRequest{}, strm)
+	}()
+
+	// Verify the wizard registry publishes its initial static entries.
+	initial := recvWizardTestValue(t, strm.sent, "initial wizard snapshot")
+	if len(initial.GetWizards()) == 0 {
+		t.Fatal("expected initial static object wizards")
+	}
+
+	// Cancel the wizard registry watch and verify it stops.
+	cancel()
+	if err := recvWizardTestValue(t, done, "wizard watch cancellation"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestWizardGitCloneProgressWatchSendsTerminalOnce(t *testing.T) {
+	// Bound the clone progress watch lifetime.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Create the wizard resource for the invalid clone request.
+	r := wizard_resource.NewWizardResource(nil, nil, "wizard/git/test", &s4wave_wizard.WizardState{})
+	defer r.Close()
+
+	// Start a Git clone with an invalid configuration.
+	_, err := r.StartGitClone(ctx, &s4wave_wizard.StartGitCloneRequest{
+		ObjectKey:  "git/repo/test",
+		Name:       "Test Repo",
+		ConfigData: []byte{0xff},
+	})
+	if err != nil {
+		t.Fatalf("StartGitClone: %v", err)
+	}
+
+	// Watch the Git clone progress until completion.
+	strm := newGitCloneProgressStream(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- r.WatchGitCloneProgress(&s4wave_wizard.WatchGitCloneProgressRequest{}, strm)
+	}()
+
+	// Verify clone progress reports exactly one terminal failure.
+	var states []s4wave_wizard.GitCloneProgressState
+	var terminalCount int
+	for {
+		select {
+		case resp := <-strm.sent:
+			progress := resp.GetProgress()
+			states = append(states, progress.GetState())
+			switch progress.GetState() {
+			case s4wave_wizard.GitCloneProgressState_GIT_CLONE_PROGRESS_STATE_DONE:
+				t.Fatalf("invalid clone config should not finish successfully: states %v", states)
+			case s4wave_wizard.GitCloneProgressState_GIT_CLONE_PROGRESS_STATE_FAILED:
+				terminalCount++
+			}
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("WatchGitCloneProgress: %v", err)
+			}
+			if terminalCount != 1 {
+				t.Fatalf("expected one terminal failure progress, got %d states %v", terminalCount, states)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for terminal clone progress: states %v", states)
+		}
+	}
+}
+
+func TestWizardGitCloneProgressWatchCancellation(t *testing.T) {
+	// Create a wizard resource with a cancellable clone context.
+	ctx, cancel := context.WithCancel(t.Context())
+	r := wizard_resource.NewWizardResource(nil, nil, "wizard/git/cancel", &s4wave_wizard.WizardState{})
+	defer r.Close()
+
+	// Start the Git clone progress watch.
+	strm := newGitCloneProgressStream(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- r.WatchGitCloneProgress(&s4wave_wizard.WatchGitCloneProgressRequest{}, strm)
+	}()
+
+	// Verify the clone progress watch starts idle.
+	initial := recvWizardTestValue(t, strm.sent, "initial clone progress")
+	if initial.GetProgress().GetState() != s4wave_wizard.GitCloneProgressState_GIT_CLONE_PROGRESS_STATE_IDLE {
+		t.Fatalf("expected idle initial progress, got %v", initial.GetProgress().GetState())
+	}
+
+	// Cancel the clone progress watch and verify it stops.
+	cancel()
+	if err := recvWizardTestValue(t, done, "clone progress watch cancellation"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestWizardResourceWatchSharesWorldUpdates(t *testing.T) {
+	// Create the initial wizard state in the World.
+	ctx := t.Context()
+	objKey := "wizard/watch-shared"
+	initial := &s4wave_wizard.WizardState{
+		Name:            "Draft Canvas",
+		TargetTypeId:    "canvas",
+		TargetKeyPrefix: "canvas/",
+	}
+	ws, cleanup := setupWizardWatchWorld(t, ctx, objKey, initial)
+	t.Cleanup(cleanup)
+
+	// Create the wizard resource and cancellable stream contexts.
+	resource := wizard_resource.NewWizardResource(ws, nil, objKey, initial)
+	t.Cleanup(resource.Close)
+	streamCtxA, cancelA := context.WithCancel(ctx)
+	defer cancelA()
+	streamCtxB, cancelB := context.WithCancel(ctx)
+	defer cancelB()
+
+	// Start two state watches on the shared wizard resource.
+	strmA := newWizardStateStream(streamCtxA)
+	strmB := newWizardStateStream(streamCtxB)
+	doneA := make(chan error, 1)
+	doneB := make(chan error, 1)
+	go func() {
+		doneA <- resource.WatchWizardState(&s4wave_wizard.WatchWizardStateRequest{}, strmA)
+	}()
+	go func() {
+		doneB <- resource.WatchWizardState(&s4wave_wizard.WatchWizardStateRequest{}, strmB)
+	}()
+
+	// Verify both wizard watches receive the initial state.
+	requireWizardStateName(t, recvWizardTestValue(t, strmA.sent, "stream A initial").GetState(), "Draft Canvas")
+	requireWizardStateName(t, recvWizardTestValue(t, strmB.sent, "stream B initial").GetState(), "Draft Canvas")
+
+	// Commit the configured wizard state to the World.
+	updated := initial.CloneVT()
+	updated.Name = "Configured Canvas"
+	updated.Step = 2
+	setWizardWatchWorldState(t, ctx, ws, objKey, updated)
+
+	// Verify both wizard watches receive the configured state.
+	requireWizardStateName(t, recvWizardTestValue(t, strmA.sent, "stream A update").GetState(), "Configured Canvas")
+	requireWizardStateName(t, recvWizardTestValue(t, strmB.sent, "stream B update").GetState(), "Configured Canvas")
+
+	// Prepare two successive wizard state changes.
+	burstA := updated.CloneVT()
+	burstA.Name = "Burst Canvas A"
+	burstA.Step = 3
+	burstB := updated.CloneVT()
+	burstB.Name = "Burst Canvas B"
+	burstB.Step = 4
+
+	// Commit both wizard states to the World.
+	setWizardWatchWorldState(t, ctx, ws, objKey, burstA)
+	setWizardWatchWorldState(t, ctx, ws, objKey, burstB)
+
+	// Verify both wizard watches reach the latest committed state.
+	requireWizardStateNameEventually(t, strmA.sent, doneA, "stream A burst update", "Burst Canvas B")
+	requireWizardStateNameEventually(t, strmB.sent, doneB, "stream B burst update", "Burst Canvas B")
+
+	// Close the wizard resource and verify both watches stop.
+	resource.Close()
+	if err := recvWizardTestValue(t, doneA, "stream A close"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected stream A context.Canceled, got %v", err)
+	}
+	if err := recvWizardTestValue(t, doneB, "stream B close"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected stream B context.Canceled, got %v", err)
+	}
+}
+
+func TestWizardResourceCloseCancelsStateWatchersImmediately(t *testing.T) {
+	// Start a wizard state watch on the initial resource.
+	ctx := t.Context()
+	resource := wizard_resource.NewWizardResource(nil, nil, "", &s4wave_wizard.WizardState{Name: "Initial"})
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	strm := newWizardStateStream(streamCtx)
+	done := make(chan error, 1)
+	go func() {
+		done <- resource.WatchWizardState(&s4wave_wizard.WatchWizardStateRequest{}, strm)
+	}()
+
+	// Close the wizard resource after receiving its initial state.
+	requireWizardStateName(t, recvWizardTestValue(t, strm.sent, "initial wizard state").GetState(), "Initial")
+	resource.Close()
+	if err := recvWizardTestValue(t, done, "wizard state watch close"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// Verify a late wizard watcher observes resource cancellation.
+	late := newWizardStateStream(ctx)
+	if err := resource.WatchWizardState(&s4wave_wizard.WatchWizardStateRequest{}, late); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected late watcher context.Canceled, got %v", err)
+	}
+}
+
+// TestWizardResourcePersistsState verifies the persistent wizard flow for a
+// test type: create a wizard object, update it through WizardResourceService,
+// then re-open it through a fresh typed-object resource and verify the updated
+// state is read back from the world.
+func TestWizardResourcePersistsState(t *testing.T) {
+	// Start the wizard World engine and resource client.
+	ctx := context.Background()
+	resClient, engine, cleanup := setupWizardWorldEngine(ctx, t)
+	defer cleanup()
+
+	// Encode a wizard creation operation for the Canvas target.
+	objectKey := "wizard/test-canvas"
+	createOp := s4wave_wizard.NewCreateWizardObjectOp(
+		objectKey,
+		"wizard/test",
+		"canvas",
+		"canvas/",
+		"Draft Canvas",
+		time.Now(),
+	)
+	createOpData, err := createOp.MarshalVT()
+	if err != nil {
+		t.Fatalf("MarshalVT(create op): %v", err)
+	}
+
+	// Create and commit the wizard object in the World.
+	writeTx, err := engine.NewTransaction(ctx, true)
+	if err != nil {
+		t.Fatalf("NewTransaction(write): %v", err)
+	}
+	_, _, err = writeTx.ApplyWorldOp(ctx, s4wave_wizard.CreateWizardObjectOpTypeID, createOpData, "")
+	if err != nil {
+		writeTx.Release()
+		t.Fatalf("ApplyWorldOp: %v", err)
+	}
+	if err := writeTx.Commit(ctx); err != nil {
+		writeTx.Release()
+		t.Fatalf("Commit(create): %v", err)
+	}
+	writeTx.Release()
+
+	// Verify the wizard resource reads its initial state.
+	readTx, wizardRef, wizardSvc := accessWizardResource(ctx, t, resClient, engine, objectKey)
+	initialState := recvWizardState(ctx, t, wizardSvc)
+	if initialState.GetStep() != 0 {
+		t.Fatalf("expected initial step 0, got %d", initialState.GetStep())
+	}
+	if initialState.GetTargetTypeId() != "canvas" {
+		t.Fatalf("expected initial target type canvas, got %q", initialState.GetTargetTypeId())
+	}
+	if initialState.GetTargetKeyPrefix() != "canvas/" {
+		t.Fatalf("expected initial key prefix canvas/, got %q", initialState.GetTargetKeyPrefix())
+	}
+	if initialState.GetName() != "Draft Canvas" {
+		t.Fatalf("expected initial name Draft Canvas, got %q", initialState.GetName())
+	}
+
+	// Update the wizard state and release its initial read resources.
+	updateResp, err := wizardSvc.UpdateWizardState(ctx, &s4wave_wizard.UpdateWizardStateRequest{
+		Step: 1,
+		Name: "Configured Canvas",
+	})
+	wizardRef.Release()
+	readTx.Release()
+	if err != nil {
+		t.Fatalf("UpdateWizardState: %v", err)
+	}
+
+	// Verify the wizard update response contains the configured state.
+	if updateResp.GetState().GetStep() != 1 {
+		t.Fatalf("expected updated step 1, got %d", updateResp.GetState().GetStep())
+	}
+	if updateResp.GetState().GetName() != "Configured Canvas" {
+		t.Fatalf("expected updated name Configured Canvas, got %q", updateResp.GetState().GetName())
+	}
+
+	// Reopen the wizard through fresh read resources.
+	verifyTx, verifyRef, verifySvc := accessWizardResource(ctx, t, resClient, engine, objectKey)
+	defer verifyRef.Release()
+	defer verifyTx.Release()
+
+	// Verify the wizard state persists its configuration and target.
+	persistedState := recvWizardState(ctx, t, verifySvc)
+	if persistedState.GetStep() != 1 {
+		t.Fatalf("expected persisted step 1, got %d", persistedState.GetStep())
+	}
+	if persistedState.GetName() != "Configured Canvas" {
+		t.Fatalf("expected persisted name Configured Canvas, got %q", persistedState.GetName())
+	}
+	if persistedState.GetTargetTypeId() != "canvas" {
+		t.Fatalf("expected persisted target type canvas, got %q", persistedState.GetTargetTypeId())
+	}
+	if persistedState.GetTargetKeyPrefix() != "canvas/" {
+		t.Fatalf("expected persisted key prefix canvas/, got %q", persistedState.GetTargetKeyPrefix())
+	}
+}
+
+// TestClusterWizardFinalize verifies the cluster wizard finalize flow: create a
+// wizard object for forge/cluster, then apply ClusterCreateOp with empty peerId
+// and a non-empty sender. The Go handler defaults peerId to sender. The cluster
+// object is created and the wizard object is deleted.
+func TestClusterWizardFinalize(t *testing.T) {
+	// Start the World engine for cluster wizard finalization.
+	ctx := context.Background()
+	_, engine, cleanup := setupWizardWorldEngine(ctx, t)
+	defer cleanup()
+
+	// Generate a test peer ID for the sender.
+	priv, _, err := bifcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	senderPeerID, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("IDFromPrivateKey: %v", err)
+	}
+
+	// Step 1: Create wizard object for forge/cluster.
+	wizardKey := "wizard/forge/cluster/test-1"
+	createWizardOp := s4wave_wizard.NewCreateWizardObjectOp(
+		wizardKey,
+		"wizard/forge/cluster",
+		"forge/cluster",
+		"forge/cluster/",
+		"test-cluster",
+		time.Now(),
+	)
+	wizardOpData, err := createWizardOp.MarshalVT()
+	if err != nil {
+		t.Fatalf("MarshalVT(wizard op): %v", err)
+	}
+
+	// Create and commit the cluster wizard object.
+	writeTx, err := engine.NewTransaction(ctx, true)
+	if err != nil {
+		t.Fatalf("NewTransaction(create wizard): %v", err)
+	}
+	_, _, err = writeTx.ApplyWorldOp(ctx, s4wave_wizard.CreateWizardObjectOpTypeID, wizardOpData, "")
+	if err != nil {
+		writeTx.Release()
+		t.Fatalf("ApplyWorldOp(create wizard): %v", err)
+	}
+	if err := writeTx.Commit(ctx); err != nil {
+		writeTx.Release()
+		t.Fatalf("Commit(create wizard): %v", err)
+	}
+	writeTx.Release()
+
+	// Step 2: Simulate finalize - apply ClusterCreateOp with empty peerId.
+	// The Go handler defaults peerId to the sender.
+	clusterKey := "forge/cluster/test-cluster-abc"
+	clusterOp := &forge_cluster.ClusterCreateOp{
+		ClusterKey: clusterKey,
+		Name:       "test-cluster",
+		PeerId:     "", // empty: defaults to sender
+	}
+	clusterOpData, err := clusterOp.MarshalVT()
+	if err != nil {
+		t.Fatalf("MarshalVT(cluster op): %v", err)
+	}
+
+	// Apply cluster creation with the sender as its default peer.
+	writeTx2, err := engine.NewTransaction(ctx, true)
+	if err != nil {
+		t.Fatalf("NewTransaction(create cluster): %v", err)
+	}
+	_, _, err = writeTx2.ApplyWorldOp(ctx, forge_cluster.ClusterCreateOpTypeID, clusterOpData, senderPeerID.String())
+	if err != nil {
+		writeTx2.Release()
+		t.Fatalf("ApplyWorldOp(create cluster): %v", err)
+	}
+
+	// Step 3: Delete the wizard object (simulating finalize cleanup).
+	_, err = writeTx2.DeleteObject(ctx, wizardKey)
+	if err != nil {
+		writeTx2.Release()
+		t.Fatalf("DeleteObject(wizard): %v", err)
+	}
+	if err := writeTx2.Commit(ctx); err != nil {
+		writeTx2.Release()
+		t.Fatalf("Commit(finalize): %v", err)
+	}
+	writeTx2.Release()
+
+	// Step 4: Verify cluster exists and wizard is gone.
+	readTx, err := engine.NewTransaction(ctx, false)
+	if err != nil {
+		t.Fatalf("NewTransaction(verify): %v", err)
+	}
+	defer readTx.Release()
+
+	// Verify finalization created the cluster object.
+	clusterObj, found, err := readTx.GetObject(ctx, clusterKey)
+	defer world.ReleaseObjectState(clusterObj)
+	if err != nil {
+		t.Fatalf("GetObject(cluster): %v", err)
+	}
+	if !found || clusterObj == nil {
+		t.Fatal("cluster object not found after finalize")
+	}
+
+	// Verify finalization removed the cluster wizard object.
+	objectState, wizardFound, err := readTx.GetObject(ctx, wizardKey)
+	world.ReleaseObjectState(objectState)
+	if err != nil {
+		t.Fatalf("GetObject(wizard): %v", err)
+	}
+	if wizardFound {
+		t.Fatal("wizard object should be deleted after finalize")
+	}
+}
+
+// TestForgeWizardChain verifies the full forge wizard creation chain:
+// cluster -> job -> task. Each entity is created through the wizard finalize
+// pattern (create wizard, apply target op, delete wizard). Verifies all three
+// objects exist, all wizard objects are deleted, and graph edges
+// (cluster-to-job, job-to-task) are correct.
+func TestForgeWizardChain(t *testing.T) {
+	// Start the World engine for the forge wizard chain.
+	ctx := context.Background()
+	_, engine, cleanup := setupWizardWorldEngine(ctx, t)
+	defer cleanup()
+
+	// Generate a test peer ID for the sender.
+	priv, _, err := bifcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	senderPeerID, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("IDFromPrivateKey: %v", err)
+	}
+	sender := senderPeerID.String()
+
+	// Prepare object and wizard keys for the cluster, job, and task.
+	clusterKey := "forge/cluster/chain-test"
+	jobKey := "forge/job/chain-test-job"
+	taskKey := "forge/task/chain-test-task"
+	clusterWizardKey := "wizard/forge/cluster/chain-1"
+	jobWizardKey := "wizard/forge/job/chain-1"
+	taskWizardKey := "wizard/forge/task/chain-1"
+
+	// Phase 1: Create cluster via wizard finalize.
+	{
+		wizardOp := s4wave_wizard.NewCreateWizardObjectOp(
+			clusterWizardKey, "wizard/forge/cluster",
+			"forge/cluster", "forge/cluster/", "chain-cluster", time.Now(),
+		)
+		wizardData, err := wizardOp.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT(cluster wizard): %v", err)
+		}
+
+		tx, err := engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(cluster wizard create): %v", err)
+		}
+		_, _, err = tx.ApplyWorldOp(ctx, s4wave_wizard.CreateWizardObjectOpTypeID, wizardData, "")
+		if err != nil {
+			tx.Release()
+			t.Fatalf("ApplyWorldOp(cluster wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(cluster wizard): %v", err)
+		}
+		tx.Release()
+
+		// Finalize: create cluster + delete wizard.
+		clusterOp := &forge_cluster.ClusterCreateOp{
+			ClusterKey: clusterKey,
+			Name:       "chain-cluster",
+		}
+		clusterData, err := clusterOp.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT(cluster op): %v", err)
+		}
+		tx, err = engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(cluster finalize): %v", err)
+		}
+		_, _, err = tx.ApplyWorldOp(ctx, forge_cluster.ClusterCreateOpTypeID, clusterData, sender)
+		if err != nil {
+			tx.Release()
+			t.Fatalf("ApplyWorldOp(cluster create): %v", err)
+		}
+		_, err = tx.DeleteObject(ctx, clusterWizardKey)
+		if err != nil {
+			tx.Release()
+			t.Fatalf("DeleteObject(cluster wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(cluster finalize): %v", err)
+		}
+		tx.Release()
+	}
+
+	// Phase 2: Create job via wizard finalize (linked to cluster).
+	{
+		wizardOp := s4wave_wizard.NewCreateWizardObjectOp(
+			jobWizardKey, "wizard/forge/job",
+			"forge/job", "forge/job/", "chain-job", time.Now(),
+		)
+		wizardData, err := wizardOp.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT(job wizard): %v", err)
+		}
+
+		tx, err := engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(job wizard create): %v", err)
+		}
+		_, _, err = tx.ApplyWorldOp(ctx, s4wave_wizard.CreateWizardObjectOpTypeID, wizardData, "")
+		if err != nil {
+			tx.Release()
+			t.Fatalf("ApplyWorldOp(job wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(job wizard): %v", err)
+		}
+		tx.Release()
+
+		// Finalize: create job with one task def, assigned to cluster, delete wizard.
+		jobOp := &forge_job_ops.ForgeJobCreateOp{
+			JobKey:     jobKey,
+			ClusterKey: clusterKey,
+			TaskDefs:   []*forge_job_ops.ForgeJobTaskDef{{Name: "build"}},
+			Timestamp:  timestamppb.Now(),
+		}
+		jobData, err := jobOp.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT(job op): %v", err)
+		}
+		tx, err = engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(job finalize): %v", err)
+		}
+		_, _, err = tx.ApplyWorldOp(ctx, forge_job_ops.ForgeJobCreateOpTypeID, jobData, sender)
+		if err != nil {
+			tx.Release()
+			t.Fatalf("ApplyWorldOp(job create): %v", err)
+		}
+		_, err = tx.DeleteObject(ctx, jobWizardKey)
+		if err != nil {
+			tx.Release()
+			t.Fatalf("DeleteObject(job wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(job finalize): %v", err)
+		}
+		tx.Release()
+	}
+
+	// Phase 3: Create task via wizard finalize (linked to job).
+	{
+		wizardOp := s4wave_wizard.NewCreateWizardObjectOp(
+			taskWizardKey, "wizard/forge/task",
+			"forge/task", "forge/task/", "chain-task", time.Now(),
+		)
+		wizardData, err := wizardOp.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT(task wizard): %v", err)
+		}
+
+		tx, err := engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(task wizard create): %v", err)
+		}
+		_, _, err = tx.ApplyWorldOp(ctx, s4wave_wizard.CreateWizardObjectOpTypeID, wizardData, "")
+		if err != nil {
+			tx.Release()
+			t.Fatalf("ApplyWorldOp(task wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(task wizard): %v", err)
+		}
+		tx.Release()
+
+		// Finalize: create task linked to job, delete wizard.
+		taskOp := &forge_task_ops.ForgeTaskCreateOp{
+			TaskKey:   taskKey,
+			Name:      "chain-task",
+			JobKey:    jobKey,
+			Timestamp: timestamppb.Now(),
+		}
+		taskData, err := taskOp.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT(task op): %v", err)
+		}
+		tx, err = engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(task finalize): %v", err)
+		}
+		_, _, err = tx.ApplyWorldOp(ctx, forge_task_ops.ForgeTaskCreateOpTypeID, taskData, sender)
+		if err != nil {
+			tx.Release()
+			t.Fatalf("ApplyWorldOp(task create): %v", err)
+		}
+		_, err = tx.DeleteObject(ctx, taskWizardKey)
+		if err != nil {
+			tx.Release()
+			t.Fatalf("DeleteObject(task wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(task finalize): %v", err)
+		}
+		tx.Release()
+	}
+
+	// Verify: all three objects exist, all wizard objects deleted, graph edges correct.
+	readTx, err := engine.NewTransaction(ctx, false)
+	if err != nil {
+		t.Fatalf("NewTransaction(verify): %v", err)
+	}
+	defer readTx.Release()
+
+	// Objects exist.
+	for _, key := range []string{clusterKey, jobKey, taskKey} {
+		objectState, found, err := readTx.GetObject(ctx, key)
+		world.ReleaseObjectState(objectState)
+		if err != nil {
+			t.Fatalf("GetObject(%s): %v", key, err)
+		}
+		if !found {
+			t.Fatalf("object %s not found", key)
+		}
+	}
+
+	// Wizard objects deleted.
+	for _, key := range []string{clusterWizardKey, jobWizardKey, taskWizardKey} {
+		objectState2, found, err := readTx.GetObject(ctx, key)
+		world.ReleaseObjectState(objectState2)
+		if err != nil {
+			t.Fatalf("GetObject(%s): %v", key, err)
+		}
+		if found {
+			t.Fatalf("wizard object %s should be deleted", key)
+		}
+	}
+
+	// Graph edge: cluster -> job (predicate forge/cluster-job).
+	clusterJobQuads, err := readTx.LookupGraphQuads(
+		ctx,
+		world.NewGraphQuadWithKeys(clusterKey, forge_cluster.PredClusterToJob.String(), jobKey, ""),
+		0,
+	)
+	if err != nil {
+		t.Fatalf("LookupGraphQuads(cluster->job): %v", err)
+	}
+	if len(clusterJobQuads) == 0 {
+		t.Fatal("missing cluster-to-job graph edge")
+	}
+
+	// Graph edge: job -> task (predicate forge/job-task).
+	jobTaskQuads, err := readTx.LookupGraphQuads(
+		ctx,
+		world.NewGraphQuadWithKeys(jobKey, forge_job.PredJobToTask.String(), taskKey, ""),
+		0,
+	)
+	if err != nil {
+		t.Fatalf("LookupGraphQuads(job->task): %v", err)
+	}
+	if len(jobTaskQuads) == 0 {
+		t.Fatal("missing job-to-task graph edge")
+	}
+}
+
+// TestGitRepoWizardOp verifies the CreateGitRepoWizardOp validation and
+// dispatch logic, and the wizard create/delete lifecycle for git/repo.
+func TestGitRepoWizardOp(t *testing.T) {
+	// Prepare the context for Git repository wizard operations.
+	ctx := context.Background()
+
+	// Verify Git repository wizard operation validation.
+	t.Run("validate", func(t *testing.T) {
+		// Valid new repo op.
+		op := &s4wave_git.CreateGitRepoWizardOp{
+			ObjectKey: "git/repo/test",
+			Name:      "test",
+			Timestamp: timestamppb.Now(),
+		}
+		if err := op.Validate(); err != nil {
+			t.Fatalf("Validate(new repo) should pass: %v", err)
+		}
+
+		// Valid clone op.
+		cloneOp := &s4wave_git.CreateGitRepoWizardOp{
+			ObjectKey: "git/repo/cloned",
+			Name:      "cloned",
+			Clone:     true,
+			CloneOpts: &git_block.CloneOpts{
+				Url: "https://github.com/example/test.git",
+				Ref: "main",
+			},
+			Timestamp: timestamppb.Now(),
+		}
+		if err := cloneOp.Validate(); err != nil {
+			t.Fatalf("Validate(clone) should pass: %v", err)
+		}
+
+		// Missing object key.
+		badOp := &s4wave_git.CreateGitRepoWizardOp{Name: "test"}
+		if err := badOp.Validate(); err == nil {
+			t.Fatal("Validate should fail with empty object_key")
+		}
+
+		// Clone without clone_opts.
+		badClone := &s4wave_git.CreateGitRepoWizardOp{
+			ObjectKey: "git/repo/test",
+			Clone:     true,
+		}
+		if err := badClone.Validate(); err == nil {
+			t.Fatal("Validate should fail: clone=true without clone_opts")
+		}
+	})
+
+	// Verify Git repository wizard operation encoding preserves clone options.
+	t.Run("marshal-roundtrip", func(t *testing.T) {
+		// Encode a Git repository wizard operation with clone options.
+		op := &s4wave_git.CreateGitRepoWizardOp{
+			ObjectKey: "git/repo/rt-test",
+			Name:      "rt-test",
+			Clone:     true,
+			CloneOpts: &git_block.CloneOpts{
+				Url:       "https://example.com/repo.git",
+				Ref:       "develop",
+				Depth:     1,
+				Recursive: true,
+			},
+			Timestamp: timestamppb.Now(),
+		}
+		data, err := op.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT: %v", err)
+		}
+
+		// Decode the Git repository wizard operation.
+		decoded := &s4wave_git.CreateGitRepoWizardOp{}
+		if err := decoded.UnmarshalVT(data); err != nil {
+			t.Fatalf("UnmarshalVT: %v", err)
+		}
+
+		// Verify the decoded Git repository identity and clone options.
+		if decoded.GetObjectKey() != "git/repo/rt-test" {
+			t.Fatalf("expected object_key git/repo/rt-test, got %q", decoded.GetObjectKey())
+		}
+		if !decoded.GetClone() {
+			t.Fatal("expected clone=true")
+		}
+		if decoded.GetCloneOpts().GetUrl() != "https://example.com/repo.git" {
+			t.Fatalf("expected clone URL, got %q", decoded.GetCloneOpts().GetUrl())
+		}
+		if decoded.GetCloneOpts().GetDepth() != 1 {
+			t.Fatalf("expected depth 1, got %d", decoded.GetCloneOpts().GetDepth())
+		}
+		if !decoded.GetCloneOpts().GetRecursive() {
+			t.Fatal("expected recursive=true")
+		}
+	})
+
+	// Verify the Git repository wizard creation and deletion lifecycle.
+	t.Run("wizard-lifecycle", func(t *testing.T) {
+		// Start the World engine for the Git repository wizard.
+		_, engine, cleanup := setupWizardWorldEngine(ctx, t)
+		defer cleanup()
+
+		// Choose the Git repository wizard key for its lifecycle checks.
+		wizardKey := "wizard/git/repo/lifecycle-1"
+
+		// Create wizard object for git/repo.
+		wizardOp := s4wave_wizard.NewCreateWizardObjectOp(
+			wizardKey, "wizard/git/repo",
+			"git/repo", "git/repo/", "my-repo", time.Now(),
+		)
+		wizardData, err := wizardOp.MarshalVT()
+		if err != nil {
+			t.Fatalf("MarshalVT(wizard): %v", err)
+		}
+
+		// Create and commit the Git repository wizard object.
+		tx, err := engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(create): %v", err)
+		}
+		_, _, err = tx.ApplyWorldOp(ctx, s4wave_wizard.CreateWizardObjectOpTypeID, wizardData, "")
+		if err != nil {
+			tx.Release()
+			t.Fatalf("ApplyWorldOp(create wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(create): %v", err)
+		}
+		tx.Release()
+
+		// Verify wizard exists.
+		readTx, err := engine.NewTransaction(ctx, false)
+		if err != nil {
+			t.Fatalf("NewTransaction(verify create): %v", err)
+		}
+		objectState, found, err := readTx.GetObject(ctx, wizardKey)
+		world.ReleaseObjectState(objectState)
+		if err != nil {
+			readTx.Release()
+			t.Fatalf("GetObject(wizard): %v", err)
+		}
+		if !found {
+			readTx.Release()
+			t.Fatal("wizard object not found after create")
+		}
+		readTx.Release()
+
+		// Delete wizard (simulating finalize cleanup).
+		tx, err = engine.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatalf("NewTransaction(delete): %v", err)
+		}
+		_, err = tx.DeleteObject(ctx, wizardKey)
+		if err != nil {
+			tx.Release()
+			t.Fatalf("DeleteObject(wizard): %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			tx.Release()
+			t.Fatalf("Commit(delete): %v", err)
+		}
+		tx.Release()
+
+		// Verify wizard deleted.
+		readTx, err = engine.NewTransaction(ctx, false)
+		if err != nil {
+			t.Fatalf("NewTransaction(verify delete): %v", err)
+		}
+		defer readTx.Release()
+		var objectState2 world.ObjectState
+		objectState2, found, err = readTx.GetObject(ctx, wizardKey)
+		world.ReleaseObjectState(objectState2)
+		if err != nil {
+			t.Fatalf("GetObject(wizard after delete): %v", err)
+		}
+		if found {
+			t.Fatal("wizard object should be deleted")
+		}
+	})
+}

@@ -1,0 +1,151 @@
+package volume
+
+import (
+	"context"
+	"strings"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	block_gc "github.com/s4wave/spacewave/db/block/gc"
+	block_store "github.com/s4wave/spacewave/db/block/store"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/coord"
+	"github.com/s4wave/spacewave/db/object"
+	"github.com/s4wave/spacewave/db/store"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// Constructor constructs a volume with common parameters.
+type Constructor func(
+	ctx context.Context,
+	le *logrus.Entry,
+) (Volume, error)
+
+// Volume stores data with an associated peer ID.
+type Volume interface {
+	// GetID returns the volume ID.
+	// Usually this is derived from the peer ID and volume type.
+	GetID() string
+
+	// GetPeerID returns the volume peer ID.
+	GetPeerID() peer.ID
+
+	// GetPeer returns the Peer object.
+	// If withPriv=false ensure that the Peer returned does not have the private key.
+	GetPeer(ctx context.Context, withPriv bool) (peer.Peer, error)
+
+	// GetStorageStats returns storage usage statistics for the volume.
+	// Returns total bytes and block count from the underlying storage backend.
+	GetStorageStats(ctx context.Context) (*StorageStats, error)
+
+	// Sync is the volume-owned durability barrier. StoreOps.Sync callers still
+	// fence durability through this method when the store is a Volume.
+	Sync(ctx context.Context) (bool, error)
+
+	// Store indicates the volume is a hydra store.
+	store.Store
+
+	// Coordinator coordinates direct multi-writer ObjectStore access.
+	coord.Coordinator
+
+	// Roots holds the named roots, reader pins and stages of the volume's
+	// buckets.
+	Roots
+
+	// RootProofs keeps the completion proofs a graph copy reads.
+	RootProofs
+
+	// Close closes the volume, returning any errors.
+	Close() error
+
+	// Delete closes the volume and removes the backing store.
+	// After Delete returns, the volume's persistent data is gone.
+	// Close is idempotent after Delete.
+	Delete() error
+}
+
+// Collector is implemented by a volume whose collector frees the blocks no
+// held named root reaches.
+type Collector interface {
+	// Collect runs one bounded collection pass: it releases lapsed leases,
+	// nets the journal and frees what died, in slices that yield to waiting
+	// writers. CollectResult.More reports work left.
+	Collect(ctx context.Context) (block_gc.CollectResult, error)
+}
+
+// BucketReleaser is implemented by a volume that holds named roots by bucket.
+type BucketReleaser interface {
+	// ReleaseBucket releases every named root of the bucket, so the collector
+	// frees what only they reached, such as the blocks of a deleted Space.
+	ReleaseBucket(ctx context.Context, bucketID string) error
+	// ReleaseBucketPrefix releases every named root of each bucket whose ID
+	// starts with prefix, such as the buckets of a deleted account.
+	ReleaseBucketPrefix(ctx context.Context, prefix string) error
+}
+
+// WriteOrderer is implemented by a volume whose block and object store writes
+// become durable in commit order: once a durable commit completes, every
+// earlier write is durable too. A writer whose block writes are followed by a
+// durable object store commit on the same volume needs no Sync between them.
+type WriteOrderer interface {
+	// OrdersWrites reports whether the volume makes writes durable in order.
+	OrdersWrites() bool
+	// WaitDurable waits until every write completed before the call is
+	// durable, without forcing a flush.
+	WaitDurable(ctx context.Context) error
+}
+
+// OrdersWrites reports whether vol makes its writes durable in commit order.
+func OrdersWrites(vol Volume) bool {
+	orderer, ok := vol.(WriteOrderer)
+	return ok && orderer.OrdersWrites()
+}
+
+// WaitDurable waits until every write to vol completed before the call is
+// durable. Volumes that do not order writes make each write durable before it
+// returns.
+func WaitDurable(ctx context.Context, vol Volume) error {
+	orderer, ok := vol.(WriteOrderer)
+	if !ok {
+		return nil
+	}
+	return orderer.WaitDurable(ctx)
+}
+
+// NewVolumeID constructs a new volume ID with a store type id and a peer id.
+//
+// storeTypeID should be like "hydra/volume/kvtxinmem"
+func NewVolumeID(storeTypeID string, peerID peer.ID) string {
+	return strings.Join([]string{
+		storeTypeID,
+		peerID.String(),
+	}, "/")
+}
+
+// Controller is a volume controller.
+type Controller interface {
+	// Controller is the controllerbus controller interface.
+	controller.Controller
+
+	// GetVolume returns the controlled volume.
+	// This may wait for the volume to be ready.
+	GetVolume(ctx context.Context) (Volume, error)
+	// BuildBucketAPI builds an API handle for the bucket ID in the volume.
+	// Returns the handle & a release function, or (nil, nil, err).
+	BuildBucketAPI(ctx context.Context, bucketID string) (bucket.BucketHandle, func(), error)
+}
+
+// ObjectStoreHandle is a object store API handle.
+type ObjectStoreHandle interface {
+	// GetID returns the object store ID.
+	GetID() string
+	// GetVolumeId returns the volume ID of the object store handle.
+	GetVolumeId() string
+	// GetVolume returns the owning volume for this object store handle.
+	GetVolume() Volume
+	// GetObjectStore returns the object store.
+	GetObjectStore() object.ObjectStore
+}
+
+// this assertion ensure LookupBlockStore matches Volume
+var _ block_store.Store = Volume(nil)

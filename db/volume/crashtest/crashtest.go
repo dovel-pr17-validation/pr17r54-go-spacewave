@@ -1,0 +1,370 @@
+// Package crashtest checks that a volume engine recovers from a crash at any
+// point of a randomized workload to a state its commits allow.
+//
+// The workload mixes durable and ordered key-value commits, block puts and
+// removes, and syncs. A durable commit or sync makes the whole
+// live state durable. An ordered commit may survive a crash only after every
+// ordered commit before it, and block writes survive when they return or
+// only through a later commit that publishes them, depending on the target.
+// The commit a crash interrupts may or may not survive.
+package crashtest
+
+import (
+	"bytes"
+	"context"
+	"maps"
+	"math/rand/v2"
+	"slices"
+	"strconv"
+	"testing"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/kvtx"
+)
+
+// ops is the length of a workload.
+const ops = 40
+
+// keys is the key space of the workload's key-value commits.
+const keys = 8
+
+// blockSpace is the block space of the workload's puts and removes.
+const blockSpace = 12
+
+// seeds is the number of workloads Run checks.
+const seeds = 8
+
+// Blocks is which commits of a target publish its pending block writes and
+// removes.
+type Blocks int
+
+const (
+	// DurablePutBlocks targets publish pending blocks with every commit, and
+	// commit durably while a block write is pending, since an ordered commit
+	// may outlive the unflushed payload.
+	DurablePutBlocks Blocks = iota
+	// AllBlocks targets publish pending blocks with every commit.
+	AllBlocks
+	// ImmediateBlocks targets make each block write and remove durable,
+	// with every commit before it, before it returns.
+	ImmediateBlocks
+)
+
+// writeCommit returns how a block write or remove commits on the target.
+func (b Blocks) writeCommit() commitKind {
+	if b == ImmediateBlocks {
+		return commitDurable
+	}
+	return commitNone
+}
+
+// Device is storage that crashes and loses power on request.
+type Device interface {
+	// Calls returns the number of mutating calls made so far.
+	Calls() int
+	// CrashAfter fails every mutating call after the next n succeed.
+	CrashAfter(n int)
+	// PowerLoss replaces the contents with a state a power loss could leave
+	// and accepts calls again.
+	PowerLoss(rng *rand.Rand)
+}
+
+// Target is the engine under test.
+type Target interface {
+	kvtx.Store
+	block.StoreOps
+
+	// Close releases the engine.
+	Close() error
+}
+
+// Run runs each workload on a new device from newDevice, crashes it at every
+// mutating device call, applies a power loss, and checks that the target open
+// reopens holds an allowed state and keeps working. blocks is which commits of
+// the target publish its pending blocks. It first checks the existence results
+// of the target's batch puts.
+func Run[D Device](t *testing.T, blocks Blocks, newDevice func() D, open func(ctx context.Context, d D) (Target, error)) {
+	checkBatchExistence(t, newDevice(), open)
+	for seed := range uint64(seeds) {
+		// Count the device calls of the uncrashed workload.
+		d := newDevice()
+		s, err := open(t.Context(), d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := d.Calls()
+		if _, err := runWorkload(t.Context(), s, blocks, seed); err != nil {
+			t.Fatal(err)
+		}
+		calls := d.Calls() - base
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Crash at each call.
+		for n := range calls {
+			checkCrash(t, newDevice(), open, blocks, seed, n)
+		}
+		t.Logf("seed %d: %d crash points", seed, calls)
+	}
+}
+
+// checkBatchExistence checks that PutBlockBatch reports a block as existing
+// only when it was stored before the write: a duplicate in the same batch
+// exists, a removed block does not, and a tombstone reports false.
+func checkBatchExistence[D Device](t *testing.T, d D, open func(ctx context.Context, d D) (Target, error)) {
+	// Build two blocks and a batch that writes the first twice.
+	ctx := t.Context()
+	s, err := open(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	entry := func(data string) *block.PutBatchEntry {
+		ref, err := block.BuildBlockRef([]byte(data), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &block.PutBatchEntry{Ref: ref, Data: []byte(data)}
+	}
+	first, second := entry("existence-first"), entry("existence-second")
+	remove := &block.PutBatchEntry{Ref: first.Ref, Tombstone: true}
+	put := func(want []bool, entries ...*block.PutBatchEntry) {
+		t.Helper()
+		got, err := s.PutBlockBatch(ctx, entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("existed = %v, want %v", got, want)
+		}
+	}
+
+	// A new block is absent, and its duplicate in the same batch is present.
+	put([]bool{false, false, true}, first, second, first)
+	put([]bool{true, true}, first, second)
+
+	// A removed block is absent again, in a later batch and in the same batch.
+	put([]bool{false}, remove)
+	put([]bool{false, true}, first, second)
+	put([]bool{false, false}, remove, first)
+}
+
+// checkCrash runs the workload of seed on d, crashes after n mutating calls,
+// and checks the recovered target.
+func checkCrash[D Device](t *testing.T, d D, open func(ctx context.Context, d D) (Target, error), blocks Blocks, seed uint64, n int) {
+	// Open the target on the device before injecting a workload crash.
+	ctx := t.Context()
+	s, err := open(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Interrupt the workload and discard device writes lost on power failure.
+	d.CrashAfter(n)
+	allowed, err := runWorkload(ctx, s, blocks, seed)
+	if err == nil {
+		t.Fatalf("seed %d crash %d: workload finished without crashing", seed, n)
+	}
+	_ = s.Close()
+	d.PowerLoss(rand.New(rand.NewPCG(seed, uint64(n)))) //nolint:gosec
+
+	// Recover and compare with the allowed states.
+	s, err = open(ctx, d)
+	if err != nil {
+		t.Fatalf("seed %d crash %d: reopen: %v", seed, n, err)
+	}
+	defer s.Close()
+	got := readState(t, s)
+	if !slices.ContainsFunc(allowed, got.equal) {
+		t.Fatalf("seed %d crash %d: recovered %+v, want one of %+v", seed, n, got, allowed)
+	}
+
+	// The recovered target takes and publishes new writes.
+	if _, _, err := s.PutBlock(ctx, []byte("after"), &block.PutOpts{Sync: true}); err != nil {
+		t.Fatalf("seed %d crash %d: put after recovery: %v", seed, n, err)
+	}
+	if err := setValue(ctx, s, "after", "1", false); err != nil {
+		t.Fatalf("seed %d crash %d: commit after recovery: %v", seed, n, err)
+	}
+}
+
+// state is the durable state a target can recover to.
+type state struct {
+	// values holds the key-value store.
+	values map[string]string
+	// blocks holds the stored blocks by payload index.
+	blocks map[int]bool
+}
+
+// clone returns a deep copy of the state.
+func (s state) clone() state {
+	return state{values: maps.Clone(s.values), blocks: maps.Clone(s.blocks)}
+}
+
+// equal reports whether two states match.
+func (s state) equal(o state) bool {
+	return maps.Equal(s.values, o.values) && maps.Equal(s.blocks, o.blocks)
+}
+
+// commitKind is how a workload step commits.
+type commitKind int
+
+const (
+	// commitNone commits nothing.
+	commitNone commitKind = iota
+	// commitDurable commits durably with the pending blocks.
+	commitDurable
+	// commitOrdered commits with write ordering only.
+	commitOrdered
+)
+
+// runWorkload runs the workload of seed until it finishes or a call fails. It
+// returns the states a crash may recover: the state of the last acknowledged
+// durable commit, of each ordered commit after it, and, when a commit failed,
+// the state that commit would have reached.
+func runWorkload(ctx context.Context, s Target, blocks Blocks, seed uint64) ([]state, error) {
+	// Initialize the seeded workload and its allowed recovery states.
+	rng := rand.New(rand.NewPCG(seed, 0)) //nolint:gosec
+	committed := state{values: make(map[string]string), blocks: make(map[int]bool)}
+	live := committed.clone()
+	allowed := []state{committed}
+
+	// putPending is set while a block write waits for a commit to publish it.
+	var putPending bool
+
+	// Advance the target and track the states each commit permits after a crash.
+	for step := range ops {
+		// Apply one step to the live state and, for an ordered commit, the
+		// committed state. A durable commit makes the whole live state durable.
+		nextLive, nextCommitted := live.clone(), committed.clone()
+		var err error
+		commit := commitDurable
+		switch rng.IntN(6) {
+		case 0, 1:
+			key := "k" + strconv.Itoa(rng.IntN(keys))
+			value := "v" + strconv.Itoa(step)
+			nextLive.values[key] = value
+			err = setValue(ctx, s, key, value, false)
+		case 2:
+			i := rng.IntN(blockSpace)
+			putPending = putPending || !live.blocks[i]
+			nextLive.blocks[i] = true
+			_, _, err = s.PutBlock(ctx, blockData(i), &block.PutOpts{RefsKnown: true})
+			commit = blocks.writeCommit()
+		case 3:
+			i := rng.IntN(blockSpace)
+			delete(nextLive.blocks, i)
+			err = s.RmBlock(ctx, blockRef(i))
+			commit = blocks.writeCommit()
+		case 4:
+			key := "k" + strconv.Itoa(rng.IntN(keys))
+			value := "o" + strconv.Itoa(step)
+			nextLive.values[key], nextCommitted.values[key] = value, value
+			err = setValue(ctx, s, key, value, true)
+			commit = commitOrdered
+		default:
+			_, err = s.Sync(ctx)
+		}
+		if commit == commitOrdered && blocks == DurablePutBlocks && putPending {
+			commit = commitDurable
+		}
+		switch commit {
+		case commitDurable:
+			nextCommitted = nextLive.clone()
+		case commitOrdered:
+			nextCommitted.blocks = maps.Clone(nextLive.blocks)
+		}
+
+		// Record the states a crash may now recover.
+		if err != nil {
+			if commit != commitNone {
+				allowed = append(allowed, nextCommitted)
+			}
+			return allowed, err
+		}
+		live, committed = nextLive, nextCommitted
+		switch commit {
+		case commitDurable:
+			allowed = []state{committed}
+			putPending = false
+		case commitOrdered:
+			allowed = append(allowed, committed)
+		}
+	}
+	return allowed, nil
+}
+
+// setValue sets one key in its own committed transaction, with write ordering
+// only if ordered is set.
+func setValue(ctx context.Context, s Target, key, value string, ordered bool) error {
+	// Open a writable transaction for the workload value.
+	tx, err := s.NewTransaction(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer tx.Discard()
+
+	// Write the workload value before publishing its transaction.
+	if err := tx.Set(ctx, []byte(key), []byte(value)); err != nil {
+		return err
+	}
+
+	// Publish the workload value with the requested commit guarantee.
+	if ordered {
+		return kvtx.CommitOrdered(ctx, tx)
+	}
+	return tx.Commit(ctx)
+}
+
+// readState reads the key-value store and the workload's blocks from s,
+// checking every stored payload.
+func readState(t *testing.T, s Target) state {
+	// Prepare the recovered target state for comparison with the workload.
+	ctx := t.Context()
+	got := state{values: make(map[string]string), blocks: make(map[int]bool)}
+
+	// Read the key-value store.
+	tx, err := s.NewTransaction(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Discard()
+	err = tx.ScanPrefix(ctx, nil, func(key, value []byte) error {
+		got.values[string(key)] = string(value)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read every block the workload can put.
+	for i := range blockSpace {
+		data, found, err := s.GetBlock(ctx, blockRef(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			continue
+		}
+		if !bytes.Equal(data, blockData(i)) {
+			t.Fatalf("block %d reads %q", i, data)
+		}
+		got.blocks[i] = true
+	}
+	return got
+}
+
+// blockData returns the payload of workload block i.
+func blockData(i int) []byte {
+	return bytes.Repeat([]byte("block-"+strconv.Itoa(i)+"."), 64)
+}
+
+// blockRef returns the reference of workload block i.
+func blockRef(i int) *block.BlockRef {
+	ref, err := block.BuildBlockRef(blockData(i), nil)
+	if err != nil {
+		panic(err)
+	}
+	return ref
+}

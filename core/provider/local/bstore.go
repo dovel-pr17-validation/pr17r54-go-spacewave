@@ -1,0 +1,884 @@
+package provider_local
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/configset"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/csync"
+	"github.com/aperturerobotics/util/keyed"
+	"github.com/aperturerobotics/util/routine"
+	account_settings "github.com/s4wave/spacewave/core/account/settings"
+	"github.com/s4wave/spacewave/core/bstore"
+	"github.com/s4wave/spacewave/core/provider"
+	"github.com/s4wave/spacewave/db/block"
+	block_store "github.com/s4wave/spacewave/db/block/store"
+	block_store_controller "github.com/s4wave/spacewave/db/block/store/controller"
+	block_store_nodepush "github.com/s4wave/spacewave/db/block/store/nodepush"
+	block_store_writeback "github.com/s4wave/spacewave/db/block/store/writeback"
+	"github.com/s4wave/spacewave/db/bucket"
+	lookup_concurrent "github.com/s4wave/spacewave/db/bucket/lookup/concurrent"
+	"github.com/s4wave/spacewave/db/packfile/packahead"
+	"github.com/s4wave/spacewave/db/volume"
+	"github.com/s4wave/spacewave/net/hash"
+	"github.com/sirupsen/logrus"
+)
+
+// blockStoreBucketConfigRev 2 keeps local-provider buckets local-only.
+const blockStoreBucketConfigRev = 2
+
+// BlockStore implements the bstore interface.
+type BlockStore struct {
+	// push sends the store's publications to its storage node, or is nil.
+	push *block_store_nodepush.Publisher
+	// store provides local writes and durability.
+	store block_store.Store
+	// readStore optionally routes uncached reads through the active Session DEX.
+	readStore block_store.Store
+	// copyStore reads like readStore without filling the local cache.
+	copyStore block.StoreOps
+	// decodedBlocks is the decoded-block cache owned by the block-store lifecycle.
+	decodedBlocks *block.DecodedBlockCache
+	// placement is the store's storage backend and upload queue.
+	placement *placementState
+}
+
+// childListReader is implemented by a volume that keeps a child list for
+// each block it stores.
+type childListReader interface {
+	// HasChildLists reports, for each ref, whether the volume keeps its child
+	// list.
+	HasChildLists(ctx context.Context, refs []*block.BlockRef) ([]bool, error)
+}
+
+// placementState is a block store's storage backend, its upload queue, and
+// the stores a storage move copies blocks between.
+type placementState struct {
+	// wb queues local writes for upload.
+	wb *block_store_writeback.Store
+	// backend is the storage backend holding the store, nil for the account's
+	// own storage. It changes before wb broadcasts the change.
+	backend atomic.Pointer[account_settings.StorageBackend]
+	// local is the account's own storage, written without upload markers.
+	local block.StoreOps
+	// remote is the open storage backend store, or nil.
+	remote *atomic.Pointer[openBackend]
+	// tracker reports the blocks the volume keeps child lists for, or nil when
+	// the volume keeps none.
+	tracker childListReader
+	// done closes when this mount ends, including a failed mount or remount.
+	done <-chan struct{}
+	// serveOnly is serve mode, as SetServeOnly describes: reads fill nothing.
+	serveOnly bool
+	// peerUpload stores peer reads with an upload marker, as
+	// SetPeerFillsUpload describes.
+	peerUpload bool
+	// reads records the blocks read since the last eviction pass.
+	reads readSet
+	// localHits counts the blocks the local store served.
+	localHits atomic.Uint64
+	// evictGate is held by each eviction pass and by a storage move.
+	evictGate *csync.Mutex
+	// evictAdmit paces eviction passes, or holds nil.
+	evictAdmit *atomic.Pointer[block_store_writeback.EvictAdmit]
+	// sqlPrimary reports that the store writes to its SQL backend, which
+	// then holds blocks the reference graph may not track.
+	sqlPrimary bool
+	// fallbackFills runs and counts the fills of the SQL read fallback.
+	fallbackFills fallbackFills
+	// cache is the fill cache that takes the blocks read from the backend, or nil
+	// when they fill the local store. A store mounted without a backend has none.
+	cache FillCache
+	// front is read after the local store misses and before the fill cache
+	// and the backend, or nil.
+	front block.StoreOps
+	// drain uploads the finalized packs of the store's packahead log, or is
+	// nil when the store has no log.
+	drain *packahead.Drain
+}
+
+// live reports which blocks a bucket reclaim must keep: the blocks the volume
+// keeps child lists for, and any the local store holds. Only the collector
+// ends a listed block's life, so a block whose local value was dropped stays
+// live, and a volume without child lists keeps what it stores.
+func (p *placementState) live(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	// Keep the blocks the graph tracks.
+	live := make([]bool, len(refs))
+	if p.tracker != nil {
+		tracked, err := p.tracker.HasChildLists(ctx, refs)
+		if err != nil {
+			return nil, err
+		}
+		live = tracked
+	}
+
+	// Keep the untracked blocks the local store holds.
+	var rest []*block.BlockRef
+	var restAt []int
+	for i, ok := range live {
+		if !ok {
+			rest = append(rest, refs[i])
+			restAt = append(restAt, i)
+		}
+	}
+	if len(rest) == 0 {
+		return live, nil
+	}
+	held, err := p.local.GetBlockExistsBatch(ctx, rest)
+	if err != nil {
+		return nil, err
+	}
+	for j, ok := range held {
+		live[restAt[j]] = ok
+	}
+	return live, nil
+}
+
+// fill writes a block read from the backend or a peer into the local store. A
+// block the graph tracks lost only its value to eviction, so it is refilled
+// below the ownership layer; any other block is a cache fill.
+func (p *placementState) fill(ctx context.Context, primary block.StoreOps, ref *block.BlockRef, stored *block.StoredBlock) error {
+	// Serve mode writes nothing.
+	if p.serveOnly {
+		return nil
+	}
+
+	// Refill a tracked block of a placed store.
+	if p.backend.Load() != nil && p.tracker != nil {
+		tracked, err := p.tracker.HasChildLists(ctx, []*block.BlockRef{ref})
+		if err != nil {
+			return err
+		}
+
+		// Account for every cached value, including a block whose graph was
+		// omitted during migration. An untracked fill also records child refs
+		// without taking ownership; eviction checks the target before dropping
+		// either value, including a fill served by a peer. Both queue behind
+		// the volume's writers.
+		if tracked[0] {
+			p.wb.Refill(ref, stored)
+		} else {
+			p.wb.CacheFill(ref, stored)
+		}
+
+		// Keep a remote hit hot for the same interval as a local hit.
+		p.reads.add(ref.GetHash())
+		return nil
+	}
+
+	// Fill any other block as a cache fill.
+	return block_store.CacheFill(ctx, primary, ref, stored)
+}
+
+// UploadStatus is a block store's storage backend and upload status.
+type UploadStatus struct {
+	// Backend is the storage backend holding the store, nil for the account's
+	// own storage.
+	Backend *account_settings.StorageBackend
+	// Status is the upload status of the queued writes.
+	block_store_writeback.Status
+	// Fallback counts the reads and fills of the store's read fallback.
+	Fallback FallbackStatus
+	// Reads counts the store's block reads by where they were served.
+	Reads ReadStatus
+	// Packs counts the finalized packs of the store's packahead log, or is
+	// nil when the store has no log.
+	Packs *packahead.DrainStatus
+}
+
+// GetID returns the inner store id.
+func (b *BlockStore) GetID() string {
+	return b.store.GetID()
+}
+
+// GetHashType returns the inner store hash type.
+func (b *BlockStore) GetHashType() hash.HashType {
+	return b.store.GetHashType()
+}
+
+// GetSupportedFeatures returns the native feature bitset for the inner store.
+func (b *BlockStore) GetSupportedFeatures() block.StoreFeature {
+	return b.store.GetSupportedFeatures()
+}
+
+// GetDecodedBlockCache returns the lifecycle-owned decoded-block cache.
+func (b *BlockStore) GetDecodedBlockCache() *block.DecodedBlockCache {
+	return b.decodedBlocks
+}
+
+// InvalidateDecodedBlockRef removes decoded-cache entries for ref.
+func (b *BlockStore) InvalidateDecodedBlockRef(ctx context.Context, ref *block.BlockRef) {
+	b.decodedBlocks.InvalidateRef(ctx, ref)
+}
+
+// GetUploadStatus returns the storage backend and upload status, and a channel
+// closed when either changes. Packs is a snapshot: GetPackStatus returns the
+// channel that follows it.
+func (b *BlockStore) GetUploadStatus() (UploadStatus, <-chan struct{}) {
+	status, changed := b.placement.wb.GetStatus()
+	out := UploadStatus{Backend: b.placement.backend.Load(), Status: status, Fallback: b.placement.fallbackFills.status(), Reads: b.placement.readStatus()}
+	out.Packs, _ = b.GetPackStatus()
+	return out, changed
+}
+
+// GetPackStatus returns the status of the finalized packs of the store's
+// packahead log, and a channel that closes when it next changes, or nils when
+// the store has no log.
+func (b *BlockStore) GetPackStatus() (*packahead.DrainStatus, <-chan struct{}) {
+	if b.placement.drain == nil {
+		return nil, nil
+	}
+	status, changed := b.placement.drain.Status()
+	return &status, changed
+}
+
+// UploadedBefore reports whether the storage backend holds every block written
+// before at: the queued writes and the packs of the store's packahead log.
+func (b *BlockStore) UploadedBefore(ctx context.Context, at time.Time) (bool, error) {
+	uploaded, err := b.placement.wb.UploadedBefore(ctx, at)
+	if err != nil || !uploaded || b.placement.drain == nil {
+		return uploaded, err
+	}
+	return b.placement.drain.UploadedBefore(at), nil
+}
+
+// ReclaimStorage drops the blocks the volume no longer tracks or holds from
+// the storage backend's bucket. Returns zero without calling fence when no storage
+// backend is open.
+func (b *BlockStore) ReclaimStorage(ctx context.Context, fence bstore.ReclaimFence) (time.Time, error) {
+	// Skip the pass without a storage backend, or when the backend is the
+	// store's primary.
+	remote := b.placement.remote.Load()
+	if remote == nil || b.placement.sqlPrimary {
+		return time.Time{}, nil
+	}
+
+	// Judge liveness by the reference graph once the fence copied the live
+	// roots.
+	copyRoots := func(ctx context.Context) error {
+		_, err := fence(ctx, true)
+		return err
+	}
+	return remote.store.Reclaim(ctx, copyRoots, b.placement.live)
+}
+
+// GetCopySource returns the store a graph copy reads from. A copy writes each
+// block itself, so it reads peers without the per-block cache fill.
+func (b *BlockStore) GetCopySource() block.StoreOps {
+	if b.copyStore != nil {
+		return b.copyStore
+	}
+	return b.readOwner()
+}
+
+func (b *BlockStore) readOwner() block_store.Store {
+	if b.readStore != nil {
+		return b.readStore
+	}
+	return b.store
+}
+
+// BeginReadOperation opens a read scope on the inner store.
+func (b *BlockStore) BeginReadOperation(ctx context.Context) (block.StoreOps, func(), error) {
+	// Open a read scope and return it as a block store bound to this placement.
+	owner := b.readOwner()
+	store, release, err := owner.BeginReadOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	scopedStore, ok := store.(block_store.Store)
+	if !ok {
+		scopedStore = block_store.NewStore(owner.GetID(), store)
+	}
+	if b.readStore != nil {
+		return &BlockStore{
+			store:         b.store,
+			readStore:     scopedStore,
+			copyStore:     b.copyStore,
+			decodedBlocks: b.decodedBlocks,
+			placement:     b.placement,
+		}, release, nil
+	}
+	return &BlockStore{store: scopedStore, decodedBlocks: b.decodedBlocks, placement: b.placement}, release, nil
+}
+
+// PutBlock forwards to the inner store.
+func (b *BlockStore) PutBlock(ctx context.Context, data []byte, opts *block.PutOpts) (*block.BlockRef, bool, error) {
+	return b.store.PutBlock(ctx, data, opts)
+}
+
+// PutBlockBatch forwards batched writes to the inner store.
+func (b *BlockStore) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	existed, err := b.store.PutBlockBatch(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+
+	// Batch tombstones bypass RmBlock, so the provider wrapper must invalidate
+	// decoded entries here before any future read can reuse stale content.
+	b.invalidateBatchTombstones(ctx, entries)
+	return existed, nil
+}
+
+// GetBlock forwards to the configured Session read store.
+func (b *BlockStore) GetBlock(ctx context.Context, ref *block.BlockRef) ([]byte, bool, error) {
+	return b.readOwner().GetBlock(ctx, ref)
+}
+
+// GetStoredBlock forwards to the inner store.
+func (b *BlockStore) GetStoredBlock(ctx context.Context, ref *block.BlockRef) (*block.StoredBlock, error) {
+	return b.readOwner().GetStoredBlock(ctx, ref)
+}
+
+// GetBlockExists forwards to the configured Session read store.
+func (b *BlockStore) GetBlockExists(ctx context.Context, ref *block.BlockRef) (bool, error) {
+	return b.readOwner().GetBlockExists(ctx, ref)
+}
+
+// GetBlockExistsBatch forwards batched existence probes to the configured read store.
+func (b *BlockStore) GetBlockExistsBatch(ctx context.Context, refs []*block.BlockRef) ([]bool, error) {
+	return b.readOwner().GetBlockExistsBatch(ctx, refs)
+}
+
+// RmBlock forwards to the inner store.
+func (b *BlockStore) RmBlock(ctx context.Context, ref *block.BlockRef) error {
+	if err := b.store.RmBlock(ctx, ref); err != nil {
+		return err
+	}
+	b.InvalidateDecodedBlockRef(ctx, ref)
+	return nil
+}
+
+func (b *BlockStore) invalidateBatchTombstones(ctx context.Context, entries []*block.PutBatchEntry) {
+	for _, entry := range entries {
+		if entry != nil && entry.Tombstone {
+			b.InvalidateDecodedBlockRef(ctx, entry.Ref)
+		}
+	}
+}
+
+// StatBlock forwards to the configured Session read store.
+func (b *BlockStore) StatBlock(ctx context.Context, ref *block.BlockRef) (*block.BlockStat, error) {
+	return b.readOwner().StatBlock(ctx, ref)
+}
+
+// Sync forwards the durability barrier to the inner store.
+func (b *BlockStore) Sync(ctx context.Context) (bool, error) {
+	return b.store.Sync(ctx)
+}
+
+// NewBlockStoreRef builds a new BlockStoreRef.
+func NewBlockStoreRef(providerID, providerAccountID, bstoreID string) *bstore.BlockStoreRef {
+	return &bstore.BlockStoreRef{
+		ProviderResourceRef: &provider.ProviderResourceRef{
+			Id:                bstoreID,
+			ProviderId:        providerID,
+			ProviderAccountId: providerAccountID,
+		},
+	}
+}
+
+// bstoreTracker tracks a BlockStore in the ProviderAccount.
+type bstoreTracker struct {
+	// nodeClient reaches the store's storage node, nil while none is up.
+	nodeClient atomic.Pointer[block_store_nodepush.Client]
+	// a is the provider account
+	a *ProviderAccount
+	// id is the bstore id
+	id string
+	// bstoreCtr is the bstore container
+	bstoreCtr *ccontainer.CContainer[*BlockStore]
+	// remote is the open storage backend store, or nil.
+	remote atomic.Pointer[openBackend]
+	// remoteBcast serializes remote and placement publication with waiter capture.
+	remoteBcast broadcast.Broadcast
+	// evictGate holds eviction passes off while a storage move fetches the
+	// blocks a backend holds and switches the placement. It outlives each
+	// mount, so a remounted store still waits.
+	evictGate csync.Mutex
+	// windowFill is where the bucket's pack reads write the windows they
+	// fetch, nil while the mount does not fill its local store.
+	windowFill atomic.Pointer[windowFill]
+}
+
+// buildBlockStoreTracker builds a new bstoreTracker for a bstore id.
+func (a *ProviderAccount) buildBlockStoreTracker(bstoreID string) (keyed.Routine, *bstoreTracker) {
+	tracker := &bstoreTracker{
+		a:         a,
+		id:        bstoreID,
+		bstoreCtr: ccontainer.NewCContainer[*BlockStore](nil),
+	}
+	return tracker.executeBlockStoreTracker, tracker
+}
+
+// executeBlockStoreTracker mounts the block store and publishes its handle
+// until ctx ends.
+func (t *bstoreTracker) executeBlockStoreTracker(rctx context.Context) error {
+	// Bound the mount to its own context and log it by store id.
+	ctx, ctxCancel := context.WithCancel(rctx)
+	defer ctxCancel()
+	le := t.a.le.WithField("bstore-id", t.id)
+	le.Debug("mounting bstore")
+
+	// Build the config of the store's bucket.
+	bucketConf, err := t.buildBucketConf()
+	if err != nil {
+		return err
+	}
+
+	// Apply bucket config. Note that if there is a config with a higher rev,
+	// nothing will happen and the one with the higher revision will be used.
+	volID := t.a.vol.GetID()
+	applyBucketResult, err := bucket.ExApplyBucketConfig(
+		ctx,
+		t.a.t.p.b,
+		bucket.NewApplyBucketConfigToVolume(bucketConf, volID),
+	)
+	if err != nil {
+		return err
+	}
+	if errStr := applyBucketResult.GetError(); errStr != "" {
+		return errors.New(errStr)
+	}
+
+	// Mount the block store.
+	blockStoreLocalID := BlockStoreLocalID(
+		t.a.t.p.info.GetProviderId(),
+		t.a.t.accountInfo.GetProviderAccountId(),
+		t.id,
+	)
+	bucketHandle, _, bucketHandleRef, err := bucket.ExBuildBucketAPI(
+		ctx,
+		t.a.t.p.b,
+		false,
+		bucketConf.GetId(),
+		volID,
+		ctxCancel,
+	)
+	if err != nil {
+		return err
+	}
+	defer bucketHandleRef.Release()
+
+	// The bucket exists once its config applies.
+	if !bucketHandle.GetExists() {
+		return errors.New("bucket does not exist even after creating it")
+	}
+
+	// Construct the block store handle and controller.
+	decodedBlocks := block.NewDecodedBlockCache()
+	defer decodedBlocks.Close()
+	localBucket := bucketHandle.GetBucket()
+	bucketID := BlockStoreBucketID(
+		t.a.t.p.info.GetProviderId(),
+		t.a.t.accountInfo.GetProviderAccountId(),
+		t.id,
+	)
+
+	// Queue writes for upload when the account places the store on a backend.
+	// The settings cannot place their own block store, which they mount from.
+	settingsRef, err := t.a.lookupAccountSettingsRef(ctx)
+	if err != nil {
+		return err
+	}
+	var settings *settingsWatch
+	var placed *account_settings.BlockStorePlacement
+	var backend, fallback *account_settings.StorageBackend
+	if settingsRef != nil && settingsRef.GetBlockStoreId() != t.id {
+		settings, err = t.a.watchAccountSettings(ctx, settingsRef)
+		if err != nil {
+			return err
+		}
+		defer settings.release()
+		placed, backend, fallback, err = t.nextBackend(ctx, settings)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Record the writes still to upload beside the store, in the volume that
+	// holds its blocks: a block and its marker commit in one transaction.
+	markersID := BlockStoreWritebackObjectStoreID(
+		t.a.t.p.info.GetProviderId(),
+		t.a.t.accountInfo.GetProviderAccountId(),
+		t.id,
+	)
+	markers, _, markersRef, err := volume.ExBuildObjectStoreAPI(
+		ctx,
+		t.a.t.p.b,
+		false,
+		markersID,
+		volID,
+		ctxCancel,
+	)
+	if err != nil {
+		return err
+	}
+	defer markersRef.Release()
+
+	// Open the store's packahead log, when the account keeps one, which then
+	// reads before the Volume's bucket and takes the store's writes.
+	local := block.StoreOps(localBucket)
+	packs, err := t.openPacks(ctx, le, localBucket)
+	if err != nil {
+		return err
+	}
+	var wb *block_store_writeback.Store
+	if packs != nil {
+		defer packs.log.Close()
+		local = packs.packed
+		wb, err = block_store_writeback.NewStoreWithPacks(ctx, packs.packed, t.a.vol, markers.GetObjectStore(), markersID, backend != nil)
+	} else {
+		wb, err = block_store_writeback.NewStore(ctx, localBucket, t.a.vol, markers.GetObjectStore(), markersID, backend != nil)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Track the store's placement, which places new writes, refills evicted
+	// blocks and reclaims backend storage.
+	placement := &placementState{wb: wb, local: local, remote: &t.remote, evictGate: &t.evictGate, evictAdmit: &t.a.evictAdmit, done: ctx.Done()}
+	if packs != nil {
+		placement.drain = packs.drain
+	}
+	placement.tracker, _ = t.a.vol.(childListReader)
+	placement.serveOnly = serveOnly.Load()
+	placement.peerUpload = !placement.serveOnly && peerFillsUpload.Load()
+	if backend != nil {
+		if !placement.serveOnly {
+			placement.cache = t.fillCache()
+		}
+		placement.front = t.packFront()
+	}
+	t.setPlacementBackend(placement, backend)
+
+	// A bucket read fills the local store with every block of the window it
+	// fetched, as it fills the block asked for, unless a fill cache takes the
+	// fills or serve mode fills nothing.
+	if !placement.serveOnly && placement.cache == nil {
+		t.windowFill.Store(&windowFill{ctx: ctx, target: &windowFillOps{StoreOps: local, fill: placement.fill}})
+		defer t.windowFill.Store(nil)
+	}
+	if err := placement.reads.load(ctx, wb); err != nil {
+		le.WithError(err).Warn("unable to load the saved block reads, eviction keeps only new reads")
+	}
+	placement.setPolicy(placed.GetCache())
+
+	// Open the SQL backend before the upload routine, which reuses it, when
+	// the account makes it the store's primary. An unreachable backend fails
+	// the mount.
+	var sqlStore backendStore
+	if t.a.sqlPrimary.Load() && backend.GetSql() != nil {
+		sqlStore, err = t.openBackendStore(ctx, backend)
+		if err != nil {
+			return err
+		}
+		t.swapRemote(&openBackend{backend: backend, store: sqlStore})
+		defer t.swapRemote(nil)
+		placement.sqlPrimary = true
+	}
+	le.WithField("sql-primary", sqlStore != nil).Info("mounting bstore")
+
+	// Open the read fallback, which connects on its first read, so an
+	// unreachable database never fails the mount.
+	var fallbackStore backendStore
+	if fallback != nil {
+		fallbackStore, err = t.openFallbackStore(ctx, fallback)
+		if err != nil {
+			return err
+		}
+		defer fallbackStore.Close()
+	}
+
+	// Upload the recorded writes to the current backend until the store
+	// unmounts. Serve mode only opens the backend for reads.
+	uploadName := "storage-upload"
+	if placement.serveOnly {
+		uploadName = "storage-reads"
+	}
+	upload := routine.NewStateRoutineContainerWithLoggerVT[*account_settings.StorageBackend](
+		le.WithField("routine", uploadName),
+		routine.WithRetry(providerBackoff),
+	)
+	upload.SetStateRoutine(func(ctx context.Context, backend *account_settings.StorageBackend) error {
+		return t.runUpload(ctx, wb, placement.drain, backend, placement.serveOnly)
+	})
+	upload.SetState(backend)
+	upload.SetContext(ctx, true)
+	defer t.swapRemote(nil)
+	defer upload.ClearContext()
+
+	// Read the local store first, then the backend's bucket, then the read
+	// fallback, then peers.
+	localStore := block_store.NewStore(blockStoreLocalID, wb)
+	var recorded block.StoreOps = &hitCounter{StoreOps: local, hits: &placement.localHits}
+	if !placement.serveOnly {
+		recorded = &readRecorder{StoreOps: recorded, reads: &placement.reads}
+	}
+	peers := t.peerSource(le, bucketID)
+	if placement.serveOnly {
+		peers = func() block.StoreOps { return nil }
+	}
+	reads, copies := placement.readChains(
+		recorded,
+		local,
+		func() block.StoreOps { return t.getRemoteReads(placement) },
+		peers,
+		fallbackStore,
+	)
+
+	// A primary SQL backend takes the writes and holds the roots.
+	if sqlStore != nil {
+		localStore, reads = sqlPrimaryStores(blockStoreLocalID, localBucket, sqlStore, func() block.StoreOps {
+			return t.a.getP2PStore(bucketID)
+		})
+		copies = reads
+	}
+
+	// A peer's request reads the store below its local volume too, without
+	// peers and filling nothing; the DEX bucket lookup alone holds only the
+	// resident blocks.
+	var serve block.StoreOps
+	if sqlStore != nil {
+		serve = block_store.NewStoreReadThrough(
+			func() block.StoreOps { return block.NewReadOnlyStore(localBucket) },
+			func() block.StoreOps { return sqlStore },
+			nil,
+		)
+	} else {
+		serve = placement.serveReads(local, func() block.StoreOps { return t.getRemoteReads(placement) }, fallbackStore)
+	}
+	served := &serveStore{StoreOps: serve}
+	t.a.serveStores.Store(bucketID, served)
+	defer t.a.serveStores.CompareAndDelete(bucketID, served)
+
+	// Build the handle over the local store and its read paths.
+	bstoreHandle := &BlockStore{
+		store:         localStore,
+		readStore:     block_store.NewStore(blockStoreLocalID, reads),
+		copyStore:     copies,
+		decodedBlocks: decodedBlocks,
+		placement:     placement,
+	}
+
+	// Push publications to the storage node, for a store the account names.
+	// Serve mode only reads the node.
+	if sqlStore == nil && placement.serveOnly {
+		stopReads := t.startNodeReads(ctx, le)
+		defer stopReads()
+	} else if sqlStore == nil {
+		stopPush := t.startNodePush(ctx, le, wb, placement, bstoreHandle)
+		defer stopPush()
+	}
+
+	// Keep the store under its placement's resident budget. A store writing
+	// to its SQL backend leaves the local bucket as it is, and serve mode
+	// evicts nothing.
+	if sqlStore == nil && !placement.serveOnly {
+		eviction := routine.NewRoutineContainerWithLogger(
+			le.WithField("routine", "storage-evict"),
+			routine.WithRetry(providerBackoff),
+		)
+		eviction.SetRoutine(placement.runEviction)
+		eviction.SetContext(ctx, true)
+		defer eviction.ClearContext()
+	}
+
+	// Serve the handle to block store directives, so their reads of evicted
+	// blocks read through to the backend.
+	bstoreCtrl := newLocalBlockStoreController(le, blockStoreLocalID, bstoreHandle)
+	relBstoreCtrl, err := t.a.t.p.b.AddController(ctx, bstoreCtrl, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		ctxCancel()
+		relBstoreCtrl()
+	}()
+
+	// Publish the handle until the store unmounts.
+	le.Debug("mounted bstore successfully")
+	t.bstoreCtr.SetValue(bstoreHandle)
+	defer t.bstoreCtr.SetValue(nil)
+
+	// Wake pending reads before controller release or backend teardown waits.
+	defer ctxCancel()
+
+	// Follow placement changes until the store unmounts. The backend receives
+	// the blocks stored before it was chosen as well as new writes.
+	// A placement that skips the backfill queues it once the placement no
+	// longer does. Serve mode queues nothing and writes no placement change.
+	if placement.serveOnly {
+		<-ctx.Done()
+		return context.Canceled
+	}
+	if err := t.backfill(ctx, wb, backend, placed); err != nil {
+		return err
+	}
+	for settings != nil {
+		placed, next, nextFallback, err := t.nextBackend(ctx, settings)
+		if err != nil {
+			return err
+		}
+		placement.setPolicy(placed.GetCache())
+		if sqlStore != nil && !next.EqualVT(backend) {
+			return errors.New("placement of an SQL primary store changed, remounting")
+		}
+		if !nextFallback.EqualVT(fallback) {
+			return errors.New("read fallback of the store changed, remounting")
+		}
+		if !next.EqualVT(backend) {
+			t.setPlacementBackend(placement, next)
+			if err := wb.SetEnabled(ctx, next != nil); err != nil {
+				return err
+			}
+			upload.SetState(next)
+			backend = next
+		}
+		if err := t.backfill(ctx, wb, backend, placed); err != nil {
+			return err
+		}
+	}
+	<-ctx.Done()
+	return context.Canceled
+}
+
+// sqlPrimaryStores builds the write store and read chain of a store whose
+// SQL backend is primary. Writes go to the backend. Reads try the local
+// bucket, read only, then the backend, then peers, and fill nothing, so the
+// local bucket takes no new blocks.
+func sqlPrimaryStores(
+	id string,
+	local, sql block.StoreOps,
+	peers block_store.StoreSource,
+) (block_store.Store, *block_store.StoreReadThrough) {
+	lower := block_store.NewStoreReadThrough(
+		func() block.StoreOps { return sql },
+		peers,
+		nil,
+	)
+	reads := block_store.NewStoreReadThrough(
+		func() block.StoreOps { return block.NewReadOnlyStore(local) },
+		func() block.StoreOps { return lower },
+		nil,
+	)
+	return block_store.NewStore(id, sql), reads
+}
+
+// newLocalBlockStoreController builds the controller that serves store under
+// blockStoreLocalID.
+func newLocalBlockStoreController(
+	le *logrus.Entry,
+	blockStoreLocalID string,
+	store block_store.Store,
+) *block_store_controller.Controller {
+	return block_store_controller.NewController(
+		le,
+		controller.NewInfo(ControllerID+"/bstore", Version, "local block store for: "+blockStoreLocalID),
+		block_store_controller.NewBlockStoreBuilder(store),
+		[]string{blockStoreLocalID},
+		true,
+		[]string{blockStoreLocalID},
+		false,
+		false,
+	)
+}
+
+// backfill queues the store's blocks for upload to backend, once per backend,
+// unless the placement skips the backfill.
+func (t *bstoreTracker) backfill(
+	ctx context.Context,
+	wb *block_store_writeback.Store,
+	backend *account_settings.StorageBackend,
+	placed *account_settings.BlockStorePlacement,
+) error {
+	if backend == nil || placed.GetCache().GetSkipBackfill() {
+		return nil
+	}
+	return wb.Backfill(ctx, backend.GetId(), func(ctx context.Context) ([]*block.BlockRef, error) {
+		return t.a.ListBlockStoreRefs(ctx, t.id)
+	})
+}
+
+// buildBucketConf builds the bucket config for the bstore.
+func (t *bstoreTracker) buildBucketConf() (*bucket.Config, error) {
+	bucketID := BlockStoreBucketID(
+		t.a.t.p.info.GetProviderId(),
+		t.a.t.accountInfo.GetProviderAccountId(),
+		t.id,
+	)
+	lookupConf, err := bucket.NewLookupConfig(configset.NewControllerConfig(1, &lookup_concurrent.Config{
+		NotFoundBehavior:  lookup_concurrent.NotFoundBehavior_NotFoundBehavior_NONE,
+		PutBlockBehavior:  lookup_concurrent.PutBlockBehavior_PutBlockBehavior_ALL,
+		WritebackBehavior: lookup_concurrent.WritebackBehavior_WritebackBehavior_ALL,
+	}))
+	if err != nil {
+		return nil, err
+	}
+	return bucket.NewConfig(bucketID, blockStoreBucketConfigRev, lookupConf)
+}
+
+// createBlockStoreLocked creates a new bstore with the given details.
+// Assumes a.mtx is locked.
+func (a *ProviderAccount) createBlockStoreLocked(ctx context.Context, id string) (*bstore.BlockStoreRef, error) {
+	// build the bstore ref
+	providerID := a.t.accountInfo.GetProviderId()
+	providerAccountID := a.t.accountInfo.GetProviderAccountId()
+	bstoreRef := NewBlockStoreRef(providerID, providerAccountID, id)
+
+	// validate the ref (also validates the id)
+	if err := bstoreRef.Validate(); err != nil {
+		return nil, err
+	}
+
+	// TODO: store block store?
+
+	// return the ws ref
+	return bstoreRef, nil
+}
+
+// CreateBlockStore creates a new bstore with the given details.
+func (a *ProviderAccount) CreateBlockStore(ctx context.Context, id string) (*bstore.BlockStoreRef, error) {
+	relMtx, err := a.mtx.Lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer relMtx()
+
+	return a.createBlockStoreLocked(ctx, id)
+}
+
+// MountBlockStore attempts to mount a BlockStore returning the bstore and a release function.
+//
+// usually called by the provider controller
+func (a *ProviderAccount) MountBlockStore(ctx context.Context, ref *bstore.BlockStoreRef, released func()) (bstore.BlockStore, func(), error) {
+	// Reject a block-store reference that does not validate.
+	if err := ref.Validate(); err != nil {
+		return nil, nil, err
+	}
+
+	// Retain the block-store tracker until the caller releases the mount.
+	bstoreID := ref.GetProviderResourceRef().GetId()
+	tkrRef, tkr, _ := a.bstores.AddKeyRef(bstoreID)
+
+	// Wait for the mounted block store, releasing the tracker on failure.
+	bstore, err := tkr.bstoreCtr.WaitValue(ctx, nil)
+	if err != nil {
+		tkrRef.Release()
+		return nil, nil, err
+	}
+
+	return bstore, tkrRef.Release, nil
+}
+
+// _ is a type assertion
+var (
+	_ bstore.BlockStoreProvider = (*ProviderAccount)(nil)
+	_ bstore.BlockStore         = (*BlockStore)(nil)
+	_ block.StoreOps            = (*BlockStore)(nil)
+)

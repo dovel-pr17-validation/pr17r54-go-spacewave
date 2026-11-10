@@ -1,0 +1,91 @@
+package unixfs_world_testbed
+
+import (
+	"time"
+
+	hydra_testbed "github.com/s4wave/spacewave/db/testbed"
+	"github.com/s4wave/spacewave/db/unixfs"
+	unixfs_world "github.com/s4wave/spacewave/db/unixfs/world"
+	"github.com/s4wave/spacewave/db/world"
+	world_testbed "github.com/s4wave/spacewave/db/world/testbed"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+)
+
+// BuildTestbed builds a unixfs world testbed.
+func BuildTestbed(
+	tb *hydra_testbed.Testbed,
+	objKey string,
+	watchWorldChanges bool,
+	opts ...world_testbed.Option,
+) (*unixfs.FSHandle, *world_testbed.Testbed, error) {
+	// Build the World testbed that owns the filesystem object.
+	wtb, err := world_testbed.NewTestbed(tb, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Initialize the filesystem in the World testbed.
+	ufs, err := InitTestbed(wtb, objKey, watchWorldChanges)
+	if err != nil {
+		return nil, wtb, err
+	}
+
+	return ufs, wtb, nil
+}
+
+// InitTestbed inits the testbed with a new fs.
+//
+// if watchWorldChanges is false the fs will be read-only
+func InitTestbed(
+	tb *world_testbed.Testbed,
+	objKey string,
+	watchWorldChanges bool,
+) (*unixfs.FSHandle, error) {
+	// Use the testbed lifecycle context for filesystem initialization.
+	ctx := tb.Context
+
+	// provide op handlers to bus
+	engineID := tb.EngineID
+	opc := world.NewLookupOpController("test-fs-ops", engineID, world.NewSchema(unixfs_world.UnixfsTypes).LookupOp)
+	_, err := tb.Bus.AddController(ctx, opc, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// uses directive to look up the engine
+	eng := tb.Engine
+
+	// uses short-lived engine txs to implement world state
+	ws := world.NewEngineWorldState(eng, true)
+
+	// Identify the testbed Volume as the filesystem initializer.
+	sender := tb.Volume.GetPeerID()
+	fsType := unixfs_world.FSType_FSType_FS_NODE
+	typeID, _ := unixfs_world.FSTypeToTypeID(fsType)
+	_, _, err = unixfs_world.FsInit(
+		ctx,
+		ws,
+		sender,
+		objKey,
+		fsType,
+		nil,
+		true,
+		time.Now(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// check type
+	if err := world_types.CheckObjectType(ctx, ws, objKey, typeID); err != nil {
+		return nil, err
+	}
+
+	// construct full fs
+	tb.Logger.Debug("filesystem initialized")
+	rootFSCursor, err := unixfs_world.FollowUnixfsRef(ctx, tb.Logger, ws, &unixfs_world.UnixfsRef{ObjectKey: objKey}, sender, watchWorldChanges)
+	if err != nil {
+		return nil, err
+	}
+	return unixfs.NewFSHandle(rootFSCursor)
+}

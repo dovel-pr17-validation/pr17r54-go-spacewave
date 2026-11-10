@@ -1,0 +1,360 @@
+import React, { type DependencyList } from 'react'
+import { describe, it, expect, afterEach, vi } from 'vitest'
+import {
+  fireEvent,
+  render,
+  screen,
+  cleanup,
+  waitFor,
+} from '@testing-library/react'
+import { SpaceObjectBrowser } from './SpaceObjectBrowser.js'
+import { SpaceContainerContext } from '@s4wave/web/contexts/SpaceContainerContext.js'
+import type { Resource } from '@aptre/bldr-sdk/hooks/useResource.js'
+import type { SpaceState } from '@s4wave/sdk/space/space.pb.js'
+import type { EngineWorldState } from '@s4wave/sdk/world/engine-state.js'
+import { SetSpaceIndexPathOp } from '@s4wave/core/space/world/ops/ops.pb.js'
+import type { WorldQuery } from '@s4wave/sdk/world/world-query.js'
+import type { TypedObject } from '@s4wave/web/test/world-query.js'
+
+const h = vi.hoisted(() => ({ objects: [] as TypedObject[] }))
+
+vi.mock('@s4wave/web/hooks/useWorldQuery.js', async () => {
+  const { listingWorld, useFakeWorldQuery } =
+    await import('@s4wave/web/test/world-query.js')
+  const world = listingWorld(() => h.objects)
+  return {
+    useWorldQuery: <T,>(
+      _world: unknown,
+      query: WorldQuery<T>,
+      deps: DependencyList,
+    ) => useFakeWorldQuery(world, query, deps),
+  }
+})
+
+vi.mock('@s4wave/web/ui/toaster.js', () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+  },
+}))
+
+vi.mock('@s4wave/web/ui/tooltip.js', () => ({
+  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  TooltipContent: ({ children }: { children: React.ReactNode }) => (
+    <span>{children}</span>
+  ),
+}))
+
+const mockOpenCommand = vi.fn()
+
+vi.mock('@s4wave/web/command/CommandContext.js', () => ({
+  useOpenCommand: () => mockOpenCommand,
+}))
+
+vi.mock('@s4wave/web/ui/DropdownMenu.js', () => ({
+  DropdownMenu: ({
+    children,
+    open,
+  }: {
+    children: React.ReactNode
+    open?: boolean
+  }) =>
+    open === false ? null : (
+      <div data-testid={open ? 'context-menu' : undefined}>{children}</div>
+    ),
+  DropdownMenuTrigger: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  DropdownMenuContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DropdownMenuItem: ({
+    children,
+    onClick,
+    variant,
+    disabled,
+  }: {
+    children: React.ReactNode
+    onClick?: () => void
+    variant?: string
+    disabled?: boolean
+  }) => (
+    <button
+      type="button"
+      onClick={onClick}
+      data-variant={variant}
+      disabled={disabled}
+    >
+      {children}
+    </button>
+  ),
+  DropdownMenuSeparator: () => <hr />,
+}))
+
+// BrowserSpace is a Space's World objects and settings.
+interface BrowserSpace {
+  objects: TypedObject[]
+  settings: SpaceState['settings']
+}
+
+describe('SpaceObjectBrowser', () => {
+  const mockNavigateToObjects = vi.fn()
+
+  const mockSpaceWorld = {
+    applyWorldOp: vi.fn().mockResolvedValue({ seqno: 1n, sysErr: false }),
+    deleteObject: vi.fn().mockResolvedValue({ deleted: true }),
+    renameObject: vi.fn().mockResolvedValue({ release: vi.fn() }),
+    getEngine: vi.fn(),
+  } as unknown as EngineWorldState
+
+  const mockWorldResource: Resource<EngineWorldState> = {
+    value: mockSpaceWorld,
+    loading: false,
+    error: null,
+    retry: vi.fn(),
+  }
+
+  const mockSpace: BrowserSpace = {
+    objects: [
+      { objectKey: 'object-layout/main', objectType: 'alpha/object-layout' },
+      { objectKey: 'files', objectType: 'unixfs/fs-node' },
+      { objectKey: 'canvas-1', objectType: 'canvas' },
+      { objectKey: 'settings', objectType: 'space/settings' },
+    ],
+    settings: { indexPath: 'object-layout/main' },
+  }
+
+  function renderBrowser(
+    space: BrowserSpace = mockSpace,
+    props?: React.ComponentProps<typeof SpaceObjectBrowser>,
+    canDeleteObjects = true,
+  ) {
+    h.objects = space.objects
+    return render(
+      <SpaceContainerContext.Provider
+        spaceId="test-space"
+        spaceState={{ ready: true, settings: space.settings }}
+        spaceWorldResource={mockWorldResource}
+        spaceWorld={mockSpaceWorld}
+        canDeleteObjects={canDeleteObjects}
+        navigateToRoot={vi.fn()}
+        navigateToObjects={mockNavigateToObjects}
+        buildObjectUrls={vi.fn()}
+        navigateToSubPath={vi.fn()}
+      >
+        <SpaceObjectBrowser {...props} />
+      </SpaceContainerContext.Provider>,
+    )
+  }
+
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  it('renders "Objects" heading', () => {
+    renderBrowser()
+    expect(screen.getByText('Objects')).toBeDefined()
+  })
+
+  it('omits the outer heading when embedded', () => {
+    renderBrowser(mockSpace, { embedded: true })
+    expect(screen.queryByText('Objects')).toBeNull()
+  })
+
+  it('opens the command palette from the create button', () => {
+    renderBrowser()
+    const buttons = screen.getAllByRole('button')
+    fireEvent.click(buttons[0])
+    expect(mockOpenCommand).toHaveBeenCalledWith('spacewave.create-object')
+  })
+
+  it('renders tree with top-level nodes', async () => {
+    renderBrowser()
+    await waitFor(() => {
+      expect(
+        screen.getByRole('treeitem', { name: /Canvas 1, Canvas/i }),
+      ).toBeDefined()
+      expect(screen.getByText('files')).toBeDefined()
+      expect(
+        screen.getByRole('treeitem', { name: /Object Layout/i }),
+      ).toBeDefined()
+    })
+  })
+
+  it('does not render the settings object in the tree', async () => {
+    renderBrowser()
+    await waitFor(() => {
+      expect(
+        screen.getByRole('treeitem', { name: /Canvas 1, Canvas/i }),
+      ).toBeDefined()
+    })
+    // "settings" objectKey with type "space/settings" should be filtered out
+    // It would appear as a top-level node named "settings" if not hidden
+    expect(screen.queryByText('settings')).toBeNull()
+  })
+
+  it('renders virtual folder nodes for prefix paths', async () => {
+    renderBrowser()
+    await waitFor(() => {
+      expect(
+        screen.getByRole('treeitem', { name: /Canvas 1, Canvas/i }),
+      ).toBeDefined()
+      expect(screen.getByText('files')).toBeDefined()
+      expect(
+        screen.getByRole('treeitem', { name: /Object Layout/i }),
+      ).toBeDefined()
+    })
+  })
+
+  it('does not render context menu when menuState is null', () => {
+    renderBrowser()
+    expect(screen.queryByTestId('context-menu')).toBeNull()
+  })
+
+  it('hides object deletion without mutation permission', async () => {
+    renderBrowser(mockSpace, undefined, false)
+
+    const node = await screen.findByText('files')
+    fireEvent.contextMenu(node, { clientX: 120, clientY: 140 })
+
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull()
+  })
+
+  it('deletes an object through the space world owner', async () => {
+    renderBrowser()
+
+    const node = await screen.findByText('files')
+    fireEvent.contextMenu(node, { clientX: 120, clientY: 140 })
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    expect(screen.getByText('Delete "files"?')).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm Delete' }))
+
+    await waitFor(() => {
+      expect(mockSpaceWorld.deleteObject).toHaveBeenCalledWith('files')
+    })
+  })
+
+  it('renames an object key from the context menu', async () => {
+    renderBrowser()
+
+    const node = await screen.findByText('files')
+    fireEvent.contextMenu(node, { clientX: 120, clientY: 140 })
+    fireEvent.click(screen.getByRole('button', { name: /rename object key/i }))
+
+    fireEvent.change(screen.getByLabelText('New object key'), {
+      target: { value: 'files-main' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Rename' }))
+
+    await waitFor(() => {
+      expect(mockSpaceWorld.renameObject).toHaveBeenCalledWith(
+        'files',
+        'files-main',
+        { descendants: true },
+      )
+    })
+  })
+
+  it('renames descendant object keys with their parent prefix', async () => {
+    const gitState: BrowserSpace = {
+      objects: [
+        { objectKey: 'repo-1', objectType: 'git/repo' },
+        { objectKey: 'repo-1/workdir', objectType: 'unixfs/fs-node' },
+        { objectKey: 'repo-1/worktree', objectType: 'git/worktree' },
+      ],
+      settings: { indexPath: 'repo-1', pluginIds: ['spacewave-app'] },
+    }
+    renderBrowser(gitState)
+
+    const node = await screen.findByRole('treeitem', {
+      name: /Repo 1, Git Repository/i,
+    })
+    fireEvent.contextMenu(node, { clientX: 120, clientY: 140 })
+    fireEvent.click(screen.getByRole('button', { name: /rename object key/i }))
+
+    fireEvent.change(screen.getByLabelText('New object key'), {
+      target: { value: 'myrepo' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Rename' }))
+
+    await waitFor(() => {
+      expect(mockSpaceWorld.renameObject).toHaveBeenCalledTimes(1)
+    })
+    expect(mockSpaceWorld.renameObject).toHaveBeenCalledWith(
+      'repo-1',
+      'myrepo',
+      { descendants: true },
+    )
+    const settingsData = vi.mocked(mockSpaceWorld.applyWorldOp).mock
+      .calls[0]?.[1]
+    expect(settingsData).toBeInstanceOf(Uint8Array)
+    const settingsOp = SetSpaceIndexPathOp.fromBinary(settingsData)
+    expect(settingsOp.indexPath).toBe('myrepo')
+  })
+
+  it('sets the selected object as the index while preserving existing plugin settings', async () => {
+    const pluginState: BrowserSpace = {
+      objects: [
+        { objectKey: 'repo-1', objectType: 'git/repo' },
+        { objectKey: 'files', objectType: 'unixfs/fs-node' },
+      ],
+      settings: { indexPath: 'repo-1', pluginIds: ['spacewave-app'] },
+    }
+    renderBrowser(pluginState)
+
+    const node = await screen.findByText('files')
+    fireEvent.contextMenu(node, { clientX: 120, clientY: 140 })
+    const menuItem = screen.getByText('Set as Index').closest('button')
+    if (!menuItem) {
+      throw new Error('expected Set as Index menu item')
+    }
+    fireEvent.click(menuItem)
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+
+    await waitFor(() => {
+      expect(mockSpaceWorld.applyWorldOp).toHaveBeenCalledTimes(1)
+    })
+    const settingsData = vi.mocked(mockSpaceWorld.applyWorldOp).mock
+      .calls[0]?.[1]
+    expect(settingsData).toBeInstanceOf(Uint8Array)
+    const settingsOp = SetSpaceIndexPathOp.fromBinary(settingsData)
+    expect(settingsOp.indexPath).toBe('files')
+  })
+
+  it('anchors the context menu in document.body at the click position', async () => {
+    renderBrowser()
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: /expand object layout/i }),
+    )
+
+    const node = await screen.findByText('main')
+    fireEvent.contextMenu(node, { clientX: 120, clientY: 140 })
+
+    const anchor = document.body.querySelector(
+      '[data-slot="dropdown-menu-ghost-anchor"]',
+    )
+    if (!(anchor instanceof HTMLDivElement)) {
+      throw new Error('expected dropdown menu ghost anchor')
+    }
+
+    expect(anchor.classList.contains('dropdown-ghost-anchor')).toBe(true)
+    expect(anchor.style.getPropertyValue('--dropdown-ghost-left')).toBe('120px')
+    expect(anchor.style.getPropertyValue('--dropdown-ghost-top')).toBe('140px')
+  })
+
+  it('shows "No objects" placeholder when object list is empty', async () => {
+    const emptyState: BrowserSpace = {
+      objects: [],
+      settings: {},
+    }
+    renderBrowser(emptyState)
+    await waitFor(() => {
+      expect(screen.getByText('No objects')).toBeDefined()
+    })
+  })
+})

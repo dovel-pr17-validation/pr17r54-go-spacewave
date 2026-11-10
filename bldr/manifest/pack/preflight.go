@@ -1,0 +1,89 @@
+package bldr_manifest_pack
+
+import (
+	"context"
+	"strings"
+
+	"github.com/pkg/errors"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	"github.com/s4wave/spacewave/db/world"
+)
+
+// VerifyImportedManifests verifies every metadata tuple is collectable.
+func VerifyImportedManifests(
+	ctx context.Context,
+	ws world.WorldState,
+	meta *ManifestPackMetadata,
+) error {
+	// Validate the metadata and read the manifest bundle.
+	if err := meta.Validate(); err != nil {
+		return err
+	}
+	bundle, err := readManifestBundle(ctx, ws, meta.GetManifestBundleRef())
+	if err != nil {
+		return err
+	}
+	if len(bundle.GetManifestRefs()) != len(meta.GetManifests()) {
+		return errors.Errorf("manifest bundle count mismatch: got %d want %d", len(bundle.GetManifestRefs()), len(meta.GetManifests()))
+	}
+
+	// Verify each tuple's refs and roots collect the expected manifests.
+	for i, tuple := range meta.GetManifests() {
+		if err := validateManifestRefMatchesTuple(bundle.GetManifestRefs()[i], tuple, meta.GetBuildType()); err != nil {
+			return errors.Wrapf(err, "manifest %d", i)
+		}
+		roots := append([]string{tuple.GetObjectKey()}, tuple.GetLinkObjectKeys()...)
+		for _, root := range roots {
+			if err := verifyImportedManifestRoot(ctx, ws, tuple, root, bundle.GetManifestRefs()[i]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// verifyImportedManifestRoot verifies that an imported manifest root collects the expected manifests without errors.
+func verifyImportedManifestRoot(
+	ctx context.Context,
+	ws world.WorldState,
+	tuple *ManifestTuple,
+	root string,
+	expected *bldr_manifest.ManifestRef,
+) error {
+	// Collect the manifests reachable from the root.
+	collected, manifestErrs, err := bldr_manifest_world.CollectManifestsForManifestID(
+		ctx,
+		ws,
+		tuple.GetManifestId(),
+		[]string{tuple.GetPlatformId()},
+		root,
+	)
+	if err != nil {
+		return errors.Wrapf(err, "collect manifests from %s", root)
+	}
+
+	// Skipped manifests are reported as a single joined error.
+	if len(manifestErrs) != 0 {
+		parts := make([]string, 0, len(manifestErrs))
+		for _, err := range manifestErrs {
+			if err != nil {
+				parts = append(parts, err.Error())
+			}
+		}
+		return errors.Errorf("collect manifests from %s had skipped manifests: %s", root, strings.Join(parts, "; "))
+	}
+
+	// Exactly one manifest must be collected and match the tuple.
+	if len(collected) != 1 {
+		return errors.Errorf("manifest tuple %s@%s not found from %s", tuple.GetManifestId(), tuple.GetPlatformId(), root)
+	}
+	got := collected[0]
+	if err := validateManifestRefMatchesTuple(bldr_manifest.NewManifestRef(got.Manifest.GetMeta(), got.ManifestRef), tuple, expected.GetMeta().GetBuildType()); err != nil {
+		return errors.Wrapf(err, "manifest tuple %s@%s from %s", tuple.GetManifestId(), tuple.GetPlatformId(), root)
+	}
+	if !got.ManifestRef.EqualVT(expected.GetManifestRef()) {
+		return errors.Errorf("manifest tuple %s@%s from %s has unexpected root ref", tuple.GetManifestId(), tuple.GetPlatformId(), root)
+	}
+	return nil
+}

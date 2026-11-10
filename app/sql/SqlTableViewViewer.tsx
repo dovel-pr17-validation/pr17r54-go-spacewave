@@ -1,0 +1,190 @@
+import { LuListFilter, LuRefreshCw } from 'react-icons/lu'
+
+import {
+  useResource,
+  type Resource,
+} from '@aptre/bldr-sdk/hooks/useResource.js'
+import { useAccessTypedHandle } from '@s4wave/web/hooks/useAccessTypedHandle.js'
+import type { ObjectViewerComponentProps } from '@s4wave/web/object/object.js'
+import { getObjectKey } from '@s4wave/web/object/object.js'
+import { useObjectName } from '@s4wave/web/object/ObjectViewerContext.js'
+import { Button } from '@s4wave/web/ui/button.js'
+import { ErrorState } from '@s4wave/web/ui/ErrorState.js'
+import { LoadingInline } from '@s4wave/web/ui/loading/LoadingInline.js'
+
+import {
+  SqlTableView,
+  SqlTableViewTypeID,
+} from '@s4wave/sdk/sql/table-view/table-view.js'
+import type {
+  FetchRowsResponse,
+  GetTableViewResponse,
+  TableView,
+} from '@s4wave/sdk/sql/table-view/table-view.pb.js'
+
+import { flattenRowBatches, type SqlGridData } from './sql-cell.js'
+import { SqlResultGrid } from './SqlResultGrid.js'
+
+export { SqlTableViewTypeID }
+
+// SqlTableViewViewer is the full sql/table-view viewer: the persisted filter
+// metadata over a typed row grid that reuses the shared result grid, with a
+// refresh that re-runs the saved SELECT.
+export function SqlTableViewViewer({
+  objectInfo,
+  worldState,
+}: ObjectViewerComponentProps) {
+  const objectKey = getObjectKey(objectInfo)
+  const handle = useAccessTypedHandle(
+    worldState,
+    objectKey,
+    SqlTableView,
+    SqlTableViewTypeID,
+  )
+
+  const metaResource = useResource(
+    handle,
+    async (tableView, signal) => {
+      if (!tableView) return null
+      return tableView.getTableView(signal)
+    },
+    [],
+  )
+
+  const rowsResource = useResource(
+    handle,
+    async (tableView, signal) => {
+      if (!tableView) return null
+      return tableView.fetchRows(signal)
+    },
+    [],
+  )
+
+  const view = metaResource.value?.tableView
+  useObjectName(view?.displayName)
+  const rows = rowsResource.value
+  const data = rows
+    ? {
+        columns: rows.columns ?? [],
+        rows: flattenRowBatches(rows.rowBatches),
+        truncated: rows.truncated ?? false,
+      }
+    : null
+
+  return (
+    <div className="bg-background-primary flex h-full w-full flex-col">
+      <div className="border-foreground/8 flex h-9 shrink-0 items-center gap-2 border-b px-4">
+        <LuListFilter className="text-foreground-alt size-3.5" aria-hidden />
+        <span className="text-foreground text-sm font-semibold tracking-tight select-none">
+          Table View
+        </span>
+        {view?.targetTableName ? (
+          <span className="text-foreground-alt/50 truncate font-mono text-xs">
+            {view.targetTableName}
+          </span>
+        ) : null}
+        <div className="flex-1" />
+        <Button
+          variant="ghost"
+          onClick={rowsResource.retry}
+          disabled={rowsResource.loading}
+          size="xs"
+        >
+          <LuRefreshCw className="size-3" />
+          Refresh
+        </Button>
+      </div>
+
+      {view ? <TableViewFilterBar view={view} /> : null}
+
+      <div className="min-h-0 flex-1">
+        <TableViewBody
+          metaResource={metaResource}
+          rowsResource={rowsResource}
+          data={data}
+          csvFileName={`${objectKey.replaceAll('/', '-')}.csv`}
+        />
+      </div>
+    </div>
+  )
+}
+
+/** TableViewFilterBar summarizes the projected columns, filter, and row limit of a table view. */
+function TableViewFilterBar({ view }: { view: TableView }) {
+  const projected = view.projectedColumns ?? []
+  return (
+    <div className="border-foreground/8 text-foreground-alt/70 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-b px-4 py-1.5 text-xs">
+      <span>
+        columns:{' '}
+        <span className="text-foreground font-mono">
+          {projected.length ? projected.join(', ') : '*'}
+        </span>
+      </span>
+      {view.whereExpression ? (
+        <span>
+          where:{' '}
+          <span className="text-foreground font-mono">
+            {view.whereExpression}
+          </span>
+        </span>
+      ) : null}
+      {view.rowLimit ? (
+        <span>
+          limit: <span className="text-foreground">{view.rowLimit}</span>
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
+interface TableViewBodyProps {
+  metaResource: Resource<GetTableViewResponse | null>
+  rowsResource: Resource<FetchRowsResponse | null>
+  data: SqlGridData | null
+  csvFileName: string
+}
+
+/** TableViewBody shows the error and loading states, then the row grid once rows arrive. */
+function TableViewBody({
+  metaResource,
+  rowsResource,
+  data,
+  csvFileName,
+}: TableViewBodyProps) {
+  return (
+    <>
+      {metaResource.error ? (
+        <div className="p-4">
+          <ErrorState
+            title="Table view unavailable"
+            message={String(metaResource.error)}
+            onRetry={metaResource.retry}
+          />
+        </div>
+      ) : null}
+      {(metaResource.loading || rowsResource.loading) && data == null ? (
+        <div className="p-4">
+          <LoadingInline label="Loading rows" tone="muted" />
+        </div>
+      ) : null}
+      {rowsResource.error ? (
+        <div className="p-4">
+          <ErrorState
+            variant="inline"
+            title="Could not fetch rows"
+            message={String(rowsResource.error)}
+            onRetry={rowsResource.retry}
+          />
+        </div>
+      ) : null}
+      {data ? (
+        <SqlResultGrid
+          data={data}
+          csvFileName={csvFileName}
+          emptyTitle="No matching rows"
+          emptyDescription="No rows match this view's filter."
+        />
+      ) : null}
+    </>
+  )
+}

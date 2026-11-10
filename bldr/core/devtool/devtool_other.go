@@ -1,0 +1,58 @@
+//go:build !js
+
+package bldr_core_devtool
+
+import (
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller/resolver/static"
+	cli_compiler "github.com/s4wave/spacewave/bldr/cli/compiler"
+	dist_compiler "github.com/s4wave/spacewave/bldr/dist/compiler"
+	bldr_plugin_builder_controller "github.com/s4wave/spacewave/bldr/manifest/builder/controller"
+	plugin_compiler_go "github.com/s4wave/spacewave/bldr/plugin/compiler/go"
+	plugin_compiler_js "github.com/s4wave/spacewave/bldr/plugin/compiler/js"
+	bldr_project_controller "github.com/s4wave/spacewave/bldr/project/controller"
+	bldr_project_watcher "github.com/s4wave/spacewave/bldr/project/watcher"
+	bldr_web_bundler_esbuild_compiler "github.com/s4wave/spacewave/bldr/web/bundler/esbuild/compiler"
+	bldr_web_bundler_vite_compiler "github.com/s4wave/spacewave/bldr/web/bundler/vite/compiler"
+	web_pkg_compiler "github.com/s4wave/spacewave/bldr/web/pkg/compiler"
+	web_plugin_compiler "github.com/s4wave/spacewave/bldr/web/plugin/compiler"
+	web_plugin_electron "github.com/s4wave/spacewave/bldr/web/plugin/electron"
+	web_plugin_saucer "github.com/s4wave/spacewave/bldr/web/plugin/saucer"
+	volume_s4db "github.com/s4wave/spacewave/db/volume/s4db"
+	volume_sqlite "github.com/s4wave/spacewave/db/volume/sqlite"
+)
+
+// AddFactories adds the devtool factories.
+func AddFactories(b bus.Bus, sr *static.Resolver) {
+	// volumes
+	sr.AddFactory(volume_s4db.NewFactory(b))
+	sr.AddFactory(volume_sqlite.NewFactory(b))
+
+	// Register factories shared across architecture-specific devtool sets.
+	addCommonFactories(b, sr)
+
+	// project
+	sr.AddFactory(bldr_project_controller.NewFactory(b))
+	sr.AddFactory(bldr_project_watcher.NewFactory(b))
+
+	// compiler
+	sr.AddFactory(bldr_plugin_builder_controller.NewFactory(b))
+	sr.AddFactory(cli_compiler.NewFactory(b))
+	sr.AddFactory(dist_compiler.NewFactory(b))
+
+	// Register the Go and JavaScript plugin compilers.
+	sr.AddFactory(plugin_compiler_go.NewFactory(b))
+	sr.AddFactory(plugin_compiler_js.NewFactory(b))
+
+	// Register the web package and plugin compilers.
+	sr.AddFactory(web_pkg_compiler.NewFactory(b))
+	sr.AddFactory(web_plugin_compiler.NewFactory(b))
+
+	// Register the esbuild and Vite bundler compilers.
+	sr.AddFactory(bldr_web_bundler_esbuild_compiler.NewFactory(b))
+	sr.AddFactory(bldr_web_bundler_vite_compiler.NewFactory(b))
+
+	// native runtimes
+	sr.AddFactory(web_plugin_electron.NewFactory(b))
+	sr.AddFactory(web_plugin_saucer.NewFactory(b))
+}

@@ -1,0 +1,188 @@
+import {
+  createContext,
+  useCallback,
+  use,
+  useEffect,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from 'react'
+
+import type { SessionMetadata } from '@s4wave/core/session/session.pb.js'
+import {
+  useBackendStateAtomValue,
+  useStateNamespace,
+} from '@s4wave/web/state/index.js'
+import type { StateAtomAccessor } from '@s4wave/web/state/index.js'
+
+import {
+  completeLocalSessionOnboardingBackup,
+  completeLocalSessionOnboardingLock,
+  completeLocalSessionOnboardingProviderChoice,
+  defaultLocalSessionOnboardingState,
+  dismissLocalSessionOnboarding,
+  getLocalSessionOnboardingProviderChoiceComplete,
+  isLocalSessionOnboardingComplete,
+  type LocalSessionOnboardingState,
+} from './local-session-onboarding-state.js'
+
+type LocalSessionOnboardingUpdate =
+  | LocalSessionOnboardingState
+  | ((prev: LocalSessionOnboardingState) => LocalSessionOnboardingState)
+
+export interface LocalSessionOnboardingContextValue {
+  onboarding: LocalSessionOnboardingState
+  loading: boolean
+  // available is true once the onboarding state has been read from the
+  // session. A bound web listener denies state access, so it stays false there.
+  available: boolean
+  metadataLoaded: boolean
+  providerChoiceComplete: boolean
+  isComplete: boolean
+  setOnboarding: (update: LocalSessionOnboardingUpdate) => void
+  markProviderChoiceComplete: () => void
+  markBackupComplete: () => void
+  markLockComplete: () => void
+  dismiss: () => void
+}
+
+const Context = createContext<LocalSessionOnboardingContextValue | null>(null)
+
+const nullStateAtomAccessor: StateAtomAccessor = {
+  value: null,
+  loading: false,
+  error: null,
+  retry: () => {},
+}
+
+function applyLocalSessionOnboardingUpdate(
+  state: LocalSessionOnboardingState,
+  update: LocalSessionOnboardingUpdate,
+): LocalSessionOnboardingState {
+  if (typeof update === 'function') return update(state)
+  return update
+}
+
+export function useSessionOnboardingState(
+  metadata?: SessionMetadata,
+): LocalSessionOnboardingContextValue {
+  const setupNs = useStateNamespace(['setup'])
+  const storeId = useMemo(
+    () => [...setupNs.namespace, 'banner'].join('/'),
+    [setupNs.namespace],
+  )
+  const {
+    value: onboarding,
+    loading,
+    available,
+    setValue: setBackendOnboarding,
+  } = useBackendStateAtomValue<LocalSessionOnboardingState>(
+    setupNs.stateAtomAccessor ?? nullStateAtomAccessor,
+    storeId,
+    defaultLocalSessionOnboardingState,
+  )
+  const pendingUpdatesRef = useRef<LocalSessionOnboardingUpdate[]>([])
+
+  const setOnboarding = useCallback(
+    (update: LocalSessionOnboardingUpdate) => {
+      if (loading) {
+        pendingUpdatesRef.current = [...pendingUpdatesRef.current, update]
+        return
+      }
+      setBackendOnboarding(update)
+    },
+    [loading, setBackendOnboarding],
+  )
+
+  useEffect(() => {
+    if (loading) return
+    if (pendingUpdatesRef.current.length === 0) return
+
+    const updates = pendingUpdatesRef.current
+    pendingUpdatesRef.current = []
+    setBackendOnboarding((state) =>
+      updates.reduce(applyLocalSessionOnboardingUpdate, state),
+    )
+  }, [loading, setBackendOnboarding])
+
+  const markProviderChoiceComplete = useCallback(() => {
+    setOnboarding(completeLocalSessionOnboardingProviderChoice)
+  }, [setOnboarding])
+
+  const markBackupComplete = useCallback(() => {
+    setOnboarding(completeLocalSessionOnboardingBackup)
+  }, [setOnboarding])
+
+  const markLockComplete = useCallback(() => {
+    setOnboarding(completeLocalSessionOnboardingLock)
+  }, [setOnboarding])
+
+  const dismiss = useCallback(() => {
+    setOnboarding(dismissLocalSessionOnboarding)
+  }, [setOnboarding])
+
+  const providerChoiceComplete = useMemo(
+    () => getLocalSessionOnboardingProviderChoiceComplete(onboarding, metadata),
+    [onboarding, metadata],
+  )
+  const metadataLoaded = metadata !== undefined
+  const isComplete = useMemo(
+    () => isLocalSessionOnboardingComplete(onboarding, metadata),
+    [onboarding, metadata],
+  )
+
+  return useMemo(
+    () => ({
+      onboarding,
+      loading,
+      available,
+      metadataLoaded,
+      providerChoiceComplete,
+      isComplete,
+      setOnboarding,
+      markProviderChoiceComplete,
+      markBackupComplete,
+      markLockComplete,
+      dismiss,
+    }),
+    [
+      onboarding,
+      loading,
+      available,
+      metadataLoaded,
+      providerChoiceComplete,
+      isComplete,
+      setOnboarding,
+      markProviderChoiceComplete,
+      markBackupComplete,
+      markLockComplete,
+      dismiss,
+    ],
+  )
+}
+
+export function LocalSessionOnboardingProvider({
+  metadata,
+  children,
+}: {
+  metadata?: SessionMetadata
+  children?: ReactNode
+}) {
+  const value = useSessionOnboardingState(metadata)
+
+  return <Context.Provider value={value}>{children}</Context.Provider>
+}
+
+export function useLocalSessionOnboardingContext(): LocalSessionOnboardingContextValue {
+  const context = use(Context)
+  if (!context) {
+    throw new Error(
+      'LocalSessionOnboardingContext not found. Wrap component in LocalSessionOnboardingProvider.',
+    )
+  }
+  return context
+}
+
+export function useOptionalLocalSessionOnboardingContext(): LocalSessionOnboardingContextValue | null {
+  return use(Context)
+}

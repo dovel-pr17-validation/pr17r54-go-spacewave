@@ -1,0 +1,1294 @@
+//go:build !js
+
+package spacewave_cli
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aperturerobotics/cli"
+	"github.com/pkg/errors"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+	s4wave_git_core "github.com/s4wave/spacewave/core/git"
+	git_block "github.com/s4wave/spacewave/db/git/block"
+	git_world "github.com/s4wave/spacewave/db/git/world"
+	unixfs_block "github.com/s4wave/spacewave/db/unixfs/block"
+	unixfs_world "github.com/s4wave/spacewave/db/unixfs/world"
+	s4wave_git "github.com/s4wave/spacewave/sdk/git"
+	s4wave_session "github.com/s4wave/spacewave/sdk/session"
+	s4wave_unixfs "github.com/s4wave/spacewave/sdk/unixfs"
+	sdk_engine "github.com/s4wave/spacewave/sdk/world/engine"
+)
+
+// gitContext holds the mounted resources for git operations.
+type gitContext struct {
+	gitSvc    s4wave_git.SRPCGitRepoResourceServiceClient
+	engine    *sdk_engine.SDKEngine
+	objectKey string
+	client    *sdkClient
+}
+
+func uint32GitFlag(c *cli.Context, name string) (uint32, error) {
+	value := c.Uint(name)
+	if value > math.MaxUint32 {
+		return 0, fmt.Errorf("--%s exceeds uint32 range: %d", name, value)
+	}
+	return uint32(value), nil //nolint:gosec // the MaxUint32 check bounds the git protocol field.
+}
+
+// parseGitURI parses the git URI, allowing it to be empty for positional key resolution.
+func parseGitURI(arg, spaceFlag string, sessFlag int) (fsURI, error) {
+	if arg == "" {
+		result := fsURI{sessionIdx: 1, spaceID: spaceFlag}
+		if sessFlag > 0 {
+			var err error
+			result.sessionIdx, err = sessionIndexFromInt(sessFlag)
+			if err != nil {
+				return fsURI{}, err
+			}
+		}
+		return result, nil
+	}
+	return parseFsURI(arg, spaceFlag, sessFlag)
+}
+
+// mountGitContext connects to the daemon and mounts the full chain to get
+// a GitRepoResourceService client for the given URI.
+func mountGitContext(c *cli.Context, statePath string, uri fsURI) (*gitContext, func(), error) {
+	mount, err := mountObjectChain(c, statePath, uri, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	gitSvc := s4wave_git.NewSRPCGitRepoResourceServiceClient(mount.TypedClient)
+
+	return &gitContext{
+		gitSvc:    gitSvc,
+		engine:    mount.Engine,
+		objectKey: mount.ObjectKey,
+		client:    mount.client,
+	}, mount.release, nil
+}
+
+// gitEngineMount holds the World engine of a Space mounted without a typed
+// object.
+type gitEngineMount struct {
+	engine  *sdk_engine.SDKEngine
+	sess    *s4wave_session.Session
+	spaceID string
+}
+
+// mountGitEngine connects to the daemon and mounts the engine without
+// accessing a typed object. spaceID may be a Space ID or name; empty selects
+// the first Space. Used by standalone commands like clone and the remote
+// helper.
+func mountGitEngine(c *cli.Context, statePath, spaceID string, sessIdx int) (*gitEngineMount, func(), error) {
+	// Take the command context for the daemon connection.
+	ctx := c.Context
+
+	// Connect to the daemon from the CLI context.
+	client, err := connectDaemonFromContext(ctx, c, statePath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Resolve the session index, defaulting to the first session.
+	idx := uint32(1)
+	if sessIdx > 0 {
+		idx, err = sessionIndexFromInt(sessIdx)
+		if err != nil {
+			client.close()
+			return nil, nil, err
+		}
+	}
+
+	// Mount that session on the daemon client.
+	sess, err := client.mountSession(ctx, idx)
+	if err != nil {
+		client.close()
+		return nil, nil, err
+	}
+
+	// Resolve the Space by name or by ID.
+	if spaceID == "" {
+		spaceID, err = client.getSpaceByName(ctx, sess, "")
+	} else {
+		spaceID, err = client.resolveSpaceID(ctx, sess, spaceID)
+	}
+	if err != nil {
+		sess.Release()
+		client.close()
+		return nil, nil, errors.Wrap(err, "resolve space")
+	}
+
+	// Mount the Space service for the resolved Space.
+	spaceSvc, spaceCleanup, err := client.mountSpace(ctx, sess, spaceID)
+	if err != nil {
+		sess.Release()
+		client.close()
+		return nil, nil, err
+	}
+
+	// Open the World engine through the Space service.
+	engine, engineCleanup, err := client.accessWorldEngine(ctx, spaceSvc)
+	if err != nil {
+		spaceCleanup()
+		sess.Release()
+		client.close()
+		return nil, nil, err
+	}
+
+	// Release the engine, Space, session, and daemon client together.
+	cleanup := func() {
+		engineCleanup()
+		spaceCleanup()
+		sess.Release()
+		client.close()
+	}
+	return &gitEngineMount{engine: engine, sess: sess, spaceID: spaceID}, cleanup, nil
+}
+
+// commonGitFlags returns the flags shared by git subcommands that need a URI.
+func commonGitFlags(gitURI *string, statePath *string, spaceID *string, sessIdx *int, outputFormat *string) []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{
+			Name:        "uri",
+			Aliases:     []string{"git", "repo"},
+			Usage:       "git repo URI",
+			EnvVars:     []string{"SPACEWAVE_URI", "SPACEWAVE_GIT"},
+			Destination: gitURI,
+		},
+		statePathFlag(statePath),
+		socketPathFlag(),
+		&cli.StringFlag{
+			Name:        "space",
+			Usage:       "space ID (overrides URI)",
+			EnvVars:     []string{"SPACEWAVE_SPACE"},
+			Destination: spaceID,
+		},
+		&cli.IntFlag{
+			Name:        "session-index",
+			Usage:       "session index (overrides URI)",
+			EnvVars:     []string{"SPACEWAVE_SESSION_INDEX"},
+			Destination: sessIdx,
+		},
+		&cli.StringFlag{
+			Name:        "output",
+			Aliases:     []string{"o"},
+			Usage:       "output format (text/json/yaml)",
+			EnvVars:     []string{"SPACEWAVE_OUTPUT"},
+			Value:       "text",
+			Destination: outputFormat,
+		},
+	}
+}
+
+// resolveGitURI resolves the URI from either --uri flag or positional arg + --space.
+func resolveGitURI(c *cli.Context, gitURI, spaceID string, sessIdx int) (fsURI, error) {
+	if gitURI != "" {
+		return parseGitURI(gitURI, spaceID, sessIdx)
+	}
+	arg := c.Args().First()
+	if arg != "" {
+		return parseGitURI(arg, spaceID, sessIdx)
+	}
+	return fsURI{}, errors.New("git repo URI or object key required (use --uri or positional arg)")
+}
+
+// parseTagMode parses a tag mode string to the proto enum.
+func parseTagMode(s string) (git_block.TagMode, error) {
+	switch strings.ToLower(s) {
+	case "", "default":
+		return git_block.TagMode_TagMode_DEFAULT, nil
+	case "none":
+		return git_block.TagMode_TagMode_NONE, nil
+	case "all":
+		return git_block.TagMode_TagMode_ALL, nil
+	case "following":
+		return git_block.TagMode_TagMode_FOLLOWING, nil
+	default:
+		return 0, errors.Errorf("unknown tag mode: %s (valid: default, none, all, following)", s)
+	}
+}
+
+// deriveKeyFromURL derives an object key from a git URL.
+func deriveKeyFromURL(url string) string {
+	// Strip the remote suffix and take the last path segment as the object key.
+	url = strings.TrimSuffix(url, ".git")
+	url = strings.TrimSuffix(url, "/")
+	idx := strings.LastIndex(url, "/")
+	if idx >= 0 {
+		return url[idx+1:]
+	}
+	return url
+}
+
+// shortHash returns the first 7 characters of a hash string.
+func shortHash(h string) string {
+	if len(h) > 7 {
+		return h[:7]
+	}
+	return h
+}
+
+// formatTimestamp formats a Unix timestamp as a date string.
+func formatTimestamp(ts int64) string {
+	if ts == 0 {
+		return ""
+	}
+	return time.Unix(ts, 0).Format("2006-01-02 15:04:05")
+}
+
+// formatSize formats a byte size as a human-readable string.
+func formatSize(size uint64) string {
+	if size < 1024 {
+		return strconv.FormatUint(size, 10)
+	}
+	if size < 1024*1024 {
+		return strconv.FormatFloat(float64(size)/1024, 'f', 1, 64) + "K"
+	}
+	return strconv.FormatFloat(float64(size)/(1024*1024), 'f', 1, 64) + "M"
+}
+
+// newGitCommand builds the top-level git command group.
+func newGitCommand(_ func() cli_entrypoint.CliBus) *cli.Command {
+	return &cli.Command{
+		Name:  "git",
+		Usage: "git repository operations",
+		Subcommands: []*cli.Command{
+			buildGitShowCommand(),
+			buildGitRefsCommand(),
+			buildGitLogCommand(),
+			buildGitDiffCommand(),
+			buildGitCommitCommand(),
+			buildGitTreeCommand(),
+			buildGitCloneCommand(),
+			buildGitFetchCommand(),
+			buildGitWorktreeCommand(),
+			buildGitLfsCommand(),
+			buildGitRemoteCommand(),
+		},
+	}
+}
+
+// buildGitShowCommand builds the git show subcommand.
+func buildGitShowCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:  "show",
+		Usage: "show repository overview",
+		Flags: commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+		Action: func(c *cli.Context) error {
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// Load the repository overview from the git service.
+			ctx := c.Context
+			resp, err := gc.gitSvc.GetRepoInfo(ctx, &s4wave_git.GetRepoInfoRequest{})
+			if err != nil {
+				return errors.Wrap(err, "get repo info")
+			}
+
+			// Emit the overview as JSON or YAML when that output format was requested.
+			if outputFormat == "json" || outputFormat == "yaml" {
+				data, err := resp.MarshalJSON()
+				if err != nil {
+					return errors.Wrap(err, "marshal repo info")
+				}
+				return formatOutput(data, outputFormat)
+			}
+
+			// Write the repository fields, including the README path when one is set.
+			w := os.Stdout
+			fields := [][2]string{
+				{"Repo", gc.objectKey},
+				{"HEAD", resp.GetHeadRef() + " (" + shortHash(resp.GetHeadCommitHash()) + ")"},
+				{"Empty", strconv.FormatBool(resp.GetIsEmpty())},
+			}
+			if resp.GetReadmePath() != "" {
+				fields = append(fields, [2]string{"README", resp.GetReadmePath()})
+			}
+			writeFields(w, fields)
+
+			// Write the last commit when the repository has one.
+			lc := resp.GetLastCommit()
+			if lc != nil {
+				w.WriteString("\nLast Commit\n")
+				writeFields(w, [][2]string{
+					{"  Hash", lc.GetHash()},
+					{"  Author", lc.GetAuthorName() + " <" + lc.GetAuthorEmail() + ">"},
+					{"  Date", formatTimestamp(lc.GetAuthorTimestamp())},
+					{"  Message", strings.TrimSpace(lc.GetMessage())},
+				})
+			}
+
+			return nil
+		},
+	}
+}
+
+// buildGitRefsCommand builds the git refs subcommand.
+func buildGitRefsCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:  "refs",
+		Usage: "list branches and tags",
+		Flags: commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+		Action: func(c *cli.Context) error {
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// List branches and tags from the git service.
+			ctx := c.Context
+			resp, err := gc.gitSvc.ListRefs(ctx, &s4wave_git.ListRefsRequest{})
+			if err != nil {
+				return errors.Wrap(err, "list refs")
+			}
+
+			// Emit the refs as JSON or YAML when that output format was requested.
+			if outputFormat == "json" || outputFormat == "yaml" {
+				data, err := resp.MarshalJSON()
+				if err != nil {
+					return errors.Wrap(err, "marshal refs")
+				}
+				return formatOutput(data, outputFormat)
+			}
+
+			// Write the HEAD ref.
+			w := os.Stdout
+			writeFields(w, [][2]string{{"HEAD", resp.GetHeadRef()}})
+
+			// Write the branch table when the repository has branches.
+			branches := resp.GetBranches()
+			if len(branches) > 0 {
+				w.WriteString("\nBranches (" + strconv.Itoa(len(branches)) + ")\n")
+				rows := [][]string{{"NAME", "COMMIT", "HEAD"}}
+				for _, b := range branches {
+					head := ""
+					if b.GetIsHead() {
+						head = "*"
+					}
+					rows = append(rows, []string{b.GetName(), shortHash(b.GetCommitHash()), head})
+				}
+				writeTable(w, "  ", rows)
+			}
+
+			// Write the tag table when the repository has tags.
+			tags := resp.GetTags()
+			if len(tags) > 0 {
+				w.WriteString("\nTags (" + strconv.Itoa(len(tags)) + ")\n")
+				rows := [][]string{{"NAME", "COMMIT"}}
+				for _, t := range tags {
+					rows = append(rows, []string{t.GetName(), shortHash(t.GetCommitHash())})
+				}
+				writeTable(w, "  ", rows)
+			}
+
+			return nil
+		},
+	}
+}
+
+// buildGitLogCommand builds the git log subcommand.
+func buildGitLogCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:  "log",
+		Usage: "show commit history",
+		Flags: append(commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+			&cli.StringFlag{
+				Name:  "ref",
+				Usage: "ref to start from (default HEAD)",
+			},
+			&cli.StringFlag{
+				Name:  "since",
+				Usage: "filter to commits not reachable from this ref",
+			},
+			&cli.UintFlag{
+				Name:  "limit",
+				Usage: "max commits to return",
+				Value: 50,
+			},
+			&cli.UintFlag{
+				Name:  "offset",
+				Usage: "number of commits to skip",
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// Build the log request from the ref, limit, offset, and since flags.
+			ctx := c.Context
+			limit, err := uint32GitFlag(c, "limit")
+			if err != nil {
+				return err
+			}
+			offset, err := uint32GitFlag(c, "offset")
+			if err != nil {
+				return err
+			}
+			req := &s4wave_git.LogRequest{
+				RefName:  c.String("ref"),
+				Limit:    limit,
+				Offset:   offset,
+				SinceRef: c.String("since"),
+			}
+
+			// Load the commit history from the git service.
+			resp, err := gc.gitSvc.Log(ctx, req)
+			if err != nil {
+				return errors.Wrap(err, "log")
+			}
+
+			// Emit the log as JSON or YAML when that output format was requested.
+			if outputFormat == "json" || outputFormat == "yaml" {
+				data, err := resp.MarshalJSON()
+				if err != nil {
+					return errors.Wrap(err, "marshal log")
+				}
+				return formatOutput(data, outputFormat)
+			}
+
+			// Write the commit table, keeping only the first line of each message.
+			w := os.Stdout
+			commits := resp.GetCommits()
+			rows := [][]string{{"HASH", "AUTHOR", "DATE", "MESSAGE"}}
+			for _, cm := range commits {
+				msg := strings.TrimSpace(cm.GetMessage())
+				if idx := strings.IndexByte(msg, '\n'); idx >= 0 {
+					msg = msg[:idx]
+				}
+				rows = append(rows, []string{
+					shortHash(cm.GetHash()),
+					cm.GetAuthorName(),
+					formatTimestamp(cm.GetAuthorTimestamp()),
+					msg,
+				})
+			}
+			writeTable(w, "", rows)
+
+			// Point at the next offset when more commits remain.
+			if resp.GetHasMore() {
+				nextOffset := uint64(req.GetOffset()) + uint64(len(commits))
+				w.WriteString("\nUse --offset " + strconv.FormatUint(nextOffset, 10) + " to see more\n")
+			}
+
+			return nil
+		},
+	}
+}
+
+// buildGitDiffCommand builds the git diff subcommand.
+func buildGitDiffCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:      "diff",
+		Usage:     "show diff stats between two refs",
+		ArgsUsage: "<refA> [refB]",
+		Flags:     commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+		Action: func(c *cli.Context) error {
+			// Require ref A and take an optional ref B.
+			refA := c.Args().Get(0)
+			if refA == "" {
+				return errors.New("refA required (branch, tag, or commit hash)")
+			}
+			refB := c.Args().Get(1)
+
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// Load the diff stat between the two refs.
+			ctx := c.Context
+			resp, err := gc.gitSvc.GetDiffStat(ctx, &s4wave_git.GetDiffStatRequest{
+				RefA: refA,
+				RefB: refB,
+			})
+			if err != nil {
+				return errors.Wrap(err, "get diff stat")
+			}
+
+			// Emit the diff stat as JSON or YAML when that output format was requested.
+			if outputFormat == "json" || outputFormat == "yaml" {
+				data, err := resp.MarshalJSON()
+				if err != nil {
+					return errors.Wrap(err, "marshal diff stat")
+				}
+				return formatOutput(data, outputFormat)
+			}
+
+			// Write the diff summary for the ref range.
+			w := os.Stdout
+			label := refA
+			if refB != "" {
+				label = refA + ".." + refB
+			}
+			writeFields(w, [][2]string{
+				{"Diff", label},
+				{"Files Changed", strconv.Itoa(len(resp.GetFiles()))},
+				{"Additions", strconv.FormatUint(uint64(resp.GetTotalAdditions()), 10)},
+				{"Deletions", strconv.FormatUint(uint64(resp.GetTotalDeletions()), 10)},
+			})
+
+			// Write the per-file addition and deletion table when files changed.
+			if len(resp.GetFiles()) > 0 {
+				w.WriteString("\n")
+				rows := [][]string{{"PATH", "+", "-"}}
+				for _, f := range resp.GetFiles() {
+					rows = append(rows, []string{
+						f.GetPath(),
+						strconv.FormatUint(uint64(f.GetAdditions()), 10),
+						strconv.FormatUint(uint64(f.GetDeletions()), 10),
+					})
+				}
+				writeTable(w, "", rows)
+			}
+
+			return nil
+		},
+	}
+}
+
+// buildGitCommitCommand builds the git commit subcommand.
+func buildGitCommitCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:      "commit",
+		Usage:     "show commit details with diff stats",
+		ArgsUsage: "<ref>",
+		Flags:     commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+		Action: func(c *cli.Context) error {
+			// Require a commit ref or hash.
+			ref := c.Args().First()
+			if ref == "" {
+				return errors.New("commit ref or hash required")
+			}
+
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// Take the command context for the parallel commit and diff calls.
+			ctx := c.Context
+
+			// Parallel calls: GetCommit + GetDiffStat
+			// Both RPCs resolve refs/short hashes/rev-parse internally.
+			type commitResult struct {
+				resp *s4wave_git.GetCommitResponse
+				err  error
+			}
+			type diffResult struct {
+				resp *s4wave_git.GetDiffStatResponse
+				err  error
+			}
+
+			// Start the commit and diff-stat calls together.
+			commitCh := make(chan commitResult, 1)
+			diffCh := make(chan diffResult, 1)
+
+			// Fetch the commit and its diff stat in parallel.
+			go func() {
+				resp, err := gc.gitSvc.GetCommit(ctx, &s4wave_git.GetCommitRequest{Hash: ref})
+				commitCh <- commitResult{resp, err}
+			}()
+			go func() {
+				resp, err := gc.gitSvc.GetDiffStat(ctx, &s4wave_git.GetDiffStatRequest{RefA: ref})
+				diffCh <- diffResult{resp, err}
+			}()
+
+			// Wait for both calls and fail on either error.
+			cr := <-commitCh
+			if cr.err != nil {
+				return errors.Wrap(cr.err, "get commit")
+			}
+			dr := <-diffCh
+			if dr.err != nil {
+				return errors.Wrap(dr.err, "get diff stat")
+			}
+
+			// Emit the commit and diff stat as one JSON or YAML document when requested.
+			if outputFormat == "json" || outputFormat == "yaml" {
+				commitJSON, err := cr.resp.MarshalJSON()
+				if err != nil {
+					return errors.Wrap(err, "marshal commit")
+				}
+				diffJSON, err := dr.resp.MarshalJSON()
+				if err != nil {
+					return errors.Wrap(err, "marshal diff stat")
+				}
+				combined := []byte(`{"commit":`)
+				combined = append(combined, commitJSON...)
+				combined = append(combined, `,"diffStat":`...)
+				combined = append(combined, diffJSON...)
+				combined = append(combined, '}')
+				return formatOutput(combined, outputFormat)
+			}
+
+			// Write the commit identity, parents, and message.
+			cm := cr.resp.GetCommit()
+			w := os.Stdout
+			fields := [][2]string{
+				{"Commit", cm.GetHash()},
+				{"Author", cm.GetAuthorName() + " <" + cm.GetAuthorEmail() + ">"},
+				{"Date", formatTimestamp(cm.GetAuthorTimestamp())},
+			}
+			if parents := cm.GetParentHashes(); len(parents) > 0 {
+				fields = append(fields, [2]string{"Parents", strings.Join(parents, ", ")})
+			}
+			writeFields(w, fields)
+			w.WriteString("\n    " + strings.TrimSpace(cm.GetMessage()) + "\n")
+
+			// Write the diff summary against the commit's parent.
+			diffResp := dr.resp
+			w.WriteString("\n")
+			writeFields(w, [][2]string{
+				{"Files Changed", strconv.Itoa(len(diffResp.GetFiles()))},
+				{"Additions", strconv.FormatUint(uint64(diffResp.GetTotalAdditions()), 10)},
+				{"Deletions", strconv.FormatUint(uint64(diffResp.GetTotalDeletions()), 10)},
+			})
+
+			// Write the per-file addition and deletion table when files changed.
+			if len(diffResp.GetFiles()) > 0 {
+				w.WriteString("\n")
+				rows := [][]string{{"PATH", "+", "-"}}
+				for _, fi := range diffResp.GetFiles() {
+					rows = append(rows, []string{
+						fi.GetPath(),
+						strconv.FormatUint(uint64(fi.GetAdditions()), 10),
+						strconv.FormatUint(uint64(fi.GetDeletions()), 10),
+					})
+				}
+				writeTable(w, "", rows)
+			}
+
+			return nil
+		},
+	}
+}
+
+// buildGitTreeCommand builds the git tree subcommand.
+func buildGitTreeCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:      "tree",
+		Usage:     "browse files in a ref's tree (read-only)",
+		ArgsUsage: "[path]",
+		Flags: append(commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+			&cli.StringFlag{
+				Name:  "ref",
+				Usage: "ref to browse (default HEAD)",
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// Take the command context, the ref, and the optional tree path.
+			ctx := c.Context
+			refName := c.String("ref")
+			fsPath := c.Args().First()
+
+			// Get the tree resource (FSHandle sub-resource).
+			treeResp, err := gc.gitSvc.GetTreeResource(ctx, &s4wave_git.GetTreeResourceRequest{
+				RefName: refName,
+			})
+			if err != nil {
+				return errors.Wrap(err, "get tree resource")
+			}
+
+			// Create a resource reference for the FSHandle.
+			ref := gc.client.resClient.CreateResourceReference(treeResp.GetResourceId())
+			defer ref.Release()
+
+			// Open the tree handle client from the resource reference.
+			childClient, err := ref.GetClient()
+			if err != nil {
+				return errors.Wrap(err, "tree handle client")
+			}
+
+			// Wrap the tree handle as a UnixFS service.
+			fsSvc := s4wave_unixfs.NewSRPCFSHandleResourceServiceClient(childClient)
+
+			// Navigate to the requested path if specified.
+			var pathSvc s4wave_unixfs.SRPCFSHandleResourceServiceClient
+			var pathCleanup func()
+			if fsPath != "" {
+				lookupResp, err := fsSvc.LookupPath(ctx, &s4wave_unixfs.HandleLookupPathRequest{Path: fsPath})
+				if err != nil {
+					return errors.Wrap(err, "lookup path "+fsPath)
+				}
+				pathRef := gc.client.resClient.CreateResourceReference(lookupResp.GetResourceId())
+				pc, err := pathRef.GetClient()
+				if err != nil {
+					pathRef.Release()
+					return errors.Wrap(err, "path handle client")
+				}
+				pathSvc = s4wave_unixfs.NewSRPCFSHandleResourceServiceClient(pc)
+				pathCleanup = func() { pathRef.Release() }
+			} else {
+				pathSvc = fsSvc
+				pathCleanup = func() {}
+			}
+			defer pathCleanup()
+
+			// Check if it's a directory or file.
+			ntResp, err := pathSvc.GetNodeType(ctx, &s4wave_unixfs.HandleGetNodeTypeRequest{})
+			if err != nil {
+				return errors.Wrap(err, "get node type")
+			}
+
+			// Read the node type and list a directory or stream a file.
+			nt := ntResp.GetNodeType()
+			if nt != nil && nt.GetIsDir() {
+				// Directory listing.
+				strm, err := pathSvc.Readdir(ctx, &s4wave_unixfs.HandleReaddirRequest{})
+				if err != nil {
+					return errors.Wrap(err, "readdir")
+				}
+
+				type entryInfo struct {
+					name  string
+					isDir bool
+					size  uint64
+				}
+				var entries []entryInfo
+				for {
+					resp, err := strm.Recv()
+					if err != nil {
+						return errors.Wrap(err, "recv readdir")
+					}
+					if resp.GetDone() {
+						break
+					}
+					entry := resp.GetEntry()
+					if entry == nil {
+						continue
+					}
+					entries = append(entries, entryInfo{
+						name:  entry.GetName(),
+						isDir: entry.GetIsDir(),
+						size:  entry.GetSize(),
+					})
+				}
+
+				if outputFormat == "json" || outputFormat == "yaml" {
+					buf, ms := newMarshalBuf()
+					ms.WriteArrayStart()
+					var af bool
+					for _, e := range entries {
+						ms.WriteMoreIf(&af)
+						ms.WriteObjectStart()
+						var fl bool
+						ms.WriteMoreIf(&fl)
+						ms.WriteObjectField("name")
+						ms.WriteString(e.name)
+						ms.WriteMoreIf(&fl)
+						ms.WriteObjectField("isDir")
+						ms.WriteBool(e.isDir)
+						ms.WriteMoreIf(&fl)
+						ms.WriteObjectField("size")
+						ms.WriteUint64(e.size)
+						ms.WriteObjectEnd()
+					}
+					ms.WriteArrayEnd()
+					return formatOutput(buf.Bytes(), outputFormat)
+				}
+
+				label := refName
+				if label == "" {
+					label = "HEAD"
+				}
+				displayPath := fsPath
+				if displayPath == "" {
+					displayPath = "/"
+				}
+				w := os.Stdout
+				writeFields(w, [][2]string{{"Tree", label + ":" + displayPath}})
+				w.WriteString("\n")
+				rows := [][]string{{"TYPE", "NAME", "SIZE"}}
+				for _, e := range entries {
+					t := "file"
+					name := e.name
+					if e.isDir {
+						t = "dir"
+						name += "/"
+					}
+					rows = append(rows, []string{t, name, formatSize(e.size)})
+				}
+				writeTable(w, "", rows)
+				return nil
+			}
+
+			// File: output raw contents.
+			return streamFile(ctx, pathSvc, 0, 0, os.Stdout)
+		},
+	}
+}
+
+// buildGitCloneCommand builds the git clone subcommand (standalone, no --uri needed).
+func buildGitCloneCommand() *cli.Command {
+	var statePath, spaceID string
+	var sessIdx int
+	return &cli.Command{
+		Name:  "clone",
+		Usage: "clone a remote repository into the world",
+		Flags: []cli.Flag{
+			statePathFlag(&statePath),
+			socketPathFlag(),
+			&cli.StringFlag{
+				Name:        "space",
+				Usage:       "space ID (auto-detected if only one space)",
+				EnvVars:     []string{"SPACEWAVE_SPACE"},
+				Destination: &spaceID,
+			},
+			&cli.IntFlag{
+				Name:        "session-index",
+				Usage:       "session index",
+				EnvVars:     []string{"SPACEWAVE_SESSION_INDEX"},
+				Destination: &sessIdx,
+			},
+			&cli.StringFlag{
+				Name:     "url",
+				Usage:    "git URL to clone",
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:  "key",
+				Usage: "object key (auto-derived from URL if omitted)",
+			},
+			&cli.StringFlag{
+				Name:  "ref",
+				Usage: "reference to clone",
+			},
+			&cli.StringFlag{
+				Name:  "remote",
+				Usage: "remote name (default origin)",
+			},
+			&cli.BoolFlag{
+				Name:  "single-branch",
+				Usage: "fetch only specified ref",
+			},
+			&cli.UintFlag{
+				Name:  "depth",
+				Usage: "shallow clone depth",
+			},
+			&cli.BoolFlag{
+				Name:  "recursive",
+				Usage: "fetch submodules",
+			},
+			&cli.StringFlag{
+				Name:  "tag-mode",
+				Usage: "tag fetching mode (default/none/all/following)",
+			},
+			&cli.BoolFlag{
+				Name:  "insecure",
+				Usage: "skip TLS verification",
+			},
+			&cli.BoolFlag{
+				Name:  "no-checkout",
+				Usage: "skip worktree creation",
+			},
+		},
+		Action: func(c *cli.Context) error {
+			// Take the clone URL and derive the object key when none was given.
+			url := c.String("url")
+			key := c.String("key")
+			if key == "" {
+				key = deriveKeyFromURL(url)
+			}
+
+			// Parse the tag mode flag.
+			tagMode, err := parseTagMode(c.String("tag-mode"))
+			if err != nil {
+				return err
+			}
+
+			// Mount the World engine and release it when the command returns.
+			mount, cleanup, err := mountGitEngine(c, statePath, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			depth, err := uint32GitFlag(c, "depth")
+			if err != nil {
+				return err
+			}
+
+			// Build the clone options from the command flags.
+			cloneOpts := &git_block.CloneOpts{
+				Url:          url,
+				RemoteName:   c.String("remote"),
+				Ref:          c.String("ref"),
+				SingleBranch: c.Bool("single-branch"),
+				Depth:        depth,
+				Recursive:    c.Bool("recursive"),
+				TagMode:      tagMode,
+				Insecure:     c.Bool("insecure"),
+			}
+
+			// Clone the remote, staged until the publish commits, and disable
+			// checkout when that flag is set.
+			cloneOpts.DisableCheckout = c.Bool("no-checkout")
+			stage, err := mount.engine.StageWorldState(c.Context)
+			if err != nil {
+				return err
+			}
+			defer stage.Release()
+			repoRef, err := s4wave_git_core.CloneGitRepoToRef(c.Context, stage, cloneOpts, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			// Publish the cloned repo under the object key.
+			tx, err := mount.engine.NewTransaction(c.Context, true)
+			if err != nil {
+				return errors.Wrap(err, "new transaction")
+			}
+			defer tx.Discard()
+			op := git_world.NewGitInitOp(key, repoRef, c.Bool("no-checkout"), nil, unixfs_block.ToTimestamp(time.Now(), false))
+			_, _, err = tx.ApplyWorldOp(c.Context, op, "")
+			if err != nil {
+				return errors.Wrap(err, "publish git repo")
+			}
+			if err := tx.Commit(c.Context); err != nil {
+				return errors.Wrap(err, "commit transaction")
+			}
+
+			// Print the object key.
+			os.Stdout.WriteString(key + "\n")
+			return nil
+		},
+	}
+}
+
+// buildGitFetchCommand builds the git fetch subcommand.
+func buildGitFetchCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:  "fetch",
+		Usage: "fetch updates from remote",
+		Flags: append(commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+			&cli.StringFlag{
+				Name:  "remote",
+				Usage: "remote name (default origin)",
+			},
+			&cli.StringFlag{
+				Name:  "remote-url",
+				Usage: "override remote URL",
+			},
+			&cli.StringSliceFlag{
+				Name:  "ref-spec",
+				Usage: "refspec (repeatable)",
+			},
+			&cli.UintFlag{
+				Name:  "depth",
+				Usage: "shallow fetch depth",
+			},
+			&cli.StringFlag{
+				Name:  "tag-mode",
+				Usage: "tag fetching mode (default/none/all/following)",
+			},
+			&cli.BoolFlag{
+				Name:  "force",
+				Usage: "allow forced updates",
+			},
+			&cli.BoolFlag{
+				Name:  "insecure",
+				Usage: "skip TLS verification",
+			},
+			&cli.BoolFlag{
+				Name:  "prune",
+				Usage: "remove local refs not on remote",
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and parse the depth flag.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			depth, err := uint32GitFlag(c, "depth")
+			if err != nil {
+				return err
+			}
+
+			// Parse the tag mode flag.
+			tagMode, err := parseTagMode(c.String("tag-mode"))
+			if err != nil {
+				return err
+			}
+
+			// Build the fetch options from the command flags.
+			fetchOpts := &git_block.FetchOpts{
+				RemoteName: c.String("remote"),
+				RemoteUrl:  c.String("remote-url"),
+				RefSpecs:   c.StringSlice("ref-spec"),
+				Depth:      depth,
+				TagMode:    tagMode,
+				Force:      c.Bool("force"),
+				Insecure:   c.Bool("insecure"),
+				Prune:      c.Bool("prune"),
+			}
+
+			// Apply the fetch as a World operation.
+			op := git_world.NewGitFetchOp(gc.objectKey, fetchOpts)
+			if err := applyWorldOp(c, gc.engine, op); err != nil {
+				return err
+			}
+
+			// Report that the fetch finished.
+			os.Stdout.WriteString("fetched\n")
+			return nil
+		},
+	}
+}
+
+// buildGitWorktreeCommand builds the git worktree command group.
+func buildGitWorktreeCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "worktree",
+		Usage: "worktree operations",
+		Subcommands: []*cli.Command{
+			buildGitWorktreeCreateCommand(),
+			buildGitWorktreeCheckoutCommand(),
+		},
+	}
+}
+
+// buildGitWorktreeCreateCommand builds the git worktree create subcommand.
+func buildGitWorktreeCreateCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:  "create",
+		Usage: "create a worktree for a repo",
+		Flags: append(commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+			&cli.StringFlag{
+				Name:  "key",
+				Usage: "worktree object key (default: <repo-key>/worktree)",
+			},
+			&cli.BoolFlag{
+				Name:  "create-workdir",
+				Usage: "create workdir if missing",
+			},
+			&cli.StringFlag{
+				Name:  "branch",
+				Usage: "branch to checkout",
+			},
+			&cli.StringFlag{
+				Name:  "commit",
+				Usage: "commit hash to checkout",
+			},
+			&cli.BoolFlag{
+				Name:  "no-checkout",
+				Usage: "skip checkout step",
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// Use the repo key and default the worktree key when none was given.
+			repoKey := gc.objectKey
+			wtKey := c.String("key")
+			if wtKey == "" {
+				wtKey = repoKey + "/worktree"
+			}
+
+			// Build checkout options unless checkout is disabled.
+			disableCheckout := c.Bool("no-checkout")
+			var checkoutOpts *git_block.CheckoutOpts
+			if !disableCheckout {
+				checkoutOpts = &git_block.CheckoutOpts{
+					Branch: c.String("branch"),
+				}
+			}
+
+			// WorkdirRef: use the worktree key as the workdir object key with FS_NODE type.
+			workdirRef := &unixfs_world.UnixfsRef{
+				ObjectKey: wtKey + "/workdir",
+				FsType:    unixfs_world.FSType_FSType_FS_NODE,
+			}
+
+			// Create the worktree, using the worktree key as its workdir.
+			op := git_world.NewGitCreateWorktreeOp(
+				wtKey,
+				repoKey,
+				workdirRef,
+				true, // create workdir
+				checkoutOpts,
+				disableCheckout,
+				time.Now(),
+			)
+
+			// Apply the create-worktree operation.
+			if err := applyWorldOp(c, gc.engine, op); err != nil {
+				return err
+			}
+
+			// Print the worktree key.
+			os.Stdout.WriteString(wtKey + "\n")
+			return nil
+		},
+	}
+}
+
+// buildGitWorktreeCheckoutCommand builds the git worktree checkout subcommand.
+func buildGitWorktreeCheckoutCommand() *cli.Command {
+	var gitURI, statePath, spaceID, outputFormat string
+	var sessIdx int
+	return &cli.Command{
+		Name:  "checkout",
+		Usage: "checkout a revision in an existing worktree",
+		Flags: append(commonGitFlags(&gitURI, &statePath, &spaceID, &sessIdx, &outputFormat),
+			&cli.StringFlag{
+				Name:     "worktree-key",
+				Usage:    "worktree object key",
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:  "branch",
+				Usage: "branch to checkout",
+			},
+			&cli.StringFlag{
+				Name:  "commit",
+				Usage: "commit hash to checkout",
+			},
+			&cli.BoolFlag{
+				Name:  "create",
+				Usage: "create branch from commit",
+			},
+			&cli.BoolFlag{
+				Name:  "force",
+				Usage: "force checkout even if dirty",
+			},
+			&cli.BoolFlag{
+				Name:  "keep",
+				Usage: "keep index/workdir changes",
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Resolve the git URI from the flag or the positional argument.
+			uri, err := resolveGitURI(c, gitURI, spaceID, sessIdx)
+			if err != nil {
+				return err
+			}
+
+			// Mount the git repo and release it when the command returns.
+			gc, cleanup, err := mountGitContext(c, statePath, uri)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			// Take the worktree key and the mounted repo key.
+			wtKey := c.String("worktree-key")
+			repoKey := gc.objectKey
+
+			// Build the checkout options from the command flags.
+			checkoutOpts := &git_block.CheckoutOpts{
+				Branch: c.String("branch"),
+				Create: c.Bool("create"),
+				Force:  c.Bool("force"),
+				Keep:   c.Bool("keep"),
+			}
+
+			// Apply the worktree checkout operation.
+			op := git_world.NewGitWorktreeCheckoutOp(wtKey, repoKey, checkoutOpts)
+			if err := applyWorldOp(c, gc.engine, op); err != nil {
+				return err
+			}
+
+			// Report that the checkout finished.
+			os.Stdout.WriteString("checked out\n")
+			return nil
+		},
+	}
+}

@@ -1,0 +1,427 @@
+//go:build !js
+
+package bldr_project_controller
+
+import (
+	"context"
+	"crypto/rand"
+	"io"
+	"maps"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"path"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync/atomic"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/util/backoff"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/aperturerobotics/util/promise"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/pkg/errors"
+	frontend "github.com/s4wave/spacewave/bldr/frontend"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_platform "github.com/s4wave/spacewave/bldr/platform"
+	js_compiler "github.com/s4wave/spacewave/bldr/plugin/compiler/js"
+	vite "github.com/s4wave/spacewave/bldr/web/bundler/vite"
+	vite_compiler "github.com/s4wave/spacewave/bldr/web/bundler/vite/compiler"
+	web_entrypoint_index "github.com/s4wave/spacewave/bldr/web/entrypoint/index"
+	web_fetch "github.com/s4wave/spacewave/bldr/web/fetch"
+	web_pkg "github.com/s4wave/spacewave/bldr/web/pkg"
+	web_pkg_external "github.com/s4wave/spacewave/bldr/web/pkg/external"
+	"github.com/sirupsen/logrus"
+)
+
+// refreshExports is the upstream React plugin's module boundary. Every compiler
+// borrows the document's bootstrap runtime so renderer and family state agree.
+const refreshExports = "register, injectIntoGlobalHook, createSignatureFunctionForTransform, registerExportsForReactRefresh, validateRefreshBoundaryAndEnqueueUpdate, __hmr_import"
+
+// FrontendService owns the project's current development environment.
+// The project Controller constructs and configures it, and other packages reach
+// it through Controller.GetFrontendService. The Controller serializes
+// configuration and shutdown; RPC methods run concurrently.
+type FrontendService struct {
+	// le records environment failures and recovery.
+	le *logrus.Entry
+	// bus supplies the project's compiler dependencies.
+	bus bus.Bus
+	// run serializes configuration changes and joins replaced environments.
+	run *routine.StateRoutineContainer[*vite.DevelopmentConfig]
+	// ready publishes the current compiler capability to waiting RPC calls.
+	ready *promise.PromiseContainer[*frontendEnvironment]
+	// active permits nonblocking validation of session-bound requests.
+	active atomic.Pointer[frontendEnvironment]
+	// bcast guards the first configuration and wakes early Watch calls.
+	bcast broadcast.Broadcast
+	// configured distinguishes a disabled frontend from one not initialized yet.
+	configured bool
+}
+
+// frontendEnvironment is a ready compiler capability, valid until ctx ends.
+type frontendEnvironment struct {
+	// ctx ends when this environment is replaced or released.
+	ctx context.Context
+	// client connects to the managed compiler process.
+	client vite.SRPCViteBundlerClient
+	// result identifies the compiler session and its private HTTP endpoint.
+	result *vite.DevelopmentResult
+	// proxy forwards module requests while preserving cancellation and queries.
+	proxy *httputil.ReverseProxy
+}
+
+// newFrontendService constructs a service without starting its compiler.
+func newFrontendService(le *logrus.Entry, b bus.Bus) *FrontendService {
+	f := &FrontendService{le: le, bus: b, ready: promise.NewPromiseContainer[*frontendEnvironment]()}
+	f.run = routine.NewStateRoutineContainerWithLoggerVT[*vite.DevelopmentConfig](le, routine.WithRetry(&backoff.Backoff{}))
+	f.run.SetStateRoutine(f.execute)
+	return f
+}
+
+// configure replaces the graph only when its configured inputs change.
+func (f *FrontendService) configure(cc *Config) error {
+	// Build the compiler configuration from the project's JS manifests.
+	conf := &vite.DevelopmentConfig{
+		RootDir:      cc.GetSourcePath(),
+		DistDir:      filepath.Join(cc.GetWorkingPath(), "src"),
+		CacheDir:     filepath.Join(cc.GetWorkingPath(), "frontend", "vite-cache"),
+		ExternalPkgs: slices.Clone(web_pkg_external.BldrExternal),
+		RoutePrefix:  cc.GetFrontendRoutePrefix(),
+		// An attached compiler's source owner reports each edit through Change.
+		ExternalChanges: cc.GetFrontendRoutePrefix() != "",
+	}
+
+	// Collect each JS builder's excluded web packages and frontend modules.
+	configured := false
+	for id, manifest := range cc.GetProjectConfig().GetManifests() {
+		builder := manifest.GetBuilder()
+		if builder.GetId() != js_compiler.ConfigID {
+			continue
+		}
+		js := &js_compiler.Config{}
+		if err := unmarshalBuilderConfig(f.le, id, "JS", builder.GetConfig(), js); err != nil {
+			return err
+		}
+		js.FlattenBuildTypes(bldr_manifest.BuildType_DEV)
+		js.FlattenPlatformTypes(bldr_platform.NewJsPlatform())
+		for _, pkg := range js.GetWebPkgs() {
+			if pkg.GetExclude() {
+				conf.WebPkgIds = append(conf.WebPkgIds, pkg.GetId())
+			}
+		}
+		for _, module := range js.GetModules() {
+			if module.GetKind() != js_compiler.JsModuleKind_JS_MODULE_KIND_FRONTEND {
+				continue
+			}
+			conf.Entrypoints = append(conf.Entrypoints, path.Clean(module.GetPath()))
+			paths := append(slices.Clone(js.GetViteConfigPaths()), module.GetViteConfigPaths()...)
+			for i, configPath := range paths {
+				paths[i] = path.Clean(configPath)
+			}
+			disableProjectConfig := js.GetViteDisableProjectConfig() || module.GetDisableProjectConfig()
+			if configured && (!slices.Equal(conf.ConfigPaths, paths) || conf.DisableProjectConfig != disableProjectConfig) {
+				return errors.New("project frontend modules must share one Vite configuration")
+			}
+			conf.ConfigPaths = paths
+			conf.DisableProjectConfig = disableProjectConfig
+			configured = true
+		}
+	}
+
+	// The startup view joins the application graph after Bldr connects.
+	startup, err := cc.GetProjectConfig().GetStart().ParseWebStartupPath()
+	if err != nil {
+		return err
+	}
+	if startup != "" {
+		conf.Entrypoints = append(conf.Entrypoints, startup)
+	}
+
+	// Sort and deduplicate the collected entrypoints and excluded web packages.
+	slices.Sort(conf.Entrypoints)
+	conf.Entrypoints = slices.Compact(conf.Entrypoints)
+	slices.Sort(conf.WebPkgIds)
+	conf.WebPkgIds = slices.Compact(conf.WebPkgIds)
+	if len(conf.Entrypoints) == 0 {
+		conf = nil
+	}
+
+	// Replace the compiler state, clearing it when no entrypoints remain.
+	f.run.SetState(conf)
+
+	// Release attachment calls only after the first configuration is visible.
+	f.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+		if !f.configured {
+			f.configured = true
+			broadcast()
+		}
+	})
+	return nil
+}
+
+// execute publishes one session and joins its compiler before any replacement.
+func (f *FrontendService) execute(ctx context.Context, config *vite.DevelopmentConfig) error {
+	// Reset the environment promise so a new session cannot serve the old one.
+	f.ready.SetPromise(nil)
+	defer func() {
+		f.active.Store(nil)
+		f.ready.SetPromise(nil)
+	}()
+
+	// Start a compiler controller that owns the managed compiler process.
+	compiler, err := vite_compiler.NewController(f.le, f.bus, &vite_compiler.Config{})
+	if err != nil {
+		f.ready.SetResult(nil, err)
+		return err
+	}
+	defer compiler.Close()
+	if err := compiler.Execute(ctx); err != nil {
+		f.ready.SetResult(nil, err)
+		return err
+	}
+
+	// Clone the config and assign a short unique development session id.
+	conf := config.CloneVT()
+
+	// The session id appears in every module URL; 40 random bits keep it short
+	// while still distinguishing one environment from the one it replaced.
+	conf.SessionId = strings.ToLower(rand.Text()[:8])
+	err = compiler.RunDevelopment(ctx, conf, func(client vite.SRPCViteBundlerClient, result *vite.DevelopmentResult) {
+		// Publish each ready compiler session as the service's active environment.
+		target, parseErr := url.Parse(result.GetPrivateUrl())
+		if parseErr != nil || target.Scheme != "http" || target.Hostname() != "127.0.0.1" {
+			f.ready.SetResult(nil, errors.New("frontend compiler returned an invalid private address"))
+			return
+		}
+
+		// The authenticated Bldr route targets Vite's private listener. Its Host
+		// must name that listener, independently of the browser's public origin.
+		env := &frontendEnvironment{ctx: ctx, client: client, result: result, proxy: &httputil.ReverseProxy{
+			Rewrite: func(request *httputil.ProxyRequest) { request.SetURL(target) },
+		}}
+		env.proxy.FlushInterval = -1
+		f.active.Store(env)
+		f.ready.SetResult(env, nil)
+	})
+
+	// Report a failure only when the session itself failed, not cancellation.
+	if err != nil && ctx.Err() == nil {
+		f.ready.SetResult(nil, err)
+	}
+	return err
+}
+
+// Close cancels and joins the current environment before returning.
+func (f *FrontendService) Close() {
+	if done, _, _ := f.run.SetStateRoutine(nil); done != nil {
+		<-done
+	}
+}
+
+// Watch forwards the compiler snapshot and ordered events for one session.
+func (f *FrontendService) Watch(_ *frontend.WatchRequest, stream frontend.SRPCFrontend_WatchStream) error {
+	// Wait for the project controller to configure this service after it is published.
+	ctx := stream.Context()
+	for {
+		var configured bool
+		var waitCh <-chan struct{}
+		f.bcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+			configured = f.configured
+			waitCh = getWaitCh()
+		})
+		if configured {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-waitCh:
+		}
+	}
+
+	// Report a genuinely disabled frontend after configuration completes.
+	if f.run.GetState() == nil {
+		return stream.Send(&frontend.Event{Session: &frontend.Session{Id: "disabled", RoutePrefix: "/b/fe/disabled/"}})
+	}
+
+	// Forward the current compiler session once its process is ready.
+	env, err := f.ready.Await(ctx)
+	if err != nil {
+		return err
+	}
+	watch, err := env.client.WatchDevelopment(ctx, &frontend.WatchRequest{})
+	if err != nil {
+		return err
+	}
+	defer watch.Close()
+	for {
+		event, err := watch.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(event); err != nil {
+			return err
+		}
+	}
+}
+
+// Send rejects messages for an expired session at the native owner.
+func (f *FrontendService) Send(ctx context.Context, req *frontend.SendRequest) (*frontend.SendResponse, error) {
+	env := f.active.Load()
+	if env == nil || env.ctx.Err() != nil || req.GetSessionId() != env.result.GetSession().GetId() {
+		return nil, errors.New("frontend session expired")
+	}
+	return env.client.SendDevelopment(ctx, req)
+}
+
+// Change reports source edits the attaching owner already wrote to the source root.
+// An environment that is not ready yet reads the edited files when it starts.
+func (f *FrontendService) Change(ctx context.Context, changes []*vite.DevelopmentChange) error {
+	env := f.active.Load()
+	if env == nil || env.ctx.Err() != nil || len(changes) == 0 {
+		return nil
+	}
+	_, err := env.client.ChangeDevelopment(ctx, &vite.ChangeDevelopmentRequest{Changes: changes})
+	return err
+}
+
+// Fetch serves module requests using the existing streamed HTTP protocol.
+func (f *FrontendService) Fetch(stream frontend.SRPCFrontend_FetchStream) error {
+	return web_fetch.HandleFetch(stream, f.ServeHTTP)
+}
+
+// ServeHTTP forwards only the current same-origin module namespace.
+func (f *FrontendService) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Reject module requests that are not read-only GET or HEAD.
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		rw.Header().Set("Allow", "GET, HEAD")
+		http.Error(rw, "frontend modules are read-only", http.StatusMethodNotAllowed)
+		return
+	}
+	env := f.active.Load()
+
+	// Redirect entrypoint paths to the session's route prefix.
+	if env != nil && env.ctx.Err() == nil && strings.HasPrefix(req.URL.Path, "/b/fe/entrypoint/") {
+		entrypoint := strings.TrimPrefix(req.URL.Path, "/b/fe/entrypoint/")
+		if !slices.Contains(env.result.GetSession().GetEntrypoints(), entrypoint) {
+			http.NotFound(rw, req)
+			return
+		}
+		target := &url.URL{Path: env.result.GetSession().GetRoutePrefix() + entrypoint, RawQuery: req.URL.RawQuery}
+		rw.Header().Set("Cache-Control", "no-store")
+		http.Redirect(rw, req, target.String(), http.StatusTemporaryRedirect)
+		return
+	}
+	if env == nil || env.ctx.Err() != nil || !strings.HasPrefix(req.URL.Path, env.result.GetSession().GetRoutePrefix()) {
+		http.Error(rw, "frontend session expired", http.StatusGone)
+		return
+	}
+	if req.URL.Path == env.result.GetSession().GetRoutePrefix()+"@react-refresh" {
+		rw.Header().Set("Content-Type", "text/javascript")
+		rw.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(rw, "const runtime = globalThis.__bldrReactRefresh;\n"+
+			"if (!runtime) throw new Error('Live React editing requires a Bldr development client');\n"+
+			"export const {"+refreshExports+"} = runtime; export default runtime;\n")
+		return
+	}
+
+	// Forward all other requests through the environment's reverse proxy.
+	// Vite's caching headers pass through: sources revalidate by ETag, and
+	// optimized dependencies are immutable under their version query. The
+	// route prefix names the compiler session, so cached URLs never span sessions.
+	env.proxy.ServeHTTP(rw, req)
+}
+
+// ServeBootstrap establishes React Refresh before the canonical renderer loads.
+// Only compiler runtime code uses this route; application modules use Fetch.
+func (f *FrontendService) ServeBootstrap(rw http.ResponseWriter, req *http.Request, entrypoint, startup string) {
+	// Serve a passthrough boot module when the frontend is disabled.
+	if f.run.GetState() == nil {
+		rw.Header().Set("Content-Type", "text/javascript")
+		rw.Header().Set("Cache-Control", "no-store")
+		entry := strconv.Quote("/" + strings.TrimPrefix(entrypoint, "/"))
+		_, _ = io.WriteString(rw, "await import("+entry+");\n")
+		return
+	}
+	env, err := f.ready.Await(req.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	// Set the module response headers after the environment becomes ready.
+	rw.Header().Set("Content-Type", "text/javascript")
+	rw.Header().Set("Cache-Control", "no-store")
+	refreshPath := "/bldr-dev/frontend-refresh/" + env.result.GetSession().GetId() + ".mjs"
+	switch req.URL.Path {
+	// Serve the frontend boot module and its per-session refresh runtime.
+	case "/bldr-dev/frontend-boot.mjs":
+		refresh := strconv.Quote(refreshPath)
+		entry := strconv.Quote("/" + strings.TrimPrefix(entrypoint, "/"))
+		boot := "import " + refresh + ";" + webPkgBindingScript(f.webPkgImports(env.result.GetWebPkgImports())) + " window.__bldrFrontendEnabled = true;"
+		if startup != "" {
+			boot += " window.__bldrFrontendStartup = " + strconv.Quote(startup) + ";"
+		}
+		_, _ = io.WriteString(rw, boot+" await import("+entry+");\n")
+	case refreshPath:
+		_, _ = io.WriteString(rw, env.result.GetRefreshRuntime())
+		if env.result.GetRefreshRuntime() == "" {
+			return
+		}
+		_, _ = io.WriteString(rw, "\nif (!globalThis.__bldrReactRefresh) {\n"+
+			"globalThis.__bldrReactRefresh = {"+refreshExports+"};\n"+
+			"injectIntoGlobalHook(window); window.$RefreshReg$ = () => {}; window.$RefreshSig$ = () => type => type; window.__vite_plugin_react_preamble_installed__ = true;\n}\n")
+	default:
+		http.Error(rw, "frontend session expired", http.StatusGone)
+	}
+}
+
+// webPkgImports returns the boot import map for excluded packages.
+// The compiler map overrides the default /b/pkg route for each id, so a
+// ready graph can serve editable source while an empty result still binds
+// the packages the startup view imports.
+func (f *FrontendService) webPkgImports(compiler map[string]string) map[string]string {
+	// Read the excluded package ids from the configured graph.
+	var ids []string
+	if conf := f.run.GetState(); conf != nil {
+		ids = conf.GetWebPkgIds()
+	}
+	if len(ids) == 0 && len(compiler) == 0 {
+		return nil
+	}
+
+	// Bind each excluded package at the shared route, then overlay the compiler.
+	imports := make(map[string]string, len(ids)+len(compiler))
+	for _, id := range ids {
+		imports[web_pkg.ImportSpecifierPrefix+id+"/"] = "/b/pkg/" + id + "/"
+	}
+	maps.Copy(imports, compiler)
+	return imports
+}
+
+// webPkgBindingScript maps the shared package specifiers the development graph
+// and separately bundled views emit to the URLs the graph reports for them.
+// The startup view loads that graph before any web view binds its packages,
+// and later bindings skip each prefix bound here.
+func webPkgBindingScript(imports map[string]string) string {
+	// A graph without shared packages needs no binding.
+	if len(imports) == 0 {
+		return ""
+	}
+
+	// Insert the map from the boot module, before the entrypoint import.
+	importMap := web_entrypoint_index.ImportMap{Imports: imports}.String()
+	return ` const webPkgs = document.createElement("script"); webPkgs.type = "importmap"; webPkgs.dataset.bldrWebPkg = ""; webPkgs.textContent = ` + strconv.Quote(importMap) + `; document.head.append(webPkgs);`
+}
+
+// GetFrontendService returns the development service, if enabled for this project.
+func (c *Controller) GetFrontendService() *FrontendService { return c.frontend }
+
+// _ asserts that the project service implements the frontend RPC contract.
+var _ frontend.SRPCFrontendServer = (*FrontendService)(nil)

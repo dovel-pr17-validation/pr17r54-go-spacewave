@@ -1,0 +1,782 @@
+//go:build !js
+
+package bldr_plugin_compiler_js_test
+
+import (
+	"context"
+	"errors"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus/inmem"
+	"github.com/aperturerobotics/controllerbus/controller/configset"
+	configset_proto "github.com/aperturerobotics/controllerbus/controller/configset/proto"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	directivecontroller "github.com/aperturerobotics/controllerbus/directive/controller"
+	starpc_mock "github.com/aperturerobotics/starpc/mock"
+	"github.com/aperturerobotics/util/promise"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_builder "github.com/s4wave/spacewave/bldr/manifest/builder"
+	bldr_manifest_builder_controller "github.com/s4wave/spacewave/bldr/manifest/builder/controller"
+	bldr_platform "github.com/s4wave/spacewave/bldr/platform"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	bldr_plugin_compiler_js "github.com/s4wave/spacewave/bldr/plugin/compiler/js"
+	plugin_host_wazero_quickjs "github.com/s4wave/spacewave/bldr/plugin/host/wazero-quickjs"
+	"github.com/s4wave/spacewave/bldr/testbed"
+	bldr_web_bundler_vite "github.com/s4wave/spacewave/bldr/web/bundler/vite"
+	bldr_web_bundler_vite_compiler "github.com/s4wave/spacewave/bldr/web/bundler/vite/compiler"
+	web_view "github.com/s4wave/spacewave/bldr/web/view"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/sirupsen/logrus"
+)
+
+func TestPluginCompilerJs(t *testing.T) {
+	// Bound the test and build the testbed with a debug logger.
+	ctx, ctxCancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer ctxCancel()
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	le := logrus.NewEntry(log)
+
+	// Build the testbed and release it when the test ends.
+	tb, err := testbed.BuildTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer tb.Release()
+
+	// Register the JS compiler and its supporting factories.
+	b, sr := tb.GetBus(), tb.GetStaticResolver()
+	sr.AddFactory(bldr_plugin_compiler_js.NewFactory(b))
+	sr.AddFactory(bldr_manifest_builder_controller.NewFactory(b))
+	sr.AddFactory(plugin_host_wazero_quickjs.NewFactory(b))
+	sr.AddFactory(bldr_web_bundler_vite_compiler.NewFactory(b))
+
+	// load the plugin host which will execute the plugin once it is ready.
+	quickjsHost, _, quickjsHostRef, err := loader.WaitExecControllerRunningTyped[*plugin_host_wazero_quickjs.Controller](
+		ctx,
+		tb.GetBus(),
+		resolver.NewLoadControllerWithConfig(plugin_host_wazero_quickjs.NewConfig()),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer quickjsHostRef.Release()
+
+	// create the directive to load the plugin
+	// the plugin scheduler will watch the world and wait for the manifest
+	pluginID := "test-plugin"
+	platformID := quickjsHost.GetPluginHost().GetPlatformId()
+
+	// Load the plugin through the plugin scheduler directive.
+	_, pluginRef, err := b.AddDirective(ctx, bldr_plugin.NewLoadPlugin(pluginID), nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer pluginRef.Release()
+
+	// run a service on the plugin host that our plugin will call
+	calledPromise := promise.NewPromise[*starpc_mock.MockMsg]()
+	mockServer := &starpc_mock.MockServer{
+		MockRequestCb: func(ctx context.Context, msg *starpc_mock.MockMsg) (*starpc_mock.MockMsg, error) {
+			calledPromise.SetResult(msg, nil)
+			return &starpc_mock.MockMsg{Body: "hello from js compiler test"}, nil
+		},
+	}
+	mux := tb.GetMux()
+	mockServer.Register(mux)
+
+	// create the plugin compiler config which defines how to build the plugin
+	jsCompilerConf, err := configset_proto.NewControllerConfig(configset.NewControllerConfig(
+		1,
+		&bldr_plugin_compiler_js.Config{
+			Modules: []*bldr_plugin_compiler_js.JsModule{{
+				Kind:       bldr_plugin_compiler_js.JsModuleKind_JS_MODULE_KIND_BACKEND,
+				Path:       "./bldr/plugin/host/wazero-quickjs/plugin-quickjs_test.ts",
+				Entrypoint: true,
+			}},
+		},
+	), false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// build the manifest
+	manifestID := pluginID
+	projectID := pluginID
+
+	// Build the manifest meta against the plugin host object key.
+	pluginHostKey := tb.GetPluginHostObjKey()
+	manifestMeta := bldr_manifest.NewManifestMeta(manifestID, bldr_manifest.BuildType_DEV, platformID, 1)
+
+	// create a working path dir
+	testDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	buildWorkingPath := filepath.Join(testDir, ".test")
+	distSrcPath := filepath.Join(testDir, "../../../..")
+	staleEntryPath := filepath.Join(buildWorkingPath, "dist", "plugin-stale.mjs")
+	if err := os.MkdirAll(filepath.Dir(staleEntryPath), 0o755); err != nil {
+		t.Fatal(err.Error())
+	}
+	if err := os.WriteFile(staleEntryPath, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// start the manifest builder controller
+	engineID := tb.GetWorldEngineID()
+	peerID := tb.GetVolume().GetPeerID().String()
+	storeLinkObjKeys := []string{pluginHostKey}
+	manifestBuilderConf := &bldr_manifest_builder.BuilderConfig{
+		ProjectId:      projectID,
+		ManifestMeta:   manifestMeta,
+		EngineId:       engineID,
+		PeerId:         peerID,
+		LinkObjectKeys: storeLinkObjKeys,
+		// Use the monorepo root as the dist source path so vendor/ and sibling
+		// packages are visible during test builds.
+		DistSourcePath: distSrcPath,
+		WorkingPath:    buildWorkingPath,
+		SourcePath:     distSrcPath,
+	}
+	builderConf := bldr_manifest_builder_controller.NewConfig(
+		manifestBuilderConf,
+		jsCompilerConf,
+		nil,
+		true,
+		nil,
+	)
+
+	// Start the manifest builder controller for the plugin.
+	builderCtrl, _, ctrlRef, err := loader.WaitExecControllerRunningTyped[*bldr_manifest_builder_controller.Controller](
+		ctx,
+		tb.GetBus(),
+		resolver.NewLoadControllerWithConfig(builderConf),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ctrlRef.Release()
+
+	// Await the build result and check the persisted Vite result.
+	buildResult, err := builderCtrl.GetResultPromise().Await(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if buildResult.GetSubManifestResults()["vite"] == nil {
+		t.Fatal("expected persisted Vite builder result")
+	}
+
+	// Assert the startup inputs cover the module, entrypoint, and dist deps.
+	var foundModuleInput, foundEntrypointInput, foundDistDepsInput bool
+	for _, inputFile := range buildResult.GetInputManifest().GetFiles() {
+		inputPath := filepath.ToSlash(inputFile.GetPath())
+		switch {
+		case strings.HasSuffix(inputPath, "bldr/plugin/host/wazero-quickjs/plugin-quickjs_test.ts"):
+			foundModuleInput = true
+		case strings.HasSuffix(inputPath, "bldr/plugin/compiler/js/entrypoint.ts"):
+			foundEntrypointInput = true
+		case strings.HasSuffix(inputPath, "bldr/dist/deps/package.json"):
+			foundDistDepsInput = true
+		}
+	}
+	if !foundModuleInput || !foundEntrypointInput || !foundDistDepsInput {
+		t.Fatalf(
+			"startup inputs missing module=%t entrypoint=%t dist-deps=%t",
+			foundModuleInput,
+			foundEntrypointInput,
+			foundDistDepsInput,
+		)
+	}
+	if _, err := os.Stat(staleEntryPath); !os.IsNotExist(err) {
+		t.Fatalf("stale plugin entrypoint survived rebuild: %v", err)
+	}
+	jdat, err := buildResult.GetManifest().MarshalJSON()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Log the compiled manifest for debugging.
+	le.Infof("compiled js plugin manifest: %v", string(jdat))
+
+	// wait for the plugin to load fully
+	pluginClient, pluginClientRef, err := bldr_plugin.ExPluginLoadWaitClient(ctx, b, pluginID, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer pluginClientRef.Release()
+	_ = pluginClient
+
+	// Log the successful plugin load.
+	le.Infof("plugin %q loaded successfully", pluginID)
+
+	// wait for rpc to be called
+	calledMsg, err := calledPromise.Await(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	calledMsgDat, err := calledMsg.MarshalJSON()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Log the RPC call the plugin made to the host.
+	le.Infof("plugin successfully called host rpc with message: %v", string(calledMsgDat))
+}
+
+func TestPluginCompilerJsReleaseWaitsForAdmittedBuild(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Start the JS compiler controller on an in-memory bus.
+		le := logrus.NewEntry(logrus.New())
+		dc := directivecontroller.NewController(t.Context(), le)
+		b := inmem.NewBus(dc)
+		ctrl, err := bldr_plugin_compiler_js.NewController(le, b, &bldr_plugin_compiler_js.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		release, err := b.AddController(t.Context(), ctrl, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Prepare the build arguments with a configured working path.
+		workDir := t.TempDir()
+		args := &bldr_manifest_builder.BuildManifestArgs{
+			BuilderConfig: &bldr_manifest_builder.BuilderConfig{
+				ManifestMeta:   bldr_manifest.NewManifestMeta("test-plugin", bldr_manifest.BuildType_DEV, "js", 1),
+				SourcePath:     t.TempDir(),
+				DistSourcePath: t.TempDir(),
+				WorkingPath:    workDir,
+			},
+		}
+
+		// Gate the admitted build behind a pre-build hook.
+		buildStarted := make(chan struct{})
+		continueBuild := make(chan struct{})
+		sentinelErr := errors.New("stop after release ordering check")
+		ctrl.AddPreBuildHook(func(
+			_ context.Context,
+			builderConf *bldr_manifest_builder.BuilderConfig,
+			_ world.Engine,
+		) (*bldr_plugin_compiler_js.PreBuildHookResult, error) {
+			close(buildStarted)
+			<-continueBuild
+			if err := os.WriteFile(filepath.Join(builderConf.GetWorkingPath(), "marker"), []byte("configured-path"), 0o644); err != nil {
+				return nil, err
+			}
+			return nil, sentinelErr
+		})
+
+		// Start the build and wait for the hook to admit it.
+		buildErr := make(chan error, 1)
+		go func() {
+			_, err := ctrl.BuildManifest(t.Context(), args, nil)
+			buildErr <- err
+		}()
+		<-buildStarted
+
+		// Release the controller while the build is still admitted.
+		releaseReturned := make(chan struct{})
+		go func() {
+			release()
+			close(releaseReturned)
+		}()
+		synctest.Wait()
+		releasedEarly := false
+		select {
+		case <-releaseReturned:
+			releasedEarly = true
+		default:
+		}
+
+		// Start a concurrent Close and assert it blocks on the build.
+		secondCloseReturned := make(chan struct{})
+		go func() {
+			_ = ctrl.Close()
+			close(secondCloseReturned)
+		}()
+		synctest.Wait()
+		select {
+		case <-secondCloseReturned:
+			t.Fatal("concurrent Close returned before the admitted build finished")
+		default:
+		}
+
+		// Finish the build and assert both teardowns then complete.
+		close(continueBuild)
+		synctest.Wait()
+		if err := <-buildErr; !errors.Is(err, sentinelErr) {
+			t.Fatalf("BuildManifest error = %v, want sentinel", err)
+		}
+		select {
+		case <-releaseReturned:
+		default:
+			t.Fatal("controller release did not return after the admitted build finished")
+		}
+		select {
+		case <-secondCloseReturned:
+		default:
+			t.Fatal("concurrent Close did not return after the admitted build finished")
+		}
+
+		// Assert the pre-build hook wrote its marker into the working path.
+		marker, err := os.ReadFile(filepath.Join(workDir, "marker"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(marker) != "configured-path" {
+			t.Fatalf("marker = %q, want configured-path", marker)
+		}
+		if releasedEarly {
+			t.Error("controller release returned before the admitted build finished")
+		}
+
+		// Builds after release must fail with the closed error.
+		if _, err := ctrl.BuildManifest(t.Context(), args, nil); err == nil || err.Error() != "js compiler is closed" {
+			t.Fatalf("BuildManifest after release error = %v, want closed", err)
+		}
+
+		// Removing the working path must leave no configured directory.
+		if err := os.RemoveAll(workDir); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+			t.Fatalf("configured working path still exists after removal: %v", err)
+		}
+	})
+}
+
+func TestPluginCompilerJsStartupCacheRequiresStaticInputs(t *testing.T) {
+	// A controller without hooks supports the startup cache.
+	ctrl := &bldr_plugin_compiler_js.Controller{}
+	if !ctrl.SupportsStartupManifestCache() {
+		t.Fatal("JS compiler with static inputs should support startup cache")
+	}
+
+	// An undeclared pre-build hook must bypass the startup cache.
+	ctrl.AddPreBuildHook(func(
+		context.Context,
+		*bldr_manifest_builder.BuilderConfig,
+		world.Engine,
+	) (*bldr_plugin_compiler_js.PreBuildHookResult, error) {
+		return nil, nil
+	})
+	if ctrl.SupportsStartupManifestCache() {
+		t.Fatal("JS compiler with an undeclared pre-build hook must bypass startup cache")
+	}
+}
+
+func TestPluginCompilerJsStartupCacheHonorsDeclaredProvenance(t *testing.T) {
+	// Build a no-op pre-build hook shared by both cases.
+	noopHook := func(
+		context.Context,
+		*bldr_manifest_builder.BuilderConfig,
+		world.Engine,
+	) (*bldr_plugin_compiler_js.PreBuildHookResult, error) {
+		return nil, nil
+	}
+
+	// A hook that declares complete deterministic provenance is cache-eligible.
+	ctrl := &bldr_plugin_compiler_js.Controller{}
+	ctrl.AddPreBuildHookWithProvenance(noopHook, &bldr_plugin_compiler_js.PreBuildHookProvenance{
+		InputFiles: []string{"hook/input.json"},
+		EnvVars:    []string{"BLDR_TEST_HOOK_ENV"},
+	})
+	if !ctrl.SupportsStartupManifestCache() {
+		t.Fatal("JS compiler with a declared-provenance hook must support startup cache")
+	}
+
+	// A single undeclared hook among declared ones still forces always-build.
+	ctrl.AddPreBuildHookWithProvenance(noopHook, nil)
+	if ctrl.SupportsStartupManifestCache() {
+		t.Fatal("JS compiler with any undeclared hook must bypass startup cache")
+	}
+}
+
+func TestPreBuildHookProvenanceResolvesStartupInputs(t *testing.T) {
+	// Declare input files and env vars with blank entries.
+	t.Setenv("BLDR_TEST_HOOK_ENV", "declared-value")
+	provenance := &bldr_plugin_compiler_js.PreBuildHookProvenance{
+		InputFiles: []string{"hook/input.json", "", "/abs/input.txt"},
+		EnvVars:    []string{"BLDR_TEST_HOOK_ENV", ""},
+	}
+
+	// Resolve the startup input paths and check the filtering.
+	paths := provenance.StartupInputPaths("/src/root")
+	wantPaths := []string{
+		filepath.Join("/src/root", "hook", "input.json"),
+		"/abs/input.txt",
+	}
+	if len(paths) != len(wantPaths) {
+		t.Fatalf("expected %d startup input paths, got %d: %v", len(wantPaths), len(paths), paths)
+	}
+	for i, want := range wantPaths {
+		if paths[i] != want {
+			t.Fatalf("startup input path[%d] = %q, want %q", i, paths[i], want)
+		}
+	}
+
+	// Resolve the env startup inputs and check their values.
+	envInputs := provenance.EnvStartupInputs()
+	if len(envInputs) != 1 {
+		t.Fatalf("expected 1 env startup input, got %d", len(envInputs))
+	}
+	if got := envInputs[0].GetKey(); got != "BLDR_TEST_HOOK_ENV" {
+		t.Fatalf("env startup input key = %q, want BLDR_TEST_HOOK_ENV", got)
+	}
+	if got := envInputs[0].GetStringValue(); got != "declared-value" {
+		t.Fatalf("env startup input value = %q, want declared-value", got)
+	}
+
+	// A nil provenance (undeclared hook) contributes no inputs.
+	var nilProvenance *bldr_plugin_compiler_js.PreBuildHookProvenance
+	if got := nilProvenance.StartupInputPaths("/src/root"); got != nil {
+		t.Fatalf("nil provenance produced startup input paths: %v", got)
+	}
+	if got := nilProvenance.EnvStartupInputs(); got != nil {
+		t.Fatalf("nil provenance produced env startup inputs: %v", got)
+	}
+}
+
+func TestCreateEntrypointsFromViteOutputsBackendImportPath(t *testing.T) {
+	// Create entrypoints from a single backend Vite output.
+	backend, frontend, err := bldr_plugin_compiler_js.CreateEntrypointsFromViteOutputs(
+		t.TempDir(),
+		[]*bldr_plugin_compiler_js.JsModule{{
+			Kind:       bldr_plugin_compiler_js.JsModuleKind_JS_MODULE_KIND_BACKEND,
+			Path:       "./plugin/notes/backend.ts",
+			Entrypoint: true,
+		}},
+		[]*bldr_web_bundler_vite.ViteOutputMeta{{
+			EntrypointPath: "plugin/notes/backend.ts",
+			Path:           "b/be/plugin/notes/backend-abc123.mjs",
+		}},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert one backend entrypoint with the asset-backed import path.
+	if len(frontend) != 0 {
+		t.Fatalf("expected no frontend entrypoints, got %d", len(frontend))
+	}
+	if len(backend) != 1 {
+		t.Fatalf("expected one backend entrypoint, got %d", len(backend))
+	}
+	if got := backend[0].GetImportPath(); got != "/assets/v/b/be/plugin/notes/backend-abc123.mjs" {
+		t.Fatalf("unexpected backend import path: %q", got)
+	}
+}
+
+func TestCreateEntrypointsFromViteOutputsQuickJSFrontendBoundary(t *testing.T) {
+	// Write the frontend asset and create entrypoints from both outputs.
+	assetsDir := t.TempDir()
+	writeCompilerAsset(t, assetsDir, "v/b/fe/spacewave-app/App-def456.mjs", "export default function App() {}")
+
+	// Create entrypoints from the backend and frontend outputs.
+	backend, frontend, err := bldr_plugin_compiler_js.CreateEntrypointsFromViteOutputs(
+		assetsDir,
+		[]*bldr_plugin_compiler_js.JsModule{
+			{
+				Kind:       bldr_plugin_compiler_js.JsModuleKind_JS_MODULE_KIND_BACKEND,
+				Path:       "./spacewave-app/backend.ts",
+				Entrypoint: true,
+			},
+			{
+				Kind:       bldr_plugin_compiler_js.JsModuleKind_JS_MODULE_KIND_FRONTEND,
+				Path:       "./spacewave-app/App.tsx",
+				Entrypoint: true,
+			},
+		},
+		[]*bldr_web_bundler_vite.ViteOutputMeta{
+			{
+				EntrypointPath: "spacewave-app/backend.ts",
+				Path:           "b/be/spacewave-app/backend-abc123.mjs",
+			},
+			{
+				EntrypointPath: "spacewave-app/App.tsx",
+				Path:           "b/fe/spacewave-app/App-def456.mjs",
+			},
+			{
+				EntrypointPath: "spacewave-app/App.tsx",
+				Path:           "b/fe/spacewave-app/App-def456.css",
+			},
+		},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert one entrypoint of each kind was produced.
+	if len(backend) != 1 {
+		t.Fatalf("expected one backend entrypoint, got %d", len(backend))
+	}
+	if len(frontend) != 1 {
+		t.Fatalf("expected one frontend entrypoint, got %d", len(frontend))
+	}
+
+	// The backend import path must point at backend assets only.
+	if got := backend[0].GetImportPath(); got != "/assets/v/b/be/spacewave-app/backend-abc123.mjs" {
+		t.Fatalf("unexpected backend import path: %q", got)
+	}
+	if strings.Contains(backend[0].GetImportPath(), "/v/b/fe/") {
+		t.Fatalf("backend import path must not point at frontend bundle assets: %q", backend[0].GetImportPath())
+	}
+
+	// Check the frontend render mode and its script URL metadata.
+	setRenderMode := frontend[0].GetSetRenderMode()
+	if setRenderMode.GetRenderMode() != web_view.RenderMode_RenderMode_REACT_COMPONENT {
+		t.Fatalf("unexpected render mode: %v", setRenderMode.GetRenderMode())
+	}
+	scriptURL, err := url.Parse(setRenderMode.GetScriptPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := scriptURL.Path; got != "v/b/fe/spacewave-app/App-def456.mjs" {
+		t.Fatalf("unexpected frontend script URL path: %q", got)
+	}
+	if got := scriptURL.Query().Get("bldr_content"); len(got) != 64 {
+		t.Fatalf("unexpected frontend content identity: %q", got)
+	}
+	if strings.HasPrefix(setRenderMode.GetScriptPath(), "/assets/") {
+		t.Fatalf("frontend script path must remain WebView asset metadata, got %q", setRenderMode.GetScriptPath())
+	}
+
+	// Check the frontend HTML links carry the CSS asset.
+	links := frontend[0].GetSetHtmlLinks().GetSetLinks()
+	link := links["css-App-def456.css"]
+	if link == nil {
+		t.Fatalf("expected frontend css link in %v", links)
+	}
+	if got := link.GetHref(); got != "v/b/fe/spacewave-app/App-def456.css" {
+		t.Fatalf("unexpected frontend css href: %q", got)
+	}
+}
+
+func TestPluginCompilerJsSupportedPlatforms(t *testing.T) {
+	// Read the supported platforms from a bare controller.
+	ctrl, err := bldr_plugin_compiler_js.NewController(nil, nil, &bldr_plugin_compiler_js.Config{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	supported := ctrl.GetSupportedPlatforms()
+
+	// The browser target must select the wasm platform.
+	browserTarget := bldr_platform.GetBuiltinTarget(bldr_platform.TargetID_Browser)
+	if got := browserTarget.SelectPlatformForCompiler(supported); got != "web/js/wasm" {
+		t.Fatalf("browser target selected platform = %q, want web/js/wasm", got)
+	}
+
+	// The desktop target must fall back to the JS platform.
+	desktopTarget := bldr_platform.GetBuiltinTarget(bldr_platform.TargetID_Desktop)
+	if got := desktopTarget.SelectPlatformForCompiler(supported); got != bldr_platform.PlatformID_JS {
+		t.Fatalf("desktop target selected platform = %q, want js", got)
+	}
+}
+
+func TestCreateEntrypointsFromViteOutputsFrontendContentIdentity(t *testing.T) {
+	// Write the frontend asset referenced by the entrypoints.
+	assetsDir := t.TempDir()
+	const entryPath = "v/b/fe/app/App.mjs"
+	writeCompilerAsset(t, assetsDir, entryPath, `import "./chunk-old.mjs"`)
+
+	// Build configured, absolute, and external frontend entrypoints.
+	configured := &bldr_plugin_compiler_js.FrontendEntrypoint{
+		SetRenderMode: &web_view.SetRenderModeRequest{
+			RenderMode: web_view.RenderMode_RenderMode_REACT_COMPONENT,
+			ScriptPath: entryPath + "?configured=https://example.com",
+		},
+	}
+	absolute := &bldr_plugin_compiler_js.FrontendEntrypoint{
+		SetRenderMode: &web_view.SetRenderModeRequest{ScriptPath: "/b/pa/app/App.mjs"},
+	}
+	external := &bldr_plugin_compiler_js.FrontendEntrypoint{
+		SetRenderMode: &web_view.SetRenderModeRequest{ScriptPath: "https://example.com/App.mjs"},
+	}
+	backend, frontend, err := bldr_plugin_compiler_js.CreateEntrypointsFromViteOutputs(
+		assetsDir,
+		nil,
+		nil,
+		nil,
+		[]*bldr_plugin_compiler_js.FrontendEntrypoint{configured, absolute, external},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert three frontend entrypoints and no backend entrypoints.
+	if len(backend) != 0 {
+		t.Fatalf("expected no backend entrypoints, got %d", len(backend))
+	}
+	if len(frontend) != 3 {
+		t.Fatalf("expected three frontend entrypoints, got %d", len(frontend))
+	}
+
+	// The configured entrypoint keeps its path, gains content identity,
+	// keeps its query, and does not force a refresh.
+	firstScriptPath := frontend[0].GetSetRenderMode().GetScriptPath()
+	firstURL, err := url.Parse(firstScriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstURL.Path != entryPath {
+		t.Fatalf("unexpected stable frontend entry path: %q", firstURL.Path)
+	}
+	if firstURL.Query().Get("bldr_content") == "" {
+		t.Fatalf("frontend script URL has no content identity: %q", firstScriptPath)
+	}
+	if firstURL.Query().Get("configured") != "https://example.com" {
+		t.Fatalf("frontend script URL lost configured query: %q", firstScriptPath)
+	}
+	if frontend[0].GetSetRenderMode().GetRefresh() {
+		t.Fatal("frontend entrypoints should not force refresh for idempotent handler reattachment")
+	}
+	if configured.GetSetRenderMode().GetScriptPath() != entryPath+"?configured=https://example.com" {
+		t.Fatalf("configured frontend entrypoint was mutated: %q", configured.GetSetRenderMode().GetScriptPath())
+	}
+
+	// Absolute and external script URLs pass through unchanged.
+	if got := frontend[1].GetSetRenderMode().GetScriptPath(); got != absolute.GetSetRenderMode().GetScriptPath() {
+		t.Fatalf("absolute frontend script URL changed: %q", got)
+	}
+	if got := frontend[2].GetSetRenderMode().GetScriptPath(); got != external.GetSetRenderMode().GetScriptPath() {
+		t.Fatalf("external frontend script URL changed: %q", got)
+	}
+
+	// Rewrite the asset and recompute the entrypoints.
+	writeCompilerAsset(t, assetsDir, entryPath, `import "./chunk-new.mjs"`)
+	_, changedFrontend, err := bldr_plugin_compiler_js.CreateEntrypointsFromViteOutputs(
+		assetsDir,
+		nil,
+		nil,
+		nil,
+		[]*bldr_plugin_compiler_js.FrontendEntrypoint{configured},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The path stays stable while the content identity changes.
+	changedScriptPath := changedFrontend[0].GetSetRenderMode().GetScriptPath()
+	changedURL, err := url.Parse(changedScriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedURL.Path != firstURL.Path {
+		t.Fatalf("frontend entry path changed with imported chunk: %q != %q", changedURL.Path, firstURL.Path)
+	}
+	if changedScriptPath == firstScriptPath {
+		t.Fatalf("frontend content URL did not change with imported chunk: %q", changedScriptPath)
+	}
+}
+
+func TestCreateEntrypointsFromViteOutputsMissingFrontendAsset(t *testing.T) {
+	// Create entrypoints for a frontend output with no written asset.
+	_, _, err := bldr_plugin_compiler_js.CreateEntrypointsFromViteOutputs(
+		t.TempDir(),
+		[]*bldr_plugin_compiler_js.JsModule{{
+			Kind:       bldr_plugin_compiler_js.JsModuleKind_JS_MODULE_KIND_FRONTEND,
+			Path:       "./app/App.tsx",
+			Entrypoint: true,
+		}},
+		[]*bldr_web_bundler_vite.ViteOutputMeta{{
+			EntrypointPath: "app/App.tsx",
+			Path:           "b/fe/app/App.mjs",
+		}},
+		nil,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected missing frontend asset error")
+	}
+	if !strings.Contains(err.Error(), `v/b/fe/app/App.mjs`) {
+		t.Fatalf("missing frontend asset error did not name path: %v", err)
+	}
+}
+
+func TestValidateFrontendEntrypointAssetClosure(t *testing.T) {
+	// Write the script and CSS assets the entrypoint references.
+	dir := t.TempDir()
+	for _, relPath := range []string{
+		"v/b/fe/app/App-abc123.mjs",
+		"v/b/fe/app/App-abc123.css",
+	} {
+		fullPath := filepath.Join(dir, filepath.FromSlash(relPath))
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte("asset"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Validate the closure of an entrypoint referencing both assets.
+	frontend := []*bldr_plugin_compiler_js.FrontendEntrypoint{{
+		SetRenderMode: &web_view.SetRenderModeRequest{
+			RenderMode: web_view.RenderMode_RenderMode_REACT_COMPONENT,
+			ScriptPath: "v/b/fe/app/App-abc123.mjs?bldr_content=0123456789abcdef",
+		},
+		SetHtmlLinks: &web_view.SetHtmlLinksRequest{
+			SetLinks: map[string]*web_view.HtmlLink{
+				"css": {Rel: "stylesheet", Href: "v/b/fe/app/App-abc123.css"},
+			},
+		},
+	}}
+	if err := bldr_plugin_compiler_js.ValidateFrontendEntrypointAssetClosure(dir, frontend); err != nil {
+		t.Fatal(err)
+	}
+
+	// A missing script asset must fail validation naming the path.
+	frontend[0].SetRenderMode.ScriptPath = "v/b/fe/app/Missing-abc123.mjs"
+	err := bldr_plugin_compiler_js.ValidateFrontendEntrypointAssetClosure(dir, frontend)
+	if err == nil {
+		t.Fatal("expected missing frontend asset validation error")
+	}
+	if !strings.Contains(err.Error(), `v/b/fe/app/Missing-abc123.mjs`) {
+		t.Fatalf("missing asset error did not name path: %v", err)
+	}
+
+	// Absolute and external script URLs skip asset validation.
+	for _, scriptPath := range []string{
+		"/b/pa/app/v/b/fe/app/App.mjs?bldr_content=external",
+		"https://example.com/App.mjs?bldr_content=external",
+	} {
+		frontend[0].SetRenderMode.ScriptPath = scriptPath
+		if err := bldr_plugin_compiler_js.ValidateFrontendEntrypointAssetClosure(dir, frontend); err != nil {
+			t.Fatalf("external frontend asset %q failed validation: %v", scriptPath, err)
+		}
+	}
+
+	// A traversal outside the asset root must fail validation.
+	frontend[0].SetRenderMode.ScriptPath = "../App.mjs?bldr_content=escape"
+	if err := bldr_plugin_compiler_js.ValidateFrontendEntrypointAssetClosure(dir, frontend); err == nil {
+		t.Fatal("expected queried frontend traversal validation error")
+	}
+}
+
+func writeCompilerAsset(t *testing.T, assetsDir, assetPath, contents string) {
+	// Mark the failure path on the test.
+	t.Helper()
+
+	// Create the parent directory and write the asset contents.
+	fullPath := filepath.Join(assetsDir, filepath.FromSlash(assetPath))
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fullPath, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,0 +1,43 @@
+package bldr_web_view_observer
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/directive"
+	web_view "github.com/s4wave/spacewave/bldr/web/view"
+)
+
+// observeHandleWebView observes the HandleWebView directive.
+func (c *Controller) observeHandleWebView(
+	ctx context.Context,
+	di directive.Instance,
+	dir web_view.HandleWebView,
+) error {
+	// Ignore HandleWebView directives without a view to observe.
+	webView := dir.HandleWebView()
+	if webView == nil {
+		return nil
+	}
+
+	// Publish the WebView in the controller registry and wake its observers.
+	webViewID := webView.GetId()
+	c.bcast.HoldLock(func(broadcast func(), getWaitCh func() <-chan struct{}) {
+		if c.webViews[webViewID] != webView {
+			c.webViews[webViewID] = webView
+			broadcast()
+		}
+	})
+
+	// remove the web view when the directive is disposed
+	_ = di.AddReference(ctx, bus.NewCallbackHandler(nil, nil, func() {
+		c.bcast.HoldLock(func(broadcast func(), getWaitCh func() <-chan struct{}) {
+			if c.webViews[webViewID] == webView {
+				delete(c.webViews, webViewID)
+				broadcast()
+			}
+		})
+	}), true)
+
+	return nil
+}

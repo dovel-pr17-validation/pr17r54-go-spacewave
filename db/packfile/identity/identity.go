@@ -1,0 +1,96 @@
+package identity
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"io"
+
+	b58 "github.com/mr-tron/base58/base58"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/packfile/writer"
+)
+
+const (
+	// PackIDPrefix is the v1 packfile identifier prefix.
+	PackIDPrefix = "pfv1_"
+	// WriterVersionV1 is the v1 kvfile writer identity namespace.
+	WriterVersionV1 = "kvfile-writer-v1"
+)
+
+const packIDDigestLen = 32
+
+// BuildPackID builds a v1 packfile identifier for one resource-scoped pack.
+func BuildPackID(resourceID string, result *writer.PackResult) (string, error) {
+	// Require a resource scope and complete digests for the pack identity.
+	if resourceID == "" {
+		return "", errors.New("resource id is empty")
+	}
+	if result == nil {
+		return "", errors.New("pack result is nil")
+	}
+	if len(result.SortedKeyDigest) != packIDDigestLen {
+		return "", errors.New("sorted key digest is invalid")
+	}
+	if len(result.PackBytesDigest) != packIDDigestLen {
+		return "", errors.New("pack bytes digest is invalid")
+	}
+
+	// Resolve the writer policies included in the pack identity.
+	policyTag := result.PolicyTag
+	if policyTag == "" {
+		policyTag = writer.PolicyTag(writer.DefaultPolicy())
+	}
+	valueOrder := result.ValueOrderPolicy
+	if valueOrder == "" {
+		valueOrder = writer.ValueOrderIterator
+	}
+
+	// Hash the resource, writer version, and policies with length framing.
+	h := sha256.New()
+	writePart(h, []byte("spacewave-packfile-id-v1"))
+	writePart(h, []byte(resourceID))
+	writePart(h, []byte(WriterVersionV1))
+	writePart(h, []byte(policyTag))
+	writePart(h, []byte(valueOrder))
+
+	// Bind the sorted keys and pack bytes to the identity digest.
+	writePart(h, result.SortedKeyDigest)
+	writePart(h, result.PackBytesDigest)
+	sum := h.Sum(nil)
+	return PackIDPrefix + b58.Encode(sum), nil
+}
+
+// NewPackID returns a random v1 packfile identifier. A store that deletes
+// packfiles names each one it writes this way, so writing the same blocks again
+// never reuses the identifier of a packfile being deleted.
+func NewPackID() string {
+	var suffix [packIDDigestLen]byte
+	_, _ = rand.Read(suffix[:])
+	return PackIDPrefix + b58.Encode(suffix[:])
+}
+
+// ValidatePackID validates the v1 packfile identifier shape.
+func ValidatePackID(id string) error {
+	// Require the pack identifier namespace before decoding its digest.
+	if len(id) <= len(PackIDPrefix) || id[:len(PackIDPrefix)] != PackIDPrefix {
+		return errors.New("pack id must start with pfv1_")
+	}
+
+	// Validate the base58 digest and its fixed length.
+	digest, err := b58.Decode(id[len(PackIDPrefix):])
+	if err != nil {
+		return errors.Wrap(err, "pack id suffix must be base58")
+	}
+	if len(digest) != packIDDigestLen {
+		return errors.New("pack id suffix must decode to 32 bytes")
+	}
+	return nil
+}
+
+func writePart(h io.Writer, part []byte) {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(part))) //nolint:gosec // pack identity parts are bounded strings and fixed-size digests in the v1 framing.
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write(part)
+}

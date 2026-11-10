@@ -1,0 +1,45 @@
+package volume_controller
+
+import (
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// defaultGCInterval is the default GC sweep interval.
+const defaultGCInterval = time.Minute
+
+// Validate validates the config.
+func (c *Config) Validate() error {
+	if _, err := c.ParseGCIntervalDur(); err != nil {
+		return errors.Wrap(err, "gc_interval_dur")
+	}
+	return nil
+}
+
+// ParseGCIntervalDur parses the GC interval duration field.
+// Returns defaultGCInterval if empty.
+func (c *Config) ParseGCIntervalDur() (time.Duration, error) {
+	// Recognize the explicit setting that disables volume collection.
+	raw := c.GetGcIntervalDur()
+	if raw == "0" {
+		return 0, nil
+	}
+
+	// Parse the collection interval and apply the default when omitted.
+	dur, err := confparse.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if dur == 0 && raw == "" {
+		return defaultGCInterval, nil
+	}
+	return dur, nil
+}
+
+// GCDisabled returns whether volume GC tracking and sweeps are disabled.
+func (c *Config) GCDisabled() bool {
+	dur, err := c.ParseGCIntervalDur()
+	return err == nil && c.GetGcIntervalDur() != "" && dur == 0
+}

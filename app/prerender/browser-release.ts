@@ -1,0 +1,56 @@
+import { createHash } from 'crypto'
+
+// BrowserReleaseShellAssets identifies the hashed shell asset URLs for one
+// browser release generation.
+export interface BrowserReleaseShellAssets {
+  entrypoint: string
+  entrypointDecompressedSize?: number
+  serviceWorker: string
+  sharedWorker: string
+  opfsWorker?: string
+  wasm?: string
+  css: string[]
+}
+
+// BrowserReleaseDescriptor defines one browser generation and the guaranteed
+// prerendered route inventory attached to it.
+export interface BrowserReleaseDescriptor {
+  schemaVersion: 1
+  generationId: string
+  shellAssets: BrowserReleaseShellAssets
+  prerenderedRoutes: string[]
+  requiredStaticAssets: string[]
+}
+
+// buildBrowserReleaseDescriptor builds a deterministic browser release
+// descriptor for the current shell assets and prerendered route inventory.
+export function buildBrowserReleaseDescriptor(
+  shellAssets: BrowserReleaseShellAssets,
+  prerenderedRoutes: string[],
+  requiredStaticAssets: string[],
+): BrowserReleaseDescriptor {
+  const routes = Array.from(new Set(prerenderedRoutes)).toSorted((a, b) =>
+    a.localeCompare(b),
+  )
+  const assets = Array.from(new Set(requiredStaticAssets)).toSorted((a, b) =>
+    a.localeCompare(b),
+  )
+  const generationId = createHash('sha256')
+    .update(
+      JSON.stringify({
+        shellAssets,
+        prerenderedRoutes: routes,
+        requiredStaticAssets: assets,
+      }),
+    )
+    .digest('hex')
+    .slice(0, 16)
+
+  return {
+    schemaVersion: 1,
+    generationId,
+    shellAssets,
+    prerenderedRoutes: routes,
+    requiredStaticAssets: assets,
+  }
+}

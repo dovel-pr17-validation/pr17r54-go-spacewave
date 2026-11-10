@@ -1,0 +1,14 @@
+syntax = "proto3";
+package pubmessage;
+
+import "google/protobuf/timestamp.proto";
+
+// PubMessageInner is the signed inner portion of the message.
+message PubMessageInner {
+  // Data is the message data.
+	bytes data = 1;
+  // Channel is the channel.
+  string channel = 2;
+  // Timestamp is the message timestamp.
+  .google.protobuf.Timestamp timestamp = 3;
+}

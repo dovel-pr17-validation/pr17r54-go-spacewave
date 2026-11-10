@@ -1,0 +1,664 @@
+syntax = "proto3";
+package s4wave.space;
+
+import "github.com/s4wave/spacewave/bldr/project/validate/validate.proto";
+import "github.com/s4wave/spacewave/core/sobject/sobject.proto";
+import "github.com/s4wave/spacewave/core/space/world/world.proto";
+import "github.com/s4wave/spacewave/sdk/provider/spacewave/spacewave.proto";
+import "github.com/s4wave/spacewave/sdk/deploy/deploy.proto";
+import "github.com/s4wave/spacewave/sdk/secret/secret.proto";
+import "github.com/s4wave/spacewave/db/block/transform/transform.proto";
+import "google/protobuf/timestamp.proto";
+// import "github.com/s4wave/spacewave/core/space/space.proto";
+
+service SpaceResourceService {
+  rpc WatchSpaceState(WatchSpaceStateRequest) returns (stream SpaceState) {};
+
+  // WatchProcessBindings streams local process binding decisions without
+  // retaining the Space plugin runtime.
+  rpc WatchProcessBindings(WatchProcessBindingsRequest) returns (stream WatchProcessBindingsResponse) {};
+
+  rpc WatchSpaceSharingState(WatchSpaceSharingStateRequest) returns (stream SpaceSharingState) {};
+
+  rpc AccessWorld(AccessWorldRequest) returns (AccessWorldResponse) {}
+
+  rpc MountSpaceContents(MountSpaceContentsRequest) returns (MountSpaceContentsResponse) {}
+
+  // HoldNodeTypePlugins runs the Space's listed plugins whose manifests hint
+  // at any of the node type IDs, until the stream ends. It streams the held
+  // plugin IDs each time the Space's manifests change them.
+  rpc HoldNodeTypePlugins(HoldNodeTypePluginsRequest) returns (stream HoldNodeTypePluginsResponse) {}
+
+  rpc CreateSecret(CreateSecretRequest) returns (CreateSecretResponse) {}
+
+  rpc ReadSecretPayload(ReadSecretPayloadRequest) returns (ReadSecretPayloadResponse) {}
+  // WriteSecretPayload replaces the nested payload under the mounted session's writer grant.
+  rpc WriteSecretPayload(WriteSecretPayloadRequest) returns (WriteSecretPayloadResponse) {}
+  // AddSecretParticipant grants a peer read or write access to an existing
+  // Secret's payload, signed by the mounted session.
+  rpc AddSecretParticipant(AddSecretParticipantRequest) returns (AddSecretParticipantResponse) {}
+
+  rpc DeployManifests(stream .s4wave.deploy.DeployManifestsMessage) returns (stream .s4wave.deploy.DeployManifestsMessage) {}
+
+  rpc AddSpacePlugin(AddSpacePluginRequest) returns (AddSpacePluginResponse) {}
+
+  // ImportSpacePlugin copies a plugin's newest build for each platform from
+  // another mounted Space into this one, as a deploy does, so AddSpacePlugin
+  // can then install it.
+  rpc ImportSpacePlugin(ImportSpacePluginRequest) returns (ImportSpacePluginResponse) {}
+
+  rpc RemoveSpacePlugin(RemoveSpacePluginRequest) returns (RemoveSpacePluginResponse) {}
+
+  // BuildSpacePlugin pins the source and queues a native build on a registered
+  // device as a Forge Job. Progress and outputs use the Job and its Task.
+  rpc BuildSpacePlugin(BuildSpacePluginRequest) returns (BuildSpacePluginResponse) {}
+
+  // FetchPluginRepository queues a Forge Job on a registered device that clones
+  // a public GitHub repository at depth one into this Space, or fetches its
+  // newest commit when the repository is already stored. The worktree stays on
+  // the commit it checked out; the fetch moves only refs/remotes/origin/HEAD.
+  rpc FetchPluginRepository(FetchPluginRepositoryRequest) returns (FetchPluginRepositoryResponse) {}
+
+  // ValidatePluginRepository checks the commit a fetched plugin repository
+  // has checked out, before any of its code runs. Building the repository
+  // requires the same commit and an empty list of refusals.
+  rpc ValidatePluginRepository(ValidatePluginRepositoryRequest) returns (ValidatePluginRepositoryResponse) {}
+
+  // OpenPluginFrontend retains a source-backed compiler on the selected device.
+  // The returned Resource serves bldr.frontend.Frontend; release cancels the job.
+  rpc OpenPluginFrontend(BuildSpacePluginRequest) returns (OpenPluginFrontendResponse) {}
+
+  // SetSpaceSequencer chooses, as an owner, who orders the Space's edits. The
+  // sharing state reports the result.
+  rpc SetSpaceSequencer(SetSpaceSequencerRequest) returns (SetSpaceSequencerResponse) {}
+
+  // SetSpaceControl chooses who controls the Space: an owner hands control to
+  // the group, and the group decides a return to owner control. The sharing
+  // state reports the result.
+  rpc SetSpaceControl(SetSpaceControlRequest) returns (SetSpaceControlResponse) {}
+
+  // SetSpaceBackfill chooses whether this device copies the whole World into
+  // its local store in the background. Without backfill the device reads
+  // blocks on demand and keeps the blocks it wrote or read. The choice is
+  // stored on this device.
+  rpc SetSpaceBackfill(SetSpaceBackfillRequest) returns (SetSpaceBackfillResponse) {}
+
+  // WatchSpaceBackfill watches this device's backfill choice.
+  rpc WatchSpaceBackfill(WatchSpaceBackfillRequest) returns (stream SpaceBackfillState) {}
+
+  // SetSpaceRoster drops, as an owner, exactly the listed writers from the
+  // trimming roster, so the Space trims history they have not built on. A
+  // dropped writer returns to the roster once it builds on the checkpointer's
+  // latest edit.
+  rpc SetSpaceRoster(SetSpaceRosterRequest) returns (SetSpaceRosterResponse) {}
+
+  // ApproveSpaceChange agrees, as a voter, to a change another voter asked the
+  // group for.
+  rpc ApproveSpaceChange(ApproveSpaceChangeRequest) returns (ApproveSpaceChangeResponse) {}
+}
+
+// BuildSpacePluginRequest selects a Space source tree and authorized build device.
+message BuildSpacePluginRequest {
+  // SourceKey is a UnixFS directory containing a Bldr project.
+  string source_key = 1;
+  // DeviceKey identifies a Device with a selectable Forge worker capability.
+  string device_key = 2;
+  // ManifestId selects the plugin manifest in the project.
+  string manifest_id = 3;
+  // ConfigPath is relative to the source directory; empty selects bldr.yaml.
+  // A plugin repository source must leave it empty.
+  string config_path = 4;
+  // ClusterKey is the Forge Cluster that receives the build Job. It must
+  // contain the Device's Worker. If empty, the Worker must belong to one Cluster.
+  // Ignored by OpenPluginFrontend.
+  string cluster_key = 5;
+  // PlatformId selects the platform to build: js or the Device's native
+  // platform. If empty, the Device's native platform is built.
+  // Ignored by OpenPluginFrontend.
+  string platform_id = 6;
+  // MilliCpu is the CPU the build requests from the Worker in milli-cores.
+  // Ignored by OpenPluginFrontend.
+  uint64 milli_cpu = 7;
+  // MemoryBytes is the memory the build requests from the Worker in bytes.
+  // Ignored by OpenPluginFrontend.
+  uint64 memory_bytes = 8;
+  // Commit is the reviewed commit of a plugin repository source. The build is
+  // refused unless the repository's worktree still has it checked out and it
+  // passes validation. Required for a plugin repository source.
+  string commit = 9;
+}
+
+// BuildSpacePluginResponse identifies the durable queued build.
+message BuildSpacePluginResponse {
+  // JobKey identifies the Forge Job with the build Task, logs, and results.
+  string job_key = 1;
+  // TaskKey identifies the Job's build Task.
+  string task_key = 2;
+}
+
+// FetchPluginRepositoryRequest selects a GitHub repository and a device to fetch it.
+message FetchPluginRepositoryRequest {
+  // Repository is the GitHub owner/repo, or its https://github.com URL.
+  string repository = 1;
+  // DeviceKey identifies a Device with a selectable Forge worker capability.
+  string device_key = 2;
+  // ClusterKey is the Forge Cluster that receives the Job. It must contain the
+  // Device's Worker. If empty, the Worker must belong to one Cluster.
+  string cluster_key = 3;
+}
+
+// FetchPluginRepositoryResponse identifies the Job that fetches the repository.
+message FetchPluginRepositoryResponse {
+  // JobKey identifies the Forge Job that clones or fetches the repository.
+  string job_key = 1;
+  // TaskKey identifies the Job's fetch Task.
+  string task_key = 2;
+}
+
+// ValidatePluginRepositoryRequest selects a fetched plugin repository.
+message ValidatePluginRepositoryRequest {
+  // Repository is the GitHub owner/repo, or its https://github.com URL.
+  string repository = 1;
+}
+
+// ValidatePluginRepositoryResponse is the validation of the checked-out commit.
+message ValidatePluginRepositoryResponse {
+  // Commit is the commit the repository's worktree has checked out.
+  string commit = 1;
+  // SourceKey is the repository's UnixFS directory to build.
+  string source_key = 2;
+  // Validation is what the repository declares and why it may not build.
+  .bldr.project.validate.Validation validation = 3;
+}
+
+// OpenPluginFrontendResponse identifies the authoring attachment and its logs.
+message OpenPluginFrontendResponse {
+  // ResourceId owns the compiler connection and its Forge execution.
+  uint32 resource_id = 1;
+  // ExecutionKey identifies the Forge Execution with startup and failure logs.
+  string execution_key = 2;
+}
+
+service SpaceContentsResourceService {
+  rpc WatchState(WatchSpaceContentsStateRequest) returns (stream SpaceContentsState) {}
+
+  rpc SetProcessBinding(SetProcessBindingRequest) returns (SetProcessBindingResponse) {}
+
+  // BindAttachedRpcService publishes a caller-attached Resource under one
+  // private service ID prefix for this Space runtime.
+  rpc BindAttachedRpcService(BindAttachedRpcServiceRequest)
+    returns (stream BindAttachedRpcServiceResponse) {}
+}
+
+// WatchSpaceStateRequest is a request to watch the Workspace state.
+message WatchSpaceStateRequest {}
+
+// SpaceState contains the state for the Space for display.
+message SpaceState {
+  // Ready indicates the state is ready, false for loading.
+  bool ready = 1;
+  // Settings is the space settings object, if it exists.
+  .space.world.SpaceSettings settings = 3;
+  // TransformInfo contains the space's encryption and compression config.
+  TransformInfo transform_info = 4;
+  // EngineId is the host World binding used for Space-local plugin discovery.
+  // It is an address, not an authority grant.
+  string engine_id = 5;
+}
+
+// WatchSpaceSharingStateRequest is the request to watch sharing state.
+message WatchSpaceSharingStateRequest {}
+
+// SpaceParticipantInfo is one app-facing participant presentation row.
+message SpaceParticipantInfo {
+  // AccountId is the stable cloud account identifier when present.
+  string account_id = 1;
+  // EntityId is the provider-attested username / entity identifier when known.
+  string entity_id = 2;
+  // PeerIds is the list of grouped participant session peers.
+  repeated string peer_ids = 3;
+  // Role is the strongest participant role across the grouped peers.
+  .sobject.SOParticipantRole role = 4;
+  // IsSelf is true when one of the grouped peers is the current viewer.
+  bool is_self = 5;
+}
+
+// SpaceSharingState contains the sharing snapshot for a space.
+message SpaceSharingState {
+  // Participants is the list of participants on the space.
+  repeated .sobject.SOParticipantConfig participants = 1;
+  // Invites is the list of invites on the space.
+  repeated .sobject.SOInvite invites = 2;
+  // MailboxEntries is the list of mailbox metadata entries for the space.
+  repeated .s4wave.provider.spacewave.MailboxEntryInfo mailbox_entries = 3;
+  // ViewerRole is the current viewer's effective participant role for the space.
+  .sobject.SOParticipantRole viewer_role = 4;
+  // CanManage is true when the current viewer can manage sharing state.
+  bool can_manage = 5;
+  // ParticipantInfo is the app-facing participant presentation list.
+  repeated SpaceParticipantInfo participant_info = 6;
+  // ConfigChainHash identifies the latest verified participant configuration.
+  bytes config_chain_hash = 7;
+  // ConfigChainSeqno is the sequence number of the latest participant configuration.
+  uint64 config_chain_seqno = 8;
+  // ViewerPeerId identifies the authenticated mounted shared-object participant peer.
+  string viewer_peer_id = 9;
+  // DeparturePending is true while the head ownership transfer carries a
+  // departure its successor has not committed. Roles change when it commits.
+  bool departure_pending = 10;
+  // JoinRequests are the join requests this host holds for an owner to grant
+  // or refuse.
+  repeated .sobject.SOJoinRequest join_requests = 11;
+  // Sequencer is who orders the Space's edits.
+  SpaceSequencer sequencer = 12;
+  // SequencerPeerId is the peer ID of the appointed sequencer, empty under
+  // Merge.
+  string sequencer_peer_id = 13;
+  // SequencerChoices are the sequencers an owner can appoint on this device.
+  repeated SpaceSequencer sequencer_choices = 14;
+  // Control is who controls the Space.
+  SpaceControl control = 15;
+  // CanVote is true when the viewer votes on the group's changes.
+  bool can_vote = 16;
+  // CanSetControl is true when the viewer can change who controls the Space:
+  // an owner under owner control, or a voter under group control.
+  bool can_set_control = 17;
+  // TotalWeight is the voting weight of every voter under group control.
+  uint64 total_weight = 18;
+  // QuorumWeight is the voting weight a change needs under group control:
+  // more than two thirds of TotalWeight.
+  uint64 quorum_weight = 19;
+  // GroupChanges are the changes voters agree to that the group has not
+  // decided, by most voting weight.
+  repeated SpaceGroupChange group_changes = 20;
+}
+
+// SpaceControl is who controls a Space.
+enum SpaceControl {
+  // SpaceControl_UNKNOWN leaves the control unset.
+  SpaceControl_UNKNOWN = 0;
+  // SpaceControl_OWNER means an owner changes members and settings alone.
+  SpaceControl_OWNER = 1;
+  // SpaceControl_GROUP means a change needs voters with more than two thirds
+  // of the voting weight. No one decides alone, including owners.
+  SpaceControl_GROUP = 2;
+}
+
+// SpaceGroupChange is a change voters agree to that the group has not decided.
+message SpaceGroupChange {
+  // Hash identifies the change for ApproveSpaceChange.
+  bytes hash = 1;
+  // ChangeType is the kind of change.
+  .sobject.SOConfigChangeType change_type = 2;
+  // AddedPeerIds are the peers the change admits.
+  repeated string added_peer_ids = 3;
+  // RemovedPeerIds are the peers the change removes.
+  repeated string removed_peer_ids = 4;
+  // Control is who controls the Space after the change.
+  SpaceControl control = 5;
+  // Sequencer is who orders the Space's edits after the change.
+  SpaceSequencer sequencer = 6;
+  // Weight is the voting weight of the voters that agree.
+  uint64 weight = 7;
+  // ViewerAgreed is true when the viewer agrees.
+  bool viewer_agreed = 8;
+}
+
+// SpaceSequencer is who orders a Space's edits.
+enum SpaceSequencer {
+  // SpaceSequencer_UNKNOWN leaves the sequencer unset.
+  SpaceSequencer_UNKNOWN = 0;
+  // SpaceSequencer_MERGE means no one orders the edits: every device keeps
+  // working and the edits combine.
+  SpaceSequencer_MERGE = 1;
+  // SpaceSequencer_PROVIDER means the provider's cloud orders the edits.
+  SpaceSequencer_PROVIDER = 2;
+  // SpaceSequencer_THIS_DEVICE means this device orders the edits as the
+  // main device.
+  SpaceSequencer_THIS_DEVICE = 3;
+  // SpaceSequencer_OTHER_DEVICE means another member device orders the edits
+  // as the main device.
+  SpaceSequencer_OTHER_DEVICE = 4;
+}
+
+// TransformInfo contains redacted transform configuration for display.
+// Sensitive fields (encryption keys) are stripped before streaming.
+message TransformInfo {
+  // Steps is the list of transform steps with sensitive fields redacted.
+  repeated .block.transform.StepConfig steps = 1;
+  // GrantCount is the number of participants with active grants.
+  uint32 grant_count = 2;
+  // StorageBytes is the total storage size in bytes from the volume.
+  uint64 storage_bytes = 3;
+}
+
+// AccessWorldRequest is a request to access the World associated with the space.
+message AccessWorldRequest {}
+
+// AccessWorldResponse contains the World resource ID.
+message AccessWorldResponse {
+  // ResourceId is the resource ID for the World resource.
+  uint32 resource_id = 1;
+}
+
+// MountSpaceContentsRequest is a request to mount the space contents.
+message MountSpaceContentsRequest {}
+
+// MountSpaceContentsResponse contains the resource ID for the SpaceContents sub-resource.
+message MountSpaceContentsResponse {
+  // ResourceId is the resource ID for the SpaceContents resource.
+  uint32 resource_id = 1;
+}
+
+// HoldNodeTypePluginsRequest is the request type for HoldNodeTypePlugins.
+message HoldNodeTypePluginsRequest {
+  // NodeTypeIds are the Flowgraph node type IDs whose plugins should run.
+  repeated string node_type_ids = 1;
+}
+
+// HoldNodeTypePluginsResponse reports the plugins the hold runs.
+message HoldNodeTypePluginsResponse {
+  // PluginIds are the sorted plugin IDs whose manifests hint at a held type.
+  repeated string plugin_ids = 1;
+}
+
+// CreateSecretRequest creates a Secret object and nested SharedObject payload.
+message CreateSecretRequest {
+  // ObjectKey is the parent Secret object key.
+  string object_key = 1;
+  // DisplayName is the human-readable Secret name.
+  string display_name = 2;
+  // Kind is the semantic Secret kind.
+  string kind = 3;
+  // ContentType is the Secret payload MIME type.
+  string content_type = 4;
+  // Value is the raw payload stored inside the nested SharedObject.
+  bytes value = 5;
+  // ReaderPublicKeyPem optionally grants read access to this peer key.
+  bytes reader_public_key_pem = 6;
+  // ParticipantRole grants the supplied key read or write access. UNKNOWN defaults to READER.
+  .sobject.SOParticipantRole participant_role = 7;
+}
+
+// CreateSecretResponse returns the redacted Secret parent metadata.
+message CreateSecretResponse {
+  // Secret is the created parent Secret object metadata.
+  .s4wave.secret.Secret secret = 1;
+}
+
+// WriteSecretPayloadRequest replaces an existing Secret's encrypted payload.
+message WriteSecretPayloadRequest {
+  // ObjectKey identifies the parent Secret whose grants remain unchanged.
+  string object_key = 1;
+  // ExpectedKind prevents writing credentials into a Secret of another kind.
+  string expected_kind = 2;
+  // Value is the new payload, kept inside the nested SharedObject.
+  bytes value = 3;
+  // ContentType describes Value's encoding.
+  string content_type = 4;
+}
+
+// WriteSecretPayloadResponse acknowledges durable nested payload storage.
+message WriteSecretPayloadResponse {
+}
+
+// AddSecretParticipantRequest grants a peer access to an existing Secret.
+message AddSecretParticipantRequest {
+  // ObjectKey identifies the parent Secret.
+  string object_key = 1;
+  // PeerId is the peer to grant, such as a Device's peer.
+  string peer_id = 2;
+  // ParticipantRole grants read or write access. UNKNOWN defaults to READER.
+  .sobject.SOParticipantRole participant_role = 3;
+}
+
+// AddSecretParticipantResponse confirms the grant.
+message AddSecretParticipantResponse {
+}
+
+// ReadSecretPayloadRequest reads a Secret payload under the mounted session authority.
+message ReadSecretPayloadRequest {
+  // ObjectKey is the parent Secret object key.
+  string object_key = 1;
+  // ExpectedKind rejects the read if the Secret kind has drifted.
+  string expected_kind = 2;
+}
+
+// ReadSecretPayloadResponse returns Secret metadata and payload bytes.
+message ReadSecretPayloadResponse {
+  // Secret is the redacted parent Secret object metadata.
+  .s4wave.secret.Secret secret = 1;
+  // Payload is the nested SharedObject payload readable by the mounted session.
+  .s4wave.secret.SecretPayload payload = 2;
+}
+
+// WatchSpaceContentsStateRequest is a request to watch the space contents state.
+message WatchSpaceContentsStateRequest {}
+
+// BindAttachedRpcServiceRequest identifies the caller-attached Resource and its
+// private service ID prefix in this Space runtime.
+message BindAttachedRpcServiceRequest {
+  // AttachedResourceId identifies a Resource attached by this caller.
+  uint32 attached_resource_id = 1;
+  // ServiceIdPrefix is a slash-terminated private prefix of at most 256 UTF-8
+  // bytes.
+  string service_id_prefix = 2;
+}
+
+// BindAttachedRpcServiceResponse confirms the attached service is callable.
+message BindAttachedRpcServiceResponse {
+}
+
+// SpaceContentsState contains plugin status for the space.
+message SpaceContentsState {
+  // Ready indicates the state is ready.
+  bool ready = 1;
+  // Plugins is the list of plugin statuses.
+  repeated SpacePluginStatus plugins = 2;
+  // ProcessBindings is the list of process binding states.
+  repeated ProcessBindingInfo process_bindings = 3;
+  // AvailablePlugins is the catalog of plugins installable into the space,
+  // enumerated from the manifests stored in the Space World. The app derives
+  // installed state by intersecting these with the plugins list.
+  repeated AvailablePlugin available_plugins = 4;
+  // RequestedPluginIds lists, in sorted order, the plugins something in the
+  // space is waiting to load that the space does not list. A load such as a
+  // Forge Execution for one of them waits until the plugin is added.
+  repeated string requested_plugin_ids = 5;
+}
+
+// AvailablePlugin is one catalog entry the space can install by manifest ID.
+message AvailablePlugin {
+  // PluginId is the manifest ID to add to SpaceSettings.plugin_ids to install.
+  string plugin_id = 1;
+  // Description is the manifest metadata description, if any.
+  string description = 2;
+  // Revision is the highest manifest revision available for the plugin.
+  string revision = 3;
+  // Background reports that the plugin can run in the background.
+  bool background = 4;
+  // NodeTypeIds lists the Flowgraph node type IDs the manifest hints at.
+  repeated string node_type_ids = 5;
+}
+
+// SpacePluginLifecycleState is the app-facing lifecycle projection for a plugin.
+enum SpacePluginLifecycleState {
+  // SpacePluginLifecycleState_UNKNOWN leaves lifecycle state unset.
+  SpacePluginLifecycleState_UNKNOWN = 0;
+  // SpacePluginLifecycleState_CONFIGURED means the plugin is configured in Space settings.
+  SpacePluginLifecycleState_CONFIGURED = 1;
+  // SpacePluginLifecycleState_LOADING means the plugin runtime has been requested.
+  SpacePluginLifecycleState_LOADING = 2;
+  // SpacePluginLifecycleState_LOADED means the plugin runtime is running.
+  SpacePluginLifecycleState_LOADED = 3;
+  // SpacePluginLifecycleState_FAILED means the latest runtime attempt failed.
+  SpacePluginLifecycleState_FAILED = 4;
+  // SpacePluginLifecycleState_RETRYING means a failed plugin is being requested again.
+  SpacePluginLifecycleState_RETRYING = 5;
+  // SpacePluginLifecycleState_REMOVED is used by app-side transition views after removal.
+  SpacePluginLifecycleState_REMOVED = 6;
+  // SpacePluginLifecycleState_UPGRADED is used by app-side transition views after upgrade.
+  SpacePluginLifecycleState_UPGRADED = 7;
+}
+
+// SpacePluginStatus contains runtime state for a single plugin.
+message SpacePluginStatus {
+  // PluginId is the manifest ID of the plugin.
+  string plugin_id = 1;
+  reserved 2;
+  // Loaded indicates whether the plugin is currently running. Kept for older
+  // consumers; State is the app-facing lifecycle owner.
+  bool loaded = 3;
+  // Description is a short description from the plugin manifest metadata.
+  string description = 4;
+  // State is the app-facing lifecycle projection.
+  SpacePluginLifecycleState state = 5;
+  // Detail is a short scheduler-owned lifecycle explanation.
+  string detail = 6;
+  // RetryCount is reserved for future scheduler retry projection.
+  uint32 retry_count = 7;
+  // Revision is reserved for future manifest-version projection.
+  string revision = 8;
+  // Account reports that the plugin comes from the account plugin list rather
+  // than the Space settings, so the Space cannot remove it.
+  bool account = 9;
+}
+
+// AddSpacePluginRequest is a request to add a plugin to the space settings.
+message AddSpacePluginRequest {
+  // PluginId is the manifest ID of the plugin to add.
+  string plugin_id = 1;
+  // ManifestKey selects an immutable manifest artifact in this Space.
+  // Empty preserves an existing pin or follows the configured catalog for a new plugin.
+  string manifest_key = 2;
+}
+
+// AddSpacePluginResponse is the response for AddSpacePlugin.
+message AddSpacePluginResponse {}
+
+// ImportSpacePluginRequest names a plugin to copy from another mounted Space.
+message ImportSpacePluginRequest {
+  // SourceSpaceResourceId is the caller's resource ID of the mounted source Space.
+  uint32 source_space_resource_id = 1;
+  // PluginId is the manifest ID of the plugin to copy.
+  string plugin_id = 2;
+}
+
+// ImportSpacePluginResponse is the response for ImportSpacePlugin.
+message ImportSpacePluginResponse {}
+
+// RemoveSpacePluginRequest is a request to remove a plugin from the space settings.
+message RemoveSpacePluginRequest {
+  // PluginId is the manifest ID of the plugin to remove.
+  string plugin_id = 1;
+}
+
+// RemoveSpacePluginResponse is the response for RemoveSpacePlugin.
+message RemoveSpacePluginResponse {}
+
+// SetSpaceSequencerRequest chooses who orders the Space's edits.
+message SetSpaceSequencerRequest {
+  // Sequencer is MERGE, PROVIDER or THIS_DEVICE. THIS_DEVICE also replaces a
+  // lost main device, continuing the order this device holds.
+  SpaceSequencer sequencer = 1;
+}
+
+// SetSpaceSequencerResponse reports whether the sequencer changed.
+message SetSpaceSequencerResponse {
+  // Changed is false when the chosen sequencer already ordered the edits.
+  bool changed = 1;
+  // AwaitingGroup is true when the viewer agreed to the change under group
+  // control, and it applies once the group decides it.
+  bool awaiting_group = 2;
+}
+
+// SetSpaceRosterRequest lists the writers to drop from the trimming roster.
+message SetSpaceRosterRequest {
+  // DroppedPeerIds are the writers to drop. Every other writer is on the
+  // roster; an empty list returns every dropped writer to it.
+  repeated string dropped_peer_ids = 1;
+}
+
+// SetSpaceRosterResponse reports whether the roster changed.
+message SetSpaceRosterResponse {
+  // Changed is false when the roster already dropped exactly those writers.
+  bool changed = 1;
+  // AwaitingGroup is true when the viewer agreed to the change under group
+  // control, and it applies once the group decides it.
+  bool awaiting_group = 2;
+}
+
+// SetSpaceBackfillRequest chooses this device's backfill of the World.
+message SetSpaceBackfillRequest {
+  // Backfill copies the whole World into the local store when set.
+  bool backfill = 1;
+}
+
+// SetSpaceBackfillResponse is the response to SetSpaceBackfill.
+message SetSpaceBackfillResponse {}
+
+// WatchSpaceBackfillRequest is the request to watch the backfill choice.
+message WatchSpaceBackfillRequest {}
+
+// SpaceBackfillState is this device's backfill choice.
+message SpaceBackfillState {
+  // Backfill is set when this device copies the whole World locally.
+  bool backfill = 1;
+}
+
+// SetSpaceControlRequest chooses who controls the Space.
+message SetSpaceControlRequest {
+  // Control is OWNER or GROUP.
+  SpaceControl control = 1;
+}
+
+// SetSpaceControlResponse reports how the change proceeds.
+message SetSpaceControlResponse {
+  // AwaitingGroup is true when the viewer agreed to the change under group
+  // control, and it applies once the group decides it.
+  bool awaiting_group = 1;
+}
+
+// ApproveSpaceChangeRequest agrees to a change the group has not decided.
+message ApproveSpaceChangeRequest {
+  // Hash is the SpaceGroupChange hash.
+  bytes hash = 1;
+}
+
+// ApproveSpaceChangeResponse is the response to ApproveSpaceChange.
+message ApproveSpaceChangeResponse {}
+
+// SetProcessBindingRequest is a request to set a process binding state.
+message SetProcessBindingRequest {
+  // ObjectKey is the world object key to bind.
+  string object_key = 1;
+  // TypeId is the ObjectType type ID.
+  string type_id = 2;
+  // Approved sets the binding state. True = approved, false = unapproved.
+  bool approved = 3;
+}
+
+// SetProcessBindingResponse is the response for SetProcessBinding.
+message SetProcessBindingResponse {}
+
+// WatchProcessBindingsRequest selects this mounted Space's local bindings.
+message WatchProcessBindingsRequest {
+}
+
+// WatchProcessBindingsResponse contains the latest local binding decisions.
+message WatchProcessBindingsResponse {
+  // ProcessBindings contains decisions for this mounted Space.
+  repeated ProcessBindingInfo process_bindings = 1;
+}
+
+// ProcessBindingInfo contains info about a single process binding.
+message ProcessBindingInfo {
+  // ObjectKey is the world object key.
+  string object_key = 1;
+  // TypeId is the ObjectType type ID.
+  string type_id = 2;
+  // Approved indicates whether the binding is approved.
+  bool approved = 3;
+  // DecidedAt is the time the binding state was last changed.
+  .google.protobuf.Timestamp decided_at = 4;
+}

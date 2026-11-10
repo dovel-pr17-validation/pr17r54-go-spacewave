@@ -1,0 +1,247 @@
+package signaling_rpc_client
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/directive"
+	cbackoff "github.com/aperturerobotics/util/backoff/cbackoff"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/keyed"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/signaling"
+	signaling_rpc "github.com/s4wave/spacewave/net/signaling/rpc"
+	stream_srpc_client "github.com/s4wave/spacewave/net/stream/srpc/client"
+	"github.com/sirupsen/logrus"
+)
+
+// Version is the version of the controller implementation.
+var Version = controller.MustParseVersion("0.0.1")
+
+// ControllerID is the ID of the controller.
+const ControllerID = "bifrost/signaling/rpc/client"
+
+// Controller is the signaling client controller.
+type Controller struct {
+	// le is the logger
+	le *logrus.Entry
+	// b is the bus
+	b bus.Bus
+	// conf is the config
+	conf *Config
+	// rpcClient is the stream srpc client
+	rpcClient stream_srpc_client.Client
+	// srv is the service client
+	srv signaling_rpc.SRPCSignalingClient
+	// sessionTrackers contains a mapping from peer id to ongoing session
+	// peer id is encoded as string
+	sessionTrackers *keyed.KeyedRefCount[string, *sessionTracker]
+	// listenSessions is a list of sessions that were initiated by remote peers.
+	// NOTE: managed by the callback from the client listen handler ONLY.
+	listenSessions map[string]*keyed.KeyedRef[string, *sessionTracker]
+	// client is the signaling client
+	// nil until resolved by Execute
+	client *ccontainer.CContainer[*Client]
+}
+
+// NewController constructs a new signaling client controller.
+func NewController(le *logrus.Entry, b bus.Bus, conf *Config) (*Controller, error) {
+	// Parse and default the protocol id.
+	protocolID, err := conf.ParseProtocolID()
+	if err != nil {
+		return nil, err
+	}
+	if protocolID == "" {
+		protocolID = signaling_rpc.ProtocolID
+	}
+
+	// Resolve and default the service id.
+	serviceID := conf.GetServiceId()
+	if serviceID == "" {
+		serviceID = signaling_rpc.SRPCSignalingServiceID
+	}
+
+	// Build the stream srpc client for the protocol.
+	rpcClient, err := stream_srpc_client.NewClient(le, b, conf.GetClient(), protocolID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Construct the signaling service client.
+	srv := signaling_rpc.NewSRPCSignalingClientWithServiceID(rpcClient, serviceID)
+
+	// Assemble the controller with its session tracker registry.
+	c := &Controller{
+		le:             le,
+		b:              b,
+		conf:           conf,
+		rpcClient:      rpcClient,
+		srv:            srv,
+		listenSessions: make(map[string]*keyed.KeyedRef[string, *sessionTracker]),
+		client:         ccontainer.NewCContainer[*Client](nil),
+	}
+
+	// The session tracker starts when we want a session with a remote peer.
+	c.sessionTrackers = keyed.NewKeyedRefCount[string, *sessionTracker](
+		c.newSessionTracker,
+		keyed.WithExitLogger[string, *sessionTracker](le),
+		keyed.WithBackoff[string, *sessionTracker](func(_ string) cbackoff.BackOff {
+			return conf.GetBackoff().Construct()
+		}),
+	)
+
+	return c, nil
+}
+
+// GetControllerInfo returns information about the controller.
+func (c *Controller) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(ControllerID, Version, "signaling rpc client")
+}
+
+// Execute executes the controller goroutine.
+// Returning nil ends execution.
+// Returning an error triggers a retry with backoff.
+func (c *Controller) Execute(ctx context.Context) error {
+	// Validate asserts that this won't return an error.
+	localPeerID, err := c.conf.ParsePeerID()
+	if err != nil {
+		return err
+	}
+
+	// Log the local peer id while waiting for its private key.
+	c.le.
+		WithField("peer-id", localPeerID.String()).
+		Debug("waiting for peer private key")
+	localPeer, _, localPeerRef, err := peer.GetPeerWithID(ctx, c.b, localPeerID, false, nil)
+	if err != nil {
+		return err
+	}
+
+	// Fetch the private key and release the peer handle.
+	privKey, err := localPeer.GetPrivKey(ctx)
+	localPeerRef.Release()
+	if err != nil {
+		return err
+	}
+
+	// Construct the signaling client with the private key.
+	signalingClient, err := NewClient(c.le, c.srv, privKey, c.conf.GetBackoff())
+	if err != nil {
+		return err
+	}
+
+	// Publish the client for dependent directives.
+	c.client.SetValue(signalingClient)
+
+	// Install the incoming-session listen handler when listening is enabled.
+	if !c.conf.GetDisableListen() {
+		signalingClient.SetListenHandler(c.handlePeerWantsSession)
+	}
+
+	// Bind the client and session trackers to the controller lifecycle.
+	signalingClient.SetContext(ctx)
+	c.sessionTrackers.SetContext(ctx, true)
+
+	return nil
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+// If it can, it returns resolver(s). If not, returns nil.
+// It is safe to add a reference to the directive during this call.
+// The passed context is canceled when the directive instance expires.
+// NOTE: the passed context is not canceled when the handler is removed.
+func (c *Controller) HandleDirective(ctx context.Context, di directive.Instance) ([]directive.Resolver, error) {
+	switch dir := di.GetDirective().(type) {
+	case signaling.SignalPeer:
+		return c.resolveSignalPeer(ctx, di, dir)
+	}
+	return nil, nil
+}
+
+// handlePeerWantsSession handles when the list of peers that want a session changes.
+func (c *Controller) handlePeerWantsSession(ctx context.Context, reset, added bool, pid string) {
+	delSession := func(delPeerID string) {
+		ref, ok := c.listenSessions[delPeerID]
+		if ok {
+			ref.Release()
+			delete(c.listenSessions, delPeerID)
+		}
+	}
+	addSession := func(addPeerID string) {
+		// Skip peers that already have an incoming session.
+		_, ok := c.listenSessions[addPeerID]
+		if ok {
+			return
+		}
+
+		// Add a session tracker ref and record the incoming session.
+		ref, _, _, err := c.addSessionTrackerRef(ctx, addPeerID)
+		if err != nil {
+			if err != context.Canceled {
+				c.le.
+					WithField("remote-peer", addPeerID).
+					WithError(err).
+					Warn("invalid incoming session peer id")
+			}
+			return
+		}
+		c.le.
+			WithField("remote-peer", addPeerID).
+			Debug("added incoming session")
+		c.listenSessions[addPeerID] = ref
+	}
+
+	if reset {
+		for delPeerID := range c.listenSessions {
+			delSession(delPeerID)
+		}
+	}
+
+	if pid != "" {
+		if added {
+			addSession(pid)
+		} else {
+			delSession(pid)
+		}
+	}
+}
+
+// addSessionTrackerRef validates the peer id string and adds a session tracker ref.
+func (c *Controller) addSessionTrackerRef(
+	ctx context.Context,
+	peerIDStr string,
+) (*keyed.KeyedRef[string, *sessionTracker], *sessionTracker, bool, error) {
+	// Parse the peer id with its public key.
+	peerID, peerPub, err := peer.ParsePeerIDWithPubKey(peerIDStr)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	// Wait for the signaling client to resolve.
+	client, err := c.client.WaitValue(ctx, nil)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	// Reject self-dialing.
+	if client.peerID.MatchesPublicKey(peerPub) {
+		return nil, nil, false, errors.New("signaling: cannot self-dial")
+	}
+
+	// Add or reference the session tracker for the peer.
+	ref, tkr, existed := c.sessionTrackers.AddKeyRef(peerID.String())
+	return ref, tkr, existed, nil
+}
+
+// Close releases any resources used by the controller.
+// Error indicates any issue encountered releasing.
+func (c *Controller) Close() error {
+	c.sessionTrackers.ClearContext()
+	c.client.SetValue(nil)
+	return nil
+}
+
+// _ is a type assertion
+var _ controller.Controller = (*Controller)(nil)

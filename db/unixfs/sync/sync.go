@@ -1,0 +1,82 @@
+package unixfs_sync
+
+import (
+	"context"
+	"io/fs"
+	"os"
+
+	"github.com/go-git/go-billy/v6/osfs"
+	"github.com/s4wave/spacewave/db/unixfs"
+	unixfs_errors "github.com/s4wave/spacewave/db/unixfs/errors"
+	unixfs_iofs "github.com/s4wave/spacewave/db/unixfs/iofs"
+)
+
+// Sync recursively synchronizes the contents of the UnixFS to disk.
+//
+// Attempts to skip files by checking size and modification time.
+// The output path does not have to be empty when starting.
+// filterCb is optional and is called with each element in the fs tree.
+// TODO: Does not (yet) support symlinks or other non-file and non-dir node types.
+func Sync(
+	ctx context.Context,
+	outPath string,
+	fsHandle *unixfs.FSHandle,
+	deleteMode DeleteMode,
+	filterCb FilterCb,
+) error {
+	if fsHandle.CheckReleased() {
+		return unixfs_errors.ErrReleased
+	}
+
+	// create outPath if necessary
+	if err := os.MkdirAll(outPath, 0o755); err != nil {
+		return err
+	}
+
+	// Open the output root, which also sets file times, for the checkout.
+	root, err := os.OpenRoot(outPath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	// construct a BillyFS at the outPath & checkout
+	outFS := &rootChtimesFS{Filesystem: osfs.New(outPath), root: root}
+	return SyncToBilly(ctx, outFS, fsHandle, deleteMode, filterCb)
+}
+
+// SyncFromDisk syncs from disk to the given UnixFS FSHandle.
+func SyncFromDisk(
+	ctx context.Context,
+	destHandle *unixfs.FSHandle,
+	srcPath string,
+	deleteMode DeleteMode,
+	filterCb FilterCb,
+) error {
+	return SyncFromFS(ctx, destHandle, os.DirFS(srcPath), deleteMode, filterCb)
+}
+
+// SyncFromFS syncs from the given fs.FS to the UnixFS FSHandle.
+func SyncFromFS(
+	ctx context.Context,
+	destHandle *unixfs.FSHandle,
+	srcFs fs.FS,
+	deleteMode DeleteMode,
+	filterCb FilterCb,
+) error {
+	// Open a cursor on the source filesystem for the sync.
+	srcCursor, err := unixfs_iofs.NewFSCursor(srcFs)
+	if err != nil {
+		return err
+	}
+	defer srcCursor.Release()
+
+	// Wrap the source cursor in a handle for the UnixFS traversal.
+	diskRef, err := unixfs.NewFSHandle(srcCursor)
+	if err != nil {
+		return err
+	}
+	defer diskRef.Release()
+
+	return SyncToUnixfs(ctx, destHandle, diskRef, deleteMode, filterCb)
+}

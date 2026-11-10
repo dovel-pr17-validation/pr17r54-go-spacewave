@@ -1,0 +1,400 @@
+syntax = "proto3";
+package account.settings;
+
+import "github.com/s4wave/spacewave/core/session/session.proto";
+import "github.com/s4wave/spacewave/core/provider/provider.proto";
+import "github.com/s4wave/spacewave/core/sobject/sobject.proto";
+import "github.com/s4wave/spacewave/db/block/store/s3/s3.proto";
+import "github.com/s4wave/spacewave/sdk/command/command.proto";
+import "github.com/s4wave/spacewave/sdk/secret/secret.proto";
+
+// AccountSettings is the root state data for account settings SharedObjects.
+// Stored as SORootInner.StateData.
+message AccountSettings {
+  // DisplayName is the user-visible name for the local provider account.
+  string display_name = 1;
+  // PairedDevices is the list of paired devices for this account.
+  repeated PairedDevice paired_devices = 2;
+  // EntityKeypairs is the list of entity keypairs for authentication.
+  // Synced between devices via the SharedObject.
+  repeated .session.EntityKeypair entity_keypairs = 3;
+  // SessionPresentations is the mirrored private presentation metadata keyed
+  // by session peer ID for both local and cloud sessions.
+  repeated SessionPresentation session_presentations = 4;
+  // KeybindingOverrides stores account-scope keybinding overrides.
+  .s4wave.command.KeybindingOverrideSet keybinding_overrides = 5;
+  // Sessions binds each approved account Session to its replica's storage identity.
+  repeated AccountSession sessions = 6;
+  // Catalog names account objects. Checkpoints require separate authenticated enrollment.
+  repeated AccountCatalogEntry catalog = 7;
+  // Transition redirects returning Sessions after all destination resources are durable.
+  .provider.AccountTransition transition = 8;
+  // AcceptedMigrations authorizes returning source Session peers to bind their local storage.
+  repeated .provider.AccountTransition accepted_migrations = 9;
+  // StorageBackends lists the account's bring-your-own block storage backends.
+  repeated StorageBackend storage_backends = 10;
+  // DefaultStorageBackendId names the backend that new Spaces use.
+  // Empty places new Spaces on the account's own storage.
+  string default_storage_backend_id = 11;
+  // BlockStorePlacements names the backend holding each placed block store.
+  // A block store without a placement is on the account's own storage.
+  repeated BlockStorePlacement block_store_placements = 12;
+  // StorageReleases are former placements whose objects remain in the
+  // backend's bucket. A device deletes them, then completes the release. A
+  // release carries only its block store and backend ids.
+  repeated BlockStorePlacement storage_releases = 13;
+  // DeveloperSpaceId names the account's developer Space, which holds the
+  // repositories the user adds and what is built from them. Empty until the
+  // first repository is added. Every device of the account uses this Space.
+  string developer_space_id = 14;
+  // PluginIds lists the manifest IDs of plugins the account loads into every
+  // Space it mounts, alongside the plugins the Space lists itself.
+  repeated string plugin_ids = 15;
+}
+
+// StorageBackend is block storage the account's devices share.
+message StorageBackend {
+  // Id identifies the backend within the account and never changes.
+  string id = 1;
+  // DisplayName is the user-visible backend name, unique within the account.
+  string display_name = 2;
+  // S3 locates the S3-compatible bucket that holds the blocks.
+  S3Location s3 = 3;
+  // Credential is the redacted Secret whose payload holds the access keys.
+  // The payload value is a block_store_s3.Credentials message. For an SQL
+  // backend its access_key_id is the database user and its
+  // secret_access_key the password.
+  .s4wave.secret.Secret credential = 4;
+  // Sql locates the SQL database that holds the blocks instead of a bucket.
+  // A backend sets exactly one of S3 and Sql.
+  SqlLocation sql = 5;
+  // Ftps locates the FTPS server that holds the packfiles instead of a
+  // bucket. It logs in from a netrc file on the host, so the backend has no
+  // credential Secret. A backend sets exactly one of S3, Sql and Ftps.
+  FtpsLocation ftps = 6;
+}
+
+// FtpsLocation locates a directory on an FTPS server that holds packfiles,
+// read and written as a bucket is. The server logs in from a netrc file on the
+// host that runs the account, which names the host without its port. Each
+// machine line of the host is one login, and each login adds its own
+// connections. Packfiles
+// are only added: the backend never deletes or compacts one.
+message FtpsLocation {
+  // Host is the server host name, also the machine of the netrc entry.
+  string host = 1;
+  // Port is the server port, zero for 21.
+  uint32 port = 2;
+  // NetrcPath is the netrc file that holds the login.
+  string netrc_path = 3;
+  // Root is the directory on the server that holds the packfile prefix.
+  string root = 4;
+  // Prefix is the key prefix of the packfiles below Root, used as given by
+  // every block store placed on the backend, such as "world/packs/".
+  string prefix = 5;
+  // MaxConns is the most sessions the backend holds open at once across
+  // all logins, spares included, zero for 10. A server may cap sessions per
+  // client host as well as per user, so logins do not raise it.
+  uint32 max_conns = 6;
+  // ConnsPerLogin is the most sessions open at once on one netrc login,
+  // counting the spares dialed ahead of range reads, zero for 9.
+  uint32 conns_per_login = 7;
+  // Sftp reads and writes the packfiles over SFTP, on the same host and the
+  // same netrc login, instead of FTPS. Port zero then means 22. The first
+  // netrc login is used, and MaxConns is the number of SSH connections the
+  // backend holds, zero for 4, each carrying many requests at once;
+  // ConnsPerLogin is ignored.
+  bool sftp = 8;
+  // HostKey pins the SFTP server's SSH host key, as an authorized_keys style
+  // public key line, which also limits the handshake to that key's type, or as
+  // the "SHA256:..." fingerprint ssh prints, which fails when the server shows
+  // another of its keys. Empty
+  // trusts the first key the server shows and requires the same one on every
+  // later connection of the backend while it runs.
+  string host_key = 9;
+  // FtpsPort, when not zero with Sftp set, also reaches the directory over
+  // FTPS on this port, with the same host and netrc logins. Each call goes to
+  // whichever protocol has fewer calls in flight, so the faster one carries
+  // more of them, and calls go over FTPS alone for a few seconds after SFTP
+  // fails to connect. The FTPS sessions follow ConnsPerLogin and the FTPS
+  // default for MaxConns, which counts the SSH connections.
+  uint32 ftps_port = 10;
+  // MergeTailBytes, when not zero, merges a short upload into the newest
+  // packfile smaller than this many bytes while the merged packfile still
+  // fits one upload batch, and deletes the packfile it replaces. Zero only
+  // ever adds packfiles.
+  uint64 merge_tail_bytes = 11;
+  // SoleWriter says each block store placed on the backend is the only writer
+  // of the packfiles it reads. A store whose pack index holds a pack then
+  // finds every pack in the index and never lists the directory, which on a
+  // large directory reads every file name. A store with an empty index still
+  // lists it once to build the index.
+  bool sole_writer = 12;
+}
+
+// SqlLocation locates a MySQL-compatible database that holds blocks. It only
+// ever adds rows: the database never deletes or rewrites a block, so a grant
+// of SELECT and INSERT alone suffices.
+message SqlLocation {
+  // Host is the database host.
+  string host = 1;
+  // Port is the database port, zero for 3306.
+  uint32 port = 2;
+  // Database is the database name.
+  string database = 3;
+  // TablePrefix precedes the name of the blocks table, TablePrefix +
+  // "blocks", whose rows are keyed by block store id and block hash.
+  string table_prefix = 4;
+  // Tls connects with TLS.
+  bool tls = 5;
+  // TlsCertSha256 is the hex SHA-256 of the server's certificate. Set, TLS
+  // trusts exactly that certificate in place of a CA and the host name, as
+  // for a server with a self-signed certificate.
+  string tls_cert_sha256 = 6;
+}
+
+// S3Location locates an S3-compatible bucket and the key space it uses.
+message S3Location {
+  // Endpoint is the host and optional port, without a scheme.
+  string endpoint = 1;
+  // Region is the signing region.
+  string region = 2;
+  // Bucket is the bucket name.
+  string bucket = 3;
+  // ObjectPrefix precedes every object key the account writes.
+  // Each block store writes under ObjectPrefix + block store id + "/".
+  string object_prefix = 4;
+  // DisableSsl connects with HTTP instead of HTTPS.
+  bool disable_ssl = 5;
+  // Pricing overrides the price list storage reclaim uses. Empty uses the
+  // published prices of the service the endpoint names.
+  .block.store.s3.Pricing pricing = 6;
+  // KeepPacks stops compaction and reclaim on the bucket, so its block stores
+  // only ever add packfiles and never rewrite or delete one.
+  bool keep_packs = 7;
+  // IndexOnly keeps each block store to the packs its local index holds: it
+  // never lists the bucket, so a block the index does not place costs no
+  // request, and packs another writer left under the prefix stay unseen. The
+  // block store is then the prefix's only writer.
+  bool index_only = 8;
+  // MaxPackBytes bounds one packfile a block store writes. An upload batch
+  // holds half of it in block bytes. Zero uses the 63 MiB default.
+  uint64 max_pack_bytes = 9;
+  // LingerSeconds is how long a short upload batch waits for more blocks
+  // before it is written anyway. Zero uses the 30 s default.
+  uint32 linger_seconds = 10;
+}
+
+// BlockStorePlacement places one block store on a storage backend.
+message BlockStorePlacement {
+  // BlockStoreId identifies the placed block store.
+  string block_store_id = 1;
+  // StorageBackendId identifies the StorageBackend that holds its blocks.
+  string storage_backend_id = 2;
+  // Cache sets how the local disk holds the placed store. Empty uploads each
+  // write at once and keeps every block local.
+  BlockStoreCache cache = 3;
+  // FallbackStorageBackendId identifies an SQL StorageBackend the store reads,
+  // read only, after its own backend misses a block. Nothing writes it. A
+  // block only the fallback holds is stored on the local disk with an upload
+  // marker, so it uploads to StorageBackendId and later reads skip the
+  // fallback. Empty has no fallback. The store's backend must be an S3 or
+  // FTPS backend, so an SQL backend is never both primary and fallback. A storage
+  // move clears it.
+  string fallback_storage_backend_id = 4;
+}
+
+// BlockStoreCache sets how the local disk holds a placed block store.
+message BlockStoreCache {
+  // SettleSeconds is how long a written block stays local before it uploads,
+  // so a block the garbage collector sweeps meanwhile never reaches the
+  // bucket. Set it above the volume's block pass interval. Zero uploads at
+  // once. A storage move waits for the blocks written during it to settle.
+  uint32 settle_seconds = 1;
+  // MaxPendingBytes uploads the oldest blocks before they settle while the
+  // blocks awaiting upload exceed it. Zero sets no limit.
+  uint64 max_pending_bytes = 2;
+  // ResidentHighBytes is the disk budget for the store's blocks: past it, the
+  // local disk drops the uploaded blocks read least recently, which read back
+  // from the bucket when used again. Zero keeps every block local.
+  uint64 resident_high_bytes = 3;
+  // ResidentLowBytes is where eviction stops once the high mark starts it.
+  // Blocks awaiting upload past it upload before they settle. Zero, or a value
+  // above the high mark, uses nine tenths of the high mark.
+  uint64 resident_low_bytes = 4;
+  // SkipBackfill uploads only the blocks written once the store is placed.
+  // The blocks stored before stay on the local disk alone, and eviction never
+  // drops them, until a placement without it queues them for upload.
+  bool skip_backfill = 5;
+  // MaxUploadReads bounds the local reads the upload keeps in flight. The
+  // upload lowers its bound while local reads slow, yielding the disk to the
+  // store's own reads. Zero uses 32.
+  uint32 max_upload_reads = 6;
+  // UploadReadSlowMillis is the least local read time the upload counts as
+  // the disk being loaded. Zero uses 5.
+  uint32 upload_read_slow_millis = 7;
+  // FillQueueBytes bounds the bytes of blocks read from the bucket that await
+  // their local write. A block already queued is not queued again, and a fill
+  // past the bound is dropped, to be filled by a later read. Zero uses 1 GiB.
+  uint64 fill_queue_bytes = 8;
+}
+
+// AccountSession is an approved account replica, distinct from a managed Device.
+message AccountSession {
+  // PeerId is the independently generated Session's transport identity.
+  string peer_id = 1;
+  // StoragePeerId identifies the replica's SharedObject signing and encryption key.
+  string storage_peer_id = 2;
+  // Revoked retains the binding after access is withdrawn.
+  bool revoked = 3;
+  // RevokedByStoragePeerId owns the signed configuration changes for revocation.
+  // Other replicas import that writer's lineage instead of signing competing changes.
+  string revoked_by_storage_peer_id = 4;
+}
+
+// AccountCatalogEntry records one account object or its durable deletion.
+message AccountCatalogEntry {
+  // Entry identifies the object and its presentation metadata.
+  .sobject.SharedObjectListEntry entry = 1;
+  // Deleted prevents an offline replica from rediscovering a removed object.
+  bool deleted = 2;
+}
+
+// PairedDevice is a device that has been paired with this account via P2P.
+message PairedDevice {
+  // PeerId is the base58 string representation of the paired device's peer ID.
+  string peer_id = 1;
+  // DisplayName is a human-readable name for the device.
+  string display_name = 2;
+  // PairedAt is the unix timestamp (seconds) when the device was paired.
+  int64 paired_at = 3;
+}
+
+// SessionPresentation stores private presentation metadata for a session row.
+message SessionPresentation {
+  // PeerId is the session peer ID.
+  string peer_id = 1;
+  // Label is the primary display label for the session.
+  string label = 2;
+  // DeviceType identifies the broad device class ("web", "desktop", etc.).
+  string device_type = 3;
+  // ClientName is the app or browser name when known.
+  string client_name = 4;
+  // Os is the operating system or platform when known.
+  string os = 5;
+  // Location is the observed network location when known.
+  string location = 6;
+}
+
+// AccountSettingsOp is an operation on the account settings SharedObject.
+// Stored as SOOperationInner.OpData.
+message AccountSettingsOp {
+  oneof op {
+    // UpdateDisplayName changes the local provider account display name.
+    UpdateDisplayNameOp update_display_name = 1;
+    // AddPairedDevice adds a paired device.
+    PairedDevice add_paired_device = 2;
+    // RemovePairedDevice removes a paired device by peer_id.
+    RemovePairedDeviceOp remove_paired_device = 3;
+    // AddEntityKeypair adds an entity keypair. Deduplicates by peer_id.
+    .session.EntityKeypair add_entity_keypair = 4;
+    // RemoveEntityKeypair removes an entity keypair by peer_id.
+    RemoveEntityKeypairOp remove_entity_keypair = 5;
+    // UpsertSessionPresentation adds or replaces a session presentation row.
+    SessionPresentation upsert_session_presentation = 6;
+    // RemoveSessionPresentation removes a session presentation by peer_id.
+    RemoveSessionPresentationOp remove_session_presentation = 7;
+    // ReplaceKeybindingOverrideSet atomically replaces the complete persisted layer.
+    ReplaceKeybindingOverrideSetOp replace_keybinding_override_set = 8;
+    // UpsertAccountSession applies an explicitly authorized Session enrollment or revocation.
+    AccountSession upsert_account_session = 9;
+    // UpsertCatalogEntry publishes an object or its permanent deletion tombstone.
+    AccountCatalogEntry upsert_catalog_entry = 10;
+    // AcceptAccountMigration records provider-approved returning Session authorization.
+    .provider.AccountTransition accept_account_migration = 11;
+    // CommitAccountTransition fixes the destination once resources and Sessions are durable.
+    .provider.AccountTransition commit_account_transition = 12;
+    // UpsertStorageBackend adds a storage backend or replaces the one with its id.
+    StorageBackend upsert_storage_backend = 13;
+    // RemoveStorageBackend removes a storage backend that holds no block store.
+    RemoveStorageBackendOp remove_storage_backend = 14;
+    // SetDefaultStorageBackend selects the backend that new Spaces use.
+    SetDefaultStorageBackendOp set_default_storage_backend = 15;
+    // SetBlockStorePlacement places a block store, or returns it to the
+    // account's own storage when storage_backend_id is empty.
+    BlockStorePlacement set_block_store_placement = 16;
+    // CompleteStorageRelease records that the released block store's objects
+    // are gone from the backend's bucket.
+    BlockStorePlacement complete_storage_release = 17;
+    // SetDeveloperSpace records the account's developer Space. It replaces the
+    // recorded Space only when that Space is the one the operation names as
+    // previous; otherwise it is rejected.
+    SetDeveloperSpaceOp set_developer_space = 18;
+    // AddPlugin adds a plugin manifest ID to the account plugin list.
+    AccountPluginOp add_plugin = 19;
+    // RemovePlugin removes a plugin manifest ID from the account plugin list.
+    AccountPluginOp remove_plugin = 20;
+  }
+}
+
+// AccountPluginOp names one plugin of the account plugin list.
+message AccountPluginOp {
+  // PluginId is the manifest ID of the plugin.
+  string plugin_id = 1;
+}
+
+// SetDeveloperSpaceOp records the account's developer Space.
+message SetDeveloperSpaceOp {
+  // SpaceId identifies the Space the account uses as its developer Space.
+  string space_id = 1;
+  // PreviousSpaceId is the developer Space the writer observed before
+  // creating SpaceId, or empty when it observed none. The operation applies
+  // only while the account still records that Space, so devices that race to
+  // replace a missing Space converge on one.
+  string previous_space_id = 2;
+}
+
+// RemoveStorageBackendOp removes a storage backend by id.
+message RemoveStorageBackendOp {
+  // StorageBackendId identifies the backend to remove.
+  string storage_backend_id = 1;
+}
+
+// SetDefaultStorageBackendOp selects the default storage backend.
+message SetDefaultStorageBackendOp {
+  // StorageBackendId identifies the new default, or empty for the account's
+  // own storage.
+  string storage_backend_id = 1;
+}
+
+// ReplaceKeybindingOverrideSetOp applies a complete layer replacement with per-surface conflict detection.
+message ReplaceKeybindingOverrideSetOp {
+  // ExpectedOverrideSet is the snapshot used to derive the replacement.
+  .s4wave.command.KeybindingOverrideSet expected_override_set = 1;
+  // OverrideSet is the complete replacement value.
+  .s4wave.command.KeybindingOverrideSet override_set = 2;
+}
+
+// UpdateDisplayNameOp changes the local provider account display name.
+message UpdateDisplayNameOp {
+  // DisplayName is the new display name for the account.
+  string display_name = 1;
+}
+
+// RemoveEntityKeypairOp removes an entity keypair by peer ID.
+message RemoveEntityKeypairOp {
+  // PeerId is the peer ID of the entity keypair to remove.
+  string peer_id = 1;
+}
+
+// RemovePairedDeviceOp removes a paired device by peer ID.
+message RemovePairedDeviceOp {
+  // PeerId is the peer ID of the device to remove.
+  string peer_id = 1;
+}
+
+// RemoveSessionPresentationOp removes session presentation metadata by peer ID.
+message RemoveSessionPresentationOp {
+  // PeerId is the peer ID of the session metadata entry to remove.
+  string peer_id = 1;
+}

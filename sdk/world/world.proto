@@ -1,0 +1,1154 @@
+syntax = "proto3";
+package s4wave.world;
+
+import "github.com/s4wave/spacewave/db/block/block.proto";
+import "github.com/s4wave/spacewave/db/bucket/bucket.proto";
+import "github.com/s4wave/spacewave/db/block/quad/quad.proto";
+import "github.com/s4wave/spacewave/core/sobject/sobject.proto";
+
+service EngineResourceService {
+  rpc GetEngineInfo(GetEngineInfoRequest) returns (GetEngineInfoResponse);
+
+  rpc GetWorldRootSnapshot(GetWorldRootSnapshotRequest) returns (WorldRootSnapshot);
+
+  rpc WatchWorldRootSnapshots(WatchWorldRootSnapshotsRequest) returns (stream WorldRootSnapshot);
+
+  // SetRetainedRoot retains the accepted World root under a name in the World's
+  // shared state, so storage reclaim keeps its blocks. An empty root releases
+  // the name.
+  rpc SetRetainedRoot(SetRetainedRootRequest) returns (SetRetainedRootResponse);
+
+  rpc NewTransaction(NewTransactionRequest) returns (NewTransactionResponse);
+
+  // ExecuteWorldOp accepts a complete operation, retrying stale bases through World.
+  // The authenticated Resource sender overrides the payload sender.
+  rpc ExecuteWorldOp(ApplyWorldOpRequest) returns (ApplyWorldOpResponse);
+
+  rpc Sync(SyncRequest) returns (SyncResponse);
+
+  // SyncThrough returns once every commit with a seqno at or below the
+  // request's seqno is durable and covered by the durable head. It does not
+  // wait for commits admitted after that seqno.
+  rpc SyncThrough(SyncThroughRequest) returns (SyncThroughResponse);
+
+  rpc GetSeqno(GetSeqnoRequest) returns (GetSeqnoResponse);
+
+  rpc WaitSeqno(WaitSeqnoRequest) returns (WaitSeqnoResponse);
+
+  // WatchChanges streams each later World revision with the objects and graph
+  // quads it changed since the previous message.
+  rpc WatchChanges(WatchChangesRequest) returns (stream WorldChange);
+
+  // WaitObjectRev waits until an object reaches a revision through the
+  // engine's key watch, which wakes only on commits that change the object.
+  rpc WaitObjectRev(WaitObjectRevRequest) returns (WaitObjectRevResponse);
+
+  rpc BuildStorageCursor(BuildStorageCursorRequest) returns (BuildStorageCursorResponse);
+
+  rpc AccessWorldState(AccessWorldStateRequest) returns (AccessWorldStateResponse);
+
+  // StageWorldState opens a staging scope for writes outside a transaction.
+  // Releasing the stage resource, or ending its resource client, releases
+  // the scope. Hold it until the transaction adopting the build returns.
+  rpc StageWorldState(StageWorldStateRequest) returns (StageWorldStateResponse);
+}
+
+// WorldStageResourceService builds cursors whose writes a staging scope owns.
+service WorldStageResourceService {
+  rpc BuildStorageCursor(BuildStorageCursorRequest) returns (BuildStorageCursorResponse);
+
+  rpc AccessWorldState(AccessWorldStateRequest) returns (AccessWorldStateResponse);
+
+  // ReleaseRoots drops the stage's ownership of roots once the transaction
+  // referencing them has returned. The stage stays open.
+  rpc ReleaseRoots(ReleaseRootsRequest) returns (ReleaseRootsResponse);
+}
+
+// ReleaseRootsRequest is the request type for ReleaseRoots.
+message ReleaseRootsRequest {
+  // RootRefs are the roots the stage no longer owns.
+  repeated .block.BlockRef root_refs = 1;
+}
+
+// ReleaseRootsResponse is the response type for ReleaseRoots.
+message ReleaseRootsResponse {}
+
+// StageWorldStateRequest is the request type for StageWorldState.
+message StageWorldStateRequest {}
+
+// StageWorldStateResponse is the response type for StageWorldState.
+message StageWorldStateResponse {
+  // ResourceId is the ID of the WorldStageResourceService resource.
+  uint32 resource_id = 1;
+}
+
+// SyncRequest is the request type for Sync.
+message SyncRequest {}
+
+// SyncResponse is the response type for Sync.
+message SyncResponse {
+  // Fenced indicates whether a durability fence was applied.
+  bool fenced = 1;
+}
+
+// SyncThroughRequest is the request type for SyncThrough.
+message SyncThroughRequest {
+  // Seqno is the World seqno the durable head must cover.
+  uint64 seqno = 1;
+}
+
+// SyncThroughResponse is the response type for SyncThrough.
+message SyncThroughResponse {
+  // DurableSeqno is the seqno of the durable head, at or above the requested seqno.
+  uint64 durable_seqno = 1;
+}
+
+// EngineInfo contains metadata about a world engine.
+message EngineInfo {
+  // EngineId is the ID of the world engine.
+  string engine_id = 1;
+  // BucketId is the bucket ID the engine is attached to.
+  string bucket_id = 2;
+}
+
+// GetEngineInfoRequest is the request type for GetEngineInfo.
+message GetEngineInfoRequest {}
+
+// GetEngineInfoResponse is the response type for GetEngineInfo.
+message GetEngineInfoResponse {
+  // EngineInfo is the engine information.
+  EngineInfo engine_info = 1;
+  // SessionPeerId is the authenticated sender bound to this Resource, when present.
+  string session_peer_id = 2;
+  // CallerParticipant is the accepted participant of the authenticated caller,
+  // when the granting mount knows it. Consumers resolve current permissions
+  // from the addressed SharedObject instead of treating this snapshot as a grant.
+  .sobject.SOParticipantConfig caller_participant = 3;
+}
+
+// WorldRootSnapshot identifies one committed Engine root.
+message WorldRootSnapshot {
+  // RootRef is the committed World root reference.
+  .bucket.ObjectRef root_ref = 1;
+  // Seqno is the world sequence number observed with RootRef.
+  uint64 seqno = 2;
+  // EngineInfo is the Engine metadata associated with RootRef.
+  EngineInfo engine_info = 3;
+  // StorageVolumeId is the local storage volume hint, when visible to the Engine.
+  string storage_volume_id = 4;
+}
+
+// GetWorldRootSnapshotRequest is the request type for GetWorldRootSnapshot.
+message GetWorldRootSnapshotRequest {}
+
+// WatchWorldRootSnapshotsRequest is the request type for WatchWorldRootSnapshots.
+message WatchWorldRootSnapshotsRequest {}
+
+// SetRetainedRootRequest is the request type for SetRetainedRoot.
+message SetRetainedRootRequest {
+  // Name identifies the retained root, 1 to 64 bytes.
+  string name = 1;
+  // RootRef is the accepted World root to retain, or empty to release the name.
+  .block.BlockRef root_ref = 2;
+}
+
+// SetRetainedRootResponse is the response type for SetRetainedRoot.
+message SetRetainedRootResponse {}
+
+// NewTransactionRequest is the request type for NewTransaction.
+message NewTransactionRequest {
+  // Write indicates whether this transaction will perform write operations.
+  bool write = 1;
+}
+
+// NewTransactionResponse is the response type for NewTransaction.
+message NewTransactionResponse {
+  // ResourceId is the ID of the created Tx resource.
+  uint32 resource_id = 1;
+  // ReadOnly indicates whether the transaction is read-only.
+  bool read_only = 2;
+}
+
+// GetSeqnoRequest is the request type for GetSeqno.
+message GetSeqnoRequest {}
+
+// GetSeqnoResponse is the response type for GetSeqno.
+message GetSeqnoResponse {
+  // Seqno is the current sequence number of the world state.
+  uint64 seqno = 1;
+}
+
+// WaitSeqnoRequest is the request type for WaitSeqno.
+message WaitSeqnoRequest {
+  // Seqno is the minimum sequence number to wait for.
+  uint64 seqno = 1;
+}
+
+// WaitSeqnoResponse is the response type for WaitSeqno.
+message WaitSeqnoResponse {
+  // Seqno is the sequence number when the wait condition was satisfied.
+  uint64 seqno = 1;
+}
+
+// WatchChangesRequest is the request type for WatchChanges.
+message WatchChangesRequest {
+  // AfterSeqno is the revision the stream starts after.
+  uint64 after_seqno = 1;
+}
+
+// WorldChange lists what one or more coalesced commits changed.
+message WorldChange {
+  // Seqno is the World revision the change reaches.
+  uint64 seqno = 1;
+  // Unknown is set when the changes could not be listed. Any read may have
+  // changed.
+  bool unknown = 2;
+  // Keys are the object keys that were set, deleted, renamed or revised.
+  repeated string keys = 3;
+  // Quads are the graph quads that were set or deleted.
+  repeated .quad.Quad quads = 4;
+}
+
+// WaitObjectRevRequest is the request type for WaitObjectRev.
+message WaitObjectRevRequest {
+  // Key is the object key to wait on.
+  string key = 1;
+  // Rev is the minimum object revision to wait for.
+  uint64 rev = 2;
+  // IgnoreNotFound waits for a missing object to appear instead of failing.
+  bool ignore_not_found = 3;
+}
+
+// WaitObjectRevResponse is the response type for WaitObjectRev.
+message WaitObjectRevResponse {
+  // Rev is the object revision that satisfied the wait.
+  uint64 rev = 1;
+  // ErrorCode is WORLD_ERROR_CODE_OBJECT_NOT_FOUND when the object is missing
+  // and IgnoreNotFound is unset.
+  WorldErrorCode error_code = 2;
+}
+
+// AccessWorldStateRequest is the request type for AccessWorldState.
+message AccessWorldStateRequest {
+  // Ref is an optional reference to access a specific object.
+  // If unset, we will access the Root of the WorldState.
+  .bucket.ObjectRef ref = 1;
+}
+
+// OpenNestedWorldRequest selects a typed outer object whose root is a NestedWorld block.
+message OpenNestedWorldRequest {
+  // ObjectKey identifies the enclosing object in this World state.
+  string object_key = 1;
+}
+
+// OpenNestedWorldResponse grants a read-only Engine over the nested World.
+message OpenNestedWorldResponse {
+  // ResourceId identifies the nested World Engine resource.
+  // Its seqno is the outer object's revision, and each transaction reads the
+  // nested World published at the revision it opened.
+  uint32 resource_id = 1;
+}
+
+// OpenOuterWorldRequest opens the enclosing Space World from a nested World resource.
+message OpenOuterWorldRequest {
+}
+
+// OpenOuterWorldResponse grants the enclosing Space Engine, retained independently.
+message OpenOuterWorldResponse {
+  // ResourceId identifies the enclosing Space Engine resource.
+  uint32 resource_id = 1;
+}
+
+// AccessWorldStateResponse is the response type for AccessWorldState.
+message AccessWorldStateResponse {
+  // ResourceId is the ID of the bucket cursor resource for accessing world state.
+  uint32 resource_id = 1;
+}
+
+service WorldStateResourceService {
+  // CompareObjectRecords compares immutable record roots within this snapshot.
+  rpc CompareObjectRecords(CompareObjectRecordsRequest) returns (CompareObjectRecordsResponse);
+
+  rpc GetReadOnly(GetReadOnlyRequest) returns (GetReadOnlyResponse);
+
+  rpc Sync(SyncRequest) returns (SyncResponse);
+
+  rpc GetSeqno(GetSeqnoRequest) returns (GetSeqnoResponse);
+
+  rpc WaitSeqno(WaitSeqnoRequest) returns (WaitSeqnoResponse);
+
+  rpc BuildStorageCursor(BuildStorageCursorRequest) returns (BuildStorageCursorResponse);
+
+  rpc AccessWorldState(AccessWorldStateRequest) returns (AccessWorldStateResponse);
+
+  // StageWorldState opens a staging scope for writes outside a transaction.
+  // An engine-level state stages on its engine. A write transaction's stage
+  // writes through the transaction, which adopts the build when it commits.
+  // A read-only state rejects the request.
+  rpc StageWorldState(StageWorldStateRequest) returns (StageWorldStateResponse);
+
+  // OpenNestedWorld opens a read-only Engine that follows the nested World an
+  // outer object publishes.
+  rpc OpenNestedWorld(OpenNestedWorldRequest) returns (OpenNestedWorldResponse);
+
+  // OpenOuterWorld grants the enclosing Space Engine under the same authority.
+  rpc OpenOuterWorld(OpenOuterWorldRequest) returns (OpenOuterWorldResponse);
+
+  rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
+
+  rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+
+  rpc IterateObjects(IterateObjectsRequest) returns (IterateObjectsResponse);
+
+  // ListObjects returns one page of objects and their metadata in key order.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+
+  rpc RenameObject(RenameObjectRequest) returns (RenameObjectResponse);
+
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+
+  rpc SetGraphQuad(SetGraphQuadRequest) returns (SetGraphQuadResponse);
+
+  rpc DeleteGraphQuad(DeleteGraphQuadRequest) returns (DeleteGraphQuadResponse);
+
+  rpc LookupGraphQuads(LookupGraphQuadsRequest) returns (LookupGraphQuadsResponse);
+
+  rpc LookupGraphQuadsBatch(LookupGraphQuadsBatchRequest) returns (LookupGraphQuadsBatchResponse);
+
+  rpc ListGraphEdgeBuckets(ListGraphEdgeBucketsRequest) returns (ListGraphEdgeBucketsResponse);
+
+  rpc ListObjectsWithType(ListObjectsWithTypeRequest) returns (ListObjectsWithTypeResponse);
+
+  rpc GetObjectRootRefsBatch(GetObjectRootRefsBatchRequest) returns (GetObjectRootRefsBatchResponse);
+
+  rpc GetObjectMetadataBatch(GetObjectMetadataBatchRequest) returns (GetObjectMetadataBatchResponse);
+  rpc GetObjectBodiesBatch(GetObjectBodiesBatchRequest) returns (stream GetObjectBodiesBatchResponse);
+
+  rpc QueryGraphPath(QueryGraphPathRequest) returns (QueryGraphPathResponse);
+
+  rpc DeleteGraphObject(DeleteGraphObjectRequest) returns (DeleteGraphObjectResponse);
+
+  rpc ApplyWorldOp(ApplyWorldOpRequest) returns (ApplyWorldOpResponse);
+
+}
+
+service WatchWorldStateResourceService {
+  rpc WatchWorldState(WatchWorldStateRequest) returns (stream WatchWorldStateResponse);
+}
+
+// TxResourceService controls one retained World transaction.
+service TxResourceService {
+  // CommitMutations applies ordered mutations and atomically commits the transaction.
+  rpc CommitMutations(CommitMutationsRequest) returns (CommitMutationsResponse);
+
+  // Commit atomically publishes the retained transaction.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  // Discard releases the retained transaction without publication.
+  rpc Discard(DiscardRequest) returns (DiscardResponse);
+}
+
+// CommitMutationsRequest is the request type for CommitMutations.
+message CommitMutationsRequest {
+  // Mutations are applied in request order before the transaction commits.
+  repeated TransactionMutation mutations = 1;
+}
+
+// TransactionMutation applies one World mutation.
+message TransactionMutation {
+  oneof mutation {
+    // CreateObject creates one object with its initial root.
+    CreateObjectRequest create_object = 1;
+    // SetObjectRoot replaces one existing object's root.
+    SetObjectRootMutation set_object_root = 2;
+    // SetGraphQuad writes one graph quad.
+    SetGraphQuadRequest set_graph_quad = 3;
+  }
+}
+
+// SetObjectRootMutation replaces an object's root by its exact key.
+message SetObjectRootMutation {
+  // ObjectKey identifies the exact object inside this transaction.
+  string object_key = 1;
+  // RootRef is the replacement immutable object root.
+  .bucket.ObjectRef root_ref = 2;
+}
+
+// TransactionMutationResult returns the value from one transaction mutation.
+message TransactionMutationResult {
+  oneof result {
+    // CreateObject reports the created object.
+    CreateObjectMutationResult create_object = 1;
+    // SetObjectRoot reports the updated object revision.
+    SetObjectRootMutationResult set_object_root = 2;
+    // SetGraphQuad reports the graph mutation result.
+    SetGraphQuadResponse set_graph_quad = 3;
+  }
+}
+
+// CreateObjectMutationResult returns the created object's key.
+message CreateObjectMutationResult {
+  // ObjectKey identifies the created object.
+  string object_key = 1;
+  // Rev is the created object's committed revision.
+  uint64 rev = 2;
+}
+
+// SetObjectRootMutationResult returns the object's new revision.
+message SetObjectRootMutationResult {
+  // Rev is the object's revision after the root replacement.
+  uint64 rev = 1;
+}
+
+// CommitMutationsResponse is the response type for CommitMutations.
+message CommitMutationsResponse {
+  // Results correspond one-for-one with the ordered request mutations.
+  repeated TransactionMutationResult results = 1;
+}
+
+// CommitRequest is the request type for Commit.
+message CommitRequest {}
+
+// CommitResponse is the response type for Commit.
+message CommitResponse {}
+
+// DiscardRequest is the request type for Discard.
+message DiscardRequest {}
+
+// DiscardResponse is the response type for Discard.
+message DiscardResponse {}
+
+// GetReadOnlyRequest is the request type for GetReadOnly.
+message GetReadOnlyRequest {}
+
+// GetReadOnlyResponse is the response type for GetReadOnly.
+message GetReadOnlyResponse {
+  // ReadOnly indicates whether the transaction is read-only.
+  bool read_only = 1;
+}
+
+// BuildStorageCursorRequest is the request type for BuildStorageCursor.
+message BuildStorageCursorRequest {}
+
+// BuildStorageCursorResponse is the response type for BuildStorageCursor.
+message BuildStorageCursorResponse {
+  // ResourceId is the ID of the storage cursor resource.
+  uint32 resource_id = 1;
+}
+
+// CreateObjectRequest is the request type for CreateObject.
+message CreateObjectRequest {
+  // ObjectKey is the unique identifier for the object within the world.
+  string object_key = 1;
+  // RootRef is the initial reference to the object's root data.
+  .bucket.ObjectRef root_ref = 2;
+}
+
+// CreateObjectResponse is the response type for CreateObject.
+message CreateObjectResponse {
+  // ResourceId is the ID of the created ObjectState resource.
+  uint32 resource_id = 1;
+  // ObjectKey is the unique identifier of the created object.
+  string object_key = 2;
+}
+
+// GetObjectRequest is the request type for GetObject.
+message GetObjectRequest {
+  // ObjectKey is the unique identifier of the object to retrieve.
+  string object_key = 1;
+}
+
+// GetObjectResponse is the response type for GetObject.
+message GetObjectResponse {
+  // Found indicates whether the object exists in the world.
+  bool found = 1;
+  // ResourceId is the ID of the ObjectState resource, if found.
+  uint32 resource_id = 2;
+  // ObjectKey is the unique identifier of the object, if found.
+  string object_key = 3;
+}
+
+// RenameObjectRequest is the request type for RenameObject.
+message RenameObjectRequest {
+  // OldObjectKey is the object key to rename.
+  string old_object_key = 1;
+  // NewObjectKey is the new object key.
+  string new_object_key = 2;
+  // Descendants renames objects under old_object_key + "/" to the new prefix.
+  bool descendants = 3;
+}
+
+// RenameObjectResponse is the response type for RenameObject.
+message RenameObjectResponse {
+  // ResourceId is the ID of the renamed ObjectState resource.
+  uint32 resource_id = 1;
+  // ObjectKey is the unique identifier of the renamed object.
+  string object_key = 2;
+}
+
+// DeleteObjectRequest is the request type for DeleteObject.
+message DeleteObjectRequest {
+  // ObjectKey is the unique identifier of the object to delete.
+  string object_key = 1;
+}
+
+// DeleteObjectResponse is the response type for DeleteObject.
+message DeleteObjectResponse {
+  // Deleted indicates whether the object was found and successfully deleted.
+  bool deleted = 1;
+}
+
+// IterateObjectsRequest is the request type for IterateObjects.
+message IterateObjectsRequest {
+  // Prefix filters objects to those whose keys start with this string.
+  // Empty prefix returns all objects.
+  string prefix = 1;
+  // Reversed indicates whether to return results in descending order.
+  bool reversed = 2;
+}
+
+// IterateObjectsResponse is the response type for IterateObjects.
+message IterateObjectsResponse {
+  // ResourceId is the ID of the ObjectIterator resource.
+  uint32 resource_id = 1;
+}
+
+// ListObjectsRequest is the request type for ListObjects.
+message ListObjectsRequest {
+  // Prefix limits the listing to object keys that start with this string.
+  // Empty prefix lists all objects.
+  string prefix = 1;
+  // StartAfter resumes the listing after this object key. It must start with
+  // prefix. Empty starts at the first key.
+  string start_after = 2;
+  // Limit is the maximum number of entries, objects plus prefixes, in the
+  // page. It must be non-zero. The server may return a shorter page and set
+  // more.
+  uint32 limit = 3;
+  // Delimiter groups keys by the next path segment. When set, each key whose
+  // remainder after prefix contains the delimiter is listed once as its prefix
+  // up to and including the first delimiter, instead of as an object. Empty
+  // lists every key under prefix.
+  string delimiter = 4;
+}
+
+// ListObjectsResponse is the response type for ListObjects.
+message ListObjectsResponse {
+  // Objects are the page's objects in ascending key order.
+  repeated ObjectMetadata objects = 1;
+  // More reports that entries after the last one match the prefix. Pass the
+  // greater of the last object key and the last prefix as start_after to read
+  // the next page.
+  bool more = 2;
+  // Prefixes are the page's grouped key prefixes in ascending order. Each sorts
+  // where its first key would. Set only when the request has a delimiter.
+  repeated string prefixes = 3;
+}
+
+// SetGraphQuadRequest is the request type for SetGraphQuad.
+message SetGraphQuadRequest {
+  // Quad is the graph quad to add or update in the store.
+  .quad.Quad quad = 1;
+}
+
+// SetGraphQuadResponse is the response type for SetGraphQuad.
+message SetGraphQuadResponse {}
+
+// DeleteGraphQuadRequest is the request type for DeleteGraphQuad.
+message DeleteGraphQuadRequest {
+  // Quad is the graph quad to remove from the store.
+  .quad.Quad quad = 1;
+}
+
+// DeleteGraphQuadResponse is the response type for DeleteGraphQuad.
+message DeleteGraphQuadResponse {}
+
+// LookupGraphQuadsRequest is the request type for LookupGraphQuads.
+message LookupGraphQuadsRequest {
+  // Filter specifies the criteria for matching quads.
+  // Empty fields in the filter match any value for that field.
+  .quad.Quad filter = 1;
+  // Limit restricts the maximum number of quads to return.
+  // Zero means no limit.
+  uint32 limit = 2;
+}
+
+// LookupGraphQuadsResponse is the response type for LookupGraphQuads.
+message LookupGraphQuadsResponse {
+  // Quads is the list of graph quads matching the filter criteria.
+  repeated .quad.Quad quads = 1;
+}
+
+// LookupGraphQuadsBatchRequest is the request type for LookupGraphQuadsBatch.
+message LookupGraphQuadsBatchRequest {
+  // Filters is the bounded list of subject/predicate or object/predicate
+  // filters to evaluate server-side.
+  repeated .quad.Quad filters = 1;
+  // LimitPerFilter is the maximum number of quads returned for each filter.
+  // It must be non-zero.
+  uint32 limit_per_filter = 2;
+}
+
+// LookupGraphQuadsBatchResult is one filtered graph lookup result.
+message LookupGraphQuadsBatchResult {
+  // Quads is the list of graph quads matching one filter.
+  repeated .quad.Quad quads = 1;
+}
+
+// LookupGraphQuadsBatchResponse is the response type for
+// LookupGraphQuadsBatch.
+message LookupGraphQuadsBatchResponse {
+  // Results preserves the request filter order.
+  repeated LookupGraphQuadsBatchResult results = 1;
+}
+
+// GraphEdgeBucketDirection indicates which edge directions to list.
+enum GraphEdgeBucketDirection {
+  // GRAPH_EDGE_BUCKET_DIRECTION_UNSPECIFIED lists incoming and outgoing edges.
+  GRAPH_EDGE_BUCKET_DIRECTION_UNSPECIFIED = 0;
+  // GRAPH_EDGE_BUCKET_DIRECTION_OUT lists only outgoing edges.
+  GRAPH_EDGE_BUCKET_DIRECTION_OUT = 1;
+  // GRAPH_EDGE_BUCKET_DIRECTION_IN lists only incoming edges.
+  GRAPH_EDGE_BUCKET_DIRECTION_IN = 2;
+  // GRAPH_EDGE_BUCKET_DIRECTION_BOTH lists incoming and outgoing edges.
+  GRAPH_EDGE_BUCKET_DIRECTION_BOTH = 3;
+}
+
+// ListGraphEdgeBucketsRequest lists grouped inbound/outbound graph edges for
+// origin object keys.
+message ListGraphEdgeBucketsRequest {
+  // OriginObjectKeys are object keys whose graph edges should be grouped.
+  // The response contains one bucket per requested origin in request order.
+  repeated string origin_object_keys = 1;
+  // Predicate optionally restricts the grouped edges.
+  string predicate = 2;
+  // LimitPerOrigin is the maximum edge count returned per origin direction.
+  // It must be non-zero.
+  uint32 limit_per_origin = 3;
+  // Direction selects which edge directions are included.
+  // Unspecified means both incoming and outgoing.
+  GraphEdgeBucketDirection direction = 4;
+}
+
+// GraphEdgeBucket contains grouped graph edges for one origin object key.
+message GraphEdgeBucket {
+  // OriginObjectKey is the requested origin object key for this bucket.
+  string origin_object_key = 1;
+  // Outgoing contains quads where the origin is the subject.
+  repeated .quad.Quad outgoing = 2;
+  // Incoming contains quads where the origin is the object.
+  repeated .quad.Quad incoming = 3;
+  // OutgoingTruncated indicates more outgoing edges matched than were returned.
+  bool outgoing_truncated = 4;
+  // IncomingTruncated indicates more incoming edges matched than were returned.
+  bool incoming_truncated = 5;
+}
+
+// ListGraphEdgeBucketsResponse returns grouped graph edge buckets.
+message ListGraphEdgeBucketsResponse {
+  // Buckets preserves the request origin order.
+  repeated GraphEdgeBucket buckets = 1;
+}
+
+// ListObjectsWithTypeRequest selects one page of subjects of the type quads.
+message ListObjectsWithTypeRequest {
+  // TypeId is the type identifier to match.
+  string type_id = 1;
+  // StartAfter is the last object key returned by the previous page.
+  // Empty starts at the first subject in graph-index order.
+  string start_after = 2;
+  // Limit bounds the number of returned keys and must be non-zero.
+  // The server may return a shorter page and set more.
+  uint32 limit = 3;
+}
+
+// ListObjectsWithTypeResponse contains one page in Cayley graph-index order.
+// On an unchanged World, pages return every matching key exactly once in a
+// stable order. This order need not be ascending by object key.
+message ListObjectsWithTypeResponse {
+  // ObjectKeys contains distinct matching subjects in graph-index order.
+  repeated string object_keys = 1;
+  // More reports that matching subjects follow the last returned object key.
+  // Pass that key as start_after to read the next page.
+  bool more = 2;
+}
+
+// ObjectRootRef contains root reference metadata for one object key.
+message ObjectRootRef {
+  // ObjectKey is the object key.
+  string object_key = 1;
+  // RootRef is the current object root reference, if the object exists.
+  .bucket.ObjectRef root_ref = 2;
+  // Rev is the object revision.
+  uint64 rev = 3;
+  // Exists indicates whether the object key exists.
+  bool exists = 4;
+}
+
+// GetObjectRootRefsBatchRequest is the request type for
+// GetObjectRootRefsBatch.
+message GetObjectRootRefsBatchRequest {
+  // ObjectKeys is the list of object keys to inspect.
+  repeated string object_keys = 1;
+}
+
+// GetObjectRootRefsBatchResponse is the response type for
+// GetObjectRootRefsBatch.
+message GetObjectRootRefsBatchResponse {
+  // RootRefs preserves the request object key order.
+  repeated ObjectRootRef root_refs = 1;
+}
+
+// ObjectMetadata contains graph metadata for one object key.
+message ObjectMetadata {
+  // ObjectKey is the object key.
+  string object_key = 1;
+  // TypeId is the object type identifier, if present.
+  string type_id = 2;
+  // ParentObjectKey is the parent object key, if present.
+  string parent_object_key = 3;
+}
+
+// GetObjectMetadataBatchRequest is the request type for
+// GetObjectMetadataBatch.
+message GetObjectMetadataBatchRequest {
+  // ObjectKeys is the list of object keys to inspect.
+  repeated string object_keys = 1;
+}
+
+// GetObjectMetadataBatchResponse is the response type for
+// GetObjectMetadataBatch.
+message GetObjectMetadataBatchResponse {
+  // Metadata preserves the request object key order.
+  repeated ObjectMetadata metadata = 1;
+}
+
+// ObjectBody contains the serialized root body for one object key.
+message ObjectBody {
+  // ObjectKey is the requested object key.
+  string object_key = 1;
+  // Body is the transformed root block data when the object exists.
+  bytes body = 2;
+  // Exists indicates whether the object key exists.
+  bool exists = 3;
+  // Rev is the object revision observed with body.
+  uint64 rev = 4;
+  // ModSeqno is the World seqno after the last commit that changed the
+  // object. Zero when the World cannot report it.
+  uint64 mod_seqno = 5;
+  // TypeId is the object's ObjectType ID, set when the request asked for
+  // JSON.
+  string type_id = 6;
+  // BodyJson is body rendered as JSON, set when the request asked for JSON
+  // and the type's owner, the host or its plugin, can render it.
+  string body_json = 7;
+}
+
+// GetObjectBodiesBatchRequest is the request type for
+// GetObjectBodiesBatch.
+message GetObjectBodiesBatchRequest {
+  // ObjectKeys is the list of object keys to inspect.
+  repeated string object_keys = 1;
+  // Json asks for each body's type ID and JSON rendering.
+  bool json = 2;
+}
+
+// GetObjectBodiesBatchResponse is one page of GetObjectBodiesBatch.
+//
+// The server streams pages in request order, each within the encoded body
+// budget, and ends the stream after the last key.
+message GetObjectBodiesBatchResponse {
+  // Bodies continues the request object key order.
+  repeated ObjectBody bodies = 1;
+  // WorldSeqno is the World sequence number observed for this page. A reader
+  // that needs one revision restarts when pages disagree.
+  uint64 world_seqno = 2;
+}
+
+
+// GraphPathDirection indicates which side of the current object key to follow.
+enum GraphPathDirection {
+  // GRAPH_PATH_DIRECTION_UNSPECIFIED is invalid.
+  GRAPH_PATH_DIRECTION_UNSPECIFIED = 0;
+  // GRAPH_PATH_DIRECTION_OUT follows quads where the current key is the subject.
+  GRAPH_PATH_DIRECTION_OUT = 1;
+  // GRAPH_PATH_DIRECTION_IN follows quads where the current key is the object.
+  GRAPH_PATH_DIRECTION_IN = 2;
+  // GRAPH_PATH_DIRECTION_BOTH follows incoming and outgoing quads.
+  GRAPH_PATH_DIRECTION_BOTH = 3;
+}
+
+// GraphPathStep is one bounded predicate traversal step.
+message GraphPathStep {
+  // Direction is the edge direction to follow.
+  GraphPathDirection direction = 1;
+  // Predicate is the graph predicate to match.
+  string predicate = 2;
+  // Limit is the maximum number of quads to inspect for each current object key.
+  uint32 limit = 3;
+}
+
+// QueryGraphPathRequest is the request type for QueryGraphPath.
+message QueryGraphPathRequest {
+  // StartKeys is the list of object keys where traversal starts.
+  repeated string start_keys = 1;
+  // Steps is the bounded traversal to execute server-side.
+  repeated GraphPathStep steps = 2;
+  // ResultLimit is the maximum number of object keys returned.
+  // It must be non-zero.
+  uint32 result_limit = 3;
+  // IncludeQuads includes traversed quads in result pages.
+  bool include_quads = 4;
+  // PageSize is the maximum number of object keys returned by one Next call.
+  // If unset, the server uses ResultLimit.
+  uint32 page_size = 5;
+}
+
+// QueryGraphPathResponse is the response type for QueryGraphPath.
+message QueryGraphPathResponse {
+  // ResourceId is the ID of the GraphPathQuery resource.
+  uint32 resource_id = 1;
+}
+
+// DeleteGraphObjectRequest is the request type for DeleteGraphObject.
+message DeleteGraphObjectRequest {
+  // ObjectKey is the key of the object whose graph references should be deleted.
+  string object_key = 1;
+}
+
+// DeleteGraphObjectResponse is the response type for DeleteGraphObject.
+message DeleteGraphObjectResponse {}
+
+// ApplyWorldOpRequest is the request type for ApplyWorldOp.
+message ApplyWorldOpRequest {
+  // OpTypeId is the operation type identifier.
+  string op_type_id = 1;
+  // OpData is the encoded operation body.
+  bytes op_data = 2;
+  // OpSender is the peer ID of the sender applying the operation.
+  string op_sender = 3;
+}
+
+// WorldErrorCode identifies a typed error returned in a World RPC response.
+enum WorldErrorCode {
+  // WORLD_ERROR_CODE_UNSPECIFIED carries no built-in World error.
+  WORLD_ERROR_CODE_UNSPECIFIED = 0;
+  // WORLD_ERROR_CODE_UNHANDLED_OP indicates that no handler accepted the operation.
+  WORLD_ERROR_CODE_UNHANDLED_OP = 1;
+  // WORLD_ERROR_CODE_TYPED_OBJECT_GRANT_RETIRED indicates that retirement of
+  // this exact granting World mount prevented typed-object acquisition.
+  WORLD_ERROR_CODE_TYPED_OBJECT_GRANT_RETIRED = 2;
+  // WORLD_ERROR_CODE_OBJECT_NOT_FOUND indicates that the World holds no object
+  // at the requested key.
+  WORLD_ERROR_CODE_OBJECT_NOT_FOUND = 3;
+}
+
+// ApplyWorldOpResponse is the response type for ApplyWorldOp.
+message ApplyWorldOpResponse {
+  // Seqno is the sequence number following the operation execution.
+  uint64 seqno = 1;
+  // SysErr indicates if the error is a transient system error.
+  bool sys_err = 2;
+  // ErrorCode identifies a typed operation error when the RPC succeeds.
+  WorldErrorCode error_code = 3;
+  // RejectionCode is a stable application-defined rejection code.
+  string rejection_code = 4;
+  // RejectionMessage is the safe explanation of a rejected operation.
+  string rejection_message = 5;
+}
+
+// WatchWorldStateRequest is the request type for WatchWorldState.
+message WatchWorldStateRequest {}
+
+// WatchWorldStateResponse is the response type for WatchWorldState.
+message WatchWorldStateResponse {
+  // ResourceId is the ID of the tracked WorldState snapshot resource.
+  // Each change to a tracked access sends a new ID. The watch sends the new ID
+  // before it releases the snapshot the ID supersedes, so a call that fails
+  // because its snapshot was released finds the replacement on this stream.
+  // A watch that ends instead releases its snapshot and closes the stream.
+  // Adopted child resources stay readable until the client releases them.
+  uint32 resource_id = 1;
+}
+
+service ObjectIteratorResourceService {
+  rpc Err(ErrRequest) returns (ErrResponse);
+
+  rpc Valid(ValidRequest) returns (ValidResponse);
+
+  rpc Key(KeyRequest) returns (KeyResponse);
+
+  rpc Next(NextRequest) returns (NextResponse);
+
+  rpc Seek(SeekRequest) returns (SeekResponse);
+
+  rpc Close(CloseRequest) returns (CloseResponse);
+}
+
+// ErrRequest is the request type for Err.
+message ErrRequest {}
+
+// ErrResponse is the response type for Err.
+message ErrResponse {
+  // Error is the error message, empty if no error.
+  string error = 1;
+}
+
+// ValidRequest is the request type for Valid.
+message ValidRequest {}
+
+// ValidResponse is the response type for Valid.
+message ValidResponse {
+  // Valid indicates if the iterator points to a valid entry.
+  bool valid = 1;
+}
+
+// KeyRequest is the request type for Key.
+message KeyRequest {}
+
+// KeyResponse is the response type for Key.
+message KeyResponse {
+  // ObjectKey is the current entry key, or empty if not valid.
+  string object_key = 1;
+}
+
+// NextRequest is the request type for Next.
+message NextRequest {}
+
+// NextResponse is the response type for Next.
+message NextResponse {
+  // Valid indicates if the iterator points to a valid entry after advancing.
+  bool valid = 1;
+}
+
+// SeekRequest is the request type for Seek.
+message SeekRequest {
+  // ObjectKey is the key to seek to, or empty to seek to beginning (or end if reversed).
+  string object_key = 1;
+}
+
+// SeekResponse is the response type for Seek.
+message SeekResponse {}
+
+// CloseRequest is the request type for Close.
+message CloseRequest {}
+
+// CloseResponse is the response type for Close.
+message CloseResponse {}
+
+service GraphPathQueryResourceService {
+  rpc Next(NextGraphPathQueryRequest) returns (NextGraphPathQueryResponse);
+
+  rpc Close(CloseGraphPathQueryRequest) returns (CloseGraphPathQueryResponse);
+}
+
+// NextGraphPathQueryRequest is the request type for GraphPathQuery Next.
+message NextGraphPathQueryRequest {}
+
+// NextGraphPathQueryResponse is one page of graph path query results.
+message NextGraphPathQueryResponse {
+  // ObjectKeys is the next page of reached object keys.
+  repeated string object_keys = 1;
+  // Quads is the traversed graph quads when requested.
+  repeated .quad.Quad quads = 2;
+  // Done indicates the resource has no more result pages.
+  bool done = 3;
+}
+
+// CloseGraphPathQueryRequest is the request type for GraphPathQuery Close.
+message CloseGraphPathQueryRequest {}
+
+// CloseGraphPathQueryResponse is the response type for GraphPathQuery Close.
+message CloseGraphPathQueryResponse {}
+
+service ObjectStateResourceService {
+  rpc GetKey(GetKeyRequest) returns (GetKeyResponse);
+
+  rpc GetRootRef(GetRootRefRequest) returns (GetRootRefResponse);
+
+  // GetModSeqno returns the World seqno after the last commit that changed
+  // the object.
+  rpc GetModSeqno(GetModSeqnoRequest) returns (GetModSeqnoResponse);
+
+  rpc SetRootRef(SetRootRefRequest) returns (SetRootRefResponse);
+
+  rpc AccessWorldState(AccessWorldStateRequest) returns (AccessWorldStateResponse);
+
+  rpc ApplyObjectOp(ApplyObjectOpRequest) returns (ApplyObjectOpResponse);
+
+  rpc IncrementRev(IncrementRevRequest) returns (IncrementRevResponse);
+
+  rpc WaitRev(WaitRevRequest) returns (WaitRevResponse);
+}
+
+// GetKeyRequest is the request type for GetKey.
+message GetKeyRequest {}
+
+// GetKeyResponse is the response type for GetKey.
+message GetKeyResponse {
+  // ObjectKey is the unique identifier of the object within the world.
+  string object_key = 1;
+}
+
+// GetRootRefRequest is the request type for GetRootRef.
+message GetRootRefRequest {}
+
+// GetRootRefResponse is the response type for GetRootRef.
+message GetRootRefResponse {
+  // RootRef is the reference to the object's root data.
+  .bucket.ObjectRef root_ref = 1;
+  // Rev is the revision number when this reference was retrieved.
+  uint64 rev = 2;
+}
+
+// GetModSeqnoRequest is the request type for GetModSeqno.
+message GetModSeqnoRequest {}
+
+// GetModSeqnoResponse is the response type for GetModSeqno.
+message GetModSeqnoResponse {
+  // ModSeqno is the World seqno after the last commit that changed the
+  // object. Zero when the World cannot report it.
+  uint64 mod_seqno = 1;
+}
+
+// SetRootRefRequest is the request type for SetRootRef.
+message SetRootRefRequest {
+  // RootRef is the new reference to set as the object's root data.
+  .bucket.ObjectRef root_ref = 1;
+}
+
+// SetRootRefResponse is the response type for SetRootRef.
+message SetRootRefResponse {
+  // Rev is the revision number after the update.
+  uint64 rev = 1;
+}
+
+// ApplyObjectOpRequest is the request type for ApplyObjectOp.
+message ApplyObjectOpRequest {
+  // OpTypeId is the operation type identifier.
+  string op_type_id = 1;
+  // OpData is the encoded operation body.
+  bytes op_data = 2;
+  // OpSender is the peer ID of the sender applying the operation.
+  string op_sender = 3;
+}
+
+// ApplyObjectOpResponse is the response type for ApplyObjectOp.
+message ApplyObjectOpResponse {
+  // Rev is the revision number following the operation execution.
+  uint64 rev = 1;
+  // SysErr indicates if the error is a transient system error.
+  bool sys_err = 2;
+  // ErrorCode identifies a typed operation error when the RPC succeeds.
+  WorldErrorCode error_code = 3;
+  // RejectionCode is a stable application-defined rejection code.
+  string rejection_code = 4;
+  // RejectionMessage is the safe explanation of a rejected operation.
+  string rejection_message = 5;
+}
+
+// IncrementRevRequest is the request type for IncrementRev.
+message IncrementRevRequest {}
+
+// IncrementRevResponse is the response type for IncrementRev.
+message IncrementRevResponse {
+  // Rev is the revision number after the increment.
+  uint64 rev = 1;
+}
+
+// WaitRevRequest is the request type for WaitRev.
+message WaitRevRequest {
+  // Rev is the minimum revision number to wait for.
+  uint64 rev = 1;
+  // IgnoreNotFound waits for the object to exist if it doesn't.
+  bool ignore_not_found = 2;
+}
+
+// WaitRevResponse is the response type for WaitRev.
+message WaitRevResponse {
+  // Rev is the revision number when the wait condition was satisfied.
+  uint64 rev = 1;
+}
+
+// TypedObjectResourceService exposes typed children within the mounted World's authority.
+service TypedObjectResourceService {
+  // AccessTypedObject returns one typed child or fails if the object or handler is absent.
+  // Mount retirement that prevents acquisition is reported in the response's
+  // ErrorCode, independently of ResourceClient release notification delivery.
+  rpc AccessTypedObject(AccessTypedObjectRequest) returns (AccessTypedObjectResponse);
+
+  // WatchTypedObject reports initial and changing typed-handler availability.
+  // Live Worlds follow object creation, type changes and deletion; immutable
+  // World snapshots retain their object state while handler availability changes.
+  // Loss or replacement releases the previous child before the next snapshot.
+  // Canceling the stream releases its lookup demand and current child.
+  // The stream never invokes or replays methods on a typed child.
+  rpc WatchTypedObject(WatchTypedObjectRequest) returns (stream WatchTypedObjectResponse);
+}
+
+// AccessTypedObjectRequest is the request type for AccessTypedObject.
+message AccessTypedObjectRequest {
+  // ObjectKey is the key of the object to access.
+  string object_key = 1;
+}
+
+// AccessTypedObjectResponse is the response type for AccessTypedObject.
+message AccessTypedObjectResponse {
+  // ResourceId is the ID of the typed resource.
+  // The resource implements the RPC service appropriate for the object type.
+  uint32 resource_id = 1;
+  // TypeId is the type identifier of the object.
+  string type_id = 2;
+  // ErrorCode reports acquisition prevented by the exact granting mount's
+  // retirement. A failed acquisition returns no ResourceId or TypeId.
+  WorldErrorCode error_code = 3;
+}
+
+// WatchTypedObjectRequest selects an object within the mounted World and registry scope.
+message WatchTypedObjectRequest {
+  // ObjectKey identifies the object whose typed handler is watched.
+  string object_key = 1;
+}
+
+// WatchTypedObjectResponse describes the current typed-handler generation or its absence.
+message WatchTypedObjectResponse {
+  // ResourceId identifies a child bound to this handler generation, or zero if
+  // the object, its type or its handler is absent. Each available generation
+  // receives a new child; the child implements the RPC service for TypeId.
+  // The consumer adopts and releases its reference; the watch also releases
+  // the child on loss, replacement or cancellation, including adopted children.
+  uint32 resource_id = 1;
+  // TypeId identifies the object's type even when its handler is absent.
+  // It is empty when the object is absent or has no type.
+  string type_id = 2;
+}
+
+// ObjectRecordBase identifies a previous immutable root for one watched collection.
+message ObjectRecordBase {
+  // ObjectKey identifies the collection object in this World.
+  string object_key = 1;
+  // RootRef is the immutable root from the previous query snapshot.
+  .bucket.ObjectRef root_ref = 2;
+}
+
+// CompareObjectRecordsRequest selects previous roots to compare with this snapshot.
+message CompareObjectRecordsRequest {
+  // Bases contains at most 256 watched collection roots.
+  repeated ObjectRecordBase bases = 1;
+}
+
+// ObjectRecordChanges lists changed keys without materializing unchanged records.
+message ObjectRecordChanges {
+  // ObjectKey identifies the requested collection.
+  string object_key = 1;
+  // Keys contains inserted, deleted, and changed record keys.
+  repeated bytes keys = 2;
+  // Unknown requires full reevaluation when a root is unavailable or the comparison exceeds its bounds.
+  bool unknown = 3;
+}
+
+// CompareObjectRecordsResponse contains one result per requested base, in request order.
+message CompareObjectRecordsResponse {
+  // Changes corresponds to Bases in request order.
+  repeated ObjectRecordChanges changes = 1;
+}

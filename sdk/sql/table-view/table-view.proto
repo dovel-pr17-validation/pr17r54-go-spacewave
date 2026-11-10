@@ -1,0 +1,110 @@
+syntax = "proto3";
+package s4wave.sql.table_view;
+
+import "github.com/s4wave/spacewave/db/sql/sql.proto";
+import "github.com/aperturerobotics/common/typeid/typeid.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/sql/table-view;s4wave_sql_table_view";
+
+// TableView is a standalone saved table projection and filter.
+message TableView {
+  option (typeid.id) = "sql/table-view";
+
+  // TargetSchemaObjectKey is the sql/schema object this view reads from.
+  string target_schema_object_key = 1;
+  // TargetTableName is the table name inside the target schema.
+  string target_table_name = 2;
+  // WhereExpression is an optional SQL WHERE expression.
+  string where_expression = 3;
+  // ProjectedColumns limits returned columns. Empty selects all columns.
+  repeated string projected_columns = 4;
+  // SortOrder orders returned rows.
+  repeated SortOrder sort_order = 5;
+  // RowLimit limits returned rows. Zero uses the default limit.
+  uint32 row_limit = 6;
+  // WhereParameters are positional bind arguments used by WhereExpression.
+  repeated .sql.SqlValue where_parameters = 7;
+  // DisplayName is an optional user-facing label.
+  string display_name = 8;
+  // Description is optional user-facing metadata.
+  string description = 9;
+}
+
+// SortOrder describes one ORDER BY term.
+message SortOrder {
+  // ColumnName is the column to sort.
+  string column_name = 1;
+  // Descending sorts the column descending when true.
+  bool descending = 2;
+}
+
+// SqlTableViewResourceService exposes a SQL table view world object.
+service SqlTableViewResourceService {
+  // GetTableView returns the table view metadata.
+  rpc GetTableView(GetTableViewRequest) returns (GetTableViewResponse);
+  // GetDriverCapability returns SQL driver operations available to this view.
+  rpc GetDriverCapability(GetDriverCapabilityRequest) returns (GetDriverCapabilityResponse);
+  // FetchRows executes the table view SELECT.
+  rpc FetchRows(FetchRowsRequest) returns (FetchRowsResponse);
+  // UpdateRow applies a typed UPDATE against rows matching the supplied row values.
+  rpc UpdateRow(UpdateRowRequest) returns (UpdateRowResponse);
+}
+
+// GetTableViewRequest is a request for table view metadata.
+message GetTableViewRequest {}
+
+// GetTableViewResponse contains table view metadata.
+message GetTableViewResponse {
+  // TableView is the persisted table view block.
+  TableView table_view = 1;
+}
+
+// GetDriverCapabilityRequest is a request for driver operation support.
+message GetDriverCapabilityRequest {}
+
+// GetDriverCapabilityResponse contains update support reported by the target driver.
+message GetDriverCapabilityResponse {
+  // Capability describes SQL operations available through the target driver.
+  DriverCapability capability = 1;
+}
+
+// DriverCapability describes SQL driver operations exposed by this table view.
+message DriverCapability {
+  // UpdateRow is true when typed row updates can be attempted.
+  bool update_row = 1;
+  // UpdateRowUnsupportedReason explains why UpdateRow is unavailable.
+  string update_row_unsupported_reason = 2;
+}
+
+// FetchRowsRequest executes the saved table view.
+message FetchRowsRequest {}
+
+// FetchRowsResponse contains rows returned by the table view.
+message FetchRowsResponse {
+  // Columns describes the returned columns.
+  repeated .sql.ColumnSchema columns = 1;
+  // RowBatches stores returned rows in column order.
+  repeated .sql.RowBatch row_batches = 2;
+  // RowCount is the number of returned rows.
+  uint64 row_count = 3;
+  // Truncated indicates rows were omitted by the view row limit.
+  bool truncated = 4;
+}
+
+// UpdateRowRequest updates table rows selected by typed match values.
+message UpdateRowRequest {
+  // MatchColumns names columns used in the WHERE clause.
+  repeated string match_columns = 1;
+  // MatchValues are compared with MatchColumns in order.
+  repeated .sql.SqlValue match_values = 2;
+  // SetColumns names columns updated by the SET clause.
+  repeated string set_columns = 3;
+  // SetValues are assigned to SetColumns in order.
+  repeated .sql.SqlValue set_values = 4;
+}
+
+// UpdateRowResponse is returned after a typed row update.
+message UpdateRowResponse {
+  // RowsAffected is the number of rows updated by the driver.
+  uint64 rows_affected = 1;
+}

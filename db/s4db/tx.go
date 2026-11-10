@@ -1,0 +1,499 @@
+package s4db
+
+import (
+	"bytes"
+	"context"
+	"slices"
+	"sync/atomic"
+
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/tidwall/btree"
+)
+
+// tentry is one buffered change of a write transaction.
+type tentry struct {
+	// key is the key.
+	key []byte
+	// data is the value of a set.
+	data []byte
+	// del deletes the key.
+	del bool
+	// expect is the offset of the value a cleaner's move replaces; the move
+	// applies only while the key still holds it. Zero for a transaction's
+	// own changes.
+	expect uint64
+}
+
+// lessTentry orders changes by key.
+func lessTentry(a, b tentry) bool {
+	return bytes.Compare(a.key, b.key) < 0
+}
+
+// newChanges returns an empty change buffer.
+func newChanges() *btree.BTreeG[tentry] {
+	return btree.NewBTreeGOptions(lessTentry, btree.Options{NoLocks: true})
+}
+
+// Tx is a transaction on one snapshot. A write transaction buffers its
+// changes and holds the writer lock, or, opened optimistically, records what
+// it reads and takes the lock only at Commit.
+type Tx struct {
+	// db is the database.
+	db *DB
+	// st is the snapshot.
+	st *state
+	// stripe is the counter of st holding the snapshot.
+	stripe int
+	// changes buffers the writes of a write transaction; nil when read-only.
+	changes *btree.BTreeG[tentry]
+	// reads records the snapshot reads of an optimistic write transaction;
+	// nil otherwise.
+	reads *readSet
+	// atCommit holds the writes an optimistic transaction deferred to its
+	// commit, in order.
+	atCommit []func(context.Context, kvtx.Tx) error
+	// committed is the seq a commit that wrote changes published.
+	committed uint64
+	// done is set after Commit or Discard.
+	done bool
+}
+
+// Size returns the number of keys.
+func (t *Tx) Size(ctx context.Context) (uint64, error) {
+	// A finished transaction has no snapshot.
+	if t.done {
+		return 0, kvtx.ErrDiscarded
+	}
+	if t.reads != nil {
+		t.reads.all = true
+	}
+
+	// Adjust the snapshot's count by each buffered change that adds or
+	// removes a key.
+	n := t.st.m.count
+	var err error
+	if t.changes != nil {
+		t.changes.Scan(func(c tentry) bool {
+			var found bool
+			_, found, err = t.db.lookup(t.st, c.key)
+			switch {
+			case err != nil:
+				return false
+			case found && c.del:
+				n--
+			case !found && !c.del:
+				n++
+			}
+			return true
+		})
+	}
+	return uint64(max(n, 0)), err
+}
+
+// Get returns the value of key. The caller owns the returned bytes.
+func (t *Tx) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
+	// Check the transaction and key.
+	switch {
+	case t.done:
+		return nil, false, kvtx.ErrDiscarded
+	case len(key) == 0:
+		return nil, false, kvtx.ErrEmptyKey
+	}
+
+	// A buffered change decides the key.
+	if t.changes != nil {
+		if c, ok := t.changes.Get(tentry{key: key}); ok {
+			return bytes.Clone(c.data), !c.del, nil
+		}
+	}
+
+	// Otherwise read the snapshot. A reference is read into a new buffer,
+	// and an inline value is copied out of the shared memory.
+	t.read(key)
+	v, found, err := t.db.lookup(t.st, key)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	data, err := t.db.readValue(v)
+	if err != nil {
+		return nil, false, err
+	}
+	if !v.isRef() {
+		data = bytes.Clone(data)
+	}
+	return data, true, nil
+}
+
+// GetBatch returns owned values in caller order. Buffered changes decide
+// their keys; the rest are read from the snapshot in key order, so adjacent
+// keys share blocks, with up to lookupInFlight index and value reads in
+// flight.
+func (t *Tx) GetBatch(ctx context.Context, keys [][]byte) ([][]byte, []bool, error) {
+	// Check the transaction and keys.
+	if t.done {
+		return nil, nil, kvtx.ErrDiscarded
+	}
+	for _, key := range keys {
+		if len(key) == 0 {
+			return nil, nil, kvtx.ErrEmptyKey
+		}
+	}
+
+	// Answer the buffered changes, and order the rest by key.
+	values := make([][]byte, len(keys))
+	found := make([]bool, len(keys))
+	var order []int
+	for i, key := range keys {
+		if t.changes != nil {
+			if c, ok := t.changes.Get(tentry{key: key}); ok {
+				values[i], found[i] = bytes.Clone(c.data), !c.del
+				continue
+			}
+		}
+		order = append(order, i)
+	}
+	slices.SortFunc(order, func(i, j int) int { return bytes.Compare(keys[i], keys[j]) })
+
+	// Look the rest up and read their values into the caller's slots. A
+	// reference is read into a new buffer, and an inline value is copied out
+	// of the shared memory.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	sorted := make([][]byte, len(order))
+	for j, i := range order {
+		sorted[j] = keys[i]
+		t.read(keys[i])
+	}
+	err := t.db.lookupEach(t.st, sorted, true, func(j int, v value, ok bool) error {
+		// Read a found key's value; an absent key keeps its empty slot.
+		if !ok {
+			return nil
+		}
+		data, err := t.db.readValue(v)
+		if err != nil {
+			return err
+		}
+		if !v.isRef() {
+			data = bytes.Clone(data)
+		}
+		values[order[j]], found[order[j]] = data, true
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return values, found, nil
+}
+
+// Exists reports whether key is present.
+func (t *Tx) Exists(ctx context.Context, key []byte) (bool, error) {
+	// Require an active transaction and a nonempty key.
+	switch {
+	case t.done:
+		return false, kvtx.ErrDiscarded
+	case len(key) == 0:
+		return false, kvtx.ErrEmptyKey
+	}
+
+	// Let a buffered change decide presence before reading the snapshot.
+	if t.changes != nil {
+		if c, ok := t.changes.Get(tentry{key: key}); ok {
+			return !c.del, nil
+		}
+	}
+
+	// Test presence in the pinned snapshot.
+	t.read(key)
+	_, found, err := t.db.lookup(t.st, key)
+	return found, err
+}
+
+// Set buffers a write of key.
+func (t *Tx) Set(ctx context.Context, key, value []byte) error {
+	// Validate the transaction, key, and value before retaining the write.
+	if err := t.writable(key); err != nil {
+		return err
+	}
+	if int64(len(value)) > MaxValueSize {
+		return ErrValueTooLarge
+	}
+
+	// Retain independent bytes until the transaction commits or discards.
+	t.changes.Set(tentry{key: bytes.Clone(key), data: bytes.Clone(value)})
+	return nil
+}
+
+// Delete buffers a deletion of key.
+func (t *Tx) Delete(ctx context.Context, key []byte) error {
+	if err := t.writable(key); err != nil {
+		return err
+	}
+	t.changes.Set(tentry{key: bytes.Clone(key), del: true})
+	return nil
+}
+
+// read records a snapshot read of key in an optimistic transaction.
+func (t *Tx) read(key []byte) {
+	if t.reads != nil {
+		t.reads.addKey(key)
+	}
+}
+
+// writable checks that the transaction may write key.
+func (t *Tx) writable(key []byte) error {
+	switch {
+	case t.done:
+		return kvtx.ErrDiscarded
+	case t.changes == nil:
+		return kvtx.ErrNotWrite
+	case len(key) == 0:
+		return kvtx.ErrEmptyKey
+	case len(key) > MaxKeySize:
+		return ErrKeyTooLong
+	}
+	return nil
+}
+
+// ScanPrefix calls cb with each key and value under prefix in key order.
+func (t *Tx) ScanPrefix(ctx context.Context, prefix []byte, cb func(key, value []byte) error) error {
+	// Hold an iterator over the snapshot and buffered changes.
+	it := t.iterate(prefix, false)
+	defer it.Close()
+
+	// Deliver the prefix's key and value pairs in key order.
+	for it.Next() {
+		v, err := it.Value()
+		if err != nil {
+			return err
+		}
+		if err := cb(it.Key(), v); err != nil {
+			return err
+		}
+	}
+	return it.Err()
+}
+
+// ScanPrefixKeys calls cb with each key under prefix in key order.
+func (t *Tx) ScanPrefixKeys(ctx context.Context, prefix []byte, cb func(key []byte) error) error {
+	// Hold an iterator over the snapshot and buffered changes.
+	it := t.iterate(prefix, false)
+	defer it.Close()
+
+	// Deliver the prefix's keys in key order.
+	for it.Next() {
+		if err := cb(it.Key()); err != nil {
+			return err
+		}
+	}
+	return it.Err()
+}
+
+// ScanPrefixLens calls cb with each key under prefix and its value's length in
+// key order. It reads only the index, never a value chunk, so a scan of a
+// large file costs its index rather than its values.
+func (t *Tx) ScanPrefixLens(ctx context.Context, prefix []byte, cb func(key []byte, n int) error) error {
+	// Hold an iterator over the snapshot and buffered changes.
+	it := t.iterate(prefix, false)
+	defer it.Close()
+
+	// Deliver the prefix's keys and value lengths in key order.
+	for it.Next() {
+		if err := cb(it.Key(), it.ValueLen()); err != nil {
+			return err
+		}
+	}
+	return it.Err()
+}
+
+// Iterate returns an iterator over keys under prefix, always in key order.
+func (t *Tx) Iterate(ctx context.Context, prefix []byte, sort, reverse bool) kvtx.Iterator {
+	return t.iterate(prefix, reverse)
+}
+
+// iterate returns an iterator over keys under prefix, failing at once when
+// the transaction is done.
+func (t *Tx) iterate(prefix []byte, reverse bool) *Iterator {
+	if t.reads != nil {
+		t.reads.addPrefix(prefix)
+	}
+	it := newIterator(t.db, t.st, t.changes, prefix, reverse)
+	if t.done {
+		it.err = kvtx.ErrDiscarded
+	}
+	return it
+}
+
+// Commit writes the changes and returns once they are durable, or commits
+// them ordered when ctx carries kvtx.WithOrderedCommitContext.
+func (t *Tx) Commit(ctx context.Context) error {
+	return t.commit(ctx, kvtx.IsOrderedCommitContext(ctx))
+}
+
+// CommitOrdered writes the changes ordered after earlier commits without
+// waiting for the drive to persist them. The next durable commit, or the
+// deadline flush, makes them durable.
+func (t *Tx) CommitOrdered(ctx context.Context) error {
+	return t.commit(ctx, true)
+}
+
+// commit finishes the transaction, writing its changes.
+func (t *Tx) commit(ctx context.Context, ordered bool) error {
+	// A read-only transaction has nothing to write.
+	if t.done {
+		return kvtx.ErrDiscarded
+	}
+	if t.changes == nil {
+		t.Discard()
+		return nil
+	}
+
+	// Take the writer lock now for an optimistic transaction, moving it onto
+	// the current state when its reads still hold there, then run the writes
+	// it deferred to this point.
+	db := t.db
+	if t.reads != nil {
+		// Reads alone serialize at the snapshot. A durable commit still
+		// makes the commits its snapshot holds durable, as a locked one
+		// does, so a caller that commits to flush what came before gets it.
+		if t.changes.Len() == 0 && len(t.atCommit) == 0 {
+			seq := t.st.seq
+			t.Discard()
+			if ordered {
+				return nil
+			}
+			return db.flush.syncThrough(ctx, seq)
+		}
+		if err := t.lockValidated(ctx); err != nil {
+			t.done = true
+			db.endWrite()
+			return err
+		}
+		t.reads = nil
+		for _, fn := range t.atCommit {
+			if err := fn(ctx, t); err != nil {
+				t.Discard()
+				return err
+			}
+		}
+		t.atCommit = nil
+	}
+
+	// Collect the changes in key order.
+	t.done = true
+	changes := make([]tentry, 0, t.changes.Len())
+	t.changes.Scan(func(c tentry) bool {
+		changes = append(changes, c)
+		return true
+	})
+
+	// Write them against the published state, which the writer lock keeps
+	// current, then release the snapshot and the lock.
+	defer db.endWrite()
+	if db.sched != nil {
+		defer db.sched.fg.begin()()
+	}
+	err := db.w.commit(ctx, db.cur.Load(), changes, false)
+	db.release(t.st, t.stripe)
+	seq := db.cur.Load().seq
+	db.w.unlock()
+	if err != nil {
+		return err
+	}
+
+	// Record the published seq, then make it durable unless ordered.
+	t.committed = seq
+	if ordered {
+		raiseSeq(&db.orderedSeq, seq)
+		db.flush.ordered()
+		return nil
+	}
+
+	// Flush outside the writer lock, sharing the flush with concurrent
+	// commits.
+	return db.flush.syncThrough(ctx, seq)
+}
+
+// Discard ends the transaction without writing.
+func (t *Tx) Discard() {
+	// Leave an already finished transaction alone.
+	if t.done {
+		return
+	}
+
+	// Release the snapshot and any writer lock without publishing changes.
+	t.done = true
+	t.db.release(t.st, t.stripe)
+	if t.changes != nil {
+		if t.reads == nil {
+			t.db.w.unlock()
+		}
+		t.db.endWrite()
+	}
+}
+
+// lockValidated takes the writer lock for an optimistic transaction and
+// moves it onto the state the lock caught up to, when no commit since its
+// snapshot changed a key it read. Otherwise it releases the lock and the
+// snapshot and returns kvtx.ErrConflict.
+func (t *Tx) lockValidated(ctx context.Context) error {
+	// Take the lock and the state it caught up to, in place of the
+	// snapshot.
+	db := t.db
+	if err := db.w.lock(ctx); err != nil {
+		db.release(t.st, t.stripe)
+		return err
+	}
+	snap := t.st
+	base, stripe := db.acquire()
+	conflict := changedSince(snap, base, t.reads)
+	db.release(snap, t.stripe)
+	t.st, t.stripe = base, stripe
+
+	// Refuse the commit when a later commit changed what it read.
+	if conflict {
+		db.release(base, stripe)
+		db.w.unlock()
+		return kvtx.ErrConflict
+	}
+	return nil
+}
+
+// AtCommit defers fn to the commit of an optimistic transaction, after its
+// reads validate, holding the writer lock, against the current state and this
+// transaction's writes. A transaction holding the lock runs fn at once.
+func (t *Tx) AtCommit(ctx context.Context, fn func(context.Context, kvtx.Tx) error) error {
+	// Require a live write transaction.
+	switch {
+	case t.done:
+		return kvtx.ErrDiscarded
+	case t.changes == nil:
+		return kvtx.ErrNotWrite
+	}
+
+	// Run fn now under the lock, or keep it for the commit.
+	if t.reads == nil {
+		return fn(ctx, t)
+	}
+	t.atCommit = append(t.atCommit, fn)
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ kvtx.OrderedCommitTx = (*Tx)(nil)
+	_ kvtx.BatchTxOps      = (*Tx)(nil)
+	_ kvtx.AtCommitTxOps   = (*Tx)(nil)
+)
+
+// raiseSeq raises v to seq unless it holds a newer one already. Commits
+// record their seq after leaving the writer lock, so they can arrive out of
+// order.
+func raiseSeq(v *atomic.Uint64, seq uint64) {
+	for {
+		cur := v.Load()
+		if cur >= seq || v.CompareAndSwap(cur, seq) {
+			return
+		}
+	}
+}

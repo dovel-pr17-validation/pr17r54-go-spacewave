@@ -1,0 +1,189 @@
+package s4wave_canvas
+
+import (
+	"context"
+	"maps"
+	"slices"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/kvtx"
+	block_kvtx "github.com/s4wave/spacewave/db/kvtx/block"
+)
+
+// UnmarshalCanvasState reads the Canvas DAG and returns the logical RPC state.
+func UnmarshalCanvasState(ctx context.Context, bcs *block.Cursor) (*CanvasState, error) {
+	storage, err := UnmarshalCanvasStorage(ctx, bcs)
+	if err != nil {
+		return nil, err
+	}
+	if err := storage.Validate(); err != nil {
+		return nil, err
+	}
+	return materializeCanvasStorage(ctx, bcs, storage)
+}
+
+func materializeCanvasStorage(
+	ctx context.Context,
+	bcs *block.Cursor,
+	storage *CanvasStorage,
+) (*CanvasState, error) {
+	// Clone the Canvas storage metadata and open its node index.
+	state := &CanvasState{
+		Nodes:            make(map[string]*CanvasNode),
+		Edges:            cloneCanvasEdges(storage.GetEdges()),
+		StrokeTreeRef:    append([]byte(nil), storage.GetStrokeTreeRef()...),
+		HiddenGraphLinks: cloneHiddenGraphLinks(storage.GetHiddenGraphLinks()),
+		LayoutMetadata:   cloneCanvasLayoutMetadata(storage.GetLayoutMetadata()),
+	}
+	nodes, err := block_kvtx.BuildKvTransaction(ctx, bcs.FollowSubBlock(1), false)
+	if err != nil {
+		return nil, err
+	}
+	defer nodes.Discard()
+
+	// Read each indexed Canvas node into the logical state.
+	it := nodes.BlockIterate(ctx, nil, false, false)
+	defer it.Close()
+	for it.Next() {
+		node, err := block.UnmarshalBlock[CanvasNode](ctx, it.ValueCursor())
+		if err != nil {
+			return nil, err
+		}
+		state.Nodes[string(it.Key())] = node
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+// WriteCanvasState writes a complete logical Canvas state through the
+// pluggable block KVTX node index. Previous must be the complete logical state
+// read from the same object root. A nil previous value reloads that state.
+func WriteCanvasState(
+	ctx context.Context,
+	bcs *block.Cursor,
+	previous *CanvasState,
+	next *CanvasState,
+) error {
+	// Load the current Canvas storage and normalize the requested state.
+	if next == nil {
+		next = &CanvasState{}
+	}
+	storage, current, err := loadCanvasStorageForWrite(ctx, bcs, previous)
+	if err != nil {
+		return err
+	}
+
+	// Replace the Canvas edges, strokes, graph links, and layout metadata.
+	storage.Edges = cloneCanvasEdges(next.GetEdges())
+	storage.StrokeTreeRef = append(storage.StrokeTreeRef[:0], next.GetStrokeTreeRef()...)
+	storage.HiddenGraphLinks = cloneHiddenGraphLinks(next.GetHiddenGraphLinks())
+	storage.LayoutMetadata = cloneCanvasLayoutMetadata(next.GetLayoutMetadata())
+	bcs.SetBlock(storage, true)
+
+	// Open the Canvas node index for changes.
+	nodes, err := block_kvtx.BuildKvTransaction(ctx, bcs.FollowSubBlock(1), true)
+	if err != nil {
+		return err
+	}
+	defer nodes.Discard()
+
+	// Write the Canvas nodes whose contents changed.
+	for _, id := range slices.Sorted(maps.Keys(next.GetNodes())) {
+		node := next.GetNodes()[id]
+		if old := current.GetNodes()[id]; old != nil && old.EqualVT(node) {
+			continue
+		}
+		if err := setCanvasNode(ctx, nodes, id, node); err != nil {
+			return err
+		}
+	}
+
+	// Remove Canvas nodes absent from the requested state.
+	for _, id := range slices.Sorted(maps.Keys(current.GetNodes())) {
+		if _, ok := next.GetNodes()[id]; ok {
+			continue
+		}
+		if _, err := nodes.DeleteCursorAtKey(ctx, []byte(id)); err != nil {
+			return err
+		}
+	}
+	return nodes.Commit(ctx)
+}
+
+func loadCanvasStorageForWrite(
+	ctx context.Context,
+	bcs *block.Cursor,
+	previous *CanvasState,
+) (*CanvasStorage, *CanvasState, error) {
+	// Initialize empty Canvas storage when the root has no block.
+	if bcs.GetRef().GetEmpty() {
+		storage := NewCanvasStorage()
+		bcs.SetBlock(storage, true)
+		return storage, &CanvasState{}, nil
+	}
+
+	// Validate the stored Canvas root and recover any missing previous state.
+	storage, err := UnmarshalCanvasStorage(ctx, bcs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := storage.Validate(); err != nil {
+		return nil, nil, err
+	}
+	if previous == nil {
+		previous, err = materializeCanvasStorage(ctx, bcs, storage)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return storage, previous, nil
+}
+
+func setCanvasNode(ctx context.Context, nodes kvtx.BlockTx, id string, node *CanvasNode) error {
+	// Remove a missing Canvas node or replace its indexed block.
+	if node == nil {
+		_, err := nodes.DeleteCursorAtKey(ctx, []byte(id))
+		return err
+	}
+	cursor := nodes.GetCursor().Detach(false)
+	cursor.ClearAllRefs()
+	cursor.SetBlock(node.CloneVT(), true)
+	return nodes.SetCursorAtKey(ctx, []byte(id), cursor, false)
+}
+
+func cloneCanvasEdges(edges []*CanvasEdge) []*CanvasEdge {
+	cloned := make([]*CanvasEdge, len(edges))
+	for i, edge := range edges {
+		if edge != nil {
+			cloned[i] = edge.CloneVT()
+		}
+	}
+	return cloned
+}
+
+func cloneHiddenGraphLinks(links []*HiddenGraphLink) []*HiddenGraphLink {
+	cloned := make([]*HiddenGraphLink, len(links))
+	for i, link := range links {
+		if link != nil {
+			cloned[i] = link.CloneVT()
+		}
+	}
+	return cloned
+}
+
+func cloneCanvasLayoutMetadata(metadata map[string]*CanvasLayoutMetadata) map[string]*CanvasLayoutMetadata {
+	if metadata == nil {
+		return nil
+	}
+	cloned := make(map[string]*CanvasLayoutMetadata, len(metadata))
+	for id, item := range metadata {
+		if item != nil {
+			cloned[id] = item.CloneVT()
+		} else {
+			cloned[id] = nil
+		}
+	}
+	return cloned
+}

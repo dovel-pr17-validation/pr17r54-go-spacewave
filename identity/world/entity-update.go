@@ -1,0 +1,118 @@
+package identity_world
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/identity"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// NewEntityUpdateOp constructs a new EntityUpdateOp block.
+func NewEntityUpdateOp(entityRef *bucket.ObjectRef) *EntityUpdateOp {
+	return &EntityUpdateOp{
+		EntityRef: entityRef,
+	}
+}
+
+// StoreEntity stores an entity to an object using EntityUpdate.
+// Returns seqno, sysErr, error.
+func StoreEntity(
+	ctx context.Context,
+	w world.WorldState,
+	sender peer.ID,
+	entity *identity.Entity,
+) (uint64, bool, error) {
+	domainID, entityID := entity.GetDomainId(), entity.GetEntityId()
+	key := NewEntityKey(domainID, entityID)
+	return storeBlockUpdate(ctx, w, sender, key, entity, func(ref *bucket.ObjectRef) world.Operation {
+		return NewEntityUpdateOp(ref)
+	})
+}
+
+// Validate performs cursory validation of the operation.
+// Should not block.
+func (o *EntityUpdateOp) Validate() error {
+	if err := o.GetEntityRef().Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *EntityUpdateOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Resolve the entity object key and validation for the reference update.
+	entityRef := o.GetEntityRef()
+	resolve := func(ctx context.Context) (string, func() error, error) {
+		// Read the referenced entity and derive its World object key.
+		entity, err := FollowEntity(ctx, worldHandle.AccessWorldState, entityRef)
+		if err != nil || entity == nil {
+			return "", nil, err
+		}
+		validate := func() error { return nil }
+		domainID, entityID := entity.GetDomainId(), entity.GetEntityId()
+		return NewEntityKey(domainID, entityID), validate, nil
+	}
+
+	// Apply the entity reference to the resolved World object.
+	if _, err := applyRefUpdate(ctx, worldHandle, entityRef, EntityTypeID, resolve); err != nil {
+		return false, err
+	}
+
+	// Re-resolve the entity to link its keypairs and domain info.
+	entity, err := FollowEntity(ctx, worldHandle.AccessWorldState, entityRef)
+	if err != nil {
+		return false, err
+	}
+
+	// Persist newly referenced keypairs and collect their object keys.
+	entityKps, err := entity.UnmarshalVerifyKeypairs()
+	if err != nil {
+		return false, err
+	}
+	kps := make([]*identity.Keypair, len(entityKps))
+	for i, ekp := range entityKps {
+		kps[i] = ekp.GetKeypair()
+	}
+	kpObjectKeys, err := EnsureKeypairsExist(ctx, worldHandle, sender, kps, false)
+	if err != nil {
+		return false, err
+	}
+
+	// Derive the entity object key for its graph links.
+	domainID, entityID := entity.GetDomainId(), entity.GetEntityId()
+	objKey := NewEntityKey(domainID, entityID)
+
+	// Link the entity to each referenced keypair.
+	for _, kpObjKey := range kpObjectKeys {
+		kpQuad := NewObjectToKeypairQuad(objKey, kpObjKey)
+		if err := worldHandle.SetGraphQuad(ctx, kpQuad); err != nil {
+			return false, err
+		}
+	}
+
+	// Link the entity to its domain information when available.
+	diKey := NewDomainInfoKey(domainID)
+	objectState, diExists, err := worldHandle.GetObject(ctx, diKey)
+	world.ReleaseObjectState(objectState)
+	if err != nil {
+		return false, err
+	}
+	if diExists {
+		diQuad := NewEntityToDomainInfoQuad(objKey, diKey)
+		if err := worldHandle.SetGraphQuad(ctx, diQuad); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// _ is a type assertion
+var _ world.Operation = (*EntityUpdateOp)(nil)

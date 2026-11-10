@@ -1,0 +1,254 @@
+import { useCallback, useMemo } from 'react'
+import {
+  LuArrowRight,
+  LuBuilding2,
+  LuChevronRight,
+  LuLayers,
+  LuLogIn,
+  LuTriangleAlert,
+} from 'react-icons/lu'
+
+import { cn } from '@s4wave/web/style/utils.js'
+import { useBottomBarSetOpenMenu } from '@s4wave/web/frame/bottom-bar-context.js'
+import { useStateAtom, useStateNamespace } from '@s4wave/web/state/persist.js'
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from '@s4wave/web/ui/command.js'
+import { useVisibleQuickstartOptions } from '@s4wave/app/quickstart/useQuickstartOptions.js'
+import { useSessionNavigate } from '@s4wave/web/contexts/contexts.js'
+
+import { MissingBillingAccountBanner } from './MissingBillingAccountBanner.js'
+import { useOrgContainerState } from './OrgContainer.js'
+
+// OrganizationDashboard renders the main content area for an organization.
+// Mirrors SessionDashboard: command palette with space list and actions.
+export function OrganizationDashboard() {
+  const {
+    orgId,
+    orgName,
+    orgState,
+    degraded,
+    isOwner,
+    spaces,
+    billingAccountId,
+  } = useOrgContainerState()
+  const navigateSession = useSessionNavigate()
+  const setOpenMenu = useBottomBarSetOpenMenu()
+  const detailsNs = useStateNamespace(['org-details'])
+  const [, setOpenSection] = useStateAtom<string | null>(
+    detailsNs,
+    'open-section',
+    'members',
+  )
+  const isEmpty = spaces.length === 0
+
+  const handleSpaceClick = useCallback(
+    (spaceId: string) => {
+      navigateSession({ path: `org/${orgId}/so/${spaceId}` })
+    },
+    [navigateSession, orgId],
+  )
+
+  const handleCreateSpace = useCallback(
+    (quickstartId: string) => {
+      navigateSession({ path: `org/${orgId}/new/${quickstartId}` })
+    },
+    [navigateSession, orgId],
+  )
+
+  const handleJoinSpace = useCallback(() => {
+    navigateSession({ path: 'join' })
+  }, [navigateSession])
+  const handleIssueClick = useCallback(() => {
+    setOpenSection('recovery')
+    setOpenMenu?.('organization')
+  }, [setOpenMenu, setOpenSection])
+  const handleConfigureBilling = useCallback(() => {
+    navigateSession({ path: 'billing' })
+  }, [navigateSession])
+
+  const showMissingBillingBanner = !!orgState && !billingAccountId
+  const visibleQuickstartOptions = useVisibleQuickstartOptions()
+
+  // Filter quickstart options to space-creating ones (no account/pair/local).
+  const quickstartOptions = useMemo(
+    () =>
+      visibleQuickstartOptions.filter(
+        (opt) =>
+          opt.id !== 'account' && opt.id !== 'pair' && opt.id !== 'local',
+      ),
+    [visibleQuickstartOptions],
+  )
+
+  return (
+    <div className="bg-background-landing relative flex h-full w-full flex-col overflow-hidden">
+      {degraded && (
+        <button
+          type="button"
+          onClick={handleIssueClick}
+          className="border-destructive/20 bg-destructive/5 hover:bg-destructive/8 relative z-10 flex w-full items-center border-b text-left transition-colors"
+        >
+          <div className="flex min-w-0 flex-1 items-start gap-2 px-3 py-1.5">
+            <LuTriangleAlert className="text-destructive size-3.5 shrink-0" />
+            <div className="min-w-0">
+              <p className="text-foreground/80 text-xs font-medium">
+                Organization root unavailable.
+              </p>
+              <p className="text-foreground-alt/60 mt-0.5 text-xs">
+                Spaces stay available from the session inventory while you
+                review remediation options.
+              </p>
+            </div>
+          </div>
+          <div className="group flex shrink-0 items-center gap-1 px-3 py-1.5 transition-colors">
+            <span className="text-foreground/70 group-hover:text-foreground text-xs font-medium transition-colors">
+              Fix issue
+            </span>
+            <LuArrowRight className="text-foreground-alt group-hover:text-foreground size-3 shrink-0 transition-colors" />
+          </div>
+        </button>
+      )}
+
+      {showMissingBillingBanner && (
+        <MissingBillingAccountBanner
+          isOwner={isOwner}
+          onConfigureBilling={handleConfigureBilling}
+        />
+      )}
+
+      <div className="relative z-10 flex flex-1 flex-col items-center justify-center overflow-y-auto px-4 py-8">
+        <div className="mb-6 text-center">
+          <div
+            className={cn(
+              'bg-brand/10 text-brand mx-auto mb-3 flex items-center justify-center rounded-xl',
+              isEmpty ? 'size-12' : 'size-10',
+            )}
+          >
+            <LuBuilding2 className={isEmpty ? 'size-6' : 'size-5'} />
+          </div>
+          <h1
+            className={cn(
+              'text-foreground font-semibold tracking-tight',
+              isEmpty ? 'text-lg' : 'text-base',
+            )}
+          >
+            {orgName}
+          </h1>
+          <p className="text-foreground-alt/60 mt-1 text-xs">
+            {isEmpty ? 'Create a space to get started.' : 'Organization'}
+          </p>
+        </div>
+
+        <div className="w-full max-w-md">
+          <Command variant="dashboard">
+            <CommandInput
+              variant="dashboard"
+              placeholder={!isEmpty ? 'Search spaces...' : 'Get started...'}
+            />
+            <CommandList variant="transparent" className="overscroll-y-contain">
+              <CommandEmpty variant="dashboard">No results</CommandEmpty>
+
+              {!isEmpty && (
+                <CommandGroup
+                  heading={
+                    <span className="flex w-full items-center justify-between">
+                      <span>Spaces</span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleCreateSpace('drive')
+                        }}
+                        className="text-brand/70 hover:text-brand micro-ten cursor-pointer font-medium tracking-normal normal-case transition-colors"
+                      >
+                        + New Space
+                      </button>
+                    </span>
+                  }
+                  variant="compact"
+                >
+                  {spaces.map((space) => (
+                    <CommandItem
+                      key={space.id}
+                      value={`space-${space.displayName}-${space.id}`}
+                      variant="dashboard"
+                      className="mx-1"
+                      onSelect={() => handleSpaceClick(space.id ?? '')}
+                    >
+                      <div className="bg-brand/10 group-data-[selected=true]:bg-brand/20 flex size-7 shrink-0 items-center justify-center rounded-md transition-colors">
+                        <LuLayers className="text-brand size-3.5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-foreground truncate text-sm font-medium">
+                          {space.displayName || space.id}
+                        </div>
+                        {space.objectType && (
+                          <div className="text-foreground-alt/60 truncate text-xs">
+                            {space.objectType}
+                          </div>
+                        )}
+                      </div>
+                      <LuChevronRight className="text-foreground-alt/40 group-data-[selected=true]:text-foreground-alt size-4 shrink-0 transition-colors" />
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              )}
+
+              <CommandGroup
+                heading={isEmpty ? 'Get Started' : 'Create'}
+                variant="compact"
+              >
+                {quickstartOptions.map((opt) => (
+                  <CommandItem
+                    key={opt.id}
+                    value={`create-${opt.id}`}
+                    variant="dashboard"
+                    className="mx-1"
+                    onSelect={() => handleCreateSpace(opt.id)}
+                  >
+                    <div className="bg-foreground/5 group-data-[selected=true]:bg-foreground/10 flex size-7 shrink-0 items-center justify-center rounded-md transition-colors">
+                      <opt.icon className="text-foreground-alt size-3.5" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-foreground truncate text-sm font-medium">
+                        {opt.name}
+                      </div>
+                      <div className="text-foreground-alt/60 truncate text-xs">
+                        {opt.description}
+                      </div>
+                    </div>
+                    <LuChevronRight className="text-foreground-alt/40 group-data-[selected=true]:text-foreground-alt size-4 shrink-0 transition-colors" />
+                  </CommandItem>
+                ))}
+                <CommandItem
+                  value="join-space"
+                  variant="dashboard"
+                  className="mx-1"
+                  onSelect={handleJoinSpace}
+                >
+                  <div className="bg-foreground/5 group-data-[selected=true]:bg-foreground/10 flex size-7 shrink-0 items-center justify-center rounded-md transition-colors">
+                    <LuLogIn className="text-foreground-alt size-3.5" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-foreground truncate text-sm font-medium">
+                      Join Space
+                    </div>
+                    <div className="text-foreground-alt/60 truncate text-xs">
+                      Join a shared space via invite code or link
+                    </div>
+                  </div>
+                  <LuChevronRight className="text-foreground-alt/40 group-data-[selected=true]:text-foreground-alt size-4 shrink-0 transition-colors" />
+                </CommandItem>
+              </CommandGroup>
+            </CommandList>
+          </Command>
+        </div>
+      </div>
+    </div>
+  )
+}

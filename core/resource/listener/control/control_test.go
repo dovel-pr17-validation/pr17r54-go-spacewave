@@ -1,0 +1,292 @@
+//go:build !js
+
+package control
+
+import (
+	"context"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/pkg/errors"
+)
+
+// TestHandlerMetadata asserts the handler advertises the expected
+// service and method identifiers.
+func TestHandlerMetadata(t *testing.T) {
+	h := NewHandler(nil, func() {})
+	if got := h.GetServiceID(); got != ServiceID {
+		t.Fatalf("service id = %q, want %q", got, ServiceID)
+	}
+	methods := h.GetMethodIDs()
+	if len(methods) != 2 || methods[0] != ShutdownMethodID || methods[1] != YieldMethodID {
+		t.Fatalf("method ids = %v, want [%s %s]", methods, ShutdownMethodID, YieldMethodID)
+	}
+}
+
+// TestInvokeMethodIgnoresForeignRoutes asserts the handler returns
+// unmatched (false, nil) for services and methods it does not own, so
+// the mux keeps probing other handlers.
+func TestInvokeMethodIgnoresForeignRoutes(t *testing.T) {
+	// Create a handler whose shutdown callback must never receive foreign routes.
+	h := NewHandler(nil, func() { t.Fatal("callback fired for foreign route") })
+
+	// Require the daemon handler to leave a foreign service unmatched.
+	handled, err := h.InvokeMethod("other.service", ShutdownMethodID, nil)
+	if handled || err != nil {
+		t.Fatalf("foreign service: handled=%v err=%v", handled, err)
+	}
+
+	// Require the daemon handler to leave a foreign method unmatched.
+	handled, err = h.InvokeMethod(ServiceID, "Other", nil)
+	if handled || err != nil {
+		t.Fatalf("foreign method: handled=%v err=%v", handled, err)
+	}
+}
+
+// TestShutdownRoundTrip asserts the Shutdown RPC round-trips between a
+// starpc client and a handler-backed mux, and that the handler's
+// shutdown callback fires exactly once.
+func TestShutdownRoundTrip(t *testing.T) {
+	// Use the test lifetime for the daemon shutdown exchange.
+	ctx := t.Context()
+
+	// Bind the daemon socket and remove its path when the test ends.
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "daemon.sock")
+	lis, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() {
+		lis.Close()
+		_ = os.Remove(sock)
+	})
+
+	// Serve a daemon shutdown handler that reports callback completion.
+	shutdownCh := make(chan struct{}, 4)
+	mux := srpc.NewMux()
+	if err := mux.Register(NewHandler(nil, func() {
+		shutdownCh <- struct{}{}
+	})); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	server := srpc.NewServer(mux)
+	go func() {
+		// Accept and serve the requester through the shutdown handler.
+		conn, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		mp, err := srpc.NewMuxedConn(conn, false, nil)
+		if err != nil {
+			conn.Close()
+			return
+		}
+		_ = server.AcceptMuxedConn(ctx, mp)
+	}()
+
+	// Connect the requester to the daemon control socket.
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Request daemon shutdown with a bounded call lifetime.
+	callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer callCancel()
+	if err := RequestShutdown(callCtx, conn); err != nil {
+		t.Fatalf("request shutdown: %v", err)
+	}
+
+	// Require the daemon shutdown callback to complete.
+	select {
+	case <-shutdownCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown callback did not fire")
+	}
+}
+
+// TestYieldRequiresYieldPolicy asserts that a handler denies the Yield RPC
+// until its yield policy allows it, without affecting the Shutdown policy.
+func TestYieldRequiresYieldPolicy(t *testing.T) {
+	// Listen on the daemon socket.
+	ctx := t.Context()
+	sock := filepath.Join(t.TempDir(), "daemon.sock")
+	lis, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = lis.Close() })
+
+	// Serve a handler that allows Shutdown and reports its callback.
+	shutdownCh := make(chan struct{}, 1)
+	h := NewHandler(AutoAllowPolicy, func() { shutdownCh <- struct{}{} })
+	mux := srpc.NewMux()
+	if err := mux.Register(h); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	server := srpc.NewServer(mux)
+	go func() {
+		// Serve each requester until the listener closes.
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			mp, err := srpc.NewMuxedConn(conn, false, nil)
+			if err != nil {
+				conn.Close()
+				continue
+			}
+			go func() { _ = server.AcceptMuxedConn(ctx, mp) }()
+		}
+	}()
+
+	// requestYield sends one Yield RPC on a fresh connection.
+	requestYield := func() error {
+		// Dial the daemon and send the request with a bounded lifetime.
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer callCancel()
+		return RequestYield(callCtx, conn)
+	}
+
+	// The default yield policy denies the request.
+	var denyErr *DenyError
+	if err := requestYield(); !errors.As(err, &denyErr) {
+		t.Fatalf("default yield = %v, want DenyError", err)
+	}
+
+	// An allowing yield policy grants the request and shuts down.
+	h.SetYieldPolicy(AutoAllowPolicy)
+	if err := requestYield(); err != nil {
+		t.Fatalf("allowed yield: %v", err)
+	}
+	select {
+	case <-shutdownCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown callback did not fire")
+	}
+}
+
+// TestShutdownFiresWhenClientClosesBeforeCloseSend asserts the handler
+// still runs its shutdown callback when the post-ack CloseSend fails,
+// which happens when the client closes the control connection the
+// instant it reads the ack (TakeoverSocket defers conn.Close). Gating
+// shutdown on CloseSend stranded the old daemon whenever the client won
+// that race.
+func TestShutdownFiresWhenClientClosesBeforeCloseSend(t *testing.T) {
+	// Create a daemon handler that records its shutdown callback.
+	shutdownFired := false
+	h := NewHandler(nil, func() { shutdownFired = true })
+
+	// Require shutdown to fire even when response-stream completion fails.
+	strm := &closeSendErrStream{ctx: t.Context()}
+	handled, err := h.InvokeMethod(ServiceID, ShutdownMethodID, strm)
+	if !handled {
+		t.Fatal("handler did not claim the Shutdown route")
+	}
+	if !errors.Is(err, errCloseSend) {
+		t.Fatalf("expected CloseSend error to surface, got %v", err)
+	}
+	if !shutdownFired {
+		t.Fatal("shutdown callback did not fire after a failed CloseSend")
+	}
+}
+
+var errCloseSend = errors.New("connection closed by peer")
+
+// closeSendErrStream is a srpc.Stream whose CloseSend fails, modeling a
+// client that closed the control connection right after the ack.
+type closeSendErrStream struct {
+	ctx context.Context
+}
+
+func (s *closeSendErrStream) Context() context.Context   { return s.ctx }
+func (s *closeSendErrStream) MsgRecv(srpc.Message) error { return nil }
+func (s *closeSendErrStream) MsgSend(srpc.Message) error { return nil }
+func (s *closeSendErrStream) CloseSend() error           { return errCloseSend }
+func (s *closeSendErrStream) Close() error               { return nil }
+
+// TestShutdownDenyPropagates asserts a deny policy propagates to the
+// caller as a DenyError without firing the shutdown callback.
+func TestShutdownDenyPropagates(t *testing.T) {
+	// Use the test lifetime for the denied shutdown exchange.
+	ctx := t.Context()
+
+	// Bind the daemon socket and remove its path when the test ends.
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "daemon.sock")
+	lis, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() {
+		lis.Close()
+		_ = os.Remove(sock)
+	})
+
+	// Serve a daemon handler whose yield policy denies the request.
+	denyErr := errors.New("denied by Spacewave desktop app")
+	shutdownFired := false
+	mux := srpc.NewMux()
+	policy := func(context.Context) error { return denyErr }
+	if err := mux.Register(NewHandler(policy, func() {
+		shutdownFired = true
+	})); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	server := srpc.NewServer(mux)
+	go func() {
+		// Accept and serve the requester through the denying handler.
+		conn, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		mp, err := srpc.NewMuxedConn(conn, false, nil)
+		if err != nil {
+			conn.Close()
+			return
+		}
+		_ = server.AcceptMuxedConn(ctx, mp)
+	}()
+
+	// Connect the requester to the daemon that denies takeover.
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Require the requester to receive the daemon policy denial.
+	callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer callCancel()
+	err = RequestShutdown(callCtx, conn)
+	if err == nil {
+		t.Fatalf("request shutdown: expected deny error, got nil")
+	}
+
+	// Verify the denial retains its typed error and the peer's reason.
+	var denyError *DenyError
+	if !errors.As(err, &denyError) {
+		t.Fatalf("expected DenyError, got %T: %v", err, err)
+	}
+	if !strings.Contains(denyError.Reason, "Spacewave desktop app") {
+		t.Fatalf("deny reason missing app name: %q", denyError.Reason)
+	}
+
+	// Require the denied request to leave the daemon running.
+	if shutdownFired {
+		t.Fatal("shutdown callback fired despite deny")
+	}
+}

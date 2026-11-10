@@ -1,0 +1,108 @@
+syntax = "proto3";
+package block.gc;
+
+// RootEntry is one named root in a Volume's root table: the block the name
+// holds.
+message RootEntry {
+  // Ref is the block the name holds, as its hash type byte and digest.
+  bytes ref = 1;
+  // ExpiresUnixMilli is when the collector releases the root itself, in Unix
+  // milliseconds. Zero holds the root until a writer releases it. A holder
+  // renews a leased root by setting it again with a later expiry.
+  int64 expires_unix_milli = 2;
+}
+
+// JournalRecord is one write transaction's change to the holders of blocks.
+// The collector nets it after the fact; nothing else reads it.
+message JournalRecord {
+  // AtUnixMilli is when the transaction committed, in Unix milliseconds. It
+  // never decreases from one record to the next.
+  int64 at_unix_milli = 1;
+  // Up names a block once for each holder the transaction added to it beyond
+  // the one a block stored by the transaction implies.
+  repeated bytes up = 2;
+  // Down names a block once for each named root that moved off it.
+  repeated bytes down = 3;
+  // Again names each block the transaction put again while the store held
+  // it. It changes no holder, but a block still at zero holders once the
+  // record nets takes the journal's end as its ripe sequence again, so the
+  // put restarts the block's grace.
+  repeated bytes again = 4;
+}
+
+// Adoption is whether a Volume's counts describe its blocks.
+enum Adoption {
+  // ADOPTION_UNADOPTED is a Volume written before its child lists were
+  // complete. It keeps no journal and frees nothing.
+  ADOPTION_UNADOPTED = 0;
+  // ADOPTION_ADOPTING is a Volume whose counts an adoption is building. It
+  // keeps a journal and frees nothing.
+  ADOPTION_ADOPTING = 1;
+  // ADOPTION_ADOPTED is a Volume whose counts and journal describe every
+  // holder. Its collector frees when its switch is on.
+  ADOPTION_ADOPTED = 2;
+}
+
+// LivenessState is the one record of a Volume's journal position and
+// adoption.
+message LivenessState {
+  reserved 4, 9, 10;
+  // Adoption is whether the counts describe the Volume's blocks.
+  Adoption adoption = 1;
+  // NextSeq is the sequence number the next journal record takes.
+  uint64 next_seq = 2;
+  // Cursor is the sequence number of the oldest record the collector has not
+  // netted.
+  uint64 cursor = 3;
+  // LegacyGraph reports that records of the reference graph of a store
+  // format before 7 remain, which a background sweep deletes in slices.
+  // Nothing reads them.
+  bool legacy_graph = 5;
+  // AdoptionRun names the adoption that marked the Volume adopting, or the
+  // one that abandoned it. Each transaction of an adoption refuses to write
+  // unless the Volume is still in its run, so a run another superseded writes
+  // nothing more.
+  string adoption_run = 6;
+  // UnverifiedLists reports that the child lists came from a store format
+  // before 7, whose lists may lack a child the block names. Adopt refuses
+  // until a repair rebuilds them from the blocks and clears it.
+  bool unverified_lists = 7;
+  // NetOffset is how much of the record at the cursor the collector has
+  // netted: its up pairs, then its down pairs, then its again entries. A
+  // slice does a bounded amount, so it splits a large record across slices.
+  uint64 net_offset = 8;
+  // Release is the paged release or re-hold in progress of one block's
+  // children, unset when none is.
+  Release release = 11;
+  // HoldMark is one past the sequence of the last journal record of a Land
+  // that held a block at zero holders, or one whose children were released,
+  // or any block while a cascade was due: a block below it may have no
+  // holder until that record nets and the re-hold it brings runs. The
+  // collector frees nothing until its cursor reaches the mark.
+  uint64 hold_mark = 12;
+  // Cascades counts the cascade records, the blocks whose cascade is due,
+  // so a Land and the free learn whether any is due from this record rather
+  // than a seek past the deleted ones. It is exact while the Volume is
+  // adopted: the adoption zeroes it once its clear has deleted the records
+  // an earlier run left, and counts each block it settles Dying.
+  uint64 cascades = 13;
+}
+
+// Release is a cascade whose child list is longer than one collector slice
+// moves: the release of the children of a block that lost its last holder,
+// or the re-hold of the children of one that gained a holder after its
+// release. The slice that starts it moves the list to release pages and
+// marks the block released or held; each later slice moves the next
+// children's holders by one and moves Next in the same transaction, and the
+// last deletes the pages and clears the release.
+message Release {
+  // Block is the block, as its hash type byte and digest.
+  bytes block = 1;
+  // Next is the index in the list of the first child not moved yet.
+  uint64 next = 2;
+  // Children is how many children the list names.
+  uint64 children = 3;
+  // Rehold reports a re-hold: each child gains a holder rather than losing
+  // one.
+  bool rehold = 4;
+}

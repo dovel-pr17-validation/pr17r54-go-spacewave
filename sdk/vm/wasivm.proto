@@ -1,0 +1,504 @@
+syntax = "proto3";
+package s4wave.vm;
+
+import "github.com/s4wave/spacewave/sdk/terminal/terminal.proto";
+import "github.com/s4wave/spacewave/sdk/vm/v86.proto";
+import "google/protobuf/timestamp.proto";
+import "github.com/aperturerobotics/common/typeid/typeid.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/vm;s4wave_vm";
+
+// WasiVmConfig configures the init process of a WasiVM.
+message WasiVmConfig {
+  // InitPath is the init program in the rootfs. Empty runs /bin/sh.
+  string init_path = 1;
+  // InitArgs are the arguments after the program name.
+  repeated string init_args = 2;
+  // Env replaces the default environment of PATH, HOME and TERM when set.
+  map<string, string> env = 3;
+}
+
+// WasiVm is a virtual machine that runs WebAssembly programs on the WasiVM
+// kernel, with its root filesystem read from a UnixFS object or a WasiVmImage.
+message WasiVm {
+  option (typeid.id) = "vm/wasivm";
+
+  // State is the desired VM state. Runtime observations are in observed_state.
+  VmState state = 1;
+  // Name is the human-readable name of this VM instance.
+  string name = 2;
+  // Config configures the init process.
+  WasiVmConfig config = 3;
+  // CreatedAt is the creation timestamp.
+  .google.protobuf.Timestamp created_at = 4;
+  // ErrorMessage is the terminal diagnostic for the observed generation.
+  string error_message = 5;
+  // ObservedState is the runtime state committed by the VM resource owner.
+  VmState observed_state = 6;
+  // RunGeneration fences runtime observations from prior starts or stops.
+  uint64 run_generation = 7;
+  // Links (via graph edges, not proto fields):
+  //   wasivm/rootfs -> UnixFS object (root filesystem, preferred when set)
+  //   wasivm/image  -> WasiVmImage (root filesystem when wasivm/rootfs is unset)
+}
+
+// CreateWasiVmOp creates a new WasiVm world object linked to its root
+// filesystem. At least one of rootfs_object_key and image_object_key is set.
+message CreateWasiVmOp {
+  option (typeid.id) = "vm/wasivm/create";
+
+  // ObjectKey is the key to create the VM at.
+  string object_key = 1;
+  // Name is the display name.
+  string name = 2;
+  // Config configures the init process.
+  WasiVmConfig config = 3;
+  // Timestamp is the creation timestamp.
+  .google.protobuf.Timestamp timestamp = 4;
+  // RootfsObjectKey points at the UnixFS object holding the root filesystem.
+  string rootfs_object_key = 5;
+  // ImageObjectKey points at the WasiVmImage supplying the root filesystem.
+  string image_object_key = 6;
+}
+
+// WasiVmImage is a root filesystem published for WasiVMs. The object carries
+// metadata; the filesystem is linked through the wasivmimage/rootfs edge, or
+// read from the published image named by cdn_source.
+message WasiVmImage {
+  option (typeid.id) = "vm/image/wasivm";
+
+  // Name is the human-readable name of the image.
+  string name = 1;
+  // Version identifies this revision of the image.
+  string version = 2;
+  // Description is a free-form description of the image.
+  string description = 3;
+  // Tags is a list of discovery tags, e.g. ["default"].
+  repeated string tags = 4;
+  // CreatedAt is the creation timestamp.
+  .google.protobuf.Timestamp created_at = 5;
+  // CdnSource locates the published image whose root filesystem this image
+  // reads lazily. Unset when the image has its own wasivmimage/rootfs edge.
+  VmImageCdnSource cdn_source = 6;
+  // Links (via graph edges, not proto fields):
+  //   wasivmimage/rootfs  -> UnixFS object (root filesystem)
+  //   wasivmimage/package -> WasiVmPackage (each package the image asks for;
+  //                          the rootfs holds their runtime closure)
+}
+
+// CreateWasiVmImageOp creates a new WasiVmImage world object. Its rootfs edge,
+// when the image has one, is set separately via SetGraphQuad.
+message CreateWasiVmImageOp {
+  option (typeid.id) = "vm/image/wasivm/create";
+
+  // ObjectKey is the key to create the image at.
+  string object_key = 1;
+  // Image carries the metadata of the new image. Name is required.
+  WasiVmImage image = 2;
+  // Timestamp is the creation timestamp. Stored on the block as CreatedAt.
+  .google.protobuf.Timestamp timestamp = 3;
+}
+
+// WasiVmPackage is one version of a package built for WasiVMs. Its files are
+// two UnixFS layers: the runtime layer every install lays onto its root, and
+// the dev layer of headers, static libraries and build metadata that only
+// builds against the package need.
+message WasiVmPackage {
+  option (typeid.id) = "vm/package/wasivm";
+
+  // Name is the package's category and name, such as app-editors/nano.
+  string name = 1;
+  // Version is the package version with its revision, such as 9.2-r1.
+  string version = 2;
+  // Description is a one-line description of the package.
+  string description = 3;
+  // License is the package's license expression, such as GPL-2+.
+  string license = 4;
+  // CreatedAt is the creation timestamp.
+  .google.protobuf.Timestamp created_at = 5;
+  // Links (via graph edges, not proto fields):
+  //   wasivmpkg/runtime -> UnixFS object (runtime files)
+  //   wasivmpkg/dev     -> UnixFS object (build-time files)
+  //   wasivmpkg/depends -> WasiVmPackage (each runtime dependency)
+}
+
+// CreateWasiVmPackageOp creates a new WasiVmPackage world object. Its layer and
+// dependency edges are set separately via SetGraphQuad.
+message CreateWasiVmPackageOp {
+  option (typeid.id) = "vm/package/wasivm/create";
+
+  // ObjectKey is the key to create the package at.
+  string object_key = 1;
+  // Package carries the metadata of the new package. Name and version are
+  // required.
+  WasiVmPackage package = 2;
+  // Timestamp is the creation timestamp. Stored on the block as CreatedAt.
+  .google.protobuf.Timestamp timestamp = 3;
+}
+
+// SetWasiVmStateOp changes the desired state of an existing WasiVm object.
+message SetWasiVmStateOp {
+  option (typeid.id) = "vm/wasivm/set-state";
+
+  // ObjectKey is the object key of the WasiVm to update.
+  string object_key = 1;
+  // State is the target state: VmState_RUNNING or VmState_STOPPED.
+  VmState state = 2;
+}
+
+// WasiVmConsoleService attaches a viewer to the console of a running WasiVM.
+service WasiVmConsoleService {
+  // Console streams terminal frames. The viewer sends OPEN with its size,
+  // then INPUT and RESIZE. The VM sends READY, the recent output, then
+  // OUTPUT as it is written, and EXIT when the VM stops.
+  rpc Console(stream .s4wave.terminal.TerminalFrame)
+      returns (stream .s4wave.terminal.TerminalFrame);
+}
+
+// WasiVmDisplayService attaches a viewer to the display of a running WasiVM:
+// X display 0 or its Wayland compositor.
+service WasiVmDisplayService {
+  // Display streams the screen's scene and carries input back. Once the
+  // guest brings up a display, an X server on display 0 or a Wayland client,
+  // the VM sends the whole scene, then each change. The viewer sends pointer
+  // and key input, and reports each update it draws; the VM runs at most two
+  // updates ahead of those reports, so a slow viewer gets fewer updates, each
+  // covering every change since the last, instead of a growing queue. The
+  // stream ends when the display closes.
+  rpc Display(stream WasiVmDisplayInput) returns (stream WasiVmScene);
+  // WatchWindows streams the Wayland windows of the display, then the list
+  // again each time a window maps, unmaps, is renamed, or moves between the
+  // desktop and a viewer of its own. An X display sends an empty list.
+  rpc WatchWindows(WatchWasiVmWindowsRequest) returns (stream WasiVmWindowList);
+  // Window shows one Wayland window in a viewer of its own, sized to it. The
+  // first input opens the window, which leaves the desktop; the rest resize
+  // it or carry the viewer's input, as Display's do, in window pixels. The
+  // stream ends when the window closes, and the window returns to the
+  // desktop once no viewer shows it.
+  rpc Window(stream WasiVmWindowInput) returns (stream WasiVmScene);
+}
+
+// WasiVmDownloadService reports what a running WasiVM downloads.
+service WasiVmDownloadService {
+  // WatchDownloads streams the downloads of the running VM's root filesystem,
+  // then again each time a read starts or finishes. It waits for the VM to
+  // run and ends with the run.
+  rpc WatchDownloads(WatchWasiVmDownloadsRequest)
+      returns (stream WasiVmDownloads);
+}
+
+// WatchWasiVmDownloadsRequest asks for the downloads of a running WasiVM.
+message WatchWasiVmDownloadsRequest {}
+
+// WasiVmDownloads is what a run of a WasiVM has downloaded for its root
+// filesystem.
+message WasiVmDownloads {
+  // Remote is set when the root filesystem is a published image read from
+  // the CDN as it is used. A root filesystem in the Space downloads nothing.
+  bool remote = 1;
+  // InFlight is the number of reads from the CDN waiting on the network.
+  uint32 in_flight = 2;
+  // Bytes is the number of bytes downloaded since the run began.
+  uint64 bytes = 3;
+}
+
+// WatchWasiVmWindowsRequest asks for the windows of a running WasiVM.
+message WatchWasiVmWindowsRequest {}
+
+// WasiVmWindowList is the mapped Wayland windows of a display, oldest first.
+message WasiVmWindowList {
+  // Windows is the mapped windows.
+  repeated WasiVmWindow windows = 1;
+}
+
+// WasiVmWindow is a mapped Wayland window.
+message WasiVmWindow {
+  // Id identifies the window for the life of the VM's run.
+  uint32 id = 1;
+  // Title is the title the client set, or empty.
+  string title = 2;
+  // AppId names the client's application, or is empty.
+  string app_id = 3;
+  // Place is where the window shows.
+  WasiVmWindowPlace place = 4;
+}
+
+// WasiVmWindowPlace is where a Wayland window shows.
+enum WasiVmWindowPlace {
+  // WasiVmWindowPlace_UNKNOWN is unset.
+  WasiVmWindowPlace_UNKNOWN = 0;
+  // WasiVmWindowPlace_DESKTOP means the window shows on the desktop.
+  WasiVmWindowPlace_DESKTOP = 1;
+  // WasiVmWindowPlace_VIEWER means the window shows in a viewer of its own.
+  WasiVmWindowPlace_VIEWER = 2;
+}
+
+// WasiVmWindowInput is an input to a window's viewer stream.
+message WasiVmWindowInput {
+  oneof body {
+    // Open takes the window off the desktop at the viewer's size. It is the
+    // stream's first input.
+    WasiVmWindowOpen open = 1;
+    // Resize sets the window's size to the viewer's new size.
+    WasiVmWindowSize resize = 2;
+    // Input is a pointer or key event in window pixels, or a drawn report.
+    WasiVmDisplayInput input = 3;
+  }
+}
+
+// WasiVmWindowOpen opens a window in a viewer of its own.
+message WasiVmWindowOpen {
+  // Id is the window's id from the window list.
+  uint32 id = 1;
+  // Size is the viewer's size.
+  WasiVmWindowSize size = 2;
+}
+
+// WasiVmWindowSize is the size of a window's viewer in pixels.
+message WasiVmWindowSize {
+  // Width is the width in pixels.
+  uint32 width = 1;
+  // Height is the height in pixels.
+  uint32 height = 2;
+}
+
+// WasiVmScene is a change to the scene a viewer draws: the screen, the
+// surfaces stacked on it as layers, where their roots sit, and pixels for the
+// layers' textures. Each field left unset keeps what the viewer has. The
+// viewer applies the screen, the layers and the roots, then the patches, and
+// draws the result.
+message WasiVmScene {
+  // Screen is the screen's size and scale, when they change.
+  WasiVmSceneScreen screen = 1;
+  // Layers is every visible surface, bottom to top, when the arrangement
+  // changes. A layer missing from the list is dropped with its texture.
+  WasiVmSceneLayers layers = 2;
+  // Roots is the position of every root, when any moves.
+  WasiVmSceneRoots roots = 3;
+  // Patches draws pixels into the layers' textures, in order.
+  repeated WasiVmScenePatch patches = 4;
+  // Grab is the window move in progress, when one starts or ends.
+  WasiVmSceneGrab grab = 5;
+  // Frames is the frame the desktop draws for each window that has one, when
+  // any changes.
+  WasiVmSceneFrames frames = 6;
+}
+
+// WasiVmSceneFrames is the desktop's window frames.
+message WasiVmSceneFrames {
+  // Frames is the frames, in any order.
+  repeated WasiVmSceneFrame frames = 1;
+}
+
+// WasiVmSceneFrame is the frame the desktop draws for a window that asked
+// for server side decorations: a title bar above its content with buttons,
+// and a band around both that resizes the window. The compositor reads
+// presses on these same rectangles: a press on the title bar moves the
+// window from the press, a press on the band resizes it, and a button acts
+// when released over it. All positions are in units from the root's
+// position.
+message WasiVmSceneFrame {
+  // Root is the id of the window's root.
+  uint32 root = 1;
+  // Title is the window's title.
+  string title = 2;
+  // Active is set while the window holds the keyboard.
+  bool active = 3;
+  // Maximized is set while the window fills the area the panels leave. A
+  // maximized window does not move or resize.
+  bool maximized = 4;
+  // X is the left edge of the window with its title bar.
+  int32 x = 5;
+  // Y is the top edge of the window with its title bar: the title bar's top.
+  int32 y = 6;
+  // Width is the width of the window.
+  uint32 width = 7;
+  // Height is the height of the window with its title bar.
+  uint32 height = 8;
+  // TitleHeight is the height of the title bar at the top of the frame.
+  uint32 title_height = 9;
+  // Border is the width of the band outside the frame that resizes the
+  // window, or zero when it does not resize.
+  uint32 border = 10;
+  // Buttons is the title bar's buttons.
+  repeated WasiVmSceneFrameButton buttons = 11;
+  // MinY is the least top edge of the root a move of the window allows,
+  // which keeps the title bar in the area the panels leave.
+  int32 min_y = 12;
+}
+
+// WasiVmSceneFrameButtonKind is what a title bar button does.
+enum WasiVmSceneFrameButtonKind {
+  // WASI_VM_SCENE_FRAME_BUTTON_KIND_UNKNOWN is not a button.
+  WASI_VM_SCENE_FRAME_BUTTON_KIND_UNKNOWN = 0;
+  // WASI_VM_SCENE_FRAME_BUTTON_KIND_CLOSE asks the window to close.
+  WASI_VM_SCENE_FRAME_BUTTON_KIND_CLOSE = 1;
+  // WASI_VM_SCENE_FRAME_BUTTON_KIND_MAXIMIZE maximizes the window, or
+  // restores a maximized one.
+  WASI_VM_SCENE_FRAME_BUTTON_KIND_MAXIMIZE = 2;
+}
+
+// WasiVmSceneFrameButton is a button on a title bar.
+message WasiVmSceneFrameButton {
+  // Kind is what the button does.
+  WasiVmSceneFrameButtonKind kind = 1;
+  // X is the left edge.
+  int32 x = 2;
+  // Y is the top edge.
+  int32 y = 3;
+  // Width is the width.
+  uint32 width = 4;
+  // Height is the height.
+  uint32 height = 5;
+}
+
+// WasiVmSceneGrab is what the pointer holds.
+message WasiVmSceneGrab {
+  // Move is the window move in progress, or unset when none is.
+  WasiVmSceneMove move = 1;
+}
+
+// WasiVmSceneMove is a window move. Until the grab ends, the root sits at
+// (x, y) plus the pointer's travel since the press, in units, with its top
+// at least min_y. The compositor places it by this rule from each pointer
+// event, so a viewer applying it to its own pointer shows the same position
+// without waiting for the roots.
+message WasiVmSceneMove {
+  // Root is the id of the root that moves.
+  uint32 root = 1;
+  // PressX is the pointer's left offset at the press in units.
+  int32 press_x = 2;
+  // PressY is the pointer's top offset at the press in units.
+  int32 press_y = 3;
+  // X is the root's left edge at the press in units.
+  int32 x = 4;
+  // Y is the root's top edge at the press in units.
+  int32 y = 5;
+  // MinY is the least top edge the root may move to, which keeps the
+  // window's title in the area the panels leave.
+  int32 min_y = 6;
+}
+
+// WasiVmSceneScreen is the screen's size in units, the viewer's CSS pixels,
+// and the scale it is drawn at.
+message WasiVmSceneScreen {
+  // Width is the screen's width in units.
+  uint32 width = 1;
+  // Height is the screen's height in units.
+  uint32 height = 2;
+  // Scale is the screen pixels a side per unit; zero means one.
+  uint32 scale = 3;
+  // Background is the color behind the layers, as red, green, blue and
+  // alpha bytes from the most significant.
+  fixed32 background = 4;
+}
+
+// WasiVmSceneLayers is the scene's layers, bottom to top.
+message WasiVmSceneLayers {
+  // Layers is the layers, bottom to top.
+  repeated WasiVmSceneLayer layers = 1;
+}
+
+// WasiVmSceneLayer is one surface: a texture drawn at an offset from its root.
+message WasiVmSceneLayer {
+  // Id identifies the layer and its texture for the life of the stream.
+  uint32 id = 1;
+  // Root is the id of the root the layer moves with: its window or layer
+  // shell surface.
+  uint32 root = 2;
+  // X is the left edge in units from the root's position.
+  int32 x = 3;
+  // Y is the top edge in units from the root's position.
+  int32 y = 4;
+  // Width is the width the layer covers in units.
+  uint32 width = 5;
+  // Height is the height the layer covers in units.
+  uint32 height = 6;
+  // TextureWidth is the texture's width in pixels. A layer whose texture
+  // size changes gets a new texture, which a patch then fills.
+  uint32 texture_width = 7;
+  // TextureHeight is the texture's height in pixels.
+  uint32 texture_height = 8;
+  // Opaque is set when every pixel of the texture is opaque, so the layer
+  // replaces what is under it instead of blending.
+  bool opaque = 9;
+}
+
+// WasiVmSceneRoots is the position of every root.
+message WasiVmSceneRoots {
+  // Roots is the roots, in any order.
+  repeated WasiVmSceneRoot roots = 1;
+}
+
+// WasiVmSceneRoot is a window or layer shell surface that its layers move
+// with.
+message WasiVmSceneRoot {
+  // Id identifies the root for the life of the stream.
+  uint32 id = 1;
+  // X is the root's left edge on the screen in units.
+  int32 x = 2;
+  // Y is the root's top edge on the screen in units.
+  int32 y = 3;
+}
+
+// WasiVmScenePatch is a rectangle of a layer's texture.
+message WasiVmScenePatch {
+  // Layer is the id of the layer whose texture the patch draws into.
+  uint32 layer = 1;
+  // X is the left edge in texture pixels.
+  uint32 x = 2;
+  // Y is the top edge in texture pixels.
+  uint32 y = 3;
+  // Width is the width in texture pixels.
+  uint32 width = 4;
+  // Height is the height in texture pixels.
+  uint32 height = 5;
+  // Rgba holds the pixels row by row, four bytes each: red, green and blue
+  // premultiplied by alpha, then alpha.
+  bytes rgba = 6;
+}
+
+// WasiVmDisplayInput is a pointer or key event from the viewer, or its report
+// that it drew a frame.
+message WasiVmDisplayInput {
+  oneof body {
+    // Pointer moves the pointer and sets its buttons.
+    WasiVmPointerEvent pointer = 1;
+    // Key presses or releases a key.
+    WasiVmKeyEvent key = 2;
+    // Drawn reports the viewer drew the last frame and takes the next.
+    WasiVmFrameDrawn drawn = 3;
+    // Scale reports the viewer's device pixels per CSS pixel.
+    WasiVmDisplayScale scale = 4;
+  }
+}
+
+// WasiVmDisplayScale is the number of device pixels per CSS pixel on the
+// viewer's screen, rounded up. The display draws at the latest scale any
+// viewer reported.
+message WasiVmDisplayScale {
+  // Scale is the device pixels per CSS pixel, at least one.
+  uint32 scale = 1;
+}
+
+// WasiVmFrameDrawn reports that the viewer drew the last frame it received.
+message WasiVmFrameDrawn {}
+
+// WasiVmPointerEvent moves the pointer and sets which buttons are held.
+message WasiVmPointerEvent {
+  // X is the pointer's column in screen pixels.
+  int32 x = 1;
+  // Y is the pointer's row in screen pixels.
+  int32 y = 2;
+  // Buttons holds bit n-1 for each held X button n: 1 is the left, 2 the
+  // middle, 3 the right, and 4 and 5 scroll up and down.
+  uint32 buttons = 3;
+}
+
+// WasiVmKeyEvent presses or releases a key.
+message WasiVmKeyEvent {
+  // Keysym is the X keysym the key produces.
+  uint32 keysym = 1;
+  // Down is set for a press and clear for a release.
+  bool down = 2;
+}

@@ -1,0 +1,43 @@
+export {
+  DirEntry,
+  FileInfo,
+  NodeType,
+  MknodType,
+  MknodType_Enum,
+  HandleLookupRequest,
+  HandleLookupResponse,
+  HandleLookupPathRequest,
+  HandleLookupPathResponse,
+  HandleReadAtRequest,
+  HandleReadAtResponse,
+  HandleWriteAtRequest,
+  HandleWriteAtResponse,
+  HandleTruncateRequest,
+  HandleTruncateResponse,
+  HandleSyncRequest,
+  HandleSyncResponse,
+  HandleGetSizeRequest,
+  HandleGetSizeResponse,
+  HandleGetFileInfoRequest,
+  HandleGetFileInfoResponse,
+  HandleGetNodeTypeRequest,
+  HandleGetNodeTypeResponse,
+  HandleReaddirRequest,
+  HandleReaddirResponse,
+  HandleMknodRequest,
+  HandleMknodResponse,
+  HandleRemoveRequest,
+  HandleRemoveResponse,
+  HandleMkdirAllRequest,
+  HandleMkdirAllResponse,
+  HandleRenameRequest,
+  HandleRenameResponse,
+  HandleCloneRequest,
+  HandleCloneResponse,
+} from './handle.pb.js'
+export * from './handle_srpc.pb.js'
+export * from './handle.js'
+export * from './fs-cursor.js'
+export * from './file-kind.js'
+export * from './path.js'
+export * from './type.js'

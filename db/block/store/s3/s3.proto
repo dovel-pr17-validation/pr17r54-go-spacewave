@@ -1,0 +1,129 @@
+syntax = "proto3";
+package block.store.s3;
+
+import "google/protobuf/timestamp.proto";
+
+// Config configures the s3 block store controller.
+message Config {
+  // BlockStoreId is the block store id to use on the bus.
+  string block_store_id = 1;
+  // Client configures the s3 client.
+  ClientConfig client = 2;
+  // BucketName is the s3 bucket name to use.
+  string bucket_name = 3;
+  // ObjectPrefix is the prefix to use for object names.
+  // Packfiles are {objectPrefix}packs/{id}, and their entries are
+  // {objectPrefix}entries/{id}. The storage reclaim state is
+  // {objectPrefix}reclaim/{time}.
+  string object_prefix = 4;
+  // BucketIds is a list of bucket ids to serve LookupBlockFromNetwork directives.
+  repeated string bucket_ids = 7;
+  // SkipNotFound skips returning a value if the block was not found.
+  bool skip_not_found = 8;
+  // Verbose enables verbose logging of the block store.
+  bool verbose = 9;
+}
+
+// ClientConfig configures the s3 client.
+// Supports any s3-compatible object store.
+message ClientConfig {
+  // Endpoint is the endpoint to access the s3 api.
+  string endpoint = 1;
+  // Credentials contains the authentication creds.
+  Credentials credentials = 2;
+  // DisableSsl disables using SSL to access the api.
+  // If false, uses ssl.
+  bool disable_ssl = 3;
+  // Region is the name of the region to use.
+  // Can be empty.
+  string region = 4;
+}
+
+// Credentials are credentials for a s3-compatible api.
+message Credentials {
+  // AccessKeyId is the authentication access key id.
+  string access_key_id = 1;
+  // SecretAccessKey is the secret access key corresponding to the access key id.
+  string secret_access_key = 2;
+  // Token is the token to use.
+  // Usually empty.
+  string token = 3;
+}
+
+// CheckOutcome classifies a bucket connectivity check.
+enum CheckOutcome {
+  // CHECK_OUTCOME_UNKNOWN is the unset outcome.
+  CHECK_OUTCOME_UNKNOWN = 0;
+  // CHECK_OUTCOME_OK means a probe object was written, read back, and deleted.
+  CHECK_OUTCOME_OK = 1;
+  // CHECK_OUTCOME_UNREACHABLE means no response arrived from the endpoint.
+  // In the browser this includes a bucket that does not allow the app's
+  // origin through CORS.
+  CHECK_OUTCOME_UNREACHABLE = 2;
+  // CHECK_OUTCOME_CREDENTIALS_REJECTED means the endpoint rejected the access
+  // key or its signature.
+  CHECK_OUTCOME_CREDENTIALS_REJECTED = 3;
+  // CHECK_OUTCOME_ACCESS_DENIED means the credentials are valid but lack
+  // permission to write, read, list, or delete objects in the bucket.
+  CHECK_OUTCOME_ACCESS_DENIED = 4;
+  // CHECK_OUTCOME_BUCKET_NOT_FOUND means the bucket does not exist.
+  CHECK_OUTCOME_BUCKET_NOT_FOUND = 5;
+  // CHECK_OUTCOME_WRONG_REGION means the bucket is in another region.
+  CHECK_OUTCOME_WRONG_REGION = 6;
+  // CHECK_OUTCOME_FAILED means another error stopped the check.
+  CHECK_OUTCOME_FAILED = 7;
+}
+
+// CheckResult is the result of a bucket connectivity check.
+message CheckResult {
+  // Outcome classifies the result.
+  CheckOutcome outcome = 1;
+  // Detail is the failing step and the server's error message.
+  // Empty when Outcome is CHECK_OUTCOME_OK.
+  string detail = 2;
+  // Usage is what the bucket holds under the object prefix. Absent when the
+  // check failed.
+  ObjectUsage usage = 3;
+}
+
+// ObjectUsage is the count and total size of the objects under a prefix.
+message ObjectUsage {
+  // Objects is the number of objects.
+  int64 objects = 1;
+  // Bytes is the total size of the objects.
+  int64 bytes = 2;
+}
+
+// ReclaimState records the last storage reclaim pass on a bucket prefix, so
+// the next pass runs only once the dead bytes it would drop cost more to keep
+// than the pass costs to run.
+message ReclaimState {
+  // PassedAt is when the pass ran.
+  .google.protobuf.Timestamp passed_at = 1;
+  // DeadBytes is the dead block bytes the pass left in place.
+  uint64 dead_bytes = 2;
+  // DeadBytesPerDay is the rate blocks died between the previous pass and
+  // this one.
+  uint64 dead_bytes_per_day = 3;
+  // Packs is the number of packfiles the pass judged.
+  uint64 packs = 4;
+  // Blocks is the number of blocks in those packfiles.
+  uint64 blocks = 5;
+}
+
+// Pricing is the price list of an S3-compatible service in dollars. Storage
+// reclaim weighs the storage a pass frees against the requests and egress it
+// costs.
+message Pricing {
+  // StorageGbMonth is the price of storing one GiB for one month.
+  double storage_gb_month = 1;
+  // EgressGb is the price of reading one GiB out of the service.
+  double egress_gb = 2;
+  // ClassAPerMillion is the price of one million PUT or LIST requests.
+  double class_a_per_million = 3;
+  // ClassBPerMillion is the price of one million GET requests.
+  double class_b_per_million = 4;
+  // MinStorageDays is the storage duration billed for an object deleted
+  // sooner.
+  uint32 min_storage_days = 5;
+}

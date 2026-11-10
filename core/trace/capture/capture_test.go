@@ -1,0 +1,279 @@
+package trace_capture_test
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	trace_capture "github.com/s4wave/spacewave/core/trace/capture"
+	s4wave_trace "github.com/s4wave/spacewave/sdk/trace"
+)
+
+type fakeTraceClient struct {
+	startReq      *s4wave_trace.StartTraceRequest
+	stopData      [][]byte
+	cpuReq        *s4wave_trace.CaptureCPUProfileRequest
+	cpuData       [][]byte
+	memReq        *s4wave_trace.CaptureMemoryProfileRequest
+	goroutineReq  *s4wave_trace.CaptureGoroutineProfileRequest
+	goroutineData [][]byte
+	memoryData    [][]byte
+}
+
+func TestCaptureRuntimeTraceWritesBytes(t *testing.T) {
+	// Prepare a trace client with two runtime trace chunks.
+	ctx := context.Background()
+	client := &fakeTraceClient{
+		stopData: [][]byte{[]byte("trace-"), []byte("bytes")},
+	}
+	var buf bytes.Buffer
+
+	// Capture the labeled runtime trace into the output buffer.
+	count, err := trace_capture.CaptureRuntimeTrace(ctx, client, &buf, trace_capture.RuntimeTraceArgs{
+		Duration:    time.Nanosecond,
+		Label:       "capture-helper-trace",
+		StopTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the runtime trace label, payload, and byte count.
+	if client.startReq.GetLabel() != "capture-helper-trace" {
+		t.Fatalf("trace label = %q", client.startReq.GetLabel())
+	}
+	if count != int64(len("trace-bytes")) || buf.String() != "trace-bytes" {
+		t.Fatalf("trace bytes: count=%d body=%q", count, buf.String())
+	}
+}
+
+func TestCaptureCPUProfileWritesBytes(t *testing.T) {
+	// Prepare a trace client with two CPU profile chunks.
+	ctx := context.Background()
+	client := &fakeTraceClient{
+		cpuData: [][]byte{[]byte("cpu-"), []byte("profile")},
+	}
+	var buf bytes.Buffer
+
+	// Capture a labeled CPU profile into the output buffer.
+	count, err := trace_capture.CaptureCPUProfile(ctx, client, &buf, trace_capture.CPUProfileArgs{
+		Duration: time.Nanosecond,
+		Label:    "capture-helper-cpu",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify CPU profile duration rounding, label, payload, and byte count.
+	if client.cpuReq.GetDurationMillis() != 1 || client.cpuReq.GetLabel() != "capture-helper-cpu" {
+		t.Fatalf("cpu request = %+v", client.cpuReq)
+	}
+	if count != int64(len("cpu-profile")) || buf.String() != "cpu-profile" {
+		t.Fatalf("CPU profile bytes: count=%d body=%q", count, buf.String())
+	}
+}
+
+func TestCaptureGoroutineProfileWritesBytes(t *testing.T) {
+	// Prepare a trace client with two goroutine profile chunks.
+	ctx := context.Background()
+	client := &fakeTraceClient{
+		goroutineData: [][]byte{[]byte("goroutine-"), []byte("profile")},
+	}
+	var buf bytes.Buffer
+
+	// Capture the requested goroutine profile into the output buffer.
+	count, err := trace_capture.CaptureGoroutineProfile(ctx, client, &buf, trace_capture.GoroutineProfileArgs{Debug: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the request, payload, and byte count.
+	if client.goroutineReq.GetDebug() != 1 {
+		t.Fatalf("goroutine request = %+v", client.goroutineReq)
+	}
+	if count != int64(len("goroutine-profile")) || buf.String() != "goroutine-profile" {
+		t.Fatalf("goroutine profile bytes: count=%d body=%q", count, buf.String())
+	}
+
+	// Reject a negative debug level before calling the client.
+	if _, err := trace_capture.CaptureGoroutineProfile(ctx, client, &buf, trace_capture.GoroutineProfileArgs{Debug: -1}); err == nil {
+		t.Fatal("expected negative debug level to fail")
+	}
+}
+
+func TestCaptureMemoryProfileWritesBytes(t *testing.T) {
+	// Prepare a trace client with two memory profile chunks.
+	ctx := context.Background()
+	client := &fakeTraceClient{
+		memoryData: [][]byte{[]byte("memory-"), []byte("profile")},
+	}
+	var buf bytes.Buffer
+
+	// Capture the requested memory profile into the output buffer.
+	count, err := trace_capture.CaptureMemoryProfile(ctx, client, &buf, trace_capture.MemoryProfileArgs{
+		Profile: "allocs",
+		GC:      true,
+		Debug:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify memory profile options, payload, and byte count.
+	if client.memReq.GetProfile() != "allocs" || !client.memReq.GetGc() || client.memReq.GetDebug() != 1 {
+		t.Fatalf("memory request = %+v", client.memReq)
+	}
+	if count != int64(len("memory-profile")) || buf.String() != "memory-profile" {
+		t.Fatalf("memory profile bytes: count=%d body=%q", count, buf.String())
+	}
+}
+
+func (c *fakeTraceClient) SRPCClient() srpc.Client {
+	return nil
+}
+
+func (c *fakeTraceClient) StartTrace(_ context.Context, req *s4wave_trace.StartTraceRequest) (*s4wave_trace.StartTraceResponse, error) {
+	c.startReq = req.CloneVT()
+	return &s4wave_trace.StartTraceResponse{}, nil
+}
+
+func (c *fakeTraceClient) StopTrace(ctx context.Context, _ *s4wave_trace.StopTraceRequest) (s4wave_trace.SRPCTraceService_StopTraceClient, error) {
+	return &fakeStopTraceStream{ctx: ctx, data: cloneTraceChunks(c.stopData)}, nil
+}
+
+func (c *fakeTraceClient) CaptureCPUProfile(ctx context.Context, req *s4wave_trace.CaptureCPUProfileRequest) (s4wave_trace.SRPCTraceService_CaptureCPUProfileClient, error) {
+	c.cpuReq = req.CloneVT()
+	return &fakeCPUProfileStream{ctx: ctx, data: cloneTraceChunks(c.cpuData)}, nil
+}
+
+func (c *fakeTraceClient) CaptureMemoryProfile(ctx context.Context, req *s4wave_trace.CaptureMemoryProfileRequest) (s4wave_trace.SRPCTraceService_CaptureMemoryProfileClient, error) {
+	c.memReq = req.CloneVT()
+	return &fakeMemoryProfileStream{ctx: ctx, data: cloneTraceChunks(c.memoryData)}, nil
+}
+
+func (c *fakeTraceClient) CaptureGoroutineProfile(ctx context.Context, req *s4wave_trace.CaptureGoroutineProfileRequest) (s4wave_trace.SRPCTraceService_CaptureGoroutineProfileClient, error) {
+	c.goroutineReq = req.CloneVT()
+	return &fakeGoroutineProfileStream{ctx: ctx, data: cloneTraceChunks(c.goroutineData)}, nil
+}
+
+type fakeTraceStream struct {
+	ctx context.Context
+}
+
+func (s fakeTraceStream) Context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+func (fakeTraceStream) MsgSend(srpc.Message) error { return nil }
+
+func (fakeTraceStream) MsgRecv(srpc.Message) error { return io.EOF }
+
+func (fakeTraceStream) CloseSend() error { return nil }
+
+func (fakeTraceStream) Close() error { return nil }
+
+type fakeStopTraceStream struct {
+	fakeTraceStream
+	data [][]byte
+}
+
+func (s *fakeStopTraceStream) Recv() (*s4wave_trace.StopTraceResponse, error) {
+	if len(s.data) == 0 {
+		return nil, io.EOF
+	}
+	data := s.data[0]
+	s.data = s.data[1:]
+	return &s4wave_trace.StopTraceResponse{Data: data}, nil
+}
+
+func (s *fakeStopTraceStream) RecvTo(resp *s4wave_trace.StopTraceResponse) error {
+	next, err := s.Recv()
+	if err != nil {
+		return err
+	}
+	*resp = *next
+	return nil
+}
+
+type fakeCPUProfileStream struct {
+	fakeTraceStream
+	data [][]byte
+}
+
+func (s *fakeCPUProfileStream) Recv() (*s4wave_trace.CaptureCPUProfileResponse, error) {
+	if len(s.data) == 0 {
+		return nil, io.EOF
+	}
+	data := s.data[0]
+	s.data = s.data[1:]
+	return &s4wave_trace.CaptureCPUProfileResponse{Data: data}, nil
+}
+
+func (s *fakeCPUProfileStream) RecvTo(resp *s4wave_trace.CaptureCPUProfileResponse) error {
+	next, err := s.Recv()
+	if err != nil {
+		return err
+	}
+	*resp = *next
+	return nil
+}
+
+type fakeMemoryProfileStream struct {
+	fakeTraceStream
+	data [][]byte
+}
+
+func (s *fakeMemoryProfileStream) Recv() (*s4wave_trace.CaptureMemoryProfileResponse, error) {
+	if len(s.data) == 0 {
+		return nil, io.EOF
+	}
+	data := s.data[0]
+	s.data = s.data[1:]
+	return &s4wave_trace.CaptureMemoryProfileResponse{Data: data}, nil
+}
+
+func (s *fakeMemoryProfileStream) RecvTo(resp *s4wave_trace.CaptureMemoryProfileResponse) error {
+	next, err := s.Recv()
+	if err != nil {
+		return err
+	}
+	*resp = *next
+	return nil
+}
+
+type fakeGoroutineProfileStream struct {
+	fakeTraceStream
+	data [][]byte
+}
+
+func (s *fakeGoroutineProfileStream) Recv() (*s4wave_trace.CaptureGoroutineProfileResponse, error) {
+	if len(s.data) == 0 {
+		return nil, io.EOF
+	}
+	data := s.data[0]
+	s.data = s.data[1:]
+	return &s4wave_trace.CaptureGoroutineProfileResponse{Data: data}, nil
+}
+
+func (s *fakeGoroutineProfileStream) RecvTo(resp *s4wave_trace.CaptureGoroutineProfileResponse) error {
+	next, err := s.Recv()
+	if err != nil {
+		return err
+	}
+	*resp = *next
+	return nil
+}
+
+func cloneTraceChunks(chunks [][]byte) [][]byte {
+	out := make([][]byte, 0, len(chunks))
+	for _, chunk := range chunks {
+		out = append(out, bytes.Clone(chunk))
+	}
+	return out
+}

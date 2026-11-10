@@ -1,0 +1,336 @@
+syntax = "proto3";
+package s4wave.device;
+
+import "google/protobuf/timestamp.proto";
+import "github.com/aperturerobotics/common/typeid/typeid.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/device;s4wave_device";
+
+// DeviceSetupState is the Space-visible setup lifecycle for a managed Device.
+enum DeviceSetupState {
+  // DEVICE_SETUP_STATE_UNKNOWN is unset.
+  DEVICE_SETUP_STATE_UNKNOWN = 0;
+  // DEVICE_SETUP_STATE_WAITING_FOR_COMPLETION means a SpaceLink ticket is pending approval.
+  DEVICE_SETUP_STATE_WAITING_FOR_COMPLETION = 1;
+  // DEVICE_SETUP_STATE_COMPLETION_IMPORTED means approval was imported locally.
+  DEVICE_SETUP_STATE_COMPLETION_IMPORTED = 2;
+  // DEVICE_SETUP_STATE_DEVICE_SESSION_READY means the approved DEVICE session mounted.
+  DEVICE_SETUP_STATE_DEVICE_SESSION_READY = 3;
+  // DEVICE_SETUP_STATE_FAILED means setup stopped in a retryable failure state.
+  DEVICE_SETUP_STATE_FAILED = 4;
+}
+
+// DeviceUpdateState is the durable update lifecycle projection for the daemon.
+enum DeviceUpdateState {
+  // DEVICE_UPDATE_STATE_UNKNOWN is unset.
+  DEVICE_UPDATE_STATE_UNKNOWN = 0;
+  // DEVICE_UPDATE_STATE_IDLE means no update is pending.
+  DEVICE_UPDATE_STATE_IDLE = 1;
+  // DEVICE_UPDATE_STATE_READY means an update is ready to stage or apply.
+  DEVICE_UPDATE_STATE_READY = 2;
+  // DEVICE_UPDATE_STATE_STAGING means update assets are being staged.
+  DEVICE_UPDATE_STATE_STAGING = 3;
+  // DEVICE_UPDATE_STATE_APPLYING means the daemon is applying an update.
+  DEVICE_UPDATE_STATE_APPLYING = 4;
+  // DEVICE_UPDATE_STATE_UPDATED means the last update completed.
+  DEVICE_UPDATE_STATE_UPDATED = 5;
+  // DEVICE_UPDATE_STATE_FAILED means the last update attempt failed.
+  DEVICE_UPDATE_STATE_FAILED = 6;
+}
+
+// DeviceLiveness is historical liveness as last reported by the daemon.
+// Current reachability comes from DeviceAvailability, not this stored report.
+enum DeviceLiveness {
+  // DEVICE_LIVENESS_UNKNOWN is unset.
+  DEVICE_LIVENESS_UNKNOWN = 0;
+  // DEVICE_LIVENESS_ONLINE means the daemon last reported itself reachable.
+  DEVICE_LIVENESS_ONLINE = 1;
+  // DEVICE_LIVENESS_DEGRADED means the daemon last reported partial service.
+  DEVICE_LIVENESS_DEGRADED = 2;
+  // DEVICE_LIVENESS_OFFLINE means the daemon last reported a shutdown/offline state.
+  DEVICE_LIVENESS_OFFLINE = 3;
+}
+
+// DeviceCapabilityState is the declared capability state projection.
+enum DeviceCapabilityState {
+  // DEVICE_CAPABILITY_STATE_UNKNOWN is unset.
+  DEVICE_CAPABILITY_STATE_UNKNOWN = 0;
+  // DEVICE_CAPABILITY_STATE_DECLARED means the daemon advertises this capability.
+  DEVICE_CAPABILITY_STATE_DECLARED = 1;
+  // DEVICE_CAPABILITY_STATE_DISABLED means local policy disables this capability.
+  DEVICE_CAPABILITY_STATE_DISABLED = 2;
+  // DEVICE_CAPABILITY_STATE_GRANT_BLOCKED means Space grants block this capability.
+  DEVICE_CAPABILITY_STATE_GRANT_BLOCKED = 3;
+  // DEVICE_CAPABILITY_STATE_AVAILABLE means the capability can be used.
+  DEVICE_CAPABILITY_STATE_AVAILABLE = 4;
+  // DEVICE_CAPABILITY_STATE_ACTIVE means the capability currently has active work.
+  DEVICE_CAPABILITY_STATE_ACTIVE = 5;
+  // DEVICE_CAPABILITY_STATE_REJECTED means the daemon declined or failed to run the
+  // capability; Detail carries the reason.
+  DEVICE_CAPABILITY_STATE_REJECTED = 6;
+}
+
+// DeviceCapabilityLocalState is the daemon-local allowlist state.
+enum DeviceCapabilityLocalState {
+  // DEVICE_CAPABILITY_LOCAL_STATE_UNKNOWN is unset.
+  DEVICE_CAPABILITY_LOCAL_STATE_UNKNOWN = 0;
+  // DEVICE_CAPABILITY_LOCAL_STATE_ENABLED means daemon-local policy allows the capability.
+  DEVICE_CAPABILITY_LOCAL_STATE_ENABLED = 1;
+  // DEVICE_CAPABILITY_LOCAL_STATE_DISABLED means daemon-local policy disables the capability.
+  DEVICE_CAPABILITY_LOCAL_STATE_DISABLED = 2;
+}
+
+// DeviceCapabilityGrantState is the Space grant projection for a capability.
+enum DeviceCapabilityGrantState {
+  // DEVICE_CAPABILITY_GRANT_STATE_UNKNOWN is unset.
+  DEVICE_CAPABILITY_GRANT_STATE_UNKNOWN = 0;
+  // DEVICE_CAPABILITY_GRANT_STATE_ALLOWED means Space policy currently allows the capability.
+  DEVICE_CAPABILITY_GRANT_STATE_ALLOWED = 1;
+  // DEVICE_CAPABILITY_GRANT_STATE_BLOCKED means Space policy currently blocks the capability.
+  DEVICE_CAPABILITY_GRANT_STATE_BLOCKED = 2;
+}
+
+// DeviceCheckoutRootAccess is the checkout-root access mode advertised by a Device.
+enum DeviceCheckoutRootAccess {
+  // DEVICE_CHECKOUT_ROOT_ACCESS_UNKNOWN is unset.
+  DEVICE_CHECKOUT_ROOT_ACCESS_UNKNOWN = 0;
+  // DEVICE_CHECKOUT_ROOT_ACCESS_READ_ONLY means the checkout root can be read but not mutated.
+  DEVICE_CHECKOUT_ROOT_ACCESS_READ_ONLY = 1;
+  // DEVICE_CHECKOUT_ROOT_ACCESS_READ_WRITE means the checkout root can be read and written after approval.
+  DEVICE_CHECKOUT_ROOT_ACCESS_READ_WRITE = 2;
+}
+
+// DevicePlatform summarizes the daemon runtime platform.
+message DevicePlatform {
+  // Os is the daemon operating system.
+  string os = 1;
+  // Arch is the daemon architecture.
+  string arch = 2;
+}
+
+// DeviceStatus is the durable last status summary authored by the daemon.
+message DeviceStatus {
+  // Liveness is the last reported durable liveness.
+  DeviceLiveness liveness = 1;
+  // Message is a short operator-visible status.
+  string message = 2;
+  // Error is the last reported error, if any.
+  string error = 3;
+  // ObservedAt is when the daemon observed this status.
+  .google.protobuf.Timestamp observed_at = 4;
+}
+
+// DeviceCapability is a declared capability summary, not the capability owner.
+message DeviceCapability {
+  // Id is the stable capability identifier.
+  string id = 1;
+  // Kind is the capability family, such as filesystem or forge-worker.
+  string kind = 2;
+  // Label is the operator-visible capability label.
+  string label = 3;
+  // State is the projected capability state.
+  DeviceCapabilityState state = 4;
+  // Detail is a short status or policy note.
+  string detail = 5;
+  // Link points at the owner that executes the capability.
+  DeviceCapabilityLink link = 6;
+  // Policy records the local and Space policy refs used for the effective state.
+  DeviceCapabilityPolicy policy = 7;
+  // CheckoutRoot records named checkout-root metadata for filesystem capabilities.
+  DeviceCheckoutRootCapability checkout_root = 8;
+  // WorkerDeclaration records the declared capacity for forge-worker capabilities.
+  ForgeWorkerDeclaration worker_declaration = 9;
+}
+
+// DeviceCapabilityLink points at the capability execution owner.
+message DeviceCapabilityLink {
+  // ObjectKey is the linked owner object, such as a UnixFS root or Forge Worker.
+  string object_key = 1;
+  // TypeId is the ObjectType id for ObjectKey when ObjectKey is set.
+  string type_id = 2;
+  // ProtocolId is the post-registration Bifrost protocol id for stream-backed adapters.
+  string protocol_id = 3;
+}
+
+// DeviceCapabilityPolicy records inputs to the effective capability state.
+message DeviceCapabilityPolicy {
+  // LocalPolicyRef identifies the daemon-local policy entry.
+  string local_policy_ref = 1;
+  // GrantPolicyRef identifies the Space grant or policy entry.
+  string grant_policy_ref = 2;
+  // LocalState is the daemon-local allowlist state.
+  DeviceCapabilityLocalState local_state = 3;
+  // GrantState is the current Space grant projection.
+  DeviceCapabilityGrantState grant_state = 4;
+}
+
+// DeviceCheckoutRootCapability records selection metadata for a named checkout root.
+message DeviceCheckoutRootCapability {
+  // Name is the stable checkout-root selector, such as skiffos.
+  string name = 1;
+  // DisplayPath is a human-readable path or mount label.
+  string display_path = 2;
+  // SelectionRef is the durable selector for this root: the ID of the
+  // capability that advertises it.
+  string selection_ref = 3;
+  // Access is the read/write mode currently exposed by the Device policy.
+  DeviceCheckoutRootAccess access = 4;
+  // ReadAvailable reports whether the linked filesystem owner may be opened for reads.
+  bool read_available = 5;
+  // WriteAvailable reports whether the linked filesystem owner may accept writes after approval.
+  bool write_available = 6;
+}
+
+// ForgeWorkerDeclaration is the capacity envelope a Device declares for the
+// Forge Worker it hosts. A forge-worker Flowgraph node supplies it.
+message ForgeWorkerDeclaration {
+  // WorkerObjectKey is the Forge Worker object key this Device hosts.
+  string worker_object_key = 1;
+  // MilliCpu is the declared total CPU in milli-cores.
+  uint64 milli_cpu = 2;
+  // MemoryBytes is the declared total memory in bytes.
+  uint64 memory_bytes = 3;
+  // Backends lists the runtime backends the Worker supports.
+  repeated string backends = 4;
+}
+
+// Device is the world-block state for a Spacewave-managed Device object.
+message Device {
+  option (typeid.id) = "spacewave/device";
+
+  // PeerId is the daemon DEVICE session peer ID.
+  string peer_id = 1;
+  // Label is the operator-visible Device label.
+  string label = 2;
+  // Platform summarizes the daemon runtime platform.
+  DevicePlatform platform = 3;
+  // DaemonVersion is the daemon entrypoint version label.
+  string daemon_version = 4;
+  // SetupState is the setup lifecycle projection.
+  DeviceSetupState setup_state = 5;
+  // UpdateState is the daemon update lifecycle projection.
+  DeviceUpdateState update_state = 6;
+  // LastStatus is the last durable daemon-authored status.
+  DeviceStatus last_status = 7;
+  // Capabilities are declared capability summaries.
+  repeated DeviceCapability capabilities = 8;
+  // CreatedAt is when this Device object was first created.
+  .google.protobuf.Timestamp created_at = 9;
+  // UpdatedAt is when this Device object was last updated.
+  .google.protobuf.Timestamp updated_at = 10;
+  // Labels contains stored selectors, overriding derived hostname, os and arch.
+  map<string, string> labels = 11;
+}
+
+// ComputersDashboard is the Space-local dashboard for managed Devices and
+// future host entries.
+message ComputersDashboard {
+  option (typeid.id) = "spacewave/computers";
+
+  // Name is the display name of this dashboard.
+  string name = 1;
+  // CreatedAt is the time this dashboard was created.
+  .google.protobuf.Timestamp created_at = 2;
+}
+
+// CreateComputersDashboardOp creates a ComputersDashboard world object.
+message CreateComputersDashboardOp {
+  option (typeid.id) = "spacewave/computers/create";
+
+  // ObjectKey is the key to create the dashboard at.
+  string object_key = 1;
+  // Name is the display name of the dashboard.
+  string name = 2;
+  // Timestamp is the creation timestamp.
+  .google.protobuf.Timestamp timestamp = 3;
+}
+
+service DeviceResourceService {
+  rpc WatchDeviceState(WatchDeviceStateRequest) returns (stream WatchDeviceStateResponse);
+  rpc WatchDeviceAvailability(WatchDeviceAvailabilityRequest) returns (stream DeviceAvailability);
+  rpc ReportDeviceStatus(ReportDeviceStatusRequest) returns (ReportDeviceStatusResponse);
+  rpc AccessCheckoutRoot(AccessCheckoutRootRequest) returns (AccessCheckoutRootResponse);
+}
+
+// DeviceAvailabilityState describes reachability over the authenticated transport.
+enum DeviceAvailabilityState {
+  // DEVICE_AVAILABILITY_STATE_UNKNOWN means either peer identity is unavailable.
+  DEVICE_AVAILABILITY_STATE_UNKNOWN = 0;
+  // DEVICE_AVAILABILITY_STATE_OFFLINE means the Device has no live authenticated link.
+  DEVICE_AVAILABILITY_STATE_OFFLINE = 1;
+  // DEVICE_AVAILABILITY_STATE_ONLINE means the Device has a live authenticated link.
+  DEVICE_AVAILABILITY_STATE_ONLINE = 2;
+}
+
+// DeviceAvailability joins the durable Device with its current transport reachability.
+// It is an ephemeral projection and is never written into the World.
+message DeviceAvailability {
+  // Device is the current durable Device object.
+  Device device = 1;
+  // State is reachability from the observing Session's authenticated transport.
+  DeviceAvailabilityState state = 2;
+}
+
+// WatchDeviceAvailabilityRequest subscribes to Device and authenticated link changes.
+message WatchDeviceAvailabilityRequest {}
+
+// WatchDeviceStateRequest is a request to watch Device state.
+message WatchDeviceStateRequest {}
+
+// WatchDeviceStateResponse contains the current Device state.
+message WatchDeviceStateResponse {
+  // State is the current Device block state.
+  Device state = 1;
+}
+
+// ReportDeviceStatusRequest updates daemon-owned Device status fields.
+message ReportDeviceStatusRequest {
+  // PeerId must match the Device peer_id.
+  string peer_id = 1;
+  // SetupState updates setup state when not UNKNOWN.
+  DeviceSetupState setup_state = 2;
+  // UpdateState updates update state when not UNKNOWN.
+  DeviceUpdateState update_state = 3;
+  // LastStatus replaces the durable last status when present.
+  DeviceStatus last_status = 4;
+  // Capabilities replaces capability summaries when replace_capabilities is true.
+  repeated DeviceCapability capabilities = 5;
+  // ReplaceCapabilities enables capability replacement.
+  bool replace_capabilities = 6;
+}
+
+// ReportDeviceStatusResponse contains the updated Device state.
+message ReportDeviceStatusResponse {
+  // State is the updated Device block state.
+  Device state = 1;
+}
+
+// AccessCheckoutRootRequest opens a named checkout root as a filesystem resource.
+message AccessCheckoutRootRequest {
+  // Name is the checkout-root selector. Empty selects the first readable root.
+  string name = 1;
+  // Write requests a write-capable filesystem handle.
+  bool write = 2;
+  // WriteApprovalRef identifies the Decision or equivalent approval for writes.
+  string write_approval_ref = 3;
+}
+
+// AccessCheckoutRootResponse contains the mounted filesystem resource.
+message AccessCheckoutRootResponse {
+  // ResourceId is the FSHandle resource id.
+  uint32 resource_id = 1;
+  // CapabilityId is the selected Device capability id.
+  string capability_id = 2;
+  // ObjectKey is the linked filesystem owner object key.
+  string object_key = 3;
+  // TypeId is the linked filesystem ObjectType id.
+  string type_id = 4;
+  // CheckoutRoot is the selected checkout-root metadata.
+  DeviceCheckoutRootCapability checkout_root = 5;
+  // WriteAvailable reports whether the selected capability can be write-gated.
+  bool write_available = 6;
+  // WriteEnabled reports whether this mounted handle was opened for writes.
+  bool write_enabled = 7;
+  // WriteApprovalRef is the approval ref accepted for a write-enabled handle.
+  string write_approval_ref = 8;
+}

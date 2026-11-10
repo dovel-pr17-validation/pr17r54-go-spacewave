@@ -1,0 +1,690 @@
+//go:build !js
+
+package devtool
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"github.com/aperturerobotics/cli"
+	"github.com/aperturerobotics/util/gitroot"
+	"github.com/s4wave/spacewave"
+	"github.com/s4wave/spacewave/bldr/util/logfile"
+	"github.com/sirupsen/logrus"
+)
+
+type webStartMode string
+
+const (
+	webStartModeWasm     webStartMode = "wasm"
+	webStartModeGoScript webStartMode = "goscript"
+)
+
+// DevtoolArgs contains common flags for the dev tools.
+type DevtoolArgs struct {
+	// Logger is the root logger.
+	Logger *logrus.Entry
+	// LogLevel is the log level string (debug, info, warn, error).
+	LogLevel string
+
+	// BldrVersion is the version of bldr to require in go.mod.
+	BldrVersion string
+	// BldrVersionSum is the version sum to require in go.sum.
+	BldrVersionSum string
+	// BldrSrcPath is the path to bldr to replace in go.mod
+	// Use for a local path to a development checkout of the bldr sources.
+	// Must be a path relative to the dist sources.
+	// Should be unset unless using a dev checkout of bldr.
+	BldrSrcPath string
+
+	// StatePath is the directory to use for working state.
+	StatePath string
+	// ConfigPath is the path to the bldr.yaml config file.
+	ConfigPath string
+	// OutputPath is the path to use for build output.
+	OutputPath string
+	// ServeStaticPath is the path to serve with the static http server.
+	ServeStaticPath string
+	// UseGitRoot enables relative paths to the git repo root.
+	UseGitRoot bool
+	// Watch indicates we should watch for changes.
+	Watch bool
+
+	// Vars are name=value inputs a bldr.star reads with var(name, default).
+	Vars cli.StringSlice
+
+	// NoTUI disables the live terminal dashboard.
+	NoTUI bool
+
+	// Remote is the remote config to use.
+	// Controls which world is used to store objects.
+	Remote string
+	// BuildType is the type of build to perform.
+	// Usually "dev" or "release".
+	// If running "dist" this is forced to "release".
+	BuildType string
+	// ManifestRevision is the minimum revision for manifests in a finite build.
+	ManifestRevision uint64
+	// MinifyEntrypoint configures if we will minify the entrypoint files.
+	MinifyEntrypoint bool
+	// JSMinification controls build-scoped JavaScript minification.
+	JSMinification string
+	// JSSourcemaps controls build-scoped JavaScript sourcemap emission.
+	JSSourcemaps string
+	// GoScriptCodeSplitting controls GoScript bundle code splitting.
+	GoScriptCodeSplitting string
+	// GoScriptDeadCodeElimination controls GoScript dead code elimination.
+	GoScriptDeadCodeElimination string
+	// WebListenAddr is the address to listen for start:web.
+	WebListenAddr string
+	// WebUseWasm compiles browser Go plugins with standard Go/WASM.
+	WebUseWasm bool
+	// WebUseGoScript compiles browser Go plugins with GoScript.
+	WebUseGoScript bool
+
+	// BuildCsv is the list of builds to build.
+	BuildCsv string
+	// DistCsv is the list of dists to build.
+	DistCsv string
+	// PublishCsv is the list of publish IDs.
+	PublishCsv string
+
+	// AccessOrderManifestID is the manifest ID to profile for startup access order.
+	AccessOrderManifestID string
+	// AccessOrderPlatformID is the manifest platform ID to profile.
+	AccessOrderPlatformID string
+	// AccessOrderOutputPath is the .bin profile output path.
+	AccessOrderOutputPath string
+
+	// DisableCleanup disables cleaning up the build files.
+	DisableCleanup bool
+
+	// TargetsCsv is the comma-separated list of deployment targets (e.g., "browser,desktop").
+	// Overrides platform_ids in build configs when specified.
+	TargetsCsv string
+
+	// WebRenderer is the web renderer to use for native applications.
+	// Valid values: "electron", "saucer".
+	WebRenderer string
+
+	// StartPlugins is additional plugin IDs to load on startup.
+	// Appended to the plugins list from bldr.yaml start config.
+	StartPlugins cli.StringSlice
+
+	// LogFiles is the list of log file specs.
+	LogFiles cli.StringSlice
+	// activeLogFile is the primary resolved log file path for the active command.
+	activeLogFile string
+	// logFileCleanup closes log file hooks on shutdown.
+	logFileCleanup func()
+}
+
+// NewDevtoolArgs constructs new default arguments.
+func NewDevtoolArgs() *DevtoolArgs {
+	a := &DevtoolArgs{}
+	a.FillDefaults()
+	return a
+}
+
+// FillDefaults fills the args defaults.
+func (a *DevtoolArgs) FillDefaults() {
+	// Default to a stdout info-level logger when none is configured.
+	if a.Logger == nil {
+		log := logrus.New()
+		log.SetLevel(logrus.InfoLevel)
+		a.Logger = logrus.NewEntry(log)
+	}
+	if a.LogLevel == "" {
+		a.LogLevel = "info"
+	}
+
+	// Set the default devtool paths and build type.
+	a.OutputPath = "output"
+	a.ConfigPath = "bldr.yaml"
+	a.StatePath = ".bldr/"
+	a.BuildType = "dev"
+	a.Remote = "devtool"
+	a.UseGitRoot = true
+
+	// Set the default web entrypoint and JavaScript build settings.
+	a.WebListenAddr = "127.0.0.1:5593"
+	a.MinifyEntrypoint = true
+	a.JSMinification = "default"
+	a.JSSourcemaps = "default"
+	a.GoScriptCodeSplitting = "default"
+	a.GoScriptDeadCodeElimination = "default"
+	a.Watch = true
+
+	// Fill the Bldr version and checksum from the build metadata.
+	if buildInfo, ok := debug.ReadBuildInfo(); ok && buildInfo.Main.Version != "(devel)" {
+		a.BldrVersion = buildInfo.Main.Version
+		a.BldrVersionSum = buildInfo.Main.Sum
+	} else {
+		a.BldrVersion = "master"
+	}
+}
+
+// BuildDevtoolCommand returns the devtool sub-command set.
+func (a *DevtoolArgs) BuildDevtoolCommand() *cli.Command {
+	return &cli.Command{
+		Name:        "bldr",
+		Usage:       "bldr devtools",
+		Flags:       a.BuildFlags(),
+		Subcommands: a.BuildSubCommands(),
+	}
+}
+
+// BuildFlags attaches the flags to a flag set.
+func (a *DevtoolArgs) BuildFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{
+			Name:        "log-level",
+			Usage:       "log level (debug, info, warn, error)",
+			EnvVars:     []string{"BLDR_LOG_LEVEL"},
+			Value:       a.LogLevel,
+			Destination: &a.LogLevel,
+		},
+		&cli.StringFlag{
+			Name:        "config",
+			Aliases:     []string{"c"},
+			Usage:       "bldr project config yaml",
+			EnvVars:     []string{"BLDR_CONFIG"},
+			Value:       a.ConfigPath,
+			Destination: &a.ConfigPath,
+		},
+		&cli.StringFlag{
+			Name:        "output",
+			Aliases:     []string{"o"},
+			Usage:       "directory for build outputs",
+			EnvVars:     []string{"BLDR_OUTPUT"},
+			Value:       a.OutputPath,
+			Destination: &a.OutputPath,
+		},
+		&cli.BoolFlag{
+			Name:        "watch",
+			Aliases:     []string{"w"},
+			Usage:       "watch for changes",
+			EnvVars:     []string{"BLDR_WATCH"},
+			Value:       a.Watch,
+			Destination: &a.Watch,
+		},
+		&cli.StringSliceFlag{
+			Name:        "var",
+			Usage:       "name=value input for var(name, default) in bldr.star, repeatable",
+			EnvVars:     []string{"BLDR_VAR"},
+			Destination: &a.Vars,
+		},
+		&cli.StringFlag{
+			Name:        "state-path",
+			Usage:       "directory to use for working state and file checkouts",
+			EnvVars:     []string{"BLDR_STATE_PATH"},
+			Value:       a.StatePath,
+			Destination: &a.StatePath,
+		},
+		&cli.StringFlag{
+			Name:        "remote",
+			Aliases:     []string{"r"},
+			Usage:       "remote config to use for storage",
+			EnvVars:     []string{"BLDR_REMOTE"},
+			Value:       a.Remote,
+			Destination: &a.Remote,
+		},
+		&cli.BoolFlag{
+			Name:        "use-git-root",
+			Usage:       "enables detecting project root with git",
+			EnvVars:     []string{"BLDR_USE_GIT_ROOT"},
+			Value:       a.UseGitRoot,
+			Destination: &a.UseGitRoot,
+		},
+		&cli.BoolFlag{
+			Name:        "minify-entrypoint",
+			Usage:       "enables minifying the entrypoint files",
+			EnvVars:     []string{"BLDR_MINIFY_ENTRYPOINT"},
+			Value:       a.MinifyEntrypoint,
+			Destination: &a.MinifyEntrypoint,
+		},
+		&cli.StringFlag{
+			Name:        "build-type",
+			Usage:       "build type: dev or release",
+			EnvVars:     []string{"BLDR_BUILD_TYPE"},
+			Value:       a.BuildType,
+			Destination: &a.BuildType,
+		},
+		&cli.StringFlag{
+			Name:        "js-minification",
+			Usage:       "JavaScript minification policy: default, enable, or disable",
+			EnvVars:     []string{"BLDR_JS_MINIFICATION"},
+			Value:       a.JSMinification,
+			Destination: &a.JSMinification,
+		},
+		&cli.StringFlag{
+			Name:        "js-sourcemaps",
+			Usage:       "JavaScript sourcemap policy: default, enable, or disable",
+			EnvVars:     []string{"BLDR_JS_SOURCEMAPS"},
+			Value:       a.JSSourcemaps,
+			Destination: &a.JSSourcemaps,
+		},
+		&cli.StringFlag{
+			Name:        "goscript-code-splitting",
+			Usage:       "GoScript bundle code-splitting policy: default, enable, or disable",
+			EnvVars:     []string{"BLDR_GOSCRIPT_CODE_SPLITTING"},
+			Value:       a.GoScriptCodeSplitting,
+			Destination: &a.GoScriptCodeSplitting,
+		},
+		&cli.StringFlag{
+			Name:        "goscript-dead-code-elimination",
+			Usage:       "GoScript dead code elimination policy: default (release builds only), enable, or disable",
+			EnvVars:     []string{"BLDR_GOSCRIPT_DEAD_CODE_ELIMINATION"},
+			Value:       a.GoScriptDeadCodeElimination,
+			Destination: &a.GoScriptDeadCodeElimination,
+		},
+
+		&cli.BoolFlag{
+			Name:        "no-tui",
+			Usage:       "disable the live terminal dashboard",
+			EnvVars:     []string{bldrNoTUIEnv},
+			Value:       a.NoTUI,
+			Destination: &a.NoTUI,
+		},
+
+		&cli.StringFlag{
+			Name:        "bldr-version",
+			Usage:       "bldr go module version",
+			EnvVars:     []string{"BLDR_VERSION"},
+			Value:       a.BldrVersion,
+			Destination: &a.BldrVersion,
+			Hidden:      true,
+		},
+		&cli.StringFlag{
+			Name:        "bldr-version-sum",
+			Usage:       "bldr go module sum",
+			EnvVars:     []string{"BLDR_VERSION_SUM"},
+			Value:       a.BldrVersionSum,
+			Destination: &a.BldrVersionSum,
+			Hidden:      true,
+		},
+		&cli.StringFlag{
+			Name:        "bldr-src-path",
+			Usage:       "bldr local replacement go sources path",
+			EnvVars:     []string{"BLDR_SRC_PATH"},
+			Value:       a.BldrSrcPath,
+			Destination: &a.BldrSrcPath,
+			Hidden:      true,
+		},
+		&cli.BoolFlag{
+			Name:        "disable-cleanup",
+			Usage:       "disables cleaning up intermediate build files",
+			EnvVars:     []string{"BLDR_DISABLE_CLEANUP"},
+			Value:       a.DisableCleanup,
+			Destination: &a.DisableCleanup,
+		},
+		logfile.BuildLogFileFlag(&a.LogFiles),
+	}
+}
+
+// BuildSubCommands builds the sub-command set.
+func (a *DevtoolArgs) BuildSubCommands() []*cli.Command {
+	return []*cli.Command{
+		a.BuildSetupCommand(),
+		a.BuildStartCommand(),
+		a.BuildStaticHttpCommand(),
+		a.BuildBuildCommand(),
+		a.BuildPublishCommand(),
+		a.BuildProfileAccessOrderCommand(),
+		a.BuildTargetsCommand(),
+		BuildTraceCommand(),
+		BuildCallpathCommand(),
+		BuildSqlServeCommand(),
+	}
+}
+
+// BuildStartCommand builds the start sub-command.
+func (a *DevtoolArgs) BuildStartCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "start",
+		Usage: "start a bldr application in development mode",
+		Flags: []cli.Flag{
+			&cli.StringSliceFlag{
+				Name:        "plugins",
+				Aliases:     []string{"p"},
+				Usage:       "additional plugin IDs to load on startup",
+				EnvVars:     []string{"BLDR_START_PLUGINS"},
+				Destination: &a.StartPlugins,
+			},
+		},
+		Subcommands: a.BuildStartCommands(),
+	}
+}
+
+// BuildSetupCommand builds the setup sub-command.
+func (a *DevtoolArgs) BuildSetupCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "setup",
+		Usage: "checkout the bldr web sources and dependencies",
+		Action: func(c *cli.Context) error {
+			return a.ExecuteSetup(c.Context)
+		},
+	}
+}
+
+// BuildStaticHttpCommand builds the static http server sub-command.
+func (a *DevtoolArgs) BuildStaticHttpCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "static",
+		Usage: "serve a static directory with a http server",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "listen, l",
+				Usage:       "address to listen on",
+				EnvVars:     []string{"BLDR_WEB_LISTEN"},
+				Destination: &a.WebListenAddr,
+				Value:       a.WebListenAddr,
+			},
+			&cli.StringFlag{
+				Name:        "path, p",
+				Usage:       "path to the directory to serve",
+				EnvVars:     []string{"BLDR_STATIC_PATH"},
+				Destination: &a.ServeStaticPath,
+				Value:       a.ServeStaticPath,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			return a.ExecuteStaticHttpServer(c.Context)
+		},
+	}
+}
+
+// BuildStartCommands builds the bldr start sub-commands.
+func (a *DevtoolArgs) BuildStartCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:      "cli",
+			Usage:     "Build and run a CLI manifest as a subprocess.",
+			ArgsUsage: "<manifest-id> [-- args...]",
+			Action: func(c *cli.Context) error {
+				manifestID := c.Args().First()
+				if manifestID == "" {
+					return errors.New("manifest ID required")
+				}
+				return a.ExecuteCliProject(c.Context, manifestID, c.Args().Tail())
+			},
+		},
+		{
+			Name:  "desktop",
+			Usage: "Start the application as a desktop app.",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:        "web-renderer",
+					Usage:       "web renderer to use (electron, saucer)",
+					EnvVars:     []string{"BLDR_WEB_RENDERER"},
+					Destination: &a.WebRenderer,
+					Value:       "electron",
+				},
+			},
+			Action: func(c *cli.Context) error {
+				return a.ExecuteNativeProject(c.Context)
+			},
+		},
+		{
+			Name:  "web",
+			Usage: "Start the application as a web server.",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:        "listen, l",
+					Usage:       "address to listen on for dev build",
+					EnvVars:     []string{"BLDR_WEB_LISTEN"},
+					Destination: &a.WebListenAddr,
+					Value:       a.WebListenAddr,
+				},
+				&cli.BoolFlag{
+					Name:        "wasm",
+					Usage:       "compile browser Go plugins with standard Go/WASM",
+					EnvVars:     []string{"BLDR_WEB_WASM"},
+					Destination: &a.WebUseWasm,
+					Value:       a.WebUseWasm,
+				},
+				&cli.BoolFlag{
+					Name:        "goscript",
+					Usage:       "compile browser Go plugins with GoScript (default)",
+					EnvVars:     []string{"BLDR_WEB_GOSCRIPT"},
+					Destination: &a.WebUseGoScript,
+					Value:       a.WebUseGoScript,
+				},
+			},
+			Action: func(c *cli.Context) error {
+				mode, err := a.resolveWebStartMode()
+				if err != nil {
+					return err
+				}
+				switch mode {
+				case webStartModeGoScript:
+					return a.ExecuteWebGoScriptProject(c.Context)
+				case webStartModeWasm:
+					return a.ExecuteWebWasmProject(c.Context)
+				default:
+					return errors.New("unknown web start mode")
+				}
+			},
+		},
+	}
+}
+
+func (a *DevtoolArgs) resolveWebStartMode() (webStartMode, error) {
+	if a.WebUseWasm && a.WebUseGoScript {
+		return "", errors.New("only one of --wasm or --goscript may be set")
+	}
+	if a.WebUseWasm {
+		return webStartModeWasm, nil
+	}
+	return webStartModeGoScript, nil
+}
+
+// BuildBuildCommand builds the bldr build command.
+func (a *DevtoolArgs) BuildBuildCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "build",
+		Usage: "builds a target",
+		Flags: []cli.Flag{
+			&cli.Uint64Flag{
+				Name:        "manifest-revision",
+				Usage:       "minimum manifest revision (builds still advance past stored revisions)",
+				Value:       a.ManifestRevision,
+				Destination: &a.ManifestRevision,
+			},
+			&cli.StringFlag{
+				Name:        "build",
+				Aliases:     []string{"builds", "b"},
+				Usage:       "comma-separated list of build target(s) to build",
+				Value:       a.BuildCsv,
+				Destination: &a.BuildCsv,
+			},
+			&cli.StringFlag{
+				Name:        "targets",
+				Aliases:     []string{"target", "t"},
+				Usage:       "comma-separated deployment targets (e.g., browser,desktop)",
+				EnvVars:     []string{"BLDR_TARGETS"},
+				Value:       a.TargetsCsv,
+				Destination: &a.TargetsCsv,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			return a.BuildProject(c.Context)
+		},
+	}
+}
+
+// BuildPublishCommand builds the bldr dist command.
+func (a *DevtoolArgs) BuildPublishCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "publish",
+		Usage: "builds and releases a bundle",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "publish",
+				Aliases:     []string{"pub", "p"},
+				Usage:       "comma-separated list of publish target(s)",
+				EnvVars:     []string{"BLDR_PUBLISH", "BLDR_PUBLISH_TARGETS"},
+				Value:       a.PublishCsv,
+				Destination: &a.PublishCsv,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			return a.PublishProject(c.Context)
+		},
+	}
+}
+
+// Validate validates the arguments.
+func (a *DevtoolArgs) Validate() error {
+	// Require the output and state paths to be set.
+	if a.OutputPath == "" {
+		return errors.New("output path must be set")
+	}
+	if a.StatePath == "" {
+		return errors.New("state path must be set")
+	}
+
+	// Require a relative Bldr source path.
+	if a.BldrSrcPath != "" {
+		if !strings.HasPrefix(a.BldrSrcPath, ".") {
+			return errors.New("bldr-src-path must be a relative path")
+		}
+	}
+
+	// Validate the build policy override.
+	if _, err := a.BuildPolicyOverride(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// FindRepoRoot returns the absolute path to the root dir to use.
+func (a *DevtoolArgs) FindRepoRoot() (string, error) {
+	// Resolve the Git root, if set.
+	if a.UseGitRoot {
+		return gitroot.FindRepoRoot()
+	}
+
+	// Use the working directory.
+	return os.Getwd()
+}
+
+// GetStateRoot returns the state directory according to the config.
+func (a *DevtoolArgs) GetStateRoot(repoRoot string) string {
+	if confStatePath := a.StatePath; confStatePath != "" {
+		if filepath.IsAbs(confStatePath) {
+			return confStatePath
+		}
+		return filepath.Join(repoRoot, confStatePath)
+	}
+	return filepath.Join(repoRoot, ".bldr")
+}
+
+// applyLogLevel parses and applies the LogLevel to the logger.
+func (a *DevtoolArgs) applyLogLevel() {
+	if a.LogLevel == "" {
+		return
+	}
+	lvl, err := logrus.ParseLevel(a.LogLevel)
+	if err != nil {
+		return
+	}
+	a.Logger.Logger.SetLevel(lvl)
+}
+
+// InitRepoRoot finds and initializes the repo root.
+func (a *DevtoolArgs) InitRepoRoot() (
+	repoRoot, stateRoot string,
+	err error,
+) {
+	// Apply the configured log level to the logger.
+	a.applyLogLevel()
+
+	// Resolve the repository root for the state directory.
+	repoRoot, err = a.FindRepoRoot()
+	if err != nil {
+		return
+	}
+
+	// Auto-enable file logging in dev mode when no --log-file flags are set.
+	if a.BuildType == "dev" && len(a.LogFiles.Value()) == 0 {
+		a.LogFiles.Set("level=DEBUG;path=.bldr/logs/{ts}.log")
+	}
+
+	// Attach log file hooks for each parsed spec, remembering the primary path.
+	raw := a.LogFiles.Value()
+	if len(raw) != 0 {
+		specs, specErr := logfile.ParseLogFileSpecs(raw, time.Now())
+		if specErr != nil {
+			err = specErr
+			return
+		}
+		if len(specs) != 0 {
+			for i := range specs {
+				if !filepath.IsAbs(specs[i].Path) {
+					specs[i].Path = filepath.Join(repoRoot, specs[i].Path)
+				}
+			}
+			a.activeLogFile = specs[0].Path
+			cleanup, attachErr := logfile.AttachLogFiles(a.Logger.Logger, specs)
+			if attachErr != nil {
+				err = attachErr
+				return
+			}
+			a.logFileCleanup = cleanup
+			logfile.EnsureLoggerLevel(a.Logger.Logger, specs)
+		}
+	}
+
+	// Create the state root and write its license and gitignore files.
+	stateRoot = a.GetStateRoot(repoRoot)
+	err = os.MkdirAll(stateRoot, 0o755)
+	if err == nil {
+		licenseFile := filepath.Join(stateRoot, "LICENSE.s4wave")
+		licenseBody := "The Bldr sources are covered by this license:\n\n" + spacewave.GetLicense()
+		err = os.WriteFile(licenseFile, []byte(licenseBody), 0o644)
+	}
+	if err == nil {
+		gitIgnoreFile := filepath.Join(stateRoot, ".gitignore")
+		gitIgnoreBody := "*\n!LICENSE.bldr\n!.gitignore\n"
+		err = os.WriteFile(gitIgnoreFile, []byte(gitIgnoreBody), 0o644)
+	}
+	return repoRoot, stateRoot, err
+}
+
+// CloseLogFiles closes any attached log file hooks.
+func (a *DevtoolArgs) CloseLogFiles() {
+	if a.logFileCleanup != nil {
+		a.logFileCleanup()
+		a.logFileCleanup = nil
+	}
+	a.activeLogFile = ""
+}
+
+func (a *DevtoolArgs) commandLogFile() string {
+	return a.activeLogFile
+}
+
+// GetOutputRoot returns the output path root relative to the project root.
+func (a *DevtoolArgs) GetOutputRoot(repoRoot string) string {
+	outputPath := a.OutputPath
+	if !filepath.IsAbs(outputPath) {
+		outputPath = filepath.Join(repoRoot, outputPath)
+	}
+	return outputPath
+}
+
+// BuildTargetsCommand builds the bldr targets command.
+func (a *DevtoolArgs) BuildTargetsCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "targets",
+		Usage: "lists available deployment targets",
+		Action: func(c *cli.Context) error {
+			return a.ListTargets()
+		},
+	}
+}

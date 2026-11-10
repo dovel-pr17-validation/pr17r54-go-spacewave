@@ -1,0 +1,1444 @@
+package spacewave_chat
+
+import (
+	"cmp"
+	"context"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/aperturerobotics/fastjson"
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/ulid"
+	"github.com/pkg/errors"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/labels"
+	spacewave_chat_rpc "github.com/s4wave/spacewave/sdk/chat/rpc"
+	chat_state "github.com/s4wave/spacewave/sdk/chat/state"
+)
+
+const (
+	// defaultMessageListLimit bounds each history response.
+	defaultMessageListLimit = 50
+	// maxMessageListLimit caps caller-selected page sizes.
+	maxMessageListLimit = 50
+	// maxThreadReadPositions bounds the timeline positions one person retains in a channel.
+	maxThreadReadPositions = 256
+	// chatMessagePageSize bounds each persisted history page.
+	chatMessagePageSize = 64
+)
+
+// ErrChatAuthorIdentityRequired is returned when a message has no authenticated author.
+var ErrChatAuthorIdentityRequired = errors.New("chat author identity required")
+
+// ErrChatRedactionForbidden is returned when a redaction targets another
+// person's message without an owner's authority or its protocol's envelope.
+var ErrChatRedactionForbidden = errors.New("chat redaction targets another person's message")
+
+// errChatStateConflict indicates that current state no longer matches a write condition.
+var errChatStateConflict = errors.New("chat state write condition conflicts with current state")
+
+// ChatResource serves ChatResourceService for a single chat channel object.
+type ChatResource struct {
+	// ws serves reads within the mounted Space.
+	ws world.WorldState
+	// engine submits channel mutations for ordered World replay.
+	engine world.Engine
+	// objectKey identifies the channel.
+	objectKey string
+	// localPeerID is the operation signing device bound by the World engine.
+	localPeerID string
+	// device retains the parsed signer for local World operations.
+	device peer.ID
+	// personID is the accepted entity or local-only signing device.
+	personID string
+	// owner reports that the signer owns the Space and may redact any message.
+	owner bool
+	// mux exposes channel operations for this attachment.
+	mux srpc.Mux
+}
+
+// NewChatResource binds a channel to the World engine's accepted author.
+func NewChatResource(
+	ctx context.Context,
+	ws world.WorldState,
+	engine world.Engine,
+	objectKey string,
+) (*ChatResource, error) {
+	// Resolve the accepted author and bind the channel Resource to its World.
+	var device peer.ID
+	var person string
+	if engine != nil {
+		var err error
+		device, person, err = engine.OperationAuthor(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	r := &ChatResource{
+		ws:          ws,
+		engine:      engine,
+		objectKey:   objectKey,
+		localPeerID: device.String(),
+		device:      device,
+		personID:    person,
+	}
+
+	// Expose the generated service through the Resource lifecycle.
+	r.mux = resource_server.NewResourceMux(func(mux srpc.Mux) error {
+		return spacewave_chat_rpc.SRPCRegisterChatResourceService(mux, r)
+	})
+	return r, nil
+}
+
+// GetMux returns the SRPC mux for this resource.
+func (r *ChatResource) GetMux() srpc.Mux {
+	return r.mux
+}
+
+// Close releases the chat resource lifecycle.
+func (r *ChatResource) Close() {}
+
+// operationResource binds this call to the engine's current accepted author.
+func (r *ChatResource) operationResource(ctx context.Context) (*ChatResource, error) {
+	// Preserve the existing binding for a read-only channel Resource.
+	if r.engine == nil {
+		return r, nil
+	}
+
+	// Resolve the World engine's current accepted author.
+	device, person, err := r.engine.OperationAuthor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bind a copy of the Resource to the author for this operation.
+	bound := *r
+	bound.device = device
+	bound.localPeerID = device.String()
+	bound.personID = person
+	return &bound, nil
+}
+
+// GetChannelInfo reads the channel block and returns metadata.
+func (r *ChatResource) GetChannelInfo(
+	ctx context.Context,
+	_ *spacewave_chat_rpc.GetChannelInfoRequest,
+) (*spacewave_chat_rpc.GetChannelInfoResponse, error) {
+	// Read the channel metadata from its shared state.
+	channel, err := r.readChannel(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return newChannelInfo(channel), nil
+}
+
+// WatchChannelInfo streams channel metadata, then again after each change.
+func (r *ChatResource) WatchChannelInfo(
+	_ *spacewave_chat_rpc.WatchChannelInfoRequest,
+	strm spacewave_chat_rpc.SRPCChatResourceService_WatchChannelInfoStream,
+) error {
+	ctx := strm.Context()
+	var sent *spacewave_chat_rpc.GetChannelInfoResponse
+	for {
+		// Read the channel root before its metadata, so a concurrent change
+		// ends the wait below.
+		seen, err := r.readChannelRoot(ctx)
+		if err != nil {
+			return err
+		}
+		channel, err := r.readChannel(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Send the metadata only when it differs from the last response.
+		info := newChannelInfo(channel)
+		if !info.EqualVT(sent) {
+			if err := strm.Send(&spacewave_chat_rpc.WatchChannelInfoResponse{Info: info}); err != nil {
+				return err
+			}
+			sent = info
+		}
+
+		// Resume when the channel changes or the client releases its stream.
+		if err := world.WaitObjectChange(ctx, r.ws, seen); err != nil {
+			return err
+		}
+	}
+}
+
+// newChannelInfo projects the channel metadata for the client.
+func newChannelInfo(channel *ChatChannel) *spacewave_chat_rpc.GetChannelInfoResponse {
+	return &spacewave_chat_rpc.GetChannelInfoResponse{
+		Name:                channel.GetName(),
+		Topic:               channel.GetTopic(),
+		MessageCount:        channel.GetMessageCount(),
+		CreatedAt:           channel.GetCreatedAt().CloneVT(),
+		CreatorPeerId:       channel.GetCreatorPeerId(),
+		EncryptionAlgorithm: channel.GetEncryptionAlgorithm(),
+	}
+}
+
+// GetState returns the latest retained event for each channel state identity.
+func (r *ChatResource) GetState(ctx context.Context, _ *spacewave_chat_rpc.GetStateRequest) (*spacewave_chat_rpc.GetStateResponse, error) {
+	// Require an existing mounted channel even when it has no retained state.
+	if _, err := r.readChannel(ctx); err != nil {
+		return nil, err
+	}
+
+	// Resolve graph references through the same projection used by history reads.
+	edges, err := r.ws.LookupGraphQuads(ctx, world.NewGraphQuadWithKeys(r.objectKey, PredChannelState.String(), "", ""), 0)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(edges))
+	for _, edge := range edges {
+		key, err := world.GraphValueToKey(edge.GetObj())
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	messages, err := r.readMessages(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+
+	// State order is independent of graph index ordering and history position.
+	slices.SortFunc(messages, func(a, b *spacewave_chat_rpc.ChatMessageInfo) int {
+		left, right := a.GetContent().GetStateChange(), b.GetContent().GetStateChange()
+		if order := strings.Compare(left.GetType(), right.GetType()); order != 0 {
+			return order
+		}
+		return strings.Compare(left.GetStateKey(), right.GetStateKey())
+	})
+	return &spacewave_chat_rpc.GetStateResponse{Messages: messages}, nil
+}
+
+// GetMessage reads one channel message by its channel-scoped object key.
+// A missing message returns a response with Message unset.
+func (r *ChatResource) GetMessage(
+	ctx context.Context,
+	req *spacewave_chat_rpc.GetMessageRequest,
+) (*spacewave_chat_rpc.GetMessageResponse, error) {
+	// Validate the requested key against the mounted channel.
+	key := req.GetMessageKey()
+	suffix, matches := strings.CutPrefix(key, r.objectKey+"/message/")
+	if !matches || suffix == "" || strings.Contains(suffix, "/") {
+		return nil, errors.New("message key belongs to another channel")
+	}
+
+	// Read the validated message through the owner projection.
+	message, err := r.readMessage(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return &spacewave_chat_rpc.GetMessageResponse{Message: message}, nil
+}
+
+// ListMessages returns a page of channel messages.
+func (r *ChatResource) ListMessages(
+	ctx context.Context,
+	req *spacewave_chat_rpc.ListMessagesRequest,
+) (*spacewave_chat_rpc.ListMessagesResponse, error) {
+	// Bound each response independently of the retained history size.
+	limit := req.GetLimit()
+	if limit == 0 || limit > maxMessageListLimit {
+		limit = defaultMessageListLimit
+	}
+
+	// Resolve the requested pagination direction and its channel boundary.
+	channel, err := r.readChannel(ctx)
+	if err != nil {
+		return nil, err
+	}
+	messageCount := channel.GetMessageCount()
+	beforeKey := req.GetBeforeKey()
+	hasBeforeIndex := req != nil && req.BeforeIndex != nil
+	hasFromIndex := req != nil && req.FromIndex != nil
+	if (hasBeforeIndex && hasFromIndex) ||
+		(hasBeforeIndex && beforeKey != "") ||
+		(hasFromIndex && beforeKey != "") {
+		return nil, errors.New("message cursors are mutually exclusive")
+	}
+
+	// Select a half-open interval while preserving ascending message order.
+	startIndex := uint64(0)
+	endIndex := messageCount
+	hasMore := false
+	switch {
+	case hasFromIndex:
+		startIndex = req.GetFromIndex()
+		if startIndex > messageCount {
+			return nil, errors.New("from index exceeds channel message count")
+		}
+		count := min(uint64(limit), messageCount-startIndex)
+		endIndex = startIndex + count
+		hasMore = endIndex < messageCount
+	case hasBeforeIndex:
+		endIndex = req.GetBeforeIndex()
+		if endIndex > messageCount {
+			return nil, errors.New("before index exceeds channel message count")
+		}
+		count := min(uint64(limit), endIndex)
+		startIndex = endIndex - count
+		hasMore = startIndex != 0
+	case beforeKey != "":
+		messageResponse, err := r.GetMessage(ctx, &spacewave_chat_rpc.GetMessageRequest{MessageKey: beforeKey})
+		if err != nil {
+			return nil, err
+		}
+		if messageResponse.GetMessage() == nil {
+			return nil, world.ErrObjectNotFound
+		}
+		endIndex = min(messageResponse.GetMessage().GetIndex(), messageCount)
+		count := min(uint64(limit), endIndex)
+		startIndex = endIndex - count
+		hasMore = startIndex != 0
+	default:
+		count := min(uint64(limit), messageCount)
+		startIndex = messageCount - count
+		hasMore = startIndex != 0
+	}
+
+	// Load only the selected interval and report directional history.
+	keys, err := r.readMessageKeys(ctx, startIndex, endIndex)
+	if err != nil {
+		return nil, err
+	}
+	messages, err := r.readMessages(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	return &spacewave_chat_rpc.ListMessagesResponse{Messages: messages, HasMore: hasMore}, nil
+}
+
+// WatchMessages streams new message batches after each channel change.
+func (r *ChatResource) WatchMessages(
+	_ *spacewave_chat_rpc.WatchMessagesRequest,
+	strm spacewave_chat_rpc.SRPCChatResourceService_WatchMessagesStream,
+) error {
+	// Track the next unsent channel position for this attachment.
+	ctx := strm.Context()
+	nextIndex := uint64(0)
+	initialized := false
+
+	// Read the channel root before the channel, so a concurrent append ends
+	// the wait below.
+	for {
+		seen, err := r.readChannelRoot(ctx)
+		if err != nil {
+			return err
+		}
+		channel, err := r.readChannel(ctx)
+		if err != nil {
+			return err
+		}
+		messageCount := channel.GetMessageCount()
+		if nextIndex > messageCount {
+			nextIndex = messageCount
+		}
+		if !initialized && messageCount == 0 {
+			if err := strm.Send(&spacewave_chat_rpc.WatchMessagesResponse{}); err != nil {
+				return err
+			}
+		}
+
+		// Emit complete bounded history batches in acceptance order.
+		initialized = true
+		for nextIndex < messageCount {
+			endIndex := min(nextIndex+defaultMessageListLimit, messageCount)
+			keys, err := r.readMessageKeys(ctx, nextIndex, endIndex)
+			if err != nil {
+				return err
+			}
+			messages, err := r.readMessages(ctx, keys)
+			if err != nil {
+				return err
+			}
+			if len(messages) != 0 {
+				if err := strm.Send(&spacewave_chat_rpc.WatchMessagesResponse{Messages: messages}); err != nil {
+					return err
+				}
+			}
+			nextIndex = endIndex
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
+		// Resume when the channel changes or the client releases its stream.
+		// Every append bumps the channel's message count.
+		if err := world.WaitObjectChange(ctx, r.ws, seen); err != nil {
+			return err
+		}
+	}
+}
+
+// SendMessage durably appends a message or resolves an identical sender-scoped retry.
+func (r *ChatResource) SendMessage(
+	ctx context.Context,
+	req *spacewave_chat_rpc.SendMessageRequest,
+) (*spacewave_chat_rpc.SendMessageResponse, error) {
+	// Bind the send to the World engine's accepted author.
+	bound, err := r.operationResource(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r = bound
+
+	// Commit the message and resolve a current-state write conflict.
+	response, err := r.commitMessage(ctx, req)
+	if errors.Is(err, errChatStateConflict) {
+		return &spacewave_chat_rpc.SendMessageResponse{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Synchronize the accepted message before returning its identity.
+	if _, err := r.engine.Sync(ctx); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+// commitMessage releases its transaction before the caller fences storage.
+func (r *ChatResource) commitMessage(ctx context.Context, req *spacewave_chat_rpc.SendMessageRequest) (*spacewave_chat_rpc.SendMessageResponse, error) {
+	// Require authenticated write authority before examining a send identity.
+	if r.engine == nil {
+		return nil, errors.New("chat resource is read-only")
+	}
+	if r.localPeerID == "" || r.personID == "" {
+		return nil, ErrChatAuthorIdentityRequired
+	}
+
+	// Prepare the intent locally; shared replay assigns its final history position.
+	wtx, err := r.engine.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	defer wtx.Discard()
+
+	// An unchanged unkeyed state write keeps the existing message identity.
+	if req.GetTransactionId() == "" && req.GetEnvelope() == nil && req.GetContent().GetStateChange() != nil {
+		content, err := normalizeSendMessageContent(req)
+		if err != nil {
+			return nil, err
+		}
+		_, acceptedKey, err := r.resolveMessageState(ctx, wtx, req, content)
+		if err != nil {
+			return nil, err
+		}
+		if acceptedKey != "" {
+			return &spacewave_chat_rpc.SendMessageResponse{MessageKey: acceptedKey}, nil
+		}
+	}
+
+	// Give every append a stable identity before submitting it for replay.
+	request := req.CloneVT()
+	if request.GetTransactionId() == "" && request.GetEnvelope() == nil {
+		request.TransactionId = ulid.NewULID()
+	}
+	seqno, err := wtx.GetSeqno(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Replay allocates the accepted position from current World history.
+	op := &SendChatMessageOp{
+		ObjectKey: r.objectKey,
+		Request:   request,
+		Timestamp: timestamppb.Now(),
+	}
+	ctx = world.WithOperationPerson(ctx, r.personID)
+	nextSeqno, _, err := wtx.ApplyWorldOp(ctx, op, r.device)
+	if err != nil {
+		return nil, err
+	}
+
+	// A retry has an existing key and needs no new World publication.
+	messageKey, err := sendMessageKey(r.objectKey, r.localPeerID, request)
+	if err != nil {
+		return nil, err
+	}
+	if nextSeqno != seqno {
+		if err := wtx.Commit(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	return &spacewave_chat_rpc.SendMessageResponse{MessageKey: messageKey}, nil
+}
+
+// AttachEnvelope gives a message without an envelope its wire form in another
+// protocol and returns the envelope the message holds afterward.
+func (r *ChatResource) AttachEnvelope(ctx context.Context, req *spacewave_chat_rpc.AttachEnvelopeRequest) (*spacewave_chat_rpc.AttachEnvelopeResponse, error) {
+	// Bind the attachment to the World engine's accepted author.
+	bound, err := r.operationResource(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r = bound
+
+	// Commit the attachment.
+	response, err := r.commitEnvelope(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Synchronize the accepted envelope before returning it.
+	if _, err := r.engine.Sync(ctx); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+// commitEnvelope applies an attachment and releases its transaction before the caller fences storage.
+func (r *ChatResource) commitEnvelope(ctx context.Context, req *spacewave_chat_rpc.AttachEnvelopeRequest) (*spacewave_chat_rpc.AttachEnvelopeResponse, error) {
+	// Require authenticated write authority.
+	if r.engine == nil {
+		return nil, errors.New("chat resource is read-only")
+	}
+	if r.localPeerID == "" || r.personID == "" {
+		return nil, ErrChatAuthorIdentityRequired
+	}
+
+	// An envelope the message already holds stands without a World mutation.
+	tx, err := r.engine.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Discard()
+	message, err := world.LookupObjectBody[ChatMessage](ctx, tx, req.GetMessageKey())
+	if err != nil {
+		return nil, err
+	}
+	if message.GetEnvelope() != nil {
+		return &spacewave_chat_rpc.AttachEnvelopeResponse{Envelope: message.GetEnvelope().CloneVT()}, nil
+	}
+
+	// Apply the attachment as a replayable operation and return the stored envelope.
+	op := &AttachChatEnvelopeOp{ObjectKey: r.objectKey, MessageKey: req.GetMessageKey(), Envelope: req.GetEnvelope()}
+	ctx = world.WithOperationPerson(ctx, r.personID)
+	if _, _, err := tx.ApplyWorldOp(ctx, op, r.device); err != nil {
+		return nil, err
+	}
+	message, err = world.LookupObjectBody[ChatMessage](ctx, tx, req.GetMessageKey())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &spacewave_chat_rpc.AttachEnvelopeResponse{Envelope: message.GetEnvelope().CloneVT()}, nil
+}
+
+// appendMessage records a message inside the caller's World transaction.
+// Channel creation uses the same append path and supplies its operation timestamp.
+func (r *ChatResource) appendMessage(ctx context.Context, wtx world.WorldState, req *spacewave_chat_rpc.SendMessageRequest, timestamp *timestamppb.Timestamp) (*spacewave_chat_rpc.SendMessageResponse, error) {
+	// Read the policy and history extent inside the caller's transaction.
+	channel, err := world.LookupObjectBody[ChatChannel](ctx, wtx, r.objectKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize the request content before resolving a send identity.
+	content, err := normalizeSendMessageContent(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAuthor(req.GetAuthor()); err != nil {
+		return nil, err
+	}
+	if envelope := req.GetEnvelope(); envelope != nil {
+		if err := envelope.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if req.ExpectedStateMessageKey != nil && content.GetStateChange() == nil {
+		return nil, errors.New("chat state write condition requires a state change")
+	}
+
+	// Resolve a retry or a repeated envelope before reserving a history position.
+	msgKey, err := sendMessageKey(r.objectKey, r.localPeerID, req)
+	if err != nil {
+		return nil, err
+	}
+	if msgKey != "" {
+		prior, err := world.LookupObjectBody[ChatMessage](ctx, wtx, msgKey)
+		if err != nil && !errors.Is(err, world.ErrObjectNotFound) {
+			return nil, err
+		}
+		// Any sender may deliver an envelope; the first accepted copy stands.
+		if prior != nil && req.GetEnvelope() != nil {
+			if prior.GetEnvelope().GetId() != req.GetEnvelope().GetId() {
+				return nil, errors.New("chat envelope conflicts with its accepted message")
+			}
+			return &spacewave_chat_rpc.SendMessageResponse{MessageKey: msgKey}, nil
+		}
+		if prior != nil {
+			personID := prior.GetPersonId()
+			// A redacted body no longer matches its retry; the accepted identity still does.
+			if prior.GetSenderPeerId() != r.localPeerID || personID != r.personID || prior.GetAuthor() != req.GetAuthor() || !req.GetReuseAcceptedTransaction() && prior.GetRedactedByKey() == "" && (!prior.GetContent().EqualVT(content) || prior.GetReplyToKey() != req.GetReplyToKey()) {
+				return nil, errors.New("chat send transaction conflicts with its accepted message")
+			}
+			return &spacewave_chat_rpc.SendMessageResponse{MessageKey: msgKey}, nil
+		}
+	}
+
+	// Resolve relationships only for new writes; accepted retries retain their original targets.
+	relation := content.GetCiphertext().GetRelation()
+	eventRelation := content.GetEvent().GetRelation()
+	for _, key := range []string{relation.GetTargetKey(), relation.GetReplyToKey(), eventRelation.GetTargetKey(), eventRelation.GetReplyToKey(), content.GetAnnotation().GetTargetKey(), content.GetRedaction().GetTargetKey()} {
+		if key == "" {
+			continue
+		}
+		suffix, found := strings.CutPrefix(key, r.objectKey+"/message/")
+		if !found || suffix == "" || strings.ContainsAny(suffix, "/\x00") {
+			return nil, errors.New("chat relation target belongs to another channel")
+		}
+		if key == content.GetRedaction().GetTargetKey() {
+			continue
+		}
+		if _, err := world.LookupObjectBody[ChatMessage](ctx, wtx, key); err != nil {
+			return nil, errors.Wrap(err, "resolve chat relation target")
+		}
+	}
+
+	// Resolve the redaction target, which may not have arrived yet.
+	var redacted *ChatMessage
+	redactsPending := false
+	if redaction := content.GetRedaction(); redaction != nil {
+		redacted, redactsPending, err = r.resolveRedactionTarget(ctx, wtx, redaction, req.GetEnvelope() != nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// New local bodies follow current encryption policy. A body that arrives in
+	// an envelope already passed its room's own rules, and accepted retries
+	// retain their original result.
+	if algorithm := channel.GetEncryptionAlgorithm(); algorithm != "" && req.GetEnvelope() == nil && content != nil && content.GetAnnotation() == nil && content.GetStateChange() == nil && content.GetRedaction() == nil && content.GetCiphertext().GetAlgorithm() != algorithm {
+		return nil, errors.New("chat message ciphertext algorithm does not match channel")
+	}
+
+	// Resolve current state after retry lookup so old retries cannot replace newer state.
+	state := content.GetStateChange()
+	priorState, acceptedKey, err := r.resolveMessageState(ctx, wtx, req, content)
+	if err != nil {
+		return nil, err
+	}
+	if acceptedKey != "" {
+		return &spacewave_chat_rpc.SendMessageResponse{MessageKey: acceptedKey}, nil
+	}
+
+	// Every new append advances an already initialized history prefix atomically.
+	if channel.ThreadIndexedMessageCount == nil ||
+		channel.GetThreadIndexedMessageCount() != channel.GetMessageCount() {
+		return nil, errors.New("chat thread index does not match channel history")
+	}
+
+	// Append the accepted message and its page entry in one World transaction.
+	index, msgKey, err := r.appendChannelMessageKey(ctx, wtx, msgKey, state)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the message body, linked to the state it replaces.
+	replacesKey := ""
+	if len(priorState) == 1 {
+		replacesKey, err = world.GraphValueToKey(priorState[0].GetObj())
+		if err != nil {
+			return nil, err
+		}
+	}
+	msg := &ChatMessage{
+		SenderPeerId: r.localPeerID,
+		PersonId:     r.personID,
+		Author:       req.GetAuthor(),
+		Content:      content,
+		CreatedAt:    timestamp.CloneVT(),
+		ReplyToKey:   req.GetReplyToKey(),
+		Index:        index,
+		ReplacesKey:  replacesKey,
+		Envelope:     req.GetEnvelope().CloneVT(),
+	}
+
+	// Strip the body when a redaction named its envelope before it arrived.
+	if req.GetEnvelope() != nil {
+		if err := applyPendingRedaction(ctx, wtx, r.objectKey, msgKey, msg); err != nil {
+			return nil, err
+		}
+	}
+
+	// Store the body under its reserved key.
+	obj, err := wtx.CreateObject(ctx, msgKey, nil)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		return nil, err
+	}
+	_, _, err = world.AccessObjectState(ctx, obj, true, func(bcs *block.Cursor) error {
+		bcs.SetBlock(msg, true)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Type the message and link it into the channel's history.
+	if err := world_types.SetObjectType(ctx, wtx, msgKey, ChatMessageTypeID); err != nil {
+		return nil, err
+	}
+	if err := wtx.SetGraphQuad(ctx, world.NewGraphQuadWithKeys(r.objectKey, PredChannelMessage.String(), msgKey, "")); err != nil {
+		return nil, err
+	}
+
+	// Link an existing peer object without manufacturing identity records.
+	peerKey := "peer/" + r.localPeerID
+	peerObject, found, err := wtx.GetObject(ctx, peerKey)
+	world.ReleaseObjectState(peerObject)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		if err := wtx.SetGraphQuad(ctx, world.NewGraphQuadWithKeys(msgKey, PredMessageSender.String(), peerKey, "")); err != nil {
+			return nil, err
+		}
+	}
+
+	// Replace only the current-state edge; earlier messages remain in history.
+	if state != nil {
+		for _, edge := range priorState {
+			if err := wtx.DeleteGraphQuad(ctx, edge); err != nil {
+				return nil, err
+			}
+		}
+		if err := wtx.SetGraphQuad(ctx, NewChatStateQuad(r.objectKey, msgKey, state.GetType(), state.GetStateKey())); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.indexAppendedMessage(ctx, wtx, msgKey, msg); err != nil {
+		return nil, err
+	}
+
+	// The first redaction strips the target body in place; its history position remains.
+	// A target not held yet is stripped when it arrives.
+	targetKey := content.GetRedaction().GetTargetKey()
+	if redactsPending {
+		if err := wtx.SetGraphQuad(ctx, NewChatPendingRedactionQuad(r.objectKey, msgKey, targetKey)); err != nil {
+			return nil, err
+		}
+	}
+	if redacted != nil && redacted.GetRedactedByKey() == "" {
+		redactChatMessage(redacted, msgKey)
+		if err := writeObjectBody(ctx, wtx, targetKey, redacted); err != nil {
+			return nil, err
+		}
+	}
+	return &spacewave_chat_rpc.SendMessageResponse{MessageKey: msgKey}, nil
+}
+
+// resolveRedactionTarget returns the message a redaction removes, or reports
+// that the target is not held yet. A person redacts their own message bodies.
+// A Space owner, or a redaction carrying its protocol's envelope, may redact
+// any message body, including one named by its envelope before it arrives.
+// State and redactions are permanent history.
+func (r *ChatResource) resolveRedactionTarget(ctx context.Context, ws world.WorldState, redaction *ChatRedaction, enveloped bool) (*ChatMessage, bool, error) {
+	// A target named by its envelope ID is stored under that envelope's key.
+	targetKey := redaction.GetTargetKey()
+	moderated := r.owner || enveloped
+	if envelopeID := redaction.GetTargetEnvelopeId(); envelopeID != "" {
+		envelopeKey, err := EnvelopeMessageKey(r.objectKey, envelopeID)
+		if err != nil {
+			return nil, false, err
+		}
+		if envelopeKey != targetKey {
+			return nil, false, errors.New("chat redaction target key does not match its envelope ID")
+		}
+	}
+
+	// Look up the target, deferring a moderator's redaction of one not held yet.
+	target, err := world.LookupObjectBody[ChatMessage](ctx, ws, targetKey)
+	if errors.Is(err, world.ErrObjectNotFound) && redaction.GetTargetEnvelopeId() != "" {
+		if !moderated {
+			return nil, false, ErrChatRedactionForbidden
+		}
+		return nil, true, nil
+	}
+	if err != nil {
+		return nil, false, errors.Wrap(err, "resolve chat redaction target")
+	}
+
+	// Check the authority and the kind of the held target.
+	if target.GetPersonId() != r.personID && !moderated {
+		return nil, false, ErrChatRedactionForbidden
+	}
+	if target.GetContent().GetStateChange() != nil || target.GetContent().GetRedaction() != nil {
+		return nil, false, errors.New("chat state and redactions cannot be redacted")
+	}
+	return target, false, nil
+}
+
+// applyPendingRedaction strips the body of a message arriving under
+// envelopeKey when a redaction named it earlier. State and redactions stay
+// intact. The pending records are consumed either way.
+func applyPendingRedaction(ctx context.Context, ws world.WorldState, channelKey, envelopeKey string, message *ChatMessage) error {
+	// Read and consume the redactions waiting for this envelope.
+	pending, err := ws.LookupGraphQuads(ctx, NewChatPendingRedactionQuad(channelKey, "", envelopeKey), 0)
+	if err != nil || len(pending) == 0 {
+		return err
+	}
+	for _, edge := range pending {
+		if err := ws.DeleteGraphQuad(ctx, edge); err != nil {
+			return err
+		}
+	}
+
+	// The first redaction strips the body.
+	content := message.GetContent()
+	if content.GetStateChange() != nil || content.GetRedaction() != nil || message.GetRedactedByKey() != "" {
+		return nil
+	}
+	redactionKey, err := world.GraphValueToKey(pending[0].GetObj())
+	if err != nil {
+		return err
+	}
+	redactChatMessage(message, redactionKey)
+	return nil
+}
+
+// redactChatMessage strips a message body in place, keeping its routing and
+// history position, and records the redaction that removed it.
+func redactChatMessage(message *ChatMessage, redactionKey string) {
+	message.Content = redactChatMessageContent(message.GetContent())
+	if envelope := message.GetEnvelope(); envelope != nil {
+		envelope.Data, envelope.RedactedData = envelope.GetRedactedData(), nil
+	}
+	message.RedactedByKey = redactionKey
+}
+
+// redactChatMessageContent keeps only the variant, event type, and relation routing of a body.
+// Thread and annotation indexes built from the routing stay valid after redaction.
+// A message without content, such as a detached one, keeps none.
+func redactChatMessageContent(content *ChatMessageContent) *ChatMessageContent {
+	if content == nil {
+		return nil
+	}
+	switch value := content.GetContent().(type) {
+	case *ChatMessageContent_Ciphertext:
+		return &ChatMessageContent{Content: &ChatMessageContent_Ciphertext{Ciphertext: &ChatCiphertext{
+			Relation: redactChatRelation(value.Ciphertext.GetRelation()),
+		}}}
+	case *ChatMessageContent_Annotation:
+		return &ChatMessageContent{Content: &ChatMessageContent_Annotation{Annotation: &ChatAnnotation{
+			TargetKey: value.Annotation.GetTargetKey(),
+		}}}
+	case *ChatMessageContent_Event:
+		return &ChatMessageContent{Content: &ChatMessageContent_Event{Event: &ChatEvent{
+			Type:        value.Event.GetType(),
+			ContentJson: "{}",
+			Relation:    redactChatRelation(value.Event.GetRelation()),
+		}}}
+	default:
+		return &ChatMessageContent{Content: &ChatMessageContent_Text{}}
+	}
+}
+
+// redactChatRelation keeps the relationship type and target that index the message.
+func redactChatRelation(relation *ChatRelation) *ChatRelation {
+	if relation == nil {
+		return nil
+	}
+	return &ChatRelation{Type: relation.GetType(), TargetKey: relation.GetTargetKey()}
+}
+
+// resolveMessageState checks current-state conditions and unchanged unkeyed writes.
+// Returned edges are replaced only when a new message is appended.
+func (r *ChatResource) resolveMessageState(ctx context.Context, ws world.WorldState, req *spacewave_chat_rpc.SendMessageRequest, content *ChatMessageContent) ([]world.GraphQuad, string, error) {
+	// Select state changes that require current-event resolution.
+	state := content.GetStateChange()
+	if state == nil {
+		return nil, "", nil
+	}
+
+	// Read the retained state edges for this type and state key.
+	priorState, err := ws.LookupGraphQuads(ctx, NewChatStateQuad(r.objectKey, "", state.GetType(), state.GetStateKey()), 0)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Compare the retained event with the caller's expected state identity.
+	if expected := req.ExpectedStateMessageKey; expected != nil {
+		currentKey := ""
+		if len(priorState) > 1 {
+			return nil, "", errors.New("chat state has multiple current events")
+		}
+		if len(priorState) == 1 {
+			currentKey, err = world.GraphValueToKey(priorState[0].GetObj())
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		if currentKey != *expected {
+			return nil, "", errChatStateConflict
+		}
+	}
+
+	// Resolve unchanged state writes and protect creation state from replacement.
+	for _, edge := range priorState {
+		key, err := world.GraphValueToKey(edge.GetObj())
+		if err != nil {
+			return nil, "", err
+		}
+		prior, err := world.LookupObjectBody[ChatMessage](ctx, ws, key)
+		if err != nil {
+			return nil, "", err
+		}
+		if req.GetTransactionId() == "" && prior.GetContent().EqualVT(content) {
+			return priorState, key, nil
+		}
+		if state.GetType() == "m.room.create" && state.GetStateKey() == "" {
+			return nil, "", errors.New("chat creation state cannot be replaced")
+		}
+	}
+	return priorState, "", nil
+}
+
+// GetReadPositions reads shared receipt state without transferring mutable channel state.
+func (r *ChatResource) GetReadPositions(ctx context.Context, _ *spacewave_chat_rpc.GetReadPositionsRequest) (*spacewave_chat_rpc.GetReadPositionsResponse, error) {
+	// Read the channel's retained receipt metadata.
+	channel, err := r.readChannel(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Clone each person's receipt for the client response.
+	positions := make(map[string]*chat_state.ChatReadPosition, len(channel.GetReadPositions()))
+	for person, position := range channel.GetReadPositions() {
+		positions[person] = position.CloneVT()
+	}
+	return &spacewave_chat_rpc.GetReadPositionsResponse{Positions: positions}, nil
+}
+
+// UpdateReadPosition advances the authenticated person's position durably across devices.
+// Repeated or older positions return the current value without a World mutation.
+func (r *ChatResource) UpdateReadPosition(ctx context.Context, req *spacewave_chat_rpc.UpdateReadPositionRequest) (*spacewave_chat_rpc.UpdateReadPositionResponse, error) {
+	// Bind the receipt advance to the accepted author.
+	bound, err := r.operationResource(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r = bound
+
+	// Commit the person's read position.
+	response, err := r.commitReadPosition(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Synchronize the accepted receipt before returning it.
+	if _, err := r.engine.Sync(ctx); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+// commitReadPosition serializes receipt advancement and releases the transaction before Sync.
+func (r *ChatResource) commitReadPosition(ctx context.Context, req *spacewave_chat_rpc.UpdateReadPositionRequest) (*spacewave_chat_rpc.UpdateReadPositionResponse, error) {
+	// Only an attributed person may hold a read position.
+	if r.engine == nil || r.localPeerID == "" || r.personID == "" {
+		return nil, ErrChatAuthorIdentityRequired
+	}
+	key := readPositionKey(r.personID, req.GetAuthor())
+
+	// Read the current position inside the write transaction.
+	tx, err := r.engine.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Discard()
+	channel, err := world.LookupObjectBody[ChatChannel](ctx, tx, r.objectKey)
+	if err != nil {
+		return nil, err
+	}
+	if req.GetNextIndex() > channel.GetMessageCount() {
+		return nil, errors.New("read position exceeds channel message count")
+	}
+
+	// A receipt that does not advance its timeline returns the retained position.
+	prior := channel.GetReadPositions()[key]
+	if req.GetNextIndex() <= readPositionIndex(prior, req.ThreadRootKey) {
+		position := prior.CloneVT()
+		if position == nil {
+			position = &chat_state.ChatReadPosition{}
+		}
+		return &spacewave_chat_rpc.UpdateReadPositionResponse{Position: position}, nil
+	}
+
+	// Apply the advance as a replayable operation and return the committed position.
+	op := &UpdateChatReadPositionOp{ObjectKey: r.objectKey, NextIndex: req.GetNextIndex(), Timestamp: timestamppb.Now(), ThreadRootKey: req.ThreadRootKey, Author: req.GetAuthor()}
+	ctx = world.WithOperationPerson(ctx, r.personID)
+	if _, _, err := tx.ApplyWorldOp(ctx, op, r.device); err != nil {
+		return nil, err
+	}
+	channel, err = world.LookupObjectBody[ChatChannel](ctx, tx, r.objectKey)
+	if err != nil {
+		return nil, err
+	}
+	position := channel.GetReadPositions()[key].CloneVT()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &spacewave_chat_rpc.UpdateReadPositionResponse{Position: position}, nil
+}
+
+// readPositionKey returns the key of the position a person holds, or an author
+// holds for the person. The author is a DNS label, so it never contains the dot.
+func readPositionKey(personID, author string) string {
+	if author == "" {
+		return personID
+	}
+	return personID + "." + author
+}
+
+// validateAuthor requires an author to be empty or a DNS label, since a Matrix
+// gateway joins it to a username with a dot.
+func validateAuthor(author string) error {
+	if author == "" {
+		return nil
+	}
+	return errors.Wrap(labels.ValidateDNSLabel(author), "chat author")
+}
+
+// applyReadPosition advances the receipt of one accepted person, or of an
+// author reading for the person, in the replay transaction.
+// A nil threadRootKey advances the whole-channel position and drops the timeline
+// positions it subsumes; otherwise only that timeline advances.
+func (r *ChatResource) applyReadPosition(ctx context.Context, tx world.WorldState, author string, nextIndex uint64, threadRootKey *string, timestamp *timestamppb.Timestamp) error {
+	// Validate the receipt against the channel history and thread root.
+	channel, err := world.LookupObjectBody[ChatChannel](ctx, tx, r.objectKey)
+	if err != nil {
+		return err
+	}
+	if nextIndex > channel.GetMessageCount() {
+		return errors.New("read position exceeds channel message count")
+	}
+	if threadRootKey != nil && *threadRootKey != "" {
+		if _, err := r.chatThreadKey(*threadRootKey); err != nil {
+			return err
+		}
+		if _, err := world.LookupObjectBody[ChatMessage](ctx, tx, *threadRootKey); err != nil {
+			return errors.Wrap(err, "resolve thread root")
+		}
+	}
+	key := readPositionKey(r.personID, author)
+	prior := channel.GetReadPositions()[key]
+	if nextIndex <= readPositionIndex(prior, threadRootKey) {
+		return nil
+	}
+
+	// Advance the selected position, keeping only timeline positions ahead of the channel position.
+	position := prior.CloneVT()
+	if position == nil {
+		position = &chat_state.ChatReadPosition{Author: author}
+	}
+	if threadRootKey == nil {
+		position.NextIndex = nextIndex
+		position.UpdatedAt = timestamp
+	} else {
+		if position.ThreadPositions == nil {
+			position.ThreadPositions = make(map[string]*chat_state.ChatThreadReadPosition)
+		}
+		position.ThreadPositions[*threadRootKey] = &chat_state.ChatThreadReadPosition{NextIndex: nextIndex, UpdatedAt: timestamp}
+	}
+	pruneThreadReadPositions(position)
+
+	// Write the channel with the person's advanced position.
+	if channel.ReadPositions == nil {
+		channel.ReadPositions = make(map[string]*chat_state.ChatReadPosition)
+	}
+	channel.ReadPositions[key] = position
+	object, found, err := tx.GetObject(ctx, r.objectKey)
+	defer world.ReleaseObjectState(object)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return world.ErrObjectNotFound
+	}
+	if _, _, err := world.AccessObjectState(ctx, object, true, func(cursor *block.Cursor) error {
+		cursor.SetBlock(channel, true)
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// readPositionIndex returns the first unread index of the timeline a receipt
+// selects. A timeline position never trails the whole-channel position.
+func readPositionIndex(position *chat_state.ChatReadPosition, threadRootKey *string) uint64 {
+	if threadRootKey == nil {
+		return position.GetNextIndex()
+	}
+	return max(position.GetNextIndex(), position.GetThreadPositions()[*threadRootKey].GetNextIndex())
+}
+
+// pruneThreadReadPositions drops timeline positions the whole-channel position
+// subsumes, then the furthest-behind positions beyond maxThreadReadPositions.
+func pruneThreadReadPositions(position *chat_state.ChatReadPosition) {
+	maps.DeleteFunc(position.ThreadPositions, func(_ string, thread *chat_state.ChatThreadReadPosition) bool {
+		return thread.GetNextIndex() <= position.GetNextIndex()
+	})
+	if len(position.ThreadPositions) <= maxThreadReadPositions {
+		return
+	}
+	keys := slices.SortedFunc(maps.Keys(position.ThreadPositions), func(a, b string) int {
+		return cmp.Or(cmp.Compare(position.ThreadPositions[a].GetNextIndex(), position.ThreadPositions[b].GetNextIndex()), cmp.Compare(a, b))
+	})
+	for _, key := range keys[:len(keys)-maxThreadReadPositions] {
+		delete(position.ThreadPositions, key)
+	}
+}
+
+// appendChannelMessageKey reserves one channel position and its stable message key.
+func (r *ChatResource) appendChannelMessageKey(ctx context.Context, ws world.WorldState, msgKey string, state *ChatStateChange) (uint64, string, error) {
+	// Acquire the mutable channel inside the caller's transaction.
+	obj, found, err := ws.GetObject(ctx, r.objectKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		return 0, "", err
+	}
+	if !found {
+		return 0, "", world.ErrObjectNotFound
+	}
+
+	// Allocate the next position, retaining a caller's stable send identity.
+	var index uint64
+	_, _, err = world.AccessObjectState(ctx, obj, true, func(bcs *block.Cursor) error {
+		// Load the mutable channel and apply the message's state change.
+		channel, err := block.UnmarshalBlock[ChatChannel](ctx, bcs)
+		if err != nil {
+			return err
+		}
+		if channel == nil {
+			return world.ErrObjectNotFound
+		}
+		if err := applyChannelState(channel, state); err != nil {
+			return err
+		}
+
+		// Reserve the message identity and advance the channel's history extent.
+		index = channel.GetMessageCount()
+		if msgKey == "" {
+			msgKey = r.messageKey(index)
+		}
+		channel.MessageCount = index + 1
+		bcs.SetBlock(channel, true)
+		return nil
+	})
+	if err != nil {
+		return 0, "", err
+	}
+
+	// Add the accepted key to its bounded page in the same transaction.
+	if err := r.appendMessagePageKey(ctx, ws, index, msgKey); err != nil {
+		return 0, "", err
+	}
+	return index, msgKey, nil
+}
+
+// appendMessagePageKey appends one key to its bounded channel page.
+func (r *ChatResource) appendMessagePageKey(ctx context.Context, ws world.WorldState, index uint64, msgKey string) error {
+	// Open or create the page containing this accepted position.
+	pageKey := r.messagePageKey(index / chatMessagePageSize)
+	obj, found, err := ws.GetObject(ctx, pageKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		return err
+	}
+	if !found {
+		obj, err = ws.CreateObject(ctx, pageKey, nil)
+		defer world.ReleaseObjectState(obj)
+		if err != nil {
+			return err
+		}
+		if err := world_types.SetObjectType(ctx, ws, pageKey, ChatMessagePageTypeID); err != nil {
+			return err
+		}
+	}
+
+	// Append within the fixed-size page selected by the channel position.
+	_, _, err = world.AccessObjectState(ctx, obj, true, func(bcs *block.Cursor) error {
+		// Load the history page or initialize its first block.
+		page, err := block.UnmarshalBlock[ChatMessagePage](ctx, bcs)
+		if err != nil {
+			return err
+		}
+		if page == nil {
+			page = &ChatMessagePage{}
+		}
+
+		// Retain the accepted message key in the page block.
+		page.MessageKeys = append(page.MessageKeys, msgKey)
+		bcs.SetBlock(page, true)
+		return nil
+	})
+	return err
+}
+
+// readChannel reads the current channel without retaining an object handle.
+func (r *ChatResource) readChannel(ctx context.Context) (*ChatChannel, error) {
+	if r.ws == nil {
+		return nil, errors.New("chat resource requires world state")
+	}
+	return world.LookupObjectBody[ChatChannel](ctx, r.ws, r.objectKey)
+}
+
+// readChannelRoot reads the channel object's root and revision.
+func (r *ChatResource) readChannelRoot(ctx context.Context) (*world.ObjectRootRef, error) {
+	if r.ws == nil {
+		return nil, errors.New("chat resource requires world state")
+	}
+	refs, err := world.GetObjectRootRefsBatch(ctx, r.ws, []string{r.objectKey})
+	if err != nil {
+		return nil, err
+	}
+	return refs[0], nil
+}
+
+// readMessages resolves only the selected history page.
+func (r *ChatResource) readMessages(ctx context.Context, keys []string) ([]*spacewave_chat_rpc.ChatMessageInfo, error) {
+	// Require the mounted state before resolving message references.
+	if r.ws == nil {
+		return nil, errors.New("chat resource requires world state")
+	}
+
+	// Preserve the page's order while projecting retained messages.
+	messages := make([]*spacewave_chat_rpc.ChatMessageInfo, 0, len(keys))
+	for _, key := range keys {
+		info, err := r.readMessage(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if info != nil {
+			messages = append(messages, info)
+		}
+	}
+	return messages, nil
+}
+
+// readMessageKeys resolves a half-open interval from bounded channel pages.
+func (r *ChatResource) readMessageKeys(ctx context.Context, startIndex, endIndex uint64) ([]string, error) {
+	// Avoid touching storage for an empty interval.
+	if startIndex >= endIndex {
+		return nil, nil
+	}
+
+	// Visit only pages intersecting the requested history interval.
+	keys := make([]string, 0, int(endIndex-startIndex)) //nolint:gosec // the requested history interval is bounded by the page query contract.
+	for pageIndex := startIndex / chatMessagePageSize; pageIndex <= (endIndex-1)/chatMessagePageSize; pageIndex++ {
+		page, err := r.readMessagePage(ctx, pageIndex)
+		if err != nil {
+			return nil, err
+		}
+		pageStart := pageIndex * chatMessagePageSize
+		from := uint64(0)
+		if startIndex > pageStart {
+			from = startIndex - pageStart
+		}
+		to := uint64(len(page.GetMessageKeys()))
+		if pageEnd := endIndex - pageStart; pageEnd < to {
+			to = pageEnd
+		}
+		if from < to {
+			keys = append(keys, page.GetMessageKeys()[from:to]...)
+		}
+	}
+	return keys, nil
+}
+
+// readMessagePage reads one bounded history page.
+func (r *ChatResource) readMessagePage(ctx context.Context, pageIndex uint64) (*ChatMessagePage, error) {
+	page, err := world.LookupObjectBody[ChatMessagePage](ctx, r.ws, r.messagePageKey(pageIndex))
+	if errors.Is(err, world.ErrObjectNotFound) {
+		return &ChatMessagePage{}, nil
+	}
+	return page, err
+}
+
+// readMessage projects an accepted message without retaining an object handle.
+func (r *ChatResource) readMessage(ctx context.Context, key string) (*spacewave_chat_rpc.ChatMessageInfo, error) {
+	// Read the stored message, including its stable history position.
+	msg, err := world.LookupObjectBody[ChatMessage](ctx, r.ws, key)
+	if errors.Is(err, world.ErrObjectNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Summarize bodies without a plain text form for the shared client projection.
+	personID := msg.GetPersonId()
+	text := msg.GetContent().GetText()
+	if msg.GetContent().GetEvent() != nil {
+		text = "Unsupported message"
+	}
+	if msg.GetRedactedByKey() != "" {
+		text = "Message deleted"
+	}
+	if state := msg.GetContent().GetStateChange(); state != nil {
+		text = "Channel settings updated"
+		if state.GetStateKey() == "" {
+			switch state.GetType() {
+			case "m.room.create":
+				text = "Channel created"
+			case "m.room.name":
+				text = "Channel name updated"
+			case "m.room.topic":
+				text = "Channel topic updated"
+			case "m.room.encryption":
+				text = "Channel encryption enabled"
+			}
+		}
+	}
+	return &spacewave_chat_rpc.ChatMessageInfo{
+		ObjectKey:     key,
+		SenderPeerId:  msg.GetSenderPeerId(),
+		PersonId:      personID,
+		Author:        msg.GetAuthor(),
+		Text:          text,
+		Content:       msg.GetContent().CloneVT(),
+		CreatedAt:     msg.GetCreatedAt().CloneVT(),
+		ReplyToKey:    msg.GetReplyToKey(),
+		Index:         msg.GetIndex(),
+		RedactedByKey: msg.GetRedactedByKey(),
+		ReplacesKey:   msg.GetReplacesKey(),
+		Envelope:      msg.GetEnvelope().CloneVT(),
+	}, nil
+}
+
+// normalizeSendMessageContent validates one shared content value without decrypting it.
+// A detached message has none and returns nil.
+func normalizeSendMessageContent(req *spacewave_chat_rpc.SendMessageRequest) (*ChatMessageContent, error) {
+	// A detached message carries no content.
+	content := req.GetContent()
+	if req.GetEnvelope().GetDetached() {
+		if content != nil || req.GetText() != "" || req.GetReplyToKey() != "" {
+			return nil, errors.New("detached chat message carries no content")
+		}
+		return nil, nil
+	}
+
+	// Keep the existing text request wire shape while accepting typed content.
+	if content == nil {
+		return &ChatMessageContent{Content: &ChatMessageContent_Text{Text: req.GetText()}}, nil
+	}
+	if req.GetText() != "" {
+		return nil, errors.New("chat send cannot include both text and content")
+	}
+
+	// Require an explicit variant and a complete encrypted envelope.
+	switch value := content.GetContent().(type) {
+	case *ChatMessageContent_Text:
+		if value == nil {
+			return nil, errors.New("chat text content is missing")
+		}
+	case *ChatMessageContent_Ciphertext:
+		if value == nil || value.Ciphertext.GetAlgorithm() == "" || value.Ciphertext.GetCiphertext() == "" || value.Ciphertext.GetSenderKey() == "" || value.Ciphertext.GetSessionId() == "" {
+			return nil, errors.New("chat encrypted content is incomplete")
+		}
+		if err := value.Ciphertext.GetRelation().Validate(); err != nil {
+			return nil, err
+		}
+	case *ChatMessageContent_Annotation:
+		if value == nil || value.Annotation.GetTargetKey() == "" || len(value.Annotation.GetTargetKey()) > 4096 || value.Annotation.GetKey() == "" || len(value.Annotation.GetKey()) > 4096 {
+			return nil, errors.New("chat annotation requires a bounded target and key")
+		}
+	case *ChatMessageContent_StateChange:
+		if value == nil {
+			return nil, errors.New("chat state content is missing")
+		}
+		if err := value.StateChange.Validate(); err != nil {
+			return nil, err
+		}
+	case *ChatMessageContent_Event:
+		if value == nil {
+			return nil, errors.New("chat event content is missing")
+		}
+		if err := value.Event.Validate(); err != nil {
+			return nil, err
+		}
+	case *ChatMessageContent_Redaction:
+		if value == nil || value.Redaction.GetTargetKey() == "" || len(value.Redaction.GetTargetKey()) > 4096 || len(value.Redaction.GetTargetEnvelopeId()) > 4096 || len(value.Redaction.GetReason()) > 4096 {
+			return nil, errors.New("chat redaction requires a bounded target and reason")
+		}
+	default:
+		return nil, errors.New("chat message content is missing")
+	}
+	return content.CloneVT(), nil
+}
+
+// applyChannelState keeps native channel metadata consistent with retained state.
+func applyChannelState(channel *ChatChannel, state *ChatStateChange) error {
+	// Named state keys and extension types do not replace channel-wide metadata.
+	if state == nil || state.GetStateKey() != "" {
+		return nil
+	}
+	var field string
+	switch state.GetType() {
+	case "m.room.name":
+		field = "name"
+	case "m.room.topic":
+		field = "topic"
+	case "m.room.encryption":
+		field = "algorithm"
+	default:
+		return nil
+	}
+
+	// These known values have native meaning and require their schema's string field.
+	value, err := fastjson.Parse(state.GetContentJson())
+	if err != nil {
+		return err
+	}
+	member := value.Get(field)
+	if member == nil || member.Type() != fastjson.TypeString {
+		return errors.New("chat state requires a string " + field)
+	}
+	text := string(member.GetStringBytes())
+	switch field {
+	case "name":
+		channel.Name = text
+	case "topic":
+		channel.Topic = text
+	case "algorithm":
+		if text == "" || channel.GetEncryptionAlgorithm() != "" && channel.GetEncryptionAlgorithm() != text {
+			return errors.New("chat encryption cannot be disabled or changed")
+		}
+		channel.EncryptionAlgorithm = text
+	}
+	return nil
+}
+
+// messageKey identifies a message sent without a transaction identity.
+func (r *ChatResource) messageKey(index uint64) string {
+	return r.objectKey + "/message/" + strconv.FormatUint(index, 10)
+}
+
+// messagePageKey identifies a bounded page owned by this channel.
+func (r *ChatResource) messagePageKey(pageIndex uint64) string {
+	return r.objectKey + "/message-page/" + strconv.FormatUint(pageIndex, 10)
+}
+
+// _ is a type assertion
+var _ spacewave_chat_rpc.SRPCChatResourceServiceServer = (*ChatResource)(nil)

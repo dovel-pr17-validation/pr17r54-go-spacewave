@@ -1,0 +1,540 @@
+import { describe, expect, it } from 'vitest'
+import path from 'path'
+import os from 'os'
+import fs from 'fs'
+import { build, type ResolvedConfig, type Rollup } from 'vite'
+
+import { bindDevelopmentImports } from './development-client.js'
+import {
+  createExternalRequirePlugin,
+  createWebPkgRemapPlugin,
+  isExternalWebPkgImport,
+  readPackageServedNameMap,
+  resolveWebPkgImportURL,
+} from './plugin.js'
+
+describe('createWebPkgRemapPlugin', () => {
+  it('preserves runtime externals and rewrites sibling web packages in rendered chunks', () => {
+    const plugin = createWebPkgRemapPlugin({
+      webPkgIDs: [
+        '@aptre/bldr',
+        '@aptre/bldr-react',
+        '@aptre/protobuf-es-lite',
+        '@s4wave/web',
+        'react',
+        'react-dom',
+        'sonner',
+      ],
+      preserveWebPkgIDs: [
+        '@aptre/bldr',
+        '@aptre/bldr-react',
+        'react',
+        'react-dom',
+      ],
+    })
+
+    const renderChunk = plugin.renderChunk
+    if (typeof renderChunk !== 'function') {
+      throw new Error('missing renderChunk hook')
+    }
+
+    const result = renderChunk.call(
+      {} as never,
+      [
+        'import "@aptre/bldr";',
+        'import { WebView } from "@aptre/bldr-react";',
+        'import React from "react";',
+        'import { createPortal } from "react-dom";',
+        'import { jsxDEV } from "react/jsx-dev-runtime";',
+        'import { createMessageType } from "@aptre/protobuf-es-lite";',
+        'import { Message } from "@aptre/protobuf-es-lite/message";',
+        'import { SpacewaveRuntimeProviders } from "@s4wave/web/sdk/app";',
+        'import { toast } from "sonner";',
+      ].join('\n'),
+      {} as never,
+      {} as never,
+      {} as never,
+    )
+
+    expect(result).toContain('"@aptre/bldr"')
+    expect(result).toContain('"@aptre/bldr-react"')
+    expect(result).toContain('"react"')
+    expect(result).toContain('"react-dom"')
+    expect(result).toContain('"react/jsx-dev-runtime"')
+    expect(result).toContain('"bldr-web-pkg/@aptre/protobuf-es-lite/index.mjs"')
+    expect(result).toContain(
+      '"bldr-web-pkg/@aptre/protobuf-es-lite/message.mjs"',
+    )
+    expect(result).toContain('"bldr-web-pkg/@s4wave/web/sdk/app.mjs"')
+    expect(result).toContain('"bldr-web-pkg/sonner/index.mjs"')
+    expect(result).not.toMatch(
+      /\b(?:from|import)\s*\(?\s*["']@aptre\/protobuf-es-lite(?:\/[^"']*)?["']/,
+    )
+    expect(result).not.toContain('"bldr-web-pkg/react/')
+    expect(result).not.toContain('"bldr-web-pkg/react-dom/')
+    expect(result).not.toContain('"bldr-web-pkg/@aptre/bldr/')
+  })
+
+  it('uses the configured web package base path for rendered sibling web packages', () => {
+    const plugin = createWebPkgRemapPlugin({
+      webPkgIDs: ['@aptre/protobuf-es-lite', '@s4wave/web', 'sonner'],
+      webPkgImports: {
+        '@aptre/protobuf-es-lite': ['index.js', 'message.js'],
+      },
+      webPkgBasePath: '/entrypoint/pkgs',
+    })
+
+    const renderChunk = plugin.renderChunk
+    if (typeof renderChunk !== 'function') {
+      throw new Error('missing renderChunk hook')
+    }
+
+    const result = renderChunk.call(
+      {} as never,
+      [
+        'import { createMessageType } from "@aptre/protobuf-es-lite";',
+        'import { Message } from "@aptre/protobuf-es-lite/message";',
+        'import { SpacewaveRuntimeProviders } from "@s4wave/web/sdk/app";',
+        'import { toast } from "sonner";',
+      ].join('\n'),
+      {} as never,
+      {} as never,
+      {} as never,
+    )
+
+    expect(result).toContain(
+      '"/entrypoint/pkgs/@aptre/protobuf-es-lite/index.mjs"',
+    )
+    expect(result).toContain(
+      '"/entrypoint/pkgs/@aptre/protobuf-es-lite/message.mjs"',
+    )
+    expect(result).toContain('"/entrypoint/pkgs/@s4wave/web/sdk/app.mjs"')
+    expect(result).toContain('"/entrypoint/pkgs/sonner/index.mjs"')
+    expect(result).not.toContain('"bldr-web-pkg/@aptre/protobuf-es-lite/')
+    expect(result).not.toContain('"bldr-web-pkg/@s4wave/web/')
+    expect(result).not.toContain('"bldr-web-pkg/sonner/')
+  })
+
+  it('normalizes repeated slashes in the configured web package base path', () => {
+    const plugin = createWebPkgRemapPlugin({
+      webPkgIDs: ['react'],
+      webPkgBasePath: '/entrypoint//pkgs/',
+    })
+
+    const renderChunk = plugin.renderChunk
+    if (typeof renderChunk !== 'function') {
+      throw new Error('missing renderChunk hook')
+    }
+
+    const result = renderChunk.call(
+      {} as never,
+      'import React from "react";',
+      {} as never,
+      {} as never,
+      {} as never,
+    )
+
+    expect(result).toContain('"/entrypoint/pkgs/react/index.mjs"')
+    expect(result).not.toContain('/entrypoint//pkgs/')
+  })
+
+  it('derives served names from declared imports, stripping dist subdir and .pb extension', async () => {
+    const plugin = createWebPkgRemapPlugin({
+      webPkgIDs: ['@aptre/protobuf-es-lite'],
+      webPkgImports: {
+        '@aptre/protobuf-es-lite': [
+          'index.js',
+          'message.js',
+          'google/protobuf/timestamp.pb.js',
+        ],
+      },
+    })
+
+    const renderChunk = plugin.renderChunk
+    if (typeof renderChunk !== 'function') {
+      throw new Error('missing renderChunk hook')
+    }
+    const rendered = renderChunk.call(
+      {} as never,
+      [
+        'import { createMessageType } from "@aptre/protobuf-es-lite";',
+        'import { Message } from "@aptre/protobuf-es-lite/message";',
+        'import { Timestamp } from "@aptre/protobuf-es-lite/google/protobuf/timestamp";',
+      ].join('\n'),
+      {} as never,
+      {} as never,
+      {} as never,
+    )
+    expect(rendered).toContain(
+      '"bldr-web-pkg/@aptre/protobuf-es-lite/index.mjs"',
+    )
+    expect(rendered).toContain(
+      '"bldr-web-pkg/@aptre/protobuf-es-lite/message.mjs"',
+    )
+    expect(rendered).toContain(
+      '"bldr-web-pkg/@aptre/protobuf-es-lite/google/protobuf/timestamp.mjs"',
+    )
+    expect(rendered).not.toContain('/dist/')
+    expect(rendered).not.toContain('.pb.mjs')
+
+    const resolveId = plugin.resolveId
+    if (typeof resolveId !== 'function') {
+      throw new Error('missing resolveId hook')
+    }
+    // A declared import resolves to the served name without touching on-disk
+    // layout, even if the resolver would have returned a dist/.pb.js path.
+    const resolved = await resolveId.call(
+      {
+        resolve: async () => {
+          throw new Error(
+            'on-disk resolution must not run for declared imports',
+          )
+        },
+      } as never,
+      '@aptre/protobuf-es-lite/google/protobuf/timestamp.pb.js',
+      '/repo/src/entry.js',
+      { isEntry: false },
+    )
+    expect(resolved).toEqual({
+      id: 'bldr-web-pkg/@aptre/protobuf-es-lite/google/protobuf/timestamp.mjs',
+      external: true,
+    })
+  })
+
+  it('keeps the package root directory when no served imports override it', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'web-pkg-dist-'))
+    try {
+      const pkgRoot = path.join(
+        root,
+        'node_modules',
+        '@aptre',
+        'protobuf-es-lite',
+      )
+      fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true })
+      // The provider's input name is relative to its package root. Consumers
+      // preserve that directory unless the provider declares different imports.
+      fs.writeFileSync(
+        path.join(pkgRoot, 'package.json'),
+        JSON.stringify({
+          name: '@aptre/protobuf-es-lite',
+          type: 'module',
+          exports: { '.': { import: './dist/index.js' } },
+        }),
+      )
+      fs.writeFileSync(
+        path.join(pkgRoot, 'dist', 'index.js'),
+        'export const root = true\n',
+      )
+
+      const plugin = createWebPkgRemapPlugin({
+        webPkgIDs: ['@aptre/protobuf-es-lite'],
+        webPkgBasePath: '/entrypoint/pkgs',
+      })
+
+      const configResolved = plugin.configResolved
+      if (typeof configResolved !== 'function') {
+        throw new Error('missing configResolved hook')
+      }
+      configResolved.call(
+        {} as never,
+        {
+          root,
+          resolve: {
+            alias: [{ find: '@aptre/protobuf-es-lite', replacement: pkgRoot }],
+          },
+        } as ResolvedConfig,
+      )
+
+      const renderChunk = plugin.renderChunk
+      if (typeof renderChunk !== 'function') {
+        throw new Error('missing renderChunk hook')
+      }
+      const rendered = renderChunk.call(
+        {} as never,
+        'import { createMessageType } from "@aptre/protobuf-es-lite";',
+        {} as never,
+        {} as never,
+        {} as never,
+      )
+      expect(rendered).toContain(
+        '"/entrypoint/pkgs/@aptre/protobuf-es-lite/dist/index.mjs"',
+      )
+      expect(rendered).not.toContain('"bldr-web-pkg/@aptre/protobuf-es-lite/')
+
+      const resolveId = plugin.resolveId
+      if (typeof resolveId !== 'function') {
+        throw new Error('missing resolveId hook')
+      }
+      const resolved = await resolveId.call(
+        {
+          resolve: async () => {
+            throw new Error(
+              'root export served map must not hit on-disk resolution',
+            )
+          },
+        } as never,
+        '@aptre/protobuf-es-lite',
+        path.join(root, 'src', 'entry.js'),
+        { isEntry: false },
+      )
+      expect(resolved).toEqual({
+        id: '/entrypoint/pkgs/@aptre/protobuf-es-lite/dist/index.mjs',
+        external: true,
+      })
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('maps a bare package import to a non-index package root served name', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'web-pkg-root-'))
+    try {
+      const pkgRoot = path.join(root, 'node_modules', 'non-index-root')
+      fs.mkdirSync(path.join(pkgRoot, 'build'), { recursive: true })
+      fs.writeFileSync(
+        path.join(pkgRoot, 'package.json'),
+        JSON.stringify({
+          name: 'non-index-root',
+          type: 'module',
+          exports: {
+            '.': {
+              import: './build/foo.module.js',
+            },
+          },
+          module: './build/foo.module.js',
+        }),
+      )
+      fs.writeFileSync(
+        path.join(pkgRoot, 'build', 'foo.module.js'),
+        'export const root = true\n',
+      )
+
+      const plugin = createWebPkgRemapPlugin({
+        webPkgIDs: ['non-index-root'],
+      })
+
+      const configResolved = plugin.configResolved
+      if (typeof configResolved !== 'function') {
+        throw new Error('missing configResolved hook')
+      }
+      configResolved.call(
+        {} as never,
+        {
+          root,
+          resolve: {
+            alias: [{ find: 'non-index-root', replacement: pkgRoot }],
+          },
+        } as ResolvedConfig,
+      )
+
+      const renderChunk = plugin.renderChunk
+      if (typeof renderChunk !== 'function') {
+        throw new Error('missing renderChunk hook')
+      }
+      const rendered = renderChunk.call(
+        {} as never,
+        'import * as root from "non-index-root";',
+        {} as never,
+        {} as never,
+        {} as never,
+      )
+
+      expect(rendered).toContain(
+        '"bldr-web-pkg/non-index-root/build/foo.module.mjs"',
+      )
+      expect(rendered).not.toContain('"bldr-web-pkg/non-index-root/index.mjs"')
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('maps export subpaths to the served entries of their targets', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'web-pkg-exports-'))
+    try {
+      const pkgRoot = path.join(root, 'node_modules', 'shiki')
+      fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true })
+      fs.writeFileSync(
+        path.join(pkgRoot, 'package.json'),
+        JSON.stringify({
+          name: 'shiki',
+          type: 'module',
+          exports: {
+            '.': { types: './dist/index.d.mts', default: './dist/index.mjs' },
+            './langs': {
+              types: './dist/langs.d.mts',
+              default: './dist/langs.mjs',
+            },
+            './*': './dist/*',
+          },
+        }),
+      )
+
+      const maps = { shiki: readPackageServedNameMap(pkgRoot) }
+      const resolve = (id: string) =>
+        resolveWebPkgImportURL(id, ['shiki'], '/b/pkg', maps)
+      expect(resolve('shiki')).toBe('bldr-web-pkg/shiki/dist/index.mjs')
+      expect(resolve('shiki/langs')).toBe('bldr-web-pkg/shiki/dist/langs.mjs')
+      expect(resolve('shiki/dist/langs.mjs')).toBe(
+        'bldr-web-pkg/shiki/dist/langs.mjs',
+      )
+      expect(resolve('other')).toBeNull()
+
+      expect(
+        bindDevelopmentImports(
+          'import { bundledLanguages } from "/b/fe/test/@id/shiki/langs"',
+          '/b/fe/test/',
+          ['shiki'],
+          '/refresh.mjs',
+          ['shiki'],
+          maps,
+        ),
+      ).toBe(
+        'import { bundledLanguages } from "bldr-web-pkg/shiki/dist/langs.mjs"',
+      )
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to the import specifier when a resolved file only shares the package root prefix', async () => {
+    const root = path.join(path.sep, 'repo')
+    const pkgRoot = path.join(root, 'node_modules', 'pkg')
+    const otherRoot = path.join(root, 'node_modules', 'pkg-extra')
+    const plugin = createWebPkgRemapPlugin({ webPkgIDs: ['pkg'] })
+
+    const configResolved = plugin.configResolved
+    if (typeof configResolved !== 'function') {
+      throw new Error('missing configResolved hook')
+    }
+    configResolved.call(
+      {} as never,
+      {
+        root,
+        resolve: {
+          alias: [{ find: 'pkg', replacement: pkgRoot }],
+        },
+      } as ResolvedConfig,
+    )
+
+    const resolveId = plugin.resolveId
+    if (typeof resolveId !== 'function') {
+      throw new Error('missing resolveId hook')
+    }
+    const result = await resolveId.call(
+      {
+        resolve: async () => ({
+          id: path.join(otherRoot, 'index.js'),
+          external: false,
+          meta: {},
+          moduleSideEffects: true,
+        }),
+      } as never,
+      'pkg/index.js',
+      path.join(root, 'src', 'entry.js'),
+      { isEntry: false },
+    )
+
+    expect(result).toEqual({ id: 'bldr-web-pkg/pkg/index.mjs', external: true })
+  })
+})
+
+describe('createExternalRequirePlugin', () => {
+  it('imports web packages required by bundled CommonJS modules', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bldr-cjs-require-'))
+    try {
+      const depRoot = path.join(root, 'node_modules', 'cjs-dep')
+      fs.mkdirSync(depRoot, { recursive: true })
+      fs.writeFileSync(
+        path.join(depRoot, 'package.json'),
+        JSON.stringify({ name: 'cjs-dep', main: 'index.js' }),
+      )
+      fs.writeFileSync(
+        path.join(depRoot, 'index.js'),
+        "module.exports = require('react').version",
+      )
+      const entry = path.join(root, 'entry.js')
+      fs.writeFileSync(
+        entry,
+        "import version from 'cjs-dep'\nexport { version }",
+      )
+
+      const output = (await build({
+        root,
+        configFile: false,
+        logLevel: 'silent',
+        plugins: [
+          createExternalRequirePlugin(['react']),
+          createWebPkgRemapPlugin({
+            webPkgIDs: ['react'],
+            webPkgImports: { react: ['index.js'] },
+          }),
+        ],
+        build: {
+          write: false,
+          minify: false,
+          lib: { entry, formats: ['es'] },
+          rolldownOptions: {
+            external: (id, importer) =>
+              isExternalWebPkgImport(['react'], id, importer),
+          },
+        },
+      })) as Rollup.RollupOutput[]
+
+      const code = output
+        .flatMap((result) => result.output)
+        .map((chunk) => (chunk.type === 'chunk' ? chunk.code : ''))
+        .join('\n')
+      expect(code).toMatch(/from ["']bldr-web-pkg\/react\/index\.mjs["']/)
+      expect(code).not.toMatch(/require\(["']react["']\)/)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('bundles stylesheets imported from web packages', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bldr-web-pkg-css-'))
+    try {
+      const pkgRoot = path.join(root, 'node_modules', 'web-pkg')
+      fs.mkdirSync(pkgRoot, { recursive: true })
+      fs.writeFileSync(
+        path.join(pkgRoot, 'package.json'),
+        JSON.stringify({ name: 'web-pkg', main: 'index.js' }),
+      )
+      fs.writeFileSync(path.join(pkgRoot, 'style.css'), '.web-pkg{color:red}')
+      const entry = path.join(root, 'entry.js')
+      fs.writeFileSync(entry, "import 'web-pkg/style.css'\nexport const x = 1")
+
+      const output = (await build({
+        root,
+        configFile: false,
+        logLevel: 'silent',
+        plugins: [createExternalRequirePlugin(['web-pkg'])],
+        build: {
+          write: false,
+          minify: false,
+          lib: { entry, formats: ['es'], cssFileName: 'style' },
+          rolldownOptions: {
+            external: (id, importer) =>
+              isExternalWebPkgImport(['web-pkg'], id, importer),
+          },
+        },
+      })) as Rollup.RollupOutput[]
+
+      const files = output.flatMap((result) => result.output)
+      const code = files
+        .map((file) => (file.type === 'chunk' ? file.code : ''))
+        .join('\n')
+      const css = files
+        .map((file) =>
+          file.type === 'asset' && file.fileName.endsWith('.css')
+            ? String(file.source)
+            : '',
+        )
+        .join('\n')
+      expect(code).not.toMatch(/web-pkg\/style\.css/)
+      expect(css).toContain('.web-pkg')
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})

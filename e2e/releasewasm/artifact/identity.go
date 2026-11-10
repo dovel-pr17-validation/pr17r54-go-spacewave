@@ -1,0 +1,302 @@
+package artifact
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"hash"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/pkg/errors"
+	"golang.org/x/mod/modfile"
+)
+
+const identitySchemaVersion = 1
+
+// Identity binds a release artifact to every source and build input that can
+// determine its contents.
+type Identity struct {
+	SchemaVersion         int
+	Digest                string
+	Compiler              string
+	Mode                  string
+	SourceDigest          string
+	BuildDigest           string
+	LockfileDigest        string
+	BldrDigest            string
+	PrerenderInputsDigest string
+}
+
+// ComputeIdentity computes the release artifact identity from the current Git
+// working tree, including tracked edits, staged edits, deletions, and untracked
+// non-ignored files, and from the files of every module go.mod replaces with a
+// local directory.
+func ComputeIdentity(repoRoot string, inputs *BuildInputs) (*Identity, error) {
+	// Digest the compiler, mode, tools, and environment inputs.
+	buildDigest, err := inputs.digest()
+	if err != nil {
+		return nil, err
+	}
+
+	// List tracked and unignored source paths from the working tree.
+	paths, err := listSourceFiles(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	// Hash source files into source, lockfile, builder, and prerender groups.
+	sourceHash := sha256.New()
+	lockfileHash := sha256.New()
+	bldrHash := sha256.New()
+	prerenderHash := sha256.New()
+	for _, path := range paths {
+		h := sourceHash
+		switch {
+		case isLockfile(path):
+			h = lockfileHash
+		case path == "bldr" || strings.HasPrefix(path, "bldr/"):
+			h = bldrHash
+		case path == "app/prerender" || strings.HasPrefix(path, "app/prerender/"):
+			h = prerenderHash
+		}
+		if err := hashFile(h, repoRoot, path, true); err != nil {
+			return nil, err
+		}
+	}
+
+	// A local replace builds the module from a directory outside the working
+	// tree, so its files are source inputs too.
+	if err := hashLocalReplaces(sourceHash, repoRoot); err != nil {
+		return nil, err
+	}
+
+	// Bind source and build digests into one artifact identity.
+	identity := &Identity{
+		SchemaVersion:         identitySchemaVersion,
+		Compiler:              inputs.Compiler,
+		Mode:                  inputs.Mode,
+		SourceDigest:          hex.EncodeToString(sourceHash.Sum(nil)),
+		BuildDigest:           buildDigest,
+		LockfileDigest:        hex.EncodeToString(lockfileHash.Sum(nil)),
+		BldrDigest:            hex.EncodeToString(bldrHash.Sum(nil)),
+		PrerenderInputsDigest: hex.EncodeToString(prerenderHash.Sum(nil)),
+	}
+	identity.Digest = identity.contentDigest()
+	return identity, nil
+}
+
+// Summary returns every digest that determines the identity, so two processes
+// that disagree about which artifact they want can be compared field by field
+// from their logs alone.
+func (i *Identity) Summary() map[string]string {
+	return map[string]string{
+		"identity":        i.Digest,
+		"schema":          strconv.Itoa(i.SchemaVersion),
+		"compiler":        i.Compiler,
+		"mode":            i.Mode,
+		"source":          i.SourceDigest,
+		"build":           i.BuildDigest,
+		"lockfiles":       i.LockfileDigest,
+		"bldr":            i.BldrDigest,
+		"prerenderInputs": i.PrerenderInputsDigest,
+	}
+}
+
+// Differences returns the current inputs that do not match the artifact.
+func (i *Identity) Differences(artifact *Identity) []string {
+	// Require an artifact identity before comparing its inputs.
+	if artifact == nil {
+		return []string{"missing identity"}
+	}
+
+	// Compare the artifact schema and compiler configuration.
+	var differences []string
+	if artifact.SchemaVersion != identitySchemaVersion {
+		differences = append(differences, "identity schema")
+	}
+	if artifact.Compiler != i.Compiler {
+		differences = append(differences, "compiler")
+	}
+	if artifact.Mode != i.Mode {
+		differences = append(differences, "build mode")
+	}
+	if artifact.BuildDigest != i.BuildDigest {
+		differences = append(differences, "build environment")
+	}
+
+	// Compare source, lockfile, builder, and prerender input digests.
+	if artifact.SourceDigest != i.SourceDigest {
+		differences = append(differences, "source content")
+	}
+	if artifact.LockfileDigest != i.LockfileDigest {
+		differences = append(differences, "lockfiles")
+	}
+	if artifact.BldrDigest != i.BldrDigest {
+		differences = append(differences, "Bldr cache format inputs")
+	}
+	if artifact.PrerenderInputsDigest != i.PrerenderInputsDigest {
+		differences = append(differences, "prerender inputs")
+	}
+
+	// Verify the artifact identity digest against its recorded fields.
+	if artifact.Digest != artifact.contentDigest() {
+		differences = append(differences, "identity digest")
+	}
+	return differences
+}
+
+func (i *Identity) contentDigest() string {
+	// Hash the identity schema and compiler configuration.
+	h := sha256.New()
+	writeDigestField(h, "schema", strconv.Itoa(i.SchemaVersion))
+	writeDigestField(h, "compiler", i.Compiler)
+	writeDigestField(h, "mode", i.Mode)
+
+	// Hash the source and build input groups into the identity digest.
+	writeDigestField(h, "source", i.SourceDigest)
+	writeDigestField(h, "build", i.BuildDigest)
+	writeDigestField(h, "lockfiles", i.LockfileDigest)
+	writeDigestField(h, "bldr", i.BldrDigest)
+	writeDigestField(h, "prerender", i.PrerenderInputsDigest)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// listSourceFiles returns the sorted tracked and unignored file paths under dir,
+// relative to dir.
+func listSourceFiles(dir string) ([]string, error) {
+	// List the files Git tracks or would track under dir.
+	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, errors.Wrapf(err, "list release artifact source files in %s", dir)
+	}
+
+	// Sort source paths to make their digest deterministic.
+	var paths []string
+	for raw := range bytes.SplitSeq(out, []byte{0}) {
+		if len(raw) != 0 {
+			paths = append(paths, string(raw))
+		}
+	}
+	slices.Sort(paths)
+	return paths, nil
+}
+
+// hashLocalReplaces hashes the source files of every module go.mod replaces
+// with a local directory outside repoRoot.
+func hashLocalReplaces(h hash.Hash, repoRoot string) error {
+	// Read the replace directives of the root module.
+	goModPath := filepath.Join(repoRoot, "go.mod")
+	data, err := os.ReadFile(goModPath) // #nosec G703 -- the caller-selected repo root's go.mod.
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return errors.Wrap(err, "read go.mod")
+	}
+	mod, err := modfile.Parse(goModPath, data, nil)
+	if err != nil {
+		return errors.Wrap(err, "parse go.mod")
+	}
+
+	// Hash each local replacement outside the working tree.
+	for _, replace := range mod.Replace {
+		// Skip module replacements and directories the working tree listing
+		// already covers.
+		dir := replace.New.Path
+		if !modfile.IsDirectoryPath(dir) {
+			continue
+		}
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(repoRoot, dir)
+		}
+		if rel, err := filepath.Rel(repoRoot, dir); err == nil && filepath.IsLocal(rel) {
+			continue
+		}
+
+		// Hash the replacement's files under the module path it replaces.
+		paths, err := listSourceFiles(dir)
+		if err != nil {
+			return err
+		}
+		writeDigestField(h, "replace", replace.Old.Path)
+		for _, path := range paths {
+			if err := hashFile(h, dir, path, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func isLockfile(path string) bool {
+	switch filepath.Base(path) {
+	case "bun.lock", "bun.lockb", "go.mod", "go.sum", "package-lock.json", "pnpm-lock.yaml", "yarn.lock":
+		return true
+	default:
+		return false
+	}
+}
+
+// includeMode controls whether filesystem permission bits participate in the
+// digest. Source inputs retain modes, while transported output trees do not.
+func hashFile(h hash.Hash, repoRoot, path string, includeMode bool) error {
+	// Resolve the input path within the selected repository.
+	fullPath := filepath.Join(repoRoot, filepath.FromSlash(path))
+
+	// Inspect the input and record tracked deletions in its digest.
+	// #nosec G703 -- fullPath is the caller-selected repo root joined with the manifest path.
+	info, err := os.Lstat(fullPath)
+	if os.IsNotExist(err) {
+		writeDigestField(h, path, "deleted")
+		return nil
+	}
+	if err != nil {
+		return errors.Wrapf(err, "stat release artifact input %s", path)
+	}
+
+	// Record the input path and optional filesystem permissions.
+	writeDigestField(h, "path", path)
+	if includeMode {
+		writeDigestField(h, "mode", strconv.FormatUint(uint64(info.Mode()), 8))
+	}
+
+	// Hash symbolic link targets without following them.
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(fullPath)
+		if err != nil {
+			return errors.Wrapf(err, "read release artifact input symlink %s", path)
+		}
+		writeDigestField(h, "symlink", target)
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Errorf("release artifact input %s has unsupported mode %s", path, info.Mode())
+	}
+
+	// Record the regular input size before reading its bytes.
+	writeDigestField(h, "size", strconv.FormatInt(info.Size(), 10))
+
+	// Hash regular input bytes and close the input file.
+	// #nosec G703 -- fullPath is the caller-selected repo root joined with the manifest path.
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return errors.Wrapf(err, "open release artifact input %s", path)
+	}
+	if _, err := io.Copy(h, f); err != nil {
+		f.Close()
+		return errors.Wrapf(err, "hash release artifact input %s", path)
+	}
+	if err := f.Close(); err != nil {
+		return errors.Wrapf(err, "close release artifact input %s", path)
+	}
+	h.Write([]byte{0})
+	return nil
+}

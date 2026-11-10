@@ -1,0 +1,393 @@
+package unixfs_billy
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"io/fs"
+	"runtime/trace"
+	"sync/atomic"
+	"time"
+
+	"github.com/go-git/go-billy/v6"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/unixfs"
+	unixfs_errors "github.com/s4wave/spacewave/db/unixfs/errors"
+)
+
+// BillyFSFile implements the Billy filesystem File interface with a FSHandle.
+type BillyFSFile struct {
+	// ctx is the context
+	ctx context.Context
+	// name is the filename as passed to open
+	name string
+	// h is the filesystem handle
+	h *unixfs.FSHandle
+	// flag contains file open flags
+	flag int
+	// t is a constant write timestamp
+	t atomic.Pointer[time.Time]
+	// idx is the current file index
+	// note: concurrent read() and write() calls have undefined behavior.
+	// while not expected, the atomic integer will protect against concurrent access.
+	// note: concurrent ReadAt calls will work correctly (even during a Write()).
+	idx atomic.Int64
+}
+
+// NewBillyFSFile constructs a new Billy FS file handle.
+// The handle will be released when the file is closed.
+// If ts is zero, uses time.Now.
+func NewBillyFSFile(ctx context.Context, name string, h *unixfs.FSHandle, flag int, ts time.Time) *BillyFSFile {
+	f := &BillyFSFile{ctx: ctx, name: name, h: h, flag: flag}
+	if !ts.IsZero() {
+		f.SetOpTimestamp(ts)
+	}
+	return f
+}
+
+// CopyToBillyFSFile copies data from a FSHandle to a BillyFSFile.
+// Writes from the current out index forward.
+// If copyBuffer is set, uses it, otherwise allocates one.
+func CopyToBillyFSFile(
+	ctx context.Context,
+	destFile billy.File,
+	srcHandle *unixfs.FSHandle,
+	copyBuffer []byte,
+) error {
+	// Provide a buffer for copying UnixFS content to the Billy file.
+	if len(copyBuffer) < 16 {
+		copyBuffer = make([]byte, 32*1024)
+	}
+
+	// Copy the UnixFS content until the source ends or a transfer fails.
+	var offset int64
+	var written int64
+	var err error
+	for {
+		// Read the next UnixFS chunk and advance the source offset.
+		nr, er := srcHandle.ReadAt(ctx, offset, copyBuffer)
+		offset += nr
+
+		// Write the source chunk to the Billy file and detect short writes.
+		if nr > 0 {
+			nw, ew := destFile.Write(copyBuffer[0:nr])
+			if nw < 0 || int(nr) < nw {
+				nw = 0
+				if ew == nil {
+					ew = unixfs_errors.ErrInvalidWrite
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if int(nr) != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+
+		// Finish the transfer when the UnixFS source reports EOF or an error.
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return err
+}
+
+// SyncToBillyFSFile synchronizes data from a FSHandle to a BillyFSFile.
+// Makes the two files identical by content and reports whether it changed
+// the destination. inBuffer and outBuffer must be different buffers; either
+// is allocated when too small.
+func SyncToBillyFSFile(
+	ctx context.Context,
+	destFile billy.File,
+	srcHandle *unixfs.FSHandle,
+	inBuffer, outBuffer []byte,
+) (bool, error) {
+	// Size separate buffers for comparing UnixFS and Billy file content.
+	if len(inBuffer) < 16 {
+		inBuffer = make([]byte, 32*1024)
+	}
+	if cap(outBuffer) < len(inBuffer) {
+		outBuffer = make([]byte, len(inBuffer))
+	} else {
+		outBuffer = outBuffer[:len(inBuffer)]
+	}
+
+	// Resize only when needed; truncating unchanged content emits file watches.
+	srcSize, err := srcHandle.GetSize(ctx)
+	if err != nil {
+		return false, err
+	}
+	destSize, err := destFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return false, err
+	}
+	changed := destSize != int64(srcSize) //nolint:gosec
+	if changed {
+		if err := destFile.Truncate(int64(srcSize)); err != nil { //nolint:gosec
+			return false, err
+		}
+	}
+
+	// read & compare in chunks
+	var offset int64
+	for {
+		// Read the next UnixFS range and verify the source ends at its declared size.
+		nreadIn, err := srcHandle.ReadAt(ctx, offset, inBuffer)
+		isEOF := err == io.EOF
+		if err != nil && !isEOF {
+			return false, err
+		}
+		if nreadIn == 0 {
+			if offset != int64(srcSize) { //nolint:gosec
+				return false, errors.Wrapf(unixfs_errors.ErrInvalidWrite, "wrote %d but expected %d", offset, srcSize)
+			}
+			break
+		}
+
+		// Read the corresponding Billy file range for comparison.
+		outBuffer = outBuffer[:nreadIn]
+		nreadOut, err := destFile.ReadAt(outBuffer, offset)
+		if err != nil {
+			// we don't expect EOF due to the Truncate above.
+			return false, err
+		}
+		if nreadOut == 0 {
+			return false, errors.Errorf("read 0 bytes but expected %d", nreadIn)
+		}
+
+		// Limit the comparison to the bytes returned by both files.
+		compareSize := nreadIn
+		if out := int64(nreadOut); out < compareSize {
+			compareSize = out
+		}
+
+		// if they are equal, continue without writing.
+		if bytes.Equal(inBuffer[:compareSize], outBuffer[:compareSize]) {
+			offset += compareSize
+			continue
+		}
+
+		// Position the Billy file before replacing a differing range.
+		// otherwise write to the destination.
+		if _, err := destFile.Seek(offset, io.SeekStart); err != nil {
+			return false, err
+		}
+
+		// Persist the changed Billy file range and advance the comparison offset.
+		wroteSize, err := destFile.Write(inBuffer[:compareSize])
+		if err != nil {
+			return false, err
+		}
+		if wroteSize == 0 {
+			return false, io.ErrShortWrite
+		}
+		offset += int64(wroteSize)
+		changed = true
+	}
+
+	return changed, nil
+}
+
+// GetReadOnly checks if the readonly flag is set.
+func (f *BillyFSFile) GetReadOnly() bool {
+	return unixfs.FlagIsReadOnly(f.flag)
+}
+
+// Name returns the name of the file as presented to Open.
+func (f *BillyFSFile) Name() string {
+	return f.name
+}
+
+// Write writes data to the file node.
+func (f *BillyFSFile) Write(p []byte) (n int, err error) {
+	// Require write access to the Billy file.
+	if f.GetReadOnly() {
+		return 0, billy.ErrReadOnly
+	}
+
+	// Write the content through the UnixFS handle and advance the file offset.
+	startIdx := f.idx.Load()
+	err = f.h.WriteAt(f.ctx, startIdx, p, f.timestamp())
+	if err != nil {
+		return 0, err
+	}
+	n = len(p)
+	if n != 0 {
+		f.idx.Add(int64(n))
+	}
+
+	return n, nil
+}
+
+// WriteAt writes data to the file node at an offset.
+func (f *BillyFSFile) WriteAt(p []byte, off int64) (n int, err error) {
+	if f.GetReadOnly() {
+		return 0, billy.ErrReadOnly
+	}
+
+	err = f.h.WriteAt(f.ctx, off, p, f.timestamp())
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// ReadFrom reads data from r until EOF or error.
+// The return value n is the number of bytes read.
+// Any error except EOF encountered during the read is also returned.
+//
+// Each write is a full buffer of the file's optimal write size, however
+// little each Read returns: a file rewrites its last blob chunk on every
+// write, so small writes multiply the bytes stored.
+//
+// The Copy function uses ReaderFrom if available.
+func (f *BillyFSFile) ReadFrom(r io.Reader) (n int64, err error) {
+	// Size the buffer to the optimal write size within sane bounds.
+	writeSize, err := f.h.GetOptimalWriteSize(f.ctx)
+	if err != nil {
+		return 0, err
+	}
+	writeSize = min(max(writeSize, 1024), 512e3*5)
+	buf := make([]byte, writeSize)
+
+	// Fill the buffer before each write.
+	for {
+		rn, err := io.ReadFull(r, buf)
+		if rn != 0 {
+			if _, werr := f.Write(buf[:rn]); werr != nil {
+				return n, werr
+			}
+			n += int64(rn)
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+	}
+}
+
+// Read reads data from the file node, advancing the file handle offset.
+func (f *BillyFSFile) Read(p []byte) (n int, err error) {
+	// Trace the Billy file read when runtime tracing is enabled.
+	if trace.IsEnabled() {
+		_, task := trace.NewTask(f.ctx, "db/unixfs/billy/file/read")
+		defer task.End()
+	}
+
+	// Read the UnixFS file content and advance the offset after a successful read.
+	idx := f.idx.Load()
+	rn, err := f.h.ReadAt(f.ctx, idx, p)
+	if rn != 0 {
+		if err == io.EOF {
+			err = nil
+		}
+		if err == nil {
+			f.idx.Add(rn)
+		}
+	}
+	return int(rn), err
+}
+
+// ReadAt attempts to read data at a location in the file.
+func (f *BillyFSFile) ReadAt(p []byte, off int64) (n int, err error) {
+	rn, err := f.h.ReadAt(f.ctx, off, p)
+	return int(rn), err
+}
+
+// Seek attempts to move the file handle to a location in a file.
+func (f *BillyFSFile) Seek(offset int64, whence int) (int64, error) {
+	var out int64
+	switch whence {
+	case io.SeekCurrent:
+		out = f.idx.Add(offset)
+	case io.SeekStart:
+		f.idx.Store(offset)
+		out = offset
+	case io.SeekEnd:
+		size, err := f.h.GetSize(f.ctx)
+		if err != nil {
+			return 0, err
+		}
+		out = int64(size) + offset //nolint:gosec
+		f.idx.Store(out)
+	}
+	if out < 0 {
+		return out, io.EOF
+	}
+	return out, nil
+}
+
+// Truncate the file.
+func (f *BillyFSFile) Truncate(size int64) error {
+	if f.GetReadOnly() {
+		return billy.ErrReadOnly
+	}
+	if size < 0 {
+		size = 0
+	}
+	return f.h.Truncate(f.ctx, uint64(size), f.timestamp()) //nolint:gosec
+}
+
+// Close commits buffered writes and closes the file handle.
+func (f *BillyFSFile) Close() error {
+	err := f.h.Sync(f.ctx)
+	f.h.Release()
+	return err
+}
+
+// Stat returns the FileInfo for the file.
+func (f *BillyFSFile) Stat() (fs.FileInfo, error) {
+	return f.h.GetFileInfo(f.ctx)
+}
+
+// Lock locks the file like e.g. flock. It protects against access from
+// other processes.
+func (f *BillyFSFile) Lock() error {
+	// XXX: we do not yet implement flock.
+	return nil
+}
+
+// Unlock unlocks the file.
+func (f *BillyFSFile) Unlock() error {
+	// XXX: we do not yet implement flock.
+	return nil
+}
+
+// SetOpTimestamp sets the timestamp for FS write operations.
+func (f *BillyFSFile) SetOpTimestamp(t time.Time) {
+	f.t.Store(&t)
+}
+
+// GetOpTimestamp returns the current timestamp set to use for writes.
+func (f *BillyFSFile) GetOpTimestamp() time.Time {
+	ts := f.t.Load()
+	if ts == nil {
+		return time.Time{}
+	}
+	return *ts
+}
+
+// timestamp returns the timestamp to use for writes..
+func (f *BillyFSFile) timestamp() time.Time {
+	t := f.GetOpTimestamp()
+	if t.IsZero() {
+		return time.Now()
+	}
+	return t
+}
+
+// _ is a type assertion
+var (
+	_ billy.File    = (*BillyFSFile)(nil)
+	_ io.WriterAt   = (*BillyFSFile)(nil)
+	_ io.ReaderFrom = (*BillyFSFile)(nil)
+)

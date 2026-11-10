@@ -1,0 +1,554 @@
+package artifact
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/aperturerobotics/fastjson"
+	"github.com/pkg/errors"
+)
+
+const (
+	identityFilename = "release-wasm-identity.json"
+	currentFilename  = "current"
+	generationsDir   = "generations"
+)
+
+var (
+	errReleaseArtifactOutputDigestMismatch   = errors.New("release artifact output digest mismatch")
+	errPrerenderArtifactOutputDigestMismatch = errors.New("prerender artifact output digest mismatch")
+)
+
+type publishHooks struct {
+	beforeRename             func()
+	afterRenameBeforeCurrent func()
+}
+
+// Publish copies a complete release and prerender output pair into an immutable
+// generation, then atomically makes that generation current.
+func Publish(storeDir, releaseDir, prerenderDir string, identity *Identity) (string, string, error) {
+	generation, err := PublishGeneration(storeDir, releaseDir, prerenderDir, identity)
+	return generation.ReleaseDir, generation.PrerenderDir, err
+}
+
+// PublishGeneration copies, validates, and atomically publishes one immutable
+// release artifact generation.
+func PublishGeneration(storeDir, releaseDir, prerenderDir string, identity *Identity) (Generation, error) {
+	return publish(storeDir, releaseDir, prerenderDir, identity, publishHooks{})
+}
+
+func publish(storeDir, releaseDir, prerenderDir string, identity *Identity, hooks publishHooks) (Generation, error) {
+	// Validate the identity and required outputs before staging a generation.
+	if identity == nil || identity.Digest == "" || identity.Digest != identity.contentDigest() {
+		return Generation{}, errors.New("invalid release artifact identity")
+	}
+	if err := validateRequiredFiles(releaseDir, prerenderDir); err != nil {
+		return Generation{}, err
+	}
+
+	// Create the generation store under the selected artifact root.
+	// #nosec G703 -- storeDir is the caller-selected artifact store root.
+	if err := os.MkdirAll(filepath.Join(storeDir, generationsDir), 0o755); err != nil {
+		return Generation{}, errors.Wrap(err, "create release artifact store")
+	}
+
+	// Create a staging directory and remove it if publication fails.
+	stageDir, err := os.MkdirTemp(storeDir, ".publish-")
+	if err != nil {
+		return Generation{}, errors.Wrap(err, "create release artifact staging directory")
+	}
+	removeStage := true
+	defer func() {
+		if removeStage {
+			os.RemoveAll(stageDir) // #nosec G703 -- stageDir is the MkdirTemp staging directory above.
+		}
+	}()
+
+	// Copy the release and prerender trees into the staged generation.
+	stagedRelease := filepath.Join(stageDir, "release")
+	stagedPrerender := filepath.Join(stageDir, "prerender")
+	if err := copyTree(releaseDir, stagedRelease); err != nil {
+		return Generation{}, errors.Wrap(err, "stage release output")
+	}
+	if err := copyTree(prerenderDir, stagedPrerender); err != nil {
+		return Generation{}, errors.Wrap(err, "stage prerender output")
+	}
+
+	// Compute the staged output digests for the identity manifest.
+	releaseDigest, err := treeDigest(stagedRelease)
+	if err != nil {
+		return Generation{}, errors.Wrap(err, "digest staged release output")
+	}
+	prerenderDigest, err := treeDigest(stagedPrerender)
+	if err != nil {
+		return Generation{}, errors.Wrap(err, "digest staged prerender output")
+	}
+
+	// Write and validate the staged identity manifest.
+	// #nosec G703 -- stagedRelease is the MkdirTemp staging directory joined with a constant name.
+	if err := os.WriteFile(
+		filepath.Join(stagedRelease, identityFilename),
+		marshalManifest(identity, releaseDigest, prerenderDigest),
+		0o644,
+	); err != nil {
+		return Generation{}, errors.Wrap(err, "write staged release artifact identity")
+	}
+	if err := Validate(stagedRelease, stagedPrerender, identity); err != nil {
+		return Generation{}, errors.Wrap(err, "validate staged release artifact")
+	}
+
+	// Choose the immutable generation path and run the publication hook.
+	generation := identity.Digest + "-" + strings.TrimPrefix(filepath.Base(stageDir), ".publish-")
+	generationDir := filepath.Join(storeDir, generationsDir, generation)
+	if hooks.beforeRename != nil {
+		hooks.beforeRename()
+	}
+
+	// Commit the staged generation and publish its current pointer.
+	// #nosec G703 -- both paths live under the caller-selected storeDir; generation is a digest plus MkdirTemp suffix.
+	if err := os.Rename(stageDir, generationDir); err != nil {
+		return Generation{}, errors.Wrap(err, "commit release artifact generation")
+	}
+	removeStage = false
+	if hooks.afterRenameBeforeCurrent != nil {
+		hooks.afterRenameBeforeCurrent()
+	}
+	if err := writeCurrent(storeDir, generation); err != nil {
+		return Generation{}, err
+	}
+	return Generation{
+		ID:           generation,
+		ReleaseDir:   filepath.Join(generationDir, "release"),
+		PrerenderDir: filepath.Join(generationDir, "prerender"),
+	}, nil
+}
+
+// Current returns the atomically published generation when it is complete and
+// matches the expected content identity.
+func Current(storeDir string, expected *Identity) (string, string, error) {
+	// Read and validate the current generation name.
+	data, err := os.ReadFile(filepath.Join(storeDir, currentFilename))
+	if err != nil {
+		return "", "", errors.Wrap(err, "read current release artifact generation")
+	}
+	generation := strings.TrimSpace(string(data))
+	if !validGenerationName(generation) {
+		return "", "", errors.New("invalid current release artifact generation")
+	}
+
+	// Validate the current output pair against the expected identity.
+	generationDir := filepath.Join(storeDir, generationsDir, generation)
+	releaseDir := filepath.Join(generationDir, "release")
+	prerenderDir := filepath.Join(generationDir, "prerender")
+	if err := Validate(releaseDir, prerenderDir, expected); err != nil {
+		return "", "", err
+	}
+	return releaseDir, prerenderDir, nil
+}
+
+func validGenerationName(generation string) bool {
+	return generation != "" && filepath.Base(generation) == generation && generation != "." && generation != ".."
+}
+
+// ValidGenerations returns every valid immutable generation matching the
+// expected content identity, with the current generation first when valid.
+func ValidGenerations(storeDir string, expected *Identity) ([]Generation, error) {
+	// Require an expected identity before searching stored generations.
+	if expected == nil {
+		return nil, errors.New("missing expected release artifact identity")
+	}
+
+	// Read the current pointer to identify the preferred generation.
+	current := ""
+	data, err := os.ReadFile(filepath.Join(storeDir, currentFilename))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, errors.Wrap(err, "read current release artifact generation")
+	}
+	if err == nil {
+		generation := strings.TrimSpace(string(data))
+		if validGenerationName(generation) {
+			current = generation
+		}
+	}
+
+	// List generation directories, allowing an absent store.
+	root := filepath.Join(storeDir, generationsDir)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errors.Wrap(err, "read release artifact generations")
+	}
+
+	// Collect matching generations and retain the current one separately.
+	var generations []Generation
+	var preferred Generation
+	for _, entry := range entries {
+		name := entry.Name()
+		parts := strings.SplitN(name, "-", 2)
+		if parts[0] != expected.Digest {
+			continue
+		}
+		if len(parts) != 2 || parts[1] == "" {
+			return nil, errors.Errorf("invalid release artifact generation %q", name)
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil, errors.Errorf("release artifact generation %q is a symbolic link", name)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, errors.Wrapf(err, "inspect release artifact generation %q", name)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return nil, errors.Errorf("release artifact generation %q is not a directory", name)
+		}
+		generationDir := filepath.Join(root, name)
+		releaseDir := filepath.Join(generationDir, "release")
+		prerenderDir := filepath.Join(generationDir, "prerender")
+		if err := Validate(releaseDir, prerenderDir, expected); err != nil {
+			// Artifact transport can preserve the identity manifest while
+			// changing output bytes or modes. Let the resolver rebuild that
+			// stale generation, but keep identity and structural failures fatal.
+			switch errors.Cause(err) {
+			case errReleaseArtifactOutputDigestMismatch, errPrerenderArtifactOutputDigestMismatch:
+				continue
+			default:
+				return nil, err
+			}
+		}
+		generation := Generation{
+			ID:           name,
+			ReleaseDir:   releaseDir,
+			PrerenderDir: prerenderDir,
+		}
+		if name == current {
+			preferred = generation
+			continue
+		}
+		generations = append(generations, generation)
+	}
+
+	// Place the current generation before the remaining matching generations.
+	if preferred.ID != "" {
+		generations = append([]Generation{preferred}, generations...)
+	}
+	return generations, nil
+}
+
+// GenerationIDs returns the name of every generation directory in the store,
+// whatever identity it carries. A caller that found no usable generation uses
+// this to report what the store did hold.
+func GenerationIDs(storeDir string) ([]string, error) {
+	// Read generation directory entries, allowing an absent store.
+	entries, err := os.ReadDir(filepath.Join(storeDir, generationsDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errors.Wrap(err, "read release artifact generations")
+	}
+
+	// Collect generation names for artifact store diagnostics.
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names, nil
+}
+
+// Validate rejects incomplete, modified, or stale artifact directory pairs.
+func Validate(releaseDir, prerenderDir string, expected *Identity) error {
+	// Require the expected identity and complete artifact outputs.
+	if expected == nil {
+		return errors.New("missing expected release artifact identity")
+	}
+	if err := validateRequiredFiles(releaseDir, prerenderDir); err != nil {
+		return err
+	}
+
+	// Read the manifest and compare its source and build identity.
+	manifest, releaseDigest, prerenderDigest, err := readManifest(filepath.Join(releaseDir, identityFilename))
+	if err != nil {
+		return err
+	}
+	if differences := expected.Differences(manifest); len(differences) != 0 {
+		return errors.Errorf("release artifact identity mismatch: %s", strings.Join(differences, ", "))
+	}
+
+	// Verify the release output against its recorded digest.
+	actualReleaseDigest, err := treeDigest(releaseDir)
+	if err != nil {
+		return errors.Wrap(err, "digest release output")
+	}
+	if actualReleaseDigest != releaseDigest {
+		return errReleaseArtifactOutputDigestMismatch
+	}
+
+	// Verify the prerender output against its recorded digest.
+	actualPrerenderDigest, err := treeDigest(prerenderDir)
+	if err != nil {
+		return errors.Wrap(err, "digest prerender output")
+	}
+	if actualPrerenderDigest != prerenderDigest {
+		return errPrerenderArtifactOutputDigestMismatch
+	}
+	return nil
+}
+
+func validateRequiredFiles(releaseDir, prerenderDir string) error {
+	// Resolve the browser release descriptor in the selected output tree.
+	descriptorPath := filepath.Join(releaseDir, "browser-release.json")
+
+	// Read and validate the browser release descriptor.
+	// #nosec G703 -- releaseDir is the caller-selected release output directory.
+	data, err := os.ReadFile(descriptorPath)
+	if err != nil {
+		return errors.Wrap(err, "read browser-release.json")
+	}
+	var parser fastjson.Parser
+	descriptor, err := parser.ParseBytes(data)
+	if err != nil {
+		return errors.Wrap(err, "parse browser-release.json")
+	}
+	if descriptor.GetInt("schemaVersion") <= 0 ||
+		len(descriptor.GetStringBytes("generationId")) == 0 ||
+		len(descriptor.GetStringBytes("shellAssets", "entrypoint")) == 0 ||
+		len(descriptor.GetStringBytes("shellAssets", "serviceWorker")) == 0 ||
+		len(descriptor.GetStringBytes("shellAssets", "sharedWorker")) == 0 {
+		return errors.New("browser-release.json is incomplete")
+	}
+
+	// Require a nonempty regular prerender index file.
+	// #nosec G703 -- prerenderDir is the caller-selected prerender output directory.
+	indexInfo, err := os.Stat(filepath.Join(prerenderDir, "index.html"))
+	if err != nil {
+		return errors.Wrap(err, "stat prerender index.html")
+	}
+	if !indexInfo.Mode().IsRegular() || indexInfo.Size() == 0 {
+		return errors.New("prerender index.html is empty or not a regular file")
+	}
+	return nil
+}
+
+func writeCurrent(storeDir, generation string) error {
+	// Create a temporary current pointer and remove it on failure.
+	f, err := os.CreateTemp(storeDir, ".current-")
+	if err != nil {
+		return errors.Wrap(err, "create current release artifact pointer")
+	}
+	path := f.Name()
+	remove := true
+	defer func() {
+		if remove {
+			os.Remove(path) // #nosec G703 -- path is the CreateTemp pointer file above.
+		}
+	}()
+	if _, err := f.WriteString(generation + "\n"); err != nil {
+		// Write and flush the generation name before publishing the pointer.
+		f.Close()
+		return errors.Wrap(err, "write current release artifact pointer")
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return errors.Wrap(err, "sync current release artifact pointer")
+	}
+	if err := f.Close(); err != nil {
+		return errors.Wrap(err, "close current release artifact pointer")
+	}
+
+	// Atomically replace the current generation pointer.
+	// #nosec G703 -- both paths live under the caller-selected storeDir with constant names.
+	if err := os.Rename(path, filepath.Join(storeDir, currentFilename)); err != nil {
+		return errors.Wrap(err, "publish current release artifact pointer")
+	}
+	remove = false
+	return nil
+}
+
+func marshalManifest(identity *Identity, releaseDigest, prerenderDigest string) []byte {
+	// Encode the manifest schema and compiler configuration.
+	var arena fastjson.Arena
+	obj := arena.NewObject()
+	obj.Set("schemaVersion", arena.NewNumberInt(identity.SchemaVersion))
+	obj.Set("digest", arena.NewString(identity.Digest))
+	obj.Set("compiler", arena.NewString(identity.Compiler))
+	obj.Set("mode", arena.NewString(identity.Mode))
+
+	// Encode the manifest source and output digests.
+	obj.Set("sourceDigest", arena.NewString(identity.SourceDigest))
+	obj.Set("buildDigest", arena.NewString(identity.BuildDigest))
+	obj.Set("lockfileDigest", arena.NewString(identity.LockfileDigest))
+	obj.Set("bldrDigest", arena.NewString(identity.BldrDigest))
+	obj.Set("prerenderInputsDigest", arena.NewString(identity.PrerenderInputsDigest))
+	obj.Set("releaseOutputDigest", arena.NewString(releaseDigest))
+	obj.Set("prerenderOutputDigest", arena.NewString(prerenderDigest))
+	return append(obj.MarshalTo(nil), '\n')
+}
+
+func readManifest(path string) (*Identity, string, string, error) {
+	// Read the stored release identity manifest.
+	// #nosec G703 -- path is the caller-selected identity manifest path.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", "", errors.Wrap(err, "read release artifact identity")
+	}
+
+	// Parse the manifest and recover its identity fields.
+	var parser fastjson.Parser
+	value, err := parser.ParseBytes(data)
+	if err != nil {
+		return nil, "", "", errors.Wrap(err, "parse release artifact identity")
+	}
+	identity := &Identity{
+		SchemaVersion:         value.GetInt("schemaVersion"),
+		Digest:                string(value.GetStringBytes("digest")),
+		Compiler:              string(value.GetStringBytes("compiler")),
+		Mode:                  string(value.GetStringBytes("mode")),
+		SourceDigest:          string(value.GetStringBytes("sourceDigest")),
+		BuildDigest:           string(value.GetStringBytes("buildDigest")),
+		LockfileDigest:        string(value.GetStringBytes("lockfileDigest")),
+		BldrDigest:            string(value.GetStringBytes("bldrDigest")),
+		PrerenderInputsDigest: string(value.GetStringBytes("prerenderInputsDigest")),
+	}
+	releaseDigest := string(value.GetStringBytes("releaseOutputDigest"))
+	prerenderDigest := string(value.GetStringBytes("prerenderOutputDigest"))
+
+	// Require the manifest identity and both output digests.
+	if identity.Digest == "" || identity.SourceDigest == "" || identity.BuildDigest == "" ||
+		identity.LockfileDigest == "" || identity.BldrDigest == "" || identity.PrerenderInputsDigest == "" ||
+		releaseDigest == "" || prerenderDigest == "" {
+		return nil, "", "", errors.New("release artifact identity is incomplete")
+	}
+	return identity, releaseDigest, prerenderDigest, nil
+}
+
+func treeDigest(root string) (string, error) {
+	h := sha256.New()
+	// #nosec G703 -- root is the caller-selected staging directory being digested.
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		// Skip directories and the identity manifest while hashing output files.
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root || entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == identityFilename {
+			return nil
+		}
+		return hashFile(h, root, rel, false)
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func copyTree(src, dst string) error {
+	// Open the source tree through root-scoped filesystem operations.
+	srcRoot, err := os.OpenRoot(src)
+	if err != nil {
+		return err
+	}
+	defer srcRoot.Close()
+
+	// Read source root permissions for the destination tree.
+	srcInfo, err := srcRoot.Stat(".")
+	if err != nil {
+		return err
+	}
+
+	// Create and open the destination tree with the source permissions.
+	// #nosec G703 -- dst is the caller-selected artifact output directory.
+	if err := os.MkdirAll(dst, srcInfo.Mode().Perm()); err != nil {
+		return err
+	}
+	dstRoot, err := os.OpenRoot(dst)
+	if err != nil {
+		return err
+	}
+	defer dstRoot.Close()
+
+	return copyTreeEntries(srcRoot, dstRoot, ".")
+}
+
+// copyTreeEntries copies one directory through root-scoped operations.
+func copyTreeEntries(srcRoot, dstRoot *os.Root, dir string) error {
+	// Read and close the source directory before copying its entries.
+	srcDir, err := srcRoot.Open(dir)
+	if err != nil {
+		return err
+	}
+	entries, readErr := srcDir.ReadDir(-1)
+	closeErr := srcDir.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+
+	// Copy directories, symbolic links, and regular files through scoped roots.
+	for _, entry := range entries {
+		rel := filepath.Join(dir, entry.Name())
+		info, err := srcRoot.Lstat(rel)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if err := dstRoot.MkdirAll(rel, info.Mode().Perm()); err != nil {
+				return err
+			}
+			if err := copyTreeEntries(srcRoot, dstRoot, rel); err != nil {
+				return err
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := srcRoot.Readlink(rel)
+			if err != nil {
+				return err
+			}
+			if err := dstRoot.Symlink(link, rel); err != nil {
+				return err
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return errors.Errorf("artifact output %s has unsupported mode %s", rel, info.Mode())
+		}
+		in, err := srcRoot.Open(rel)
+		if err != nil {
+			return err
+		}
+		out, err := dstRoot.OpenFile(rel, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+		if err != nil {
+			in.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		closeOutErr := out.Close()
+		closeInErr := in.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeOutErr != nil {
+			return closeOutErr
+		}
+		if closeInErr != nil {
+			return closeInErr
+		}
+	}
+	return nil
+}

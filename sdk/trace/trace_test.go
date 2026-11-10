@@ -1,0 +1,225 @@
+package s4wave_trace
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"testing"
+
+	"github.com/aperturerobotics/starpc/srpc"
+)
+
+type testTraceService struct {
+	startLabel     string
+	stopData       [][]byte
+	stopCalls      int
+	cpuProfileData [][]byte
+	cpuProfileCall int
+	memProfileData [][]byte
+	memProfileReq  *CaptureMemoryProfileRequest
+	goroutineCall  int
+	goroutineReq   *CaptureGoroutineProfileRequest
+	memProfileCall int
+}
+
+func (t *testTraceService) StartTrace(_ context.Context, req *StartTraceRequest) (*StartTraceResponse, error) {
+	t.startLabel = req.GetLabel()
+	return &StartTraceResponse{}, nil
+}
+
+func (t *testTraceService) StopTrace(_ *StopTraceRequest, strm SRPCTraceService_StopTraceStream) error {
+	t.stopCalls++
+	for _, chunk := range t.stopData {
+		if err := strm.Send(&StopTraceResponse{Data: chunk}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *testTraceService) CaptureCPUProfile(_ *CaptureCPUProfileRequest, strm SRPCTraceService_CaptureCPUProfileStream) error {
+	t.cpuProfileCall++
+	for _, chunk := range t.cpuProfileData {
+		if err := strm.Send(&CaptureCPUProfileResponse{Data: chunk}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *testTraceService) CaptureMemoryProfile(req *CaptureMemoryProfileRequest, strm SRPCTraceService_CaptureMemoryProfileStream) error {
+	t.memProfileCall++
+	t.memProfileReq = req
+	for _, chunk := range t.memProfileData {
+		if err := strm.Send(&CaptureMemoryProfileResponse{Data: chunk}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *testTraceService) CaptureGoroutineProfile(req *CaptureGoroutineProfileRequest, strm SRPCTraceService_CaptureGoroutineProfileStream) error {
+	t.goroutineCall++
+	t.goroutineReq = req
+	return strm.Send(&CaptureGoroutineProfileResponse{Data: []byte("goroutine-profile")})
+}
+
+func newTestTraceClient(t *testing.T, impl SRPCTraceServiceServer) SRPCTraceServiceClient {
+	// Mark failures as originating from the calling test.
+	t.Helper()
+
+	// Build an in-memory RPC mux and register the test service.
+	mux := srpc.NewMux()
+
+	// Verify that registration exposes each service method.
+	if err := SRPCRegisterTraceService(mux, impl); err != nil {
+		t.Fatal(err)
+	}
+	if !mux.HasServiceMethod(SRPCTraceServiceServiceID, "StartTrace") {
+		t.Fatal("expected StartTrace to be registered")
+	}
+	if !mux.HasServiceMethod(SRPCTraceServiceServiceID, "StopTrace") {
+		t.Fatal("expected StopTrace to be registered")
+	}
+	if !mux.HasServiceMethod(SRPCTraceServiceServiceID, "CaptureCPUProfile") {
+		t.Fatal("expected CaptureCPUProfile to be registered")
+	}
+	if !mux.HasServiceMethod(SRPCTraceServiceServiceID, "CaptureMemoryProfile") {
+		t.Fatal("expected CaptureMemoryProfile to be registered")
+	}
+
+	// Connect an in-memory client to the registered service.
+	server := srpc.NewServer(mux)
+	client := srpc.NewClient(srpc.NewServerPipe(server))
+	return NewSRPCTraceServiceClient(client)
+}
+
+func TestTraceServiceContract(t *testing.T) {
+	// Prepare the test context, service, and client.
+	ctx := context.Background()
+	impl := &testTraceService{
+		stopData: [][]byte{
+			[]byte("trace-"),
+			[]byte("bytes"),
+		},
+		cpuProfileData: [][]byte{
+			[]byte("cpu-"),
+			[]byte("profile"),
+		},
+		memProfileData: [][]byte{
+			[]byte("mem-"),
+			[]byte("profile"),
+		},
+	}
+	client := newTestTraceClient(t, impl)
+
+	// Start a trace and verify the service receives its label.
+	_, err := client.StartTrace(ctx, &StartTraceRequest{Label: "phase1-seed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if impl.startLabel != "phase1-seed" {
+		t.Fatalf("expected start label %q, got %q", "phase1-seed", impl.startLabel)
+	}
+
+	// Stop the trace and collect its streamed data.
+	stopStrm, err := client.StopTrace(ctx, &StopTraceRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read every trace chunk until the stream closes.
+	var traceData []byte
+	for {
+		msg, err := stopStrm.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		traceData = append(traceData, msg.GetData()...)
+	}
+
+	// Verify the stop call count and reconstructed trace.
+	if impl.stopCalls != 1 {
+		t.Fatalf("expected 1 StopTrace call, got %d", impl.stopCalls)
+	}
+	if !bytes.Equal(traceData, []byte("trace-bytes")) {
+		t.Fatalf("expected streamed trace %q, got %q", []byte("trace-bytes"), traceData)
+	}
+
+	// Capture and assemble a CPU profile.
+	cpuStrm, err := client.CaptureCPUProfile(ctx, &CaptureCPUProfileRequest{DurationMillis: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read every CPU profile chunk until the stream closes.
+	var cpuData []byte
+	for {
+		msg, err := cpuStrm.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		cpuData = append(cpuData, msg.GetData()...)
+	}
+	if impl.cpuProfileCall != 1 {
+		t.Fatalf("expected 1 CaptureCPUProfile call, got %d", impl.cpuProfileCall)
+	}
+	if !bytes.Equal(cpuData, []byte("cpu-profile")) {
+		t.Fatalf("expected streamed CPU profile %q, got %q", []byte("cpu-profile"), cpuData)
+	}
+
+	// Capture and assemble a memory profile.
+	memStrm, err := client.CaptureMemoryProfile(ctx, &CaptureMemoryProfileRequest{Profile: "allocs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var memData []byte
+	for {
+		msg, err := memStrm.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		memData = append(memData, msg.GetData()...)
+	}
+	if impl.memProfileCall != 1 {
+		t.Fatalf("expected 1 CaptureMemoryProfile call, got %d", impl.memProfileCall)
+	}
+	if impl.memProfileReq.GetProfile() != "allocs" {
+		t.Fatalf("expected memory profile %q, got %q", "allocs", impl.memProfileReq.GetProfile())
+	}
+	if !bytes.Equal(memData, []byte("mem-profile")) {
+		t.Fatalf("expected streamed memory profile %q, got %q", []byte("mem-profile"), memData)
+	}
+
+	// Capture and assemble a goroutine profile.
+	goroutineStrm, err := client.CaptureGoroutineProfile(ctx, &CaptureGoroutineProfileRequest{Debug: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var goroutineData []byte
+	for {
+		msg, err := goroutineStrm.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		goroutineData = append(goroutineData, msg.GetData()...)
+	}
+	if impl.goroutineCall != 1 || impl.goroutineReq.GetDebug() != 1 {
+		t.Fatalf("unexpected CaptureGoroutineProfile call: %d %+v", impl.goroutineCall, impl.goroutineReq)
+	}
+	if !bytes.Equal(goroutineData, []byte("goroutine-profile")) {
+		t.Fatalf("expected streamed goroutine profile %q, got %q", []byte("goroutine-profile"), goroutineData)
+	}
+}

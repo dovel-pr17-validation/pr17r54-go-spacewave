@@ -1,0 +1,238 @@
+package bldr_plugin
+
+import (
+	"context"
+	stderrors "errors"
+	"io"
+	"strings"
+	"sync"
+
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/pkg/errors"
+	bifrost_rpc "github.com/s4wave/spacewave/net/rpc"
+)
+
+// LookupRpcServiceResolver resolves LookupRpcService with the plugin or plugin host.
+//
+// Resolves service IDs like:
+//   - plugin/{plugin-id}/{service id}
+//   - plugin-host/{service id}
+type LookupRpcServiceResolver struct {
+	// h is the handler
+	h LookupRpcClientHandler
+	// pluginID is the plugin identifier
+	// if empty we are looking up the plugin host
+	pluginID string
+	// stripServiceIDPrefix is the prefix to strip from the service id, if any
+	stripServiceIDPrefix string
+}
+
+// NewLookupRpcServiceResolver constructs a new LookupRpcServiceResolver.
+//
+// Usually you will want to use ResolveLookupRpcService instead.
+// If pluginID is empty, addresses the plugin host.
+// stripServiceIDPrefix is the prefix to strip from the service id, if any
+func NewLookupRpcServiceResolver(h LookupRpcClientHandler, pluginID, stripServiceIDPrefix string) *LookupRpcServiceResolver {
+	return &LookupRpcServiceResolver{
+		h:                    h,
+		pluginID:             pluginID,
+		stripServiceIDPrefix: stripServiceIDPrefix,
+	}
+}
+
+// ResolveLookupRpcService resolves a LookupRpcService directive with a plugin or plugin host.
+//
+// Resolves service IDs like:
+//   - plugin/{plugin-id}/{service id}
+//   - plugin-host/{service id}
+//
+// Returns nil, nil if the service ID does not match any of the known prefixes.
+// Returns an error if the plugin id is invalid.
+func ResolveLookupRpcService(ctx context.Context, dir bifrost_rpc.LookupRpcService, h LookupRpcClientHandler) (directive.Resolver, error) {
+	serviceID := dir.LookupRpcServiceID()
+
+	pluginID, stripServiceIDPrefix, ok := matchPluginServiceID(serviceID)
+	if !ok {
+		return nil, nil
+	}
+
+	return NewLookupRpcServiceResolver(
+		h,
+		pluginID,
+		stripServiceIDPrefix,
+	), nil
+}
+
+// clientForwardingInvoker implements an Invoker that forwards calls to a Client.
+type clientForwardingInvoker struct {
+	client      srpc.Client
+	stripPrefix string
+}
+
+// newClientForwardingInvoker creates a new forwarding invoker.
+func newClientForwardingInvoker(client srpc.Client, stripPrefix string) srpc.Invoker {
+	return &clientForwardingInvoker{
+		client:      client,
+		stripPrefix: stripPrefix,
+	}
+}
+
+// InvokeMethod invokes the method by forwarding to the client.
+func (f *clientForwardingInvoker) InvokeMethod(serviceID, methodID string, strm srpc.Stream) (bool, error) {
+	// Strip the prefix from serviceID if needed
+	targetServiceID := serviceID
+	if f.stripPrefix != "" && strings.HasPrefix(serviceID, f.stripPrefix) {
+		targetServiceID = strings.TrimPrefix(serviceID, f.stripPrefix)
+	}
+
+	// If target service ID is empty after stripping, we can't forward
+	if targetServiceID == "" {
+		return false, nil
+	}
+
+	// Create outgoing stream via client
+	outgoingStream, err := f.client.NewStream(strm.Context(), targetServiceID, methodID, nil)
+	if err != nil {
+		return true, errors.Wrap(err, "failed to create outgoing stream")
+	}
+	defer outgoingStream.Close()
+
+	// NOTE: do not defer strm.Close() here. strm.Close() writes a CallCancel
+	// packet which sets remoteErr=context.Canceled on the client, breaking
+	// server-streaming RPCs. The caller (invokeRPC) handles stream completion
+	// by sending CallData(complete=true) and closing the writer.
+
+	// Relay each server message to the client stream until EOF.
+	writeServerToClient := func() error {
+		serverMsg := &srpc.RawMessage{}
+		for {
+			if err := outgoingStream.MsgRecv(serverMsg); err != nil {
+				return err
+			}
+			if err := strm.MsgSend(serverMsg); err != nil {
+				return err
+			}
+			serverMsg.Clear()
+		}
+	}
+
+	// Run the server-to-client relay in the background.
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- writeServerToClient()
+	}()
+
+	// Relay each client message to the server stream until EOF.
+	writeClientToServer := func() error {
+		clientMsg := &srpc.RawMessage{}
+		for {
+			if err := strm.MsgRecv(clientMsg); err != nil {
+				return err
+			}
+			if err := outgoingStream.MsgSend(clientMsg); err != nil {
+				return err
+			}
+			clientMsg.Clear()
+		}
+	}
+
+	// Run the client-to-server relay in the background.
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- writeClientToServer()
+	}()
+
+	// Treat a relay's EOF as a clean completion.
+	normalizeDone := func(err error) error {
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	}
+
+	// Return when either relay finishes, closing the send side on clean client EOF.
+	for {
+		select {
+		case writeErr := <-clientDone:
+			if writeErr == nil || writeErr == io.EOF {
+				if err := outgoingStream.CloseSend(); err != nil && !stderrors.Is(err, srpc.ErrCompleted) {
+					return true, err
+				}
+				return true, normalizeDone(<-serverDone)
+			}
+			if stderrors.Is(writeErr, srpc.ErrCompleted) {
+				return true, normalizeDone(<-serverDone)
+			}
+			return true, writeErr
+		case srvErr := <-serverDone:
+			return true, normalizeDone(srvErr)
+		}
+	}
+}
+
+// Resolve resolves the values, emitting them to the handler.
+func (r *LookupRpcServiceResolver) Resolve(ctx context.Context, handler directive.ResolverHandler) error {
+	// Clear any previous values before resolving.
+	handler.ClearValues()
+
+	// Prepare the plugin client wait state.
+	var client srpc.Client
+	var rel func()
+	var err error
+
+	// Set up a channel that closes when the resolver value is released.
+	pluginID := r.pluginID
+	releasedCh := make(chan struct{})
+	releasedFn := sync.OnceFunc(func() {
+		close(releasedCh)
+	})
+
+	// Wait for the plugin-host or per-plugin client, or until release.
+	if pluginID == "" {
+		client, rel, err = r.h.WaitPluginHostClient(ctx, releasedFn)
+	} else {
+		client, rel, err = r.h.WaitPluginClient(ctx, releasedFn, pluginID)
+	}
+
+	// Release the client and fail when no client became available.
+	if err != nil || client == nil {
+		if rel != nil {
+			rel()
+		}
+		return err
+	}
+
+	// rel is nil for the loopback and plugin-host client paths
+	// (WaitPluginClient/WaitPluginHostClient return a nil release func there), so
+	// guard the deferred release to avoid a nil func call when the deferred runs.
+	if rel != nil {
+		defer rel()
+	}
+
+	// Create an invoker that forwards calls to the client and strips the service id prefix
+	invoker := newClientForwardingInvoker(client, r.stripServiceIDPrefix)
+
+	// Publish the invoker as the resolved value and mark idle.
+	value := invoker
+	valueID, valueOk := handler.AddValue(value)
+	handler.MarkIdle(true)
+
+	// Return on cancellation, or remove the value when the client is released.
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	case <-releasedCh:
+		if valueOk {
+			_, _ = handler.RemoveValue(valueID)
+		}
+		// client became invalid, return to retry
+		return nil
+	}
+}
+
+// _ is a type assertion
+var (
+	_ directive.Resolver = (*LookupRpcServiceResolver)(nil)
+	_ srpc.Invoker       = (*clientForwardingInvoker)(nil)
+)

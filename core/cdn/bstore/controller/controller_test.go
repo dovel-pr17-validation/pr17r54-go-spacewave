@@ -1,0 +1,358 @@
+package cdn_bstore_controller
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	packedmsg "github.com/s4wave/spacewave/bldr/util/packedmsg"
+	"github.com/s4wave/spacewave/core/cdn"
+	cdn_bstore "github.com/s4wave/spacewave/core/cdn/bstore"
+	"github.com/s4wave/spacewave/core/provider/spacewave/packfile/manifest"
+	"github.com/s4wave/spacewave/db/block"
+	block_store "github.com/s4wave/spacewave/db/block/store"
+	block_store_controller "github.com/s4wave/spacewave/db/block/store/controller"
+	core_test "github.com/s4wave/spacewave/db/core/test"
+	"github.com/s4wave/spacewave/db/packfile"
+	"github.com/s4wave/spacewave/db/packfile/writer"
+	"github.com/s4wave/spacewave/db/testbed"
+	"github.com/s4wave/spacewave/db/volume"
+	volume_controller "github.com/s4wave/spacewave/db/volume/controller"
+	volume_kvtxinmem "github.com/s4wave/spacewave/db/volume/kvtxinmem"
+	"github.com/s4wave/spacewave/net/hash"
+	"github.com/sirupsen/logrus"
+)
+
+func TestConfigValidation(t *testing.T) {
+	// Validate the CDN store configuration and parse its pointer lifetime.
+	valid := NewConfig("release-cdn", "01release", "https://cdn.example.invalid")
+	valid.PointerTtlDur = "5s"
+	valid.RangeCacheMaxBytes = 1024
+	valid.WritebackWindowBytes = 2048
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	ttl, err := valid.ParsePointerTTLDur()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if ttl.String() != "5s" {
+		t.Fatalf("pointer TTL = %s", ttl)
+	}
+}
+
+func TestControllerResolvesBlockStore(t *testing.T) {
+	// Start a controller bus with the CDN store factory registered.
+	ctx := context.Background()
+	b, sr, err := core_test.NewTestingBus(ctx, logrus.NewEntry(logrus.New()))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	sr.AddFactory(NewFactory(b))
+
+	// Load the CDN block-store controller with its configured store identifier.
+	conf := NewConfig("release-cdn", "01release", "https://cdn.example.invalid")
+	_, _, ctrlRef, err := loader.WaitExecControllerRunning(ctx, b, resolver.NewLoadControllerWithConfig(conf), nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer ctrlRef.Release()
+
+	// Resolve the CDN block store and verify its identifier.
+	store, _, storeRef, err := block_store.ExLookupFirstBlockStore(ctx, b, "release-cdn", false, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer storeRef.Release()
+	if store.GetID() != "release-cdn" {
+		t.Fatalf("store id = %q", store.GetID())
+	}
+}
+
+func TestBlockStoreBuilderReleaseClosesCdnStore(t *testing.T) {
+	// Prepare the CDN block-store builder for release checks.
+	ctx := context.Background()
+	conf := NewConfig("release-cdn", "01release", "https://cdn.example.invalid")
+	builder := NewBlockStoreBuilder(logrus.NewEntry(logrus.New()), nil, conf)
+
+	// Build the CDN store and verify its decoded cache is active.
+	store, release, err := builder(ctx, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	handle, ok := store.(*blockStoreHandle)
+	if !ok {
+		t.Fatalf("store type = %T, want *blockStoreHandle", store)
+	}
+	if handle.cdnStore.GetDecodedBlockCache() == nil {
+		t.Fatal("expected CDN store decoded cache before release")
+	}
+
+	// Release the CDN store and verify its decoded cache closes.
+	release()
+	if handle.cdnStore.GetDecodedBlockCache() != nil {
+		t.Fatal("release did not close CDN store decoded cache")
+	}
+}
+
+type notifyingStore struct {
+	block.StoreOps
+	putCh chan struct{}
+}
+
+func (s *notifyingStore) PutBlock(
+	ctx context.Context,
+	data []byte,
+	opts *block.PutOpts,
+) (*block.BlockRef, bool, error) {
+	ref, existed, err := s.StoreOps.PutBlock(ctx, data, opts)
+	if err != nil {
+		return nil, false, err
+	}
+	select {
+	case s.putCh <- struct{}{}:
+	default:
+	}
+	return ref, existed, nil
+}
+
+// PutBlockBatch writes entries and signals one put.
+func (s *notifyingStore) PutBlockBatch(ctx context.Context, entries []*block.PutBatchEntry) ([]bool, error) {
+	existed, err := s.StoreOps.PutBlockBatch(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case s.putCh <- struct{}{}:
+	default:
+	}
+	return existed, nil
+}
+
+func (s *notifyingStore) waitPut(ctx context.Context) error {
+	select {
+	case <-s.putCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestBlockStoreBuilderDurableIndexCacheSurvivesRestart(t *testing.T) {
+	// Prepare stable CDN identifiers and bound the cache restart test.
+	const (
+		spaceID = "01kpftest0000000000000003"
+		cacheID = "dist"
+		packID  = "01kcdnpack0000000000000008"
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Pack a source block and encode the CDN root pointer.
+	data := []byte("bstore controller durable cache")
+	blockHash, err := hash.Sum(hash.HashType_HashType_SHA256, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var packData bytes.Buffer
+	packResult, err := writer.PackBlocks(&packData, func() (*hash.Hash, *block.StoredBlock, error) {
+		if packData.Len() != 0 {
+			return nil, nil, nil
+		}
+		return blockHash, &block.StoredBlock{Data: data, RefsKnown: true}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish the packed block through the encoded CDN root pointer.
+	pointer, err := (&cdn.CdnRootPointer{
+		SpaceId: spaceID,
+		Packs: []*packfile.PackfileEntry{{
+			Id:          packID,
+			BloomFilter: packResult.BloomFilter,
+			BlockCount:  1,
+			SizeBytes:   uint64(packData.Len()),
+		}},
+	}).MarshalVT()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointer = []byte(packedmsg.EncodePackedMessage(pointer))
+
+	// Serve the CDN pointer and pack ranges while recording cache misses.
+	var reqMu sync.Mutex
+	var rangeRequests int
+	var packBlocked bool
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/"+spaceID+"/root.packedmsg":
+			_, _ = w.Write(pointer)
+		case strings.HasPrefix(r.URL.Path, "/"+spaceID+"/packs/") &&
+			strings.HasSuffix(r.URL.Path, "/"+packID+".kvf"):
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader == "" {
+				_, _ = w.Write(packData.Bytes())
+				return
+			}
+			reqMu.Lock()
+			rangeRequests++
+			blocked := packBlocked
+			reqMu.Unlock()
+			if blocked {
+				http.Error(w, "pack source blocked", http.StatusInternalServerError)
+				return
+			}
+			parts := strings.SplitN(strings.TrimPrefix(rangeHeader, "bytes="), "-", 2)
+			off, parseErr := strconv.Atoi(parts[0])
+			if parseErr != nil || off < 0 || off >= packData.Len() {
+				http.Error(w, "invalid pack range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			end := packData.Len() - 1
+			if len(parts) == 2 && parts[1] != "" {
+				end, parseErr = strconv.Atoi(parts[1])
+				if parseErr != nil {
+					http.Error(w, "invalid pack range", http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+				if end >= packData.Len() {
+					end = packData.Len() - 1
+				}
+			}
+			if end < off {
+				http.Error(w, "invalid pack range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", "bytes "+strconv.Itoa(off)+"-"+strconv.Itoa(end)+"/"+strconv.Itoa(packData.Len()))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(packData.Bytes()[off : end+1])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer httpServer.Close()
+
+	// Start a storage testbed for the durable CDN cache.
+	tb, err := testbed.NewTestbed(ctx, logrus.NewEntry(logrus.New()), testbed.WithVolumeConfig(
+		&volume_kvtxinmem.Config{
+			VolumeConfig: &volume_controller.Config{
+				VolumeIdAlias:           []string{cacheID},
+				DisableLookupBlockStore: true,
+			},
+		},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tb.Release()
+
+	// Register a cache block store that signals completed writes.
+	cacheStoreOps := &notifyingStore{
+		StoreOps: tb.Volume,
+		putCh:    make(chan struct{}, 1),
+	}
+	cacheCtrl := block_store_controller.NewController(
+		logrus.NewEntry(logrus.New()),
+		controller.NewInfo("test/cache", controller.MustParseVersion("0.0.1"), "test cache"),
+		func(context.Context, func()) (block_store.Store, func(), error) {
+			return block_store.NewStore(cacheID, cacheStoreOps), nil, nil
+		},
+		[]string{cacheID},
+		true,
+		nil,
+		false,
+		false,
+	)
+	cacheControllerRelease, err := tb.Bus.AddController(ctx, cacheCtrl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cacheControllerRelease()
+
+	// Build the first CDN store with durable caching enabled.
+	conf := NewConfig("release-cdn", spaceID, httpServer.URL)
+	conf.CacheBlockStoreId = cacheID
+	conf.WritebackWindowBytes = 1 << 20
+	firstStore, releaseFirst, err := NewBlockStoreBuilder(
+		logrus.NewEntry(logrus.New()),
+		tb.Bus,
+		conf,
+	)(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch the CDN block and wait for durable cache writeback.
+	ref := &block.BlockRef{Hash: blockHash}
+	got, found, err := firstStore.GetBlock(ctx, ref)
+	if err != nil || !found || !bytes.Equal(got, data) {
+		t.Fatalf("first CDN read found=%v err=%v data=%q", found, err, got)
+	}
+	if err := cacheStoreOps.waitPut(ctx); err != nil {
+		t.Fatalf("wait for CDN writeback: %v", err)
+	}
+
+	// Read the saved pack index from the durable object store.
+	objHandle, _, objRef, err := volume.ExBuildObjectStoreAPI(
+		ctx,
+		tb.Bus,
+		false,
+		cdn_bstore.PackIndexObjectStoreID(spaceID),
+		cacheID,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexData, indexFound, err := manifest.NewIndexCache(objHandle.GetObjectStore()).Get(ctx, packID)
+	objRef.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !indexFound || len(indexData) == 0 {
+		t.Fatalf("durable pack index found=%v bytes=%d", indexFound, len(indexData))
+	}
+
+	// Block further pack ranges after the first store populates its cache.
+	reqMu.Lock()
+	firstRanges := rangeRequests
+	packBlocked = true
+	reqMu.Unlock()
+	if firstRanges == 0 {
+		t.Fatal("first CDN read did not use an HTTP Range request")
+	}
+	releaseFirst()
+
+	// Rebuild the CDN store and verify cached block retrieval.
+	secondStore, releaseSecond, err := NewBlockStoreBuilder(
+		logrus.NewEntry(logrus.New()),
+		tb.Bus,
+		conf,
+	)(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSecond()
+	got, found, err = secondStore.GetBlock(ctx, ref)
+	if err != nil || !found || !bytes.Equal(got, data) {
+		t.Fatalf("restart cache read found=%v err=%v data=%q", found, err, got)
+	}
+
+	// Verify the restarted store avoided further CDN range requests.
+	reqMu.Lock()
+	restartRanges := rangeRequests
+	reqMu.Unlock()
+	if restartRanges != firstRanges {
+		t.Fatalf("restart cache path attempted CDN Range requests: before=%d after=%d", firstRanges, restartRanges)
+	}
+}

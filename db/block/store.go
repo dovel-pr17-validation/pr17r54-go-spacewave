@@ -1,0 +1,104 @@
+package block
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+// StoreOps can read/write blocks.
+type StoreOps interface {
+	// GetHashType returns the preferred hash type for the store.
+	// This should return as fast as possible (called frequently).
+	// If 0 is returned, uses a default defined by Hydra.
+	GetHashType() hash.HashType
+	// GetSupportedFeatures returns the native feature bitmask for the store.
+	// This should return as fast as possible (called frequently) and remain
+	// static for the lifetime of the store.
+	GetSupportedFeatures() StoreFeature
+	// BeginReadOperation opens a read scope for a bounded logical operation.
+	// The returned store must be released after use. Implementations without
+	// native read-operation state may return themselves with a no-op release.
+	BeginReadOperation(ctx context.Context) (StoreOps, func(), error)
+	// PutBlock puts a block into the store. By default this may enqueue a
+	// buffered, read-through write without waiting for durability. Set
+	// PutOpts.Sync to fence this write and all prior buffered writes before return.
+	// The ref should not be modified after return.
+	// The second return value can optionally indicate if the block already existed.
+	// If the hash type is unset, use the type from GetHashType().
+	PutBlock(ctx context.Context, data []byte, opts *PutOpts) (*BlockRef, bool, error)
+	// PutBlockBatch writes a batch of block operations.
+	// Implementations without native batching fall back internally.
+	// Returns one result per entry, in order: whether the block was already
+	// stored before the write, like the second return value of PutBlock.
+	// A tombstone entry reports false.
+	PutBlockBatch(ctx context.Context, entries []*PutBatchEntry) ([]bool, error)
+	// GetBlock gets a block with the given reference.
+	// The ref should not be modified or retained by GetBlock.
+	// Returns data, found, error.
+	// Returns nil, false, nil if not found.
+	// Note: the block may not be in the specified bucket.
+	GetBlock(ctx context.Context, ref *BlockRef) ([]byte, bool, error)
+	// GetStoredBlock gets a block and its outgoing block references in one
+	// read. RefsKnown is unset when the store holds the bytes without their
+	// references; with RefsKnown set, empty Refs means the block is a leaf.
+	// Returns nil, nil if not found.
+	GetStoredBlock(ctx context.Context, ref *BlockRef) (*StoredBlock, error)
+	// GetBlockExists checks if a block exists with a cid reference.
+	// The ref should not be modified or retained by GetBlock.
+	// Note: the block may not be in the specified bucket.
+	GetBlockExists(ctx context.Context, ref *BlockRef) (bool, error)
+	// GetBlockExistsBatch checks whether each block reference exists.
+	// Implementations without native batching fall back internally.
+	GetBlockExistsBatch(ctx context.Context, refs []*BlockRef) ([]bool, error)
+	// RmBlock deletes a block from the bucket.
+	// Does not return an error if the block was not present.
+	// In some cases, will return before confirming delete.
+	RmBlock(ctx context.Context, ref *BlockRef) error
+	// StatBlock returns metadata about a block without reading its data.
+	// Returns nil, nil if the block does not exist.
+	StatBlock(ctx context.Context, ref *BlockRef) (*BlockStat, error)
+	// Sync is the sole durability barrier: it drains any buffered writes and
+	// blocks until every write issued before the call is durable, like POSIX
+	// sync(2). The boolean reports whether a fence was applied: true when the
+	// barrier completed or the store is always-durable, false when the store
+	// provides no durability fence. A nil error with false means "no fence
+	// available", not a failure; a non-nil error means a real sync failure.
+	Sync(ctx context.Context) (bool, error)
+	// RootOps holds the named roots that decide which blocks are live.
+	RootOps
+}
+
+// DecodedBlockCacheFreshener is implemented by stores whose decoded-cache hits
+// depend on external freshness state that ordinary block reads would refresh.
+type DecodedBlockCacheFreshener interface {
+	// EnsureDecodedBlockCacheFresh refreshes the external freshness state
+	// before a decoded-cache lookup.
+	EnsureDecodedBlockCacheFresh(ctx context.Context) error
+}
+
+// BlockStat contains metadata about a stored block.
+type BlockStat struct {
+	// Ref is the block reference.
+	Ref *BlockRef
+	// Size is the block data size in bytes.
+	// May be -1 if the size is unknown.
+	Size int64
+}
+
+// PutBlock marshals b and puts it into bk with the refs it holds. Any store,
+// cursor or transaction that writes blocks can be bk.
+func PutBlock(ctx context.Context, bk interface {
+	PutBlock(ctx context.Context, data []byte, opts *PutOpts) (*BlockRef, bool, error)
+}, b Block) (*BlockRef, bool, error) {
+	// Marshal the block with its outgoing references for storage.
+	dat, err := b.MarshalVT()
+	if err != nil {
+		return nil, false, err
+	}
+	refs, err := ExtractBlockRefs(b)
+	if err != nil {
+		return nil, false, err
+	}
+	return bk.PutBlock(ctx, dat, &PutOpts{Refs: refs, RefsKnown: true})
+}

@@ -1,0 +1,283 @@
+import React from 'react'
+import {
+  LuBookOpen,
+  LuBox,
+  LuDatabase,
+  LuGitBranch,
+  LuHammer,
+  LuHardDrive,
+  LuKey,
+  LuLayoutGrid,
+  LuLink,
+  LuLogIn,
+  LuMessageSquare,
+  LuMonitor,
+  LuNotebookPen,
+  LuPenLine,
+  LuUser,
+} from 'react-icons/lu'
+import { isExperimentalCreatorVisible } from '../creator-visibility.js'
+
+// QuickstartOption is a type that represents a quickstart option for an app with preset space contents
+export interface QuickstartOption {
+  id: string
+  name: string
+  description: string
+  seoDescription?: string
+  category: string
+  icon: React.ComponentType<{ className?: string }>
+  path?: string
+  hidden?: boolean
+  // experimental marks options only shown when experimental creators are enabled.
+  experimental?: boolean
+  // dynamic marks plugin-registered app-only Quickstarts.
+  dynamic?: boolean
+  // pluginId is the registering plugin for dynamic Quickstarts.
+  pluginId?: string
+  // spaceName is the default Space name for dynamic Quickstarts.
+  spaceName?: string
+  // requiredPluginIds are Space plugin manifest IDs declared by this Quickstart.
+  requiredPluginIds?: string[]
+}
+
+export const QUICKSTART_OPTIONS = [
+  {
+    id: 'account',
+    name: 'Sign in or create account',
+    description: 'Access your account or create a new one',
+    category: 'account',
+    icon: LuLogIn,
+    path: '/login',
+  },
+  {
+    id: 'pair',
+    name: 'Enter a device pairing code',
+    description: 'Link to an existing device via pairing code',
+    category: 'account',
+    icon: LuLink,
+    path: '/pair',
+  },
+  {
+    id: 'local',
+    name: 'Continue without account',
+    description: 'Start with a local session',
+    category: 'account',
+    icon: LuUser,
+    hidden: true,
+  },
+  {
+    id: 'space',
+    name: 'Create an Empty Space',
+    description: 'Start with a blank space',
+    seoDescription:
+      'Create a blank Spacewave space in your browser, then add files, notes, canvases, or custom objects as your local-first workspace grows.',
+    category: 'storage',
+    icon: LuBox,
+  },
+  {
+    id: 'drive',
+    name: 'Create a Drive',
+    description: 'Private browser files with offline work and device sync',
+    seoDescription:
+      'Create a Spacewave Drive workspace with folders, uploads, downloads, offline file browsing, and private sync through your own devices.',
+    category: 'storage',
+    icon: LuHardDrive,
+  },
+  {
+    id: 'git',
+    name: 'Create/clone a Git Repository',
+    description: 'Start fresh or clone an existing Git repository',
+    seoDescription:
+      'Create or clone a Git repository in Spacewave and manage project files from a local-first workspace that runs in your browser.',
+    category: 'storage',
+    icon: LuGitBranch,
+  },
+  {
+    id: 'notebook',
+    name: 'Create a Notebook',
+    description: 'Markdown notes with folders, tags, and sync',
+    seoDescription:
+      'Create a Spacewave Notebook for markdown notes, folders, tags, and local-first writing that stays private while syncing across your own devices.',
+    category: 'storage',
+    icon: LuNotebookPen,
+    experimental: true,
+  },
+  {
+    id: 'canvas',
+    name: 'Create a Canvas',
+    description: 'Visual workspace with objects on a canvas',
+    seoDescription:
+      'Create a Spacewave Canvas for visual planning, object organization, and local-first collaboration across your own devices.',
+    category: 'storage',
+    icon: LuLayoutGrid,
+  },
+  {
+    id: 'chat',
+    name: 'Start a Chat',
+    description: 'Create a space with a chat channel',
+    seoDescription:
+      'Start a Spacewave Chat with an encrypted channel for local-first group messaging, shared history, and private collaboration across your devices.',
+    category: 'social',
+    icon: LuMessageSquare,
+    experimental: true,
+  },
+  {
+    id: 'kv',
+    name: 'Create a Key/Value Store',
+    description: 'Seed a byte-oriented key/value store with examples',
+    seoDescription:
+      'Create an experimental Spacewave key/value store seeded with text, JSON, and binary examples for local-first app data.',
+    category: 'data',
+    icon: LuKey,
+    experimental: true,
+  },
+  {
+    id: 'sql',
+    name: 'Create a SQL Database',
+    description: 'Seed a SQL database with sample tables and a query',
+    seoDescription:
+      'Create an experimental Spacewave SQL database seeded with related tables, rows, and a linked example query.',
+    category: 'data',
+    icon: LuDatabase,
+    experimental: true,
+  },
+  {
+    id: 'docs',
+    name: 'Create Documentation',
+    description: 'Markdown documentation site',
+    seoDescription:
+      'Create Spacewave Documentation as a markdown site with organized pages, local-first editing, and browser-native publishing from your workspace.',
+    category: 'content',
+    icon: LuBookOpen,
+    experimental: true,
+  },
+  {
+    id: 'blog',
+    name: 'Create a Blog',
+    description: 'Date-based markdown blog',
+    seoDescription:
+      'Create a Spacewave Blog with dated markdown posts, tags, local-first editing, and static publishing from a private browser workspace.',
+    category: 'content',
+    icon: LuPenLine,
+    experimental: true,
+  },
+  {
+    id: 'v86',
+    name: 'Create an x86 VM',
+    description: 'x86 virtual machine in the browser',
+    seoDescription:
+      'Create a Spacewave x86 virtual machine workspace that runs x86 environments in the browser for portable experiments and development.',
+    category: 'compute',
+    icon: LuMonitor,
+    experimental: true,
+  },
+  {
+    id: 'device',
+    name: 'Add a Device',
+    description: 'Experimental managed Device setup',
+    seoDescription:
+      'Create an experimental Spacewave Devices workspace for SpaceLink-backed managed Device setup.',
+    category: 'compute',
+    icon: LuMonitor,
+    experimental: true,
+  },
+  {
+    id: 'forge',
+    name: 'Create Forge Dashboard',
+    description: 'Task orchestration dashboard',
+    seoDescription:
+      'Create a Spacewave Forge dashboard for task orchestration, worker coordination, and local-first project automation from your browser.',
+    category: 'tools',
+    icon: LuHammer,
+    experimental: true,
+  },
+] as const satisfies readonly QuickstartOption[]
+
+// isQuickstartOptionVisible returns true when a quickstart should be shown in
+// the running app.
+export function isQuickstartOptionVisible(
+  option: QuickstartOption,
+  experimentalCreatorsEnabled = !!import.meta.env?.DEV,
+): boolean {
+  return (
+    !(option.hidden ?? false) &&
+    isExperimentalCreatorVisible(
+      option.experimental,
+      experimentalCreatorsEnabled,
+    )
+  )
+}
+
+// isQuickstartOptionPublic returns true when a quickstart should get a
+// prerendered /quickstart/{id} page.
+export function isQuickstartOptionPublic(
+  option: QuickstartOption,
+  experimentalCreatorsEnabled = !!import.meta.env?.DEV,
+): boolean {
+  return (
+    !(option.dynamic ?? false) &&
+    !option.path &&
+    isQuickstartOptionVisible(option, experimentalCreatorsEnabled)
+  )
+}
+
+// getVisibleQuickstartOptions returns the in-app quickstart inventory for the
+// current experimental creator visibility.
+export function getVisibleQuickstartOptions(
+  experimentalCreatorsEnabled = !!import.meta.env?.DEV,
+): QuickstartOption[] {
+  return QUICKSTART_OPTIONS.filter((option) =>
+    isQuickstartOptionVisible(option, experimentalCreatorsEnabled),
+  )
+}
+
+// getPublicQuickstartOptions returns the public prerender quickstarts for the
+// build-mode public policy.
+export function getPublicQuickstartOptions(
+  experimentalCreatorsEnabled = !!import.meta.env?.DEV,
+): QuickstartOption[] {
+  return QUICKSTART_OPTIONS.filter((option) =>
+    isQuickstartOptionPublic(option, experimentalCreatorsEnabled),
+  )
+}
+
+// VISIBLE_QUICKSTART_OPTIONS is a module-load fallback. Runtime app surfaces
+// should call getVisibleQuickstartOptions with the current visibility value.
+export const VISIBLE_QUICKSTART_OPTIONS = getVisibleQuickstartOptions()
+
+// PUBLIC_QUICKSTART_OPTIONS is the release-visible quickstart inventory that
+// receives prerendered /quickstart/{id} pages.
+export const PUBLIC_QUICKSTART_OPTIONS = getPublicQuickstartOptions(false)
+
+export type QuickstartId = (typeof QUICKSTART_OPTIONS)[number]['id']
+
+// QuickstartCreateId has quickstart IDs that create a new account as part of the option.
+// Excludes the navigation-only account and pairing entries.
+export type QuickstartCreateId = Exclude<QuickstartId, 'account' | 'pair'>
+
+// QuickstartSpaceCreateId has quickstart IDs that create a new space (excludes 'local' which only creates a session).
+export type QuickstartSpaceCreateId = Exclude<QuickstartCreateId, 'local'>
+
+export function getQuickstartOption(id: QuickstartId): QuickstartOption {
+  const option = QUICKSTART_OPTIONS.find((opt) => opt.id === id)
+  if (!option) throw new Error(`Unknown quickstart ID: ${id}`)
+  return option
+}
+
+export function getQuickstartPath(item: QuickstartOption): string {
+  return item.path || `/quickstart/${item.id}`
+}
+
+// isQuickstartId checks if the given ID is a known quickstart option ID.
+export function isQuickstartId(id: string): id is QuickstartId {
+  return QUICKSTART_OPTIONS.some((opt) => opt.id === id)
+}
+
+// isQuickstartCreateId checks if the given ID is a quickstart create ID.
+export function isQuickstartCreateId(id: string): id is QuickstartCreateId {
+  return (
+    id !== 'account' &&
+    id !== 'pair' &&
+    QUICKSTART_OPTIONS.some((opt) => opt.id === id)
+  )
+}

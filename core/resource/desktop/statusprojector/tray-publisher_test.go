@@ -1,0 +1,137 @@
+package statusprojector
+
+import (
+	"context"
+	"testing"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	desktop_tray "github.com/s4wave/spacewave/bldr/desktop/tray"
+	bldr_resource "github.com/s4wave/spacewave/bldr/resource"
+	resource_client "github.com/s4wave/spacewave/bldr/resource/client"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	desktop_runtime "github.com/s4wave/spacewave/bldr/web/electron/desktop-runtime"
+	resource_listener "github.com/s4wave/spacewave/core/resource/listener"
+)
+
+type recordingTrayActionHandler struct {
+	requests []*desktop_tray.HandleDesktopTrayActionRequest
+}
+
+func (h *recordingTrayActionHandler) HandleDesktopTrayAction(
+	ctx context.Context,
+	req *desktop_tray.HandleDesktopTrayActionRequest,
+) (*desktop_tray.HandleDesktopTrayActionResponse, error) {
+	h.requests = append(h.requests, req.CloneVT())
+	return &desktop_tray.HandleDesktopTrayActionResponse{}, nil
+}
+
+func TestDesktopTrayPublisherPublishesUpdatesAndReleasesProjectedEntries(t *testing.T) {
+	// Open the tray publisher fixture and register its cleanup.
+	ctx := t.Context()
+	publisher, tray := newTestDesktopTrayPublisher(t)
+	defer func() {
+		if err := publisher.Release(context.Background()); err != nil {
+			t.Fatalf("release publisher: %v", err)
+		}
+	}()
+
+	// Prepare listener status and an available desktop update.
+	state := BuildDesktopRuntimeStateFromListener(resource_listener.ListenerStatus{
+		SocketPath:       "/run/spacewave.sock",
+		Listening:        true,
+		ConnectedClients: 1,
+	})
+	state.Update = &desktop_runtime.DesktopRuntimeUpdateStatus{
+		Ready:   true,
+		Version: "1.2.3",
+		Label:   "Update ready",
+	}
+
+	// Publish the initial runtime state and verify tray entries change.
+	changed, err := publisher.Publish(ctx, state)
+	if err != nil {
+		t.Fatalf("publish initial state: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected initial publish to change tray entries")
+	}
+
+	// Verify the update action opens an application route without a daemon handler.
+	updateEntry := publisher.entries["apply-update"]
+	if updateEntry == nil {
+		t.Fatal("expected projected update action")
+	}
+	if updateEntry.attachedActionResourceID != 0 {
+		t.Fatal("app-open action must not attach a daemon update handler")
+	}
+	if updateEntry.entry.GetAction().GetKind() != desktop_tray.DesktopTrayActionKind_DESKTOP_TRAY_ACTION_KIND_OPEN_ROUTE {
+		t.Fatalf("update action kind = %v, want open route", updateEntry.entry.GetAction().GetKind())
+	}
+
+	// Verify an identical runtime snapshot leaves the tray unchanged.
+	changed, err = publisher.Publish(ctx, state.CloneVT())
+	if err != nil {
+		t.Fatalf("publish unchanged state: %v", err)
+	}
+	if changed {
+		t.Fatal("expected unchanged publish to be suppressed")
+	}
+
+	// Remove the update and verify its projected action becomes unavailable.
+	state.Update = nil
+	changed, err = publisher.Publish(ctx, state)
+	if err != nil {
+		t.Fatalf("publish state without update: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected removing update action to change tray entries")
+	}
+	if _, err := tray.InvokeDesktopTrayEntry(ctx, &desktop_tray.InvokeDesktopTrayEntryRequest{
+		EntryId: "apply-update",
+	}); err == nil {
+		t.Fatal("expected removed update action to be unavailable")
+	}
+}
+
+func newTestDesktopTrayPublisher(
+	t *testing.T,
+) (*desktopTrayPublisher, desktop_tray.SRPCDesktopTrayResourceServiceClient) {
+	// Start the tray resource server and its in-process RPC transport.
+	t.Helper()
+	tray := desktop_tray.NewDesktopTray()
+	server := resource_server.NewResourceServer(tray.GetMux())
+	serverMux := srpc.NewMux()
+	if err := server.Register(serverMux); err != nil {
+		t.Fatalf("register resource server: %v", err)
+	}
+	resourceService := bldr_resource.NewSRPCResourceServiceClient(
+		srpc.NewClient(srpc.NewServerPipe(srpc.NewServer(serverMux))),
+	)
+
+	// Open a resource client against the tray server.
+	resources, err := resource_client.NewClient(t.Context(), resourceService)
+	if err != nil {
+		t.Fatalf("new resource client: %v", err)
+	}
+
+	// Acquire the tray root resource and open its client.
+	rootRef := resources.AccessRootResource()
+	rootClient, err := rootRef.GetClient()
+	if err != nil {
+		rootRef.Release()
+		resources.Release()
+		t.Fatalf("root resource client: %v", err)
+	}
+	service := desktop_tray.NewSRPCDesktopTrayResourceServiceClient(rootClient)
+	return &desktopTrayPublisher{
+		resources: resources,
+		trayRef:   rootRef,
+		tray:      service,
+		entries:   make(map[string]*desktopTrayEntryRegistration),
+		actionHandlers: map[string]desktop_tray.SRPCDesktopTrayActionHandlerServiceServer{
+			"apply-update": &recordingTrayActionHandler{},
+		},
+	}, service
+}
+
+var _ desktop_tray.SRPCDesktopTrayActionHandlerServiceServer = (*recordingTrayActionHandler)(nil)

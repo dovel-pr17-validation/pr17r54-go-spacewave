@@ -1,0 +1,102 @@
+syntax = "proto3";
+package s4wave.flowgraph.registry;
+
+import "github.com/s4wave/spacewave/sdk/flowgraph/flowgraph.proto";
+import "github.com/aperturerobotics/starpc/rpcstream/rpcstream.proto";
+import "github.com/aperturerobotics/controllerbus/controller/configset/proto/configset.proto";
+import "github.com/aperturerobotics/controllerbus/controller/exec/exec.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/flowgraph/registry;flowgraph_registry";
+
+// NodeType describes a plugin's standing Device node type.
+message NodeType {
+  // TypeId is the node type's stable identifier.
+  // It is a slash-separated path such as "flowgraph/stream-echo"; core node type IDs are bare.
+  string type_id = 1;
+  // DisplayName is the name shown for the node type.
+  string display_name = 2;
+  // Ports declares the endpoints offered by new nodes.
+  repeated .s4wave.flowgraph.FlowgraphPort ports = 3;
+  // ConfigIds lists every controller config the compiler may emit.
+  repeated string config_ids = 4;
+  // PluginConfigIds lists the config_ids whose factories exist only in the
+  // plugin. While the registration lives, the host builds these configs as
+  // controllers that run inside the plugin through ExecController; the host
+  // builds the other config_ids itself. A config ID belongs to one
+  // registration at a time.
+  repeated string plugin_config_ids = 5;
+  // PluginServiceIds lists the RPC services implemented on the plugin bus.
+  // A compiled lookup server uses the port protocol as its server_id; the host
+  // binds it to this registration before applying it on the Device.
+  repeated string plugin_service_ids = 6;
+}
+
+// NodeTypeRegistryResourceService retains plugin compiler registrations.
+service NodeTypeRegistryResourceService {
+  // RegisterNodeType publishes a compiler until its returned Resource releases.
+  rpc RegisterNodeType(RegisterNodeTypeRequest) returns (RegisterNodeTypeResponse);
+}
+
+// RegisterNodeTypeRequest grants a compiler attached by this Resource client.
+message RegisterNodeTypeRequest {
+  // NodeType describes the compiler's node type.
+  NodeType node_type = 1;
+  // HandlerResourceId is the caller-attached NodeTypeResourceService capability.
+  uint32 handler_resource_id = 2;
+}
+
+// RegisterNodeTypeResponse retains one node type registration.
+message RegisterNodeTypeResponse {
+  // ResourceId releases the registration when the caller releases this Resource.
+  uint32 resource_id = 1;
+}
+
+// NodeTypeResourceService compiles placements inside the plugin.
+service NodeTypeResourceService {
+  // Compile returns entries whose keys and revisions the Device assigns.
+  rpc Compile(CompileRequest) returns (CompileResponse);
+  // ExecController runs one of the plugin_config_ids on the plugin's bus and
+  // streams its status until the call ends.
+  rpc ExecController(ExecControllerRequest) returns (stream .controller.exec.ExecControllerResponse);
+  // ServeRpc forwards port calls to the plugin bus. RpcStreamInit.component_id
+  // names the port protocol used as LookupRpcService's server ID.
+  rpc ServeRpc(stream .rpcstream.RpcStreamPacket) returns (stream .rpcstream.RpcStreamPacket);
+}
+
+// CompileRequest carries the placement context across the plugin boundary.
+message CompileRequest {
+  // FlowgraphKey is the containing Flowgraph's object key.
+  string flowgraph_key = 1;
+  // NodeId is the graph-local node ID.
+  string node_id = 2;
+  // Node contains the authored settings and ports.
+  .s4wave.flowgraph.FlowgraphNode node = 3;
+  // DevicePeerId is the peer that will run the compiled controllers.
+  string device_peer_id = 4;
+  // Connections contains the edges ending at this node.
+  repeated PlacedConnection connections = 5;
+  // EngineId is the ID of the World engine holding the Flowgraph.
+  string engine_id = 6;
+}
+
+// PlacedConnection adds remote Device identity to an authored edge.
+message PlacedConnection {
+  // Id is the graph-local connection ID.
+  string id = 1;
+  // Connection contains the authored edge.
+  .s4wave.flowgraph.FlowgraphConnection connection = 2;
+  // RemoteDevicePeerId is the peer running the other end.
+  string remote_device_peer_id = 3;
+}
+
+// CompileResponse contains configs encoded by ControllerBus's config codec.
+message CompileResponse {
+  // Entries contains configs by node-local entry name. The Device ignores Rev.
+  map<string, .configset.proto.ControllerConfig> entries = 1;
+}
+
+// ExecControllerRequest runs one plugin controller.
+message ExecControllerRequest {
+  // Config is the controller config, encoded by ControllerBus's config codec.
+  .configset.proto.ControllerConfig config = 1;
+}

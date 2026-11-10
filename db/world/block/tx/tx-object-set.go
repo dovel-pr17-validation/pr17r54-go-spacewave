@@ -1,0 +1,90 @@
+package world_block_tx
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// NewTxObjectSet constructs a new OBJECT_SET transaction.
+func NewTxObjectSet(objKey string, rootRef *bucket.ObjectRef) (*Tx, error) {
+	return &Tx{
+		TxType: TxType_TxType_OBJECT_SET,
+		TxObjectSet: &TxObjectSet{
+			ObjectKey: objKey,
+			RootRef:   rootRef,
+		},
+	}, nil
+}
+
+// NewTxObjectSetTxn constructs a new OBJECT_SET transaction.
+func NewTxObjectSetTxn() Transaction {
+	return &TxObjectSet{}
+}
+
+// IsNil returns if the object is nil.
+func (t *TxObjectSet) IsNil() bool {
+	return t == nil
+}
+
+// GetTxType returns the type of transaction this is.
+func (t *TxObjectSet) GetTxType() TxType {
+	return TxType_TxType_OBJECT_SET
+}
+
+// GetEmpty checks if the tx is empty.
+func (t *TxObjectSet) GetEmpty() bool {
+	return t.GetObjectKey() == ""
+}
+
+// Clone clones the tx object.
+func (t *TxObjectSet) Clone() *TxObjectSet {
+	if t == nil {
+		return nil
+	}
+	return &TxObjectSet{
+		ObjectKey: t.GetObjectKey(),
+		RootRef:   t.GetRootRef().Clone(),
+	}
+}
+
+// Validate performs a cursory check of the transaction.
+// Note: this should not fetch network data.
+func (t *TxObjectSet) Validate() error {
+	if len(t.GetObjectKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	if err := t.GetRootRef().Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ExecuteTx executes the transaction against a world instance.
+func (t *TxObjectSet) ExecuteTx(
+	ctx context.Context,
+	sender peer.ID,
+	lookupWorldOp world.LookupOp,
+	worldInstance world.WorldState,
+) (sysErr bool, rerr error) {
+	// Validate the transaction before touching the World.
+	if err := t.Validate(); err != nil {
+		return false, err
+	}
+
+	// Fetch the target object and hold its state for release.
+	obj, err := world.MustGetObject(ctx, worldInstance, t.GetObjectKey())
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		return false, err
+	}
+
+	// Set the object's root reference to the transaction's root ref.
+	_, err = obj.SetRootRef(ctx, t.GetRootRef())
+	return false, err
+}
+
+// _ is a type assertion
+var _ Transaction = (*TxObjectSet)(nil)

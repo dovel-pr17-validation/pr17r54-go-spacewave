@@ -1,0 +1,343 @@
+//go:build !js
+
+package paylog
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/s4db"
+	"github.com/s4wave/spacewave/db/volume/device"
+	"github.com/s4wave/spacewave/db/volume/logindex"
+	"github.com/s4wave/spacewave/db/volume/workload"
+)
+
+// _ checks that a Store serves a replay.
+var _ workload.Target = (*Store)(nil)
+
+// engine opens an index on a device.
+type engine struct {
+	// name names the engine.
+	name string
+	// open opens the index.
+	open func(ctx context.Context, d device.Device) (Index, error)
+}
+
+// s4dbEngine is the s4db index in one device file.
+var s4dbEngine = engine{name: "s4db", open: func(ctx context.Context, d device.Device) (Index, error) {
+	return s4db.OpenDevice(ctx, d, "index", s4db.Options{})
+}}
+
+// logEngine returns the log-structured index with opts.
+func logEngine(opts logindex.Options) engine {
+	return engine{name: "log", open: func(ctx context.Context, d device.Device) (Index, error) {
+		return logindex.Open(ctx, d, opts)
+	}}
+}
+
+// engines are the indexes every store test runs on.
+var engines = []engine{s4dbEngine, logEngine(logindex.Options{})}
+
+// openStore opens a Store on d with e.
+func (e engine) openStore(ctx context.Context, d device.Device) (*Store, error) {
+	index, err := e.open(ctx, d)
+	if err != nil {
+		return nil, err
+	}
+	return Open(ctx, d, index, 0)
+}
+
+// openStore opens a Store on d with e and closes it when the test ends.
+func openStore(t *testing.T, e engine, d device.Device) *Store {
+	// Open the selected store engine and close it after the test.
+	t.Helper()
+	s, err := e.openStore(t.Context(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// TestStore checks interleaved write transactions, block publication by a
+// key-value commit, removes, and reopening on every engine.
+func TestStore(t *testing.T) {
+	for _, e := range engines {
+		t.Run(e.name, func(t *testing.T) { testStore(t, e) })
+	}
+}
+
+// testStore runs TestStore on e.
+func testStore(t *testing.T, e engine) {
+	// Prepare an in-memory device and store for the selected engine.
+	ctx := t.Context()
+	d := device.NewMemory()
+	s := openStore(t, e, d)
+
+	// A block put outside a transaction is published by the next commit.
+	kept, _, err := s.PutBlock(ctx, []byte("kept"), &block.PutOpts{RefsKnown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.NewTransaction(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Discard()
+	if err := a.Set(ctx, []byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A transaction's blocks stay its own until it ends: its discard drops a
+	// put and a remove, and its commit publishes them with its records.
+	exists := func(ref *block.BlockRef) bool {
+		t.Helper()
+		ok, err := s.GetBlockExists(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	doomed, _, err := s.PutBlock(ctx, []byte("doomed"), &block.PutOpts{Sync: true, RefsKnown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owned *block.BlockRef
+	for _, commit := range []bool{false, true} {
+		tx, err := s.NewTransaction(ctx, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks := tx.(*Tx).GetBlockStore()
+		owned, _, err = blocks.PutBlock(ctx, []byte("owned"), &block.PutOpts{RefsKnown: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := blocks.RmBlock(ctx, doomed); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Set(ctx, []byte("b"), []byte("2")); err != nil {
+			t.Fatal(err)
+		}
+		if exists(owned) || !exists(doomed) {
+			t.Fatal("transaction blocks visible outside it")
+		}
+		if commit {
+			err = tx.Commit(ctx)
+		}
+		tx.Discard()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exists(owned) != commit || exists(doomed) == commit {
+			t.Fatalf("commit %v: owned %v, doomed %v", commit, exists(owned), exists(doomed))
+		}
+	}
+
+	// A removed block is gone after Sync, and a duplicate put stores nothing.
+	gone, _, err := s.PutBlock(ctx, []byte("gone"), &block.PutOpts{Sync: true, RefsKnown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RmBlock(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, existed, err := s.PutBlock(ctx, []byte("kept"), &block.PutOpts{RefsKnown: true}); err != nil || !existed {
+		t.Fatalf("duplicate put: existed %v, err %v", existed, err)
+	}
+
+	// Reopen and check the key-value store and the blocks.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openStore(t, e, d)
+	read, err := s.NewTransaction(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Discard()
+	for key, want := range map[string]string{"a": "1", "b": "2"} {
+		got, found, err := read.Get(ctx, []byte(key))
+		if err != nil || !found || string(got) != want {
+			t.Fatalf("get %s = %q, %v, %v", key, got, found, err)
+		}
+	}
+
+	// Verify committed and removed blocks survive reopening with their expected state.
+	data, found, err := s.GetBlock(ctx, kept)
+	if err != nil || !found || string(data) != "kept" {
+		t.Fatalf("get kept block = %q, %v, %v", data, found, err)
+	}
+	if exists(gone) || exists(doomed) || !exists(owned) {
+		t.Fatal("blocks changed by reopening")
+	}
+}
+
+// TestWorkloadReplayTraces replays the captured traces named by the
+// comma-separated WORKLOAD_TRACES against the store on a file device with
+// every engine and logs the replay metrics. Each trace runs once flushing on
+// every commit and once ordered, flushing only on block Sync and head commits.
+// WORKLOAD_FILL_BLOCKS first fills the volume with that many blocks of
+// WORKLOAD_FILL_SIZE bytes (default 1024) to measure scale.
+func TestWorkloadReplayTraces(t *testing.T) {
+	// Select captured workload traces and replay them under both durability policies.
+	paths := os.Getenv("WORKLOAD_TRACES")
+	if paths == "" {
+		t.Skip("set WORKLOAD_TRACES to replay captured traces")
+	}
+	fillBlocks := envInt(t, "WORKLOAD_FILL_BLOCKS", 0)
+	fillSize := envInt(t, "WORKLOAD_FILL_SIZE", 1024)
+	for _, e := range engines {
+		for _, policy := range []string{"durable", "ordered"} {
+			for path := range strings.SplitSeq(paths, ",") {
+				t.Run(e.name+"/"+policy+"/"+filepath.Base(path), func(t *testing.T) {
+					replayTrace(t, e, path, policy == "ordered", fillBlocks, fillSize)
+				})
+			}
+		}
+	}
+}
+
+// replayTrace replays one captured trace, with ordered commits if ordered is
+// set, and logs its metrics.
+func replayTrace(t *testing.T, e engine, path string, ordered bool, fillBlocks, fillSize int) {
+	// Use the test context for the workload replay and recovery measurements.
+	ctx := t.Context()
+
+	// Prepare the workload and the volume it runs against.
+	replay, err := workload.ReadTrace(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay.Ordered = ordered
+	dir, err := device.OpenDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	d := &countingDevice{Device: dir}
+	target := openStore(t, e, d)
+
+	// Fill and seed the volume.
+	fillStart := time.Now()
+	if err := workload.Fill(ctx, target, fillBlocks, fillSize); err != nil {
+		t.Fatal(err)
+	}
+	fillTime := time.Since(fillStart)
+	fill := d.snapshot()
+	if err := replay.Seed(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replay and measure the workload.
+	seeded := d.snapshot()
+	result, err := replay.Run(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := d.snapshot().sub(seeded)
+	stored := result.BlockBytes + result.ValueBytes
+
+	// Reopen the volume.
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	openStart := time.Now()
+	openStore(t, e, d)
+	openTime := time.Since(openStart)
+
+	// Report.
+	t.Logf("fill %d blocks of %d B in %s: %s", fillBlocks, fillSize, fillTime.Round(time.Millisecond), fill)
+	t.Logf("records %d", result.Ops)
+	t.Logf("wall %s, commit errors %d, ordered commits %d", result.Wall.Round(time.Microsecond), result.CommitErrors, result.OrderedCommits)
+	for _, op := range []workload.Op{workload.OpCommit, workload.OpSync, workload.OpPutBatch, workload.OpPut, workload.OpGetBlock} {
+		if n := len(result.Latency[op]); n != 0 {
+			t.Logf("%-15s n %4d  p50 %9s  p99 %9s", op, n, result.Percentile(op, 0.5).Round(time.Microsecond), result.Percentile(op, 0.99).Round(time.Microsecond))
+		}
+	}
+	t.Logf("replay wrote %s", written)
+	if stored != 0 {
+		t.Logf("written %d B for %d B stored (%.2fx)", written.bytes, stored, float64(written.bytes)/float64(stored))
+	}
+	t.Logf("open %s", openTime.Round(time.Microsecond))
+}
+
+// countingDevice counts the writes and flushes made through a device.
+type countingDevice struct {
+	device.Device
+
+	// mtx guards stats.
+	mtx sync.Mutex
+	// stats holds the counts so far.
+	stats deviceStats
+}
+
+// deviceStats counts device writes.
+type deviceStats struct {
+	// calls counts Write calls.
+	calls int
+	// flushes counts flushed Write calls.
+	flushes int
+	// bytes counts written bytes.
+	bytes int64
+}
+
+// Write counts and forwards a write.
+func (c *countingDevice) Write(ctx context.Context, writes []device.Write, flush bool) error {
+	// Count write bytes and flushes under the device statistics lock.
+	c.mtx.Lock()
+	c.stats.calls++
+	if flush {
+		c.stats.flushes++
+	}
+	for _, w := range writes {
+		c.stats.bytes += int64(len(w.Data))
+	}
+	c.mtx.Unlock()
+	return c.Device.Write(ctx, writes, flush)
+}
+
+// snapshot returns the counts so far.
+func (c *countingDevice) snapshot() deviceStats {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.stats
+}
+
+// sub returns the counts in s made after base.
+func (s deviceStats) sub(base deviceStats) deviceStats {
+	return deviceStats{calls: s.calls - base.calls, flushes: s.flushes - base.flushes, bytes: s.bytes - base.bytes}
+}
+
+// String formats the counts.
+func (s deviceStats) String() string {
+	return strconv.Itoa(s.calls) + " writes, " + strconv.Itoa(s.flushes) + " flushes, " + strconv.FormatInt(s.bytes, 10) + " B"
+}
+
+// envInt parses an optional integer environment variable.
+func envInt(t *testing.T, name string, def int) int {
+	// Read the optional integer setting and reject malformed values.
+	t.Helper()
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return v
+}

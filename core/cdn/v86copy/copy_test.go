@@ -1,0 +1,237 @@
+package v86copy
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	timestamppb "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/s4wave/spacewave/db/block"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	"github.com/s4wave/spacewave/db/unixfs"
+	unixfs_block "github.com/s4wave/spacewave/db/unixfs/block"
+	unixfs_world "github.com/s4wave/spacewave/db/unixfs/world"
+	"github.com/s4wave/spacewave/db/world"
+	world_testbed "github.com/s4wave/spacewave/db/world/testbed"
+	s4wave_vm "github.com/s4wave/spacewave/sdk/vm"
+	"github.com/sirupsen/logrus"
+)
+
+func TestCopyV86ImageFromCdnCopiesAssetObjectsBeforeEdges(t *testing.T) {
+	// Initialize source and destination World testbeds.
+	ctx := context.Background()
+	srcTB, err := world_testbed.Default(ctx, world_testbed.WithWorldVerbose(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcTB.Release()
+	dstTB, err := world_testbed.Default(ctx, world_testbed.WithWorldVerbose(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dstTB.Release()
+	const (
+		srcImageKey = "v86image/default"
+		dstImageKey = "vm-image/default-copy"
+		assetKey    = "assets/rootfs"
+	)
+
+	// Create the source asset object and V86 image graph.
+	content := bytes.Repeat([]byte("copied rootfs payload\n"), 64*1024)
+	createFSNodeObjectWithFile(t, ctx, srcTB.WorldState, assetKey, "hello.txt", content)
+	createdAt := time.Unix(123, 0)
+	img := &s4wave_vm.V86Image{
+		Name:          "Aperture Linux",
+		Platform:      "v86",
+		KernelVersion: "7.0.0-rc5",
+		CreatedAt:     timestamppb.New(createdAt),
+	}
+	if _, _, err := srcTB.WorldState.ApplyWorldOp(ctx, s4wave_vm.NewCreateV86ImageOp(srcImageKey, img, createdAt), ""); err != nil {
+		t.Fatalf("create source v86 image: %v", err)
+	}
+	if err := srcTB.WorldState.SetGraphQuad(ctx, world.NewGraphQuadWithKeys(srcImageKey, string(s4wave_vm.PredV86ImageRootfs), assetKey, "")); err != nil {
+		t.Fatalf("set source rootfs edge: %v", err)
+	}
+
+	// Copy the image while collecting progress.
+	var progress []bucket_lookup.ObjectCopyStats
+	if err := CopyV86ImageFromCdnWithProgress(
+		ctx,
+		srcTB.WorldState,
+		dstTB.WorldState,
+		srcImageKey,
+		dstImageKey,
+		func(current bucket_lookup.ObjectCopyStats) error {
+			progress = append(progress, current)
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("copy v86 image: %v", err)
+	}
+	if len(progress) == 0 {
+		t.Fatal("expected block-copy progress")
+	}
+	finalProgress := progress[len(progress)-1]
+	if finalProgress.BlocksSeen == 0 ||
+		finalProgress.BlocksCopied == 0 ||
+		finalProgress.BlocksWritten == 0 ||
+		finalProgress.LogicalSourceBytes == 0 {
+		t.Fatalf("final copy progress = %#v, want real block and byte accounting", finalProgress)
+	}
+	if err := CopyV86ImageFromCdn(ctx, srcTB.WorldState, dstTB.WorldState, srcImageKey, dstImageKey); err != nil {
+		t.Fatalf("retry completed v86 image copy: %v", err)
+	}
+
+	// Verify destination object, type, and graph edge state.
+	{
+		objectState, found, err := dstTB.WorldState.GetObject(ctx, assetKey)
+		world.ReleaseObjectState(objectState)
+		if err != nil {
+			t.Fatalf("get copied asset: %v", err)
+		} else if !found {
+			t.Fatalf("expected destination asset object %q to exist", assetKey)
+		}
+	}
+	ft, explicit, err := unixfs_world.LookupFsType(ctx, dstTB.WorldState, assetKey)
+	if err != nil {
+		t.Fatalf("lookup copied asset type: %v", err)
+	}
+	if !explicit || ft != unixfs_world.FSType_FSType_FS_NODE {
+		t.Fatalf("expected explicit copied FS_NODE type, got type=%s explicit=%v", ft.String(), explicit)
+	}
+	target, err := lookupV86ImageEdge(ctx, dstTB.WorldState, dstImageKey, string(s4wave_vm.PredV86ImageRootfs))
+	if err != nil {
+		t.Fatalf("lookup copied rootfs edge: %v", err)
+	}
+	if target != assetKey {
+		t.Fatalf("expected copied rootfs edge target %q, got %q", assetKey, target)
+	}
+
+	// Verify copied asset content.
+	got := readFSNodeFile(t, ctx, dstTB.WorldState, assetKey, "hello.txt")
+	if !bytes.Equal(got, content) {
+		t.Fatalf("copied asset file content mismatch: got %q want %q", string(got), string(content))
+	}
+}
+
+func createFSNodeObjectWithFile(
+	t *testing.T,
+	ctx context.Context,
+	ws world.WorldState,
+	objKey string,
+	name string,
+	content []byte,
+) {
+	// Attribute filesystem object setup failures to the calling test.
+	t.Helper()
+
+	// Create the source filesystem object and file.
+	op := unixfs_world.NewFsInitOp(objKey, unixfs_world.FSType_FSType_FS_NODE, nil, false, time.Unix(1, 0))
+	if _, _, err := ws.ApplyWorldOp(ctx, op, ""); err != nil {
+		t.Fatalf("create fs-node object %q: %v", objKey, err)
+	}
+	obj, found, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatalf("get fs-node object %q: %v", objKey, err)
+	}
+	if !found {
+		t.Fatalf("expected fs-node object %q to exist", objKey)
+	}
+	if _, _, err := unixfs_world.FsMknodWithContent(
+		ctx,
+		ws,
+		obj,
+		"",
+		unixfs_world.FSType_FSType_FS_NODE,
+		[]string{name},
+		unixfs.NewFSCursorNodeType_File(),
+		int64(len(content)),
+		bytes.NewReader(content),
+		0o644,
+		time.Unix(2, 0),
+	); err != nil {
+		t.Fatalf("create fs-node file %q: %v", name, err)
+	}
+}
+
+// Open and read the copied filesystem file.
+func readFSNodeFile(t *testing.T, ctx context.Context, ws world.WorldState, objKey, name string) []byte {
+	// Open a filesystem handle for the copied asset object.
+	t.Helper()
+	fsc := unixfs_world.NewFSCursor(logrus.NewEntry(logrus.New()), ws, objKey, unixfs_world.FSType_FSType_FS_NODE, nil, false)
+	fsh, err := unixfs.NewFSHandle(fsc)
+	if err != nil {
+		fsc.Release()
+		t.Fatalf("open fs-node handle %q: %v", objKey, err)
+	}
+	defer fsh.Release()
+
+	// Look up the copied file within the filesystem handle.
+	child, err := fsh.Lookup(ctx, name)
+	if err != nil {
+		t.Fatalf("lookup copied file %q: %v (%s)", name, err, describeFSNodeObject(t, ctx, ws, objKey))
+	}
+	defer child.Release()
+
+	// Read the copied file contents for comparison with the source.
+	got, err := unixfs.ReadFile(ctx, child)
+	if err != nil {
+		t.Fatalf("read copied file %q: %v", name, err)
+	}
+
+	return got
+}
+
+// Build diagnostic information for a filesystem object.
+func describeFSNodeObject(t *testing.T, ctx context.Context, ws world.WorldState, objKey string) string {
+	// Open the filesystem object whose blocks need diagnostic inspection.
+	t.Helper()
+	obj, found, err := ws.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		return fmt.Sprintf("get object: %v", err)
+	}
+	if !found {
+		return "object not found"
+	}
+
+	// Collect root and child block availability from the filesystem object.
+	var out string
+	_, _, err = world.AccessObjectState(ctx, obj, false, func(bcs *block.Cursor) error {
+		// Inspect the filesystem root reference and its block availability.
+		store, _ := bcs.GetBlockStore()
+		rootRef := bcs.GetRef()
+		rootExists := false
+		if store != nil && rootRef != nil && !rootRef.GetEmpty() {
+			rootExists, _ = store.GetBlockExists(ctx, rootRef)
+		}
+
+		// Decode the filesystem root to inspect its directory entries.
+		root, err := unixfs_block.UnmarshalFSNode(ctx, bcs)
+		if err != nil {
+			out = fmt.Sprintf("root-ref=%s root-exists=%v root-unmarshal=%v", rootRef.MarshalString(), rootExists, err)
+			return nil
+		}
+
+		// Describe the filesystem root and each child reference with block availability.
+		out = fmt.Sprintf("root-ref=%s root-exists=%v dirents=%d", rootRef.MarshalString(), rootExists, len(root.GetDirectoryEntry()))
+		for _, dirent := range root.GetDirectoryEntry() {
+			childRef := dirent.GetNodeRef()
+			childExists := false
+			if store != nil && childRef != nil && !childRef.GetEmpty() {
+				childExists, _ = store.GetBlockExists(ctx, childRef)
+			}
+			out += fmt.Sprintf(" %s=%s exists=%v", dirent.GetName(), childRef.MarshalString(), childExists)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Sprintf("access object: %v", err)
+	}
+
+	return out
+}

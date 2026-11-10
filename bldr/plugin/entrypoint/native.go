@@ -1,0 +1,163 @@
+//go:build !js
+
+package plugin_entrypoint
+
+import (
+	"context"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/bldr/entrypoint/storagepath"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	"github.com/s4wave/spacewave/bldr/util/logfile"
+	bldr_pipesock "github.com/s4wave/spacewave/bldr/util/pipesock"
+	"github.com/sirupsen/logrus"
+)
+
+// Version is the entrypoint version
+var Version = controller.MustParseVersion("0.0.1")
+
+// Main runs the default main entrypoint for a plugin. logLevel is the
+// compiled default; <PROJECT>_LOG_LEVEL or BLDR_LOG_LEVEL from the host's
+// environment overrides it, matching the host process.
+func Main(
+	pluginStartInfoJsonB64,
+	pluginMetaB58 string,
+	logLevel logrus.Level,
+	addFactoryFuncs []AddFactoryFunc,
+	configSetFuncs []BuildConfigSetFunc,
+) {
+	// Configure the logger for the plugin entrypoint.
+	log := logrus.New()
+	log.SetFormatter(&logrus.TextFormatter{
+		DisableColors:    true,
+		DisableTimestamp: true,
+	})
+	log.SetLevel(logLevel)
+	le := logrus.NewEntry(log)
+
+	// Handle stop signals by canceling the context.
+	ctx, ctxCancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer ctxCancel()
+
+	// Run the entrypoint and exit fatally on an unexpected error.
+	if err := func() error {
+		// Resolve the current working directory.
+		wd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+
+		// If the environment variable with the startup info was empty, try to load
+		// it from the .plugin-start-info file in the current working dir.
+		if pluginStartInfoJsonB64 == "" {
+			startInfoBin, err := os.ReadFile(filepath.Join(wd, ".plugin-start-info"))
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("start info not found")
+				}
+				return errors.Wrap(err, "load start info")
+			}
+			pluginStartInfoJsonB64 = string(startInfoBin)
+		}
+
+		// Unmarshal the plugin start info and meta.
+		pluginStartInfo, err := UnmarshalPluginStartInfo(pluginStartInfoJsonB64)
+		if err != nil {
+			return err
+		}
+		pluginMeta, err := UnmarshalPluginMeta(pluginMetaB58)
+		if err != nil {
+			return err
+		}
+
+		// Apply the host's log level override for this project.
+		log.SetLevel(logfile.ResolveLogLevel(
+			[]string{storagepath.LogLevelEnvVar(pluginMeta.GetProjectId()), "BLDR_LOG_LEVEL"},
+			logLevel,
+		))
+
+		// Run the plugin entrypoint, treating expected shutdown as success.
+		err = Run(ctx, le, pluginStartInfo, pluginMeta, addFactoryFuncs, configSetFuncs)
+		if !isExpectedPluginEntrypointError(err) {
+			return err
+		}
+
+		return nil
+	}(); err != nil {
+		le.WithError(err).Error("exiting with fatal error")
+		ctxCancel()
+		<-time.After(time.Millisecond * 100)
+		os.Exit(1)
+	}
+}
+
+// Run runs the plugin entrypoint.
+func Run(
+	ctx context.Context,
+	le *logrus.Entry,
+	pluginStartInfo *bldr_plugin.PluginStartInfo,
+	pluginMeta *bldr_plugin.PluginMeta,
+	addFactoryFuncs []AddFactoryFunc,
+	configSetFuncs []BuildConfigSetFunc,
+) error {
+	// Resolve the working directory and validate the start info.
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	if err := pluginStartInfo.Validate(); err != nil {
+		return err
+	}
+
+	// Resolve the pipe socket root from the environment.
+	pipeRoot := os.Getenv("BLDR_PIPE_ROOT")
+	if pipeRoot == "" {
+		pipeRoot = wd
+	}
+
+	// Serve pprof and the process identity for stack reads while running.
+	servePluginDebug(ctx, le, pluginStartInfo, pipeRoot)
+
+	// construct pipe socket
+	instanceID := pluginStartInfo.GetInstanceId()
+	conn, err := bldr_pipesock.Dial(ctx, le, pipeRoot, instanceID)
+	if err != nil {
+		return err
+	}
+
+	// yamux config
+	yamuxConf := srpc.NewYamuxConfig()
+	yamuxConf.EnableKeepAlive = false
+
+	// construct mplex
+	muxedConn, err := srpc.NewMuxedConn(conn, false, yamuxConf)
+	if err != nil {
+		return err
+	}
+	defer muxedConn.Close()
+
+	// Run the plugin entrypoint over the muxed connection.
+	return ExecutePluginEntrypoint(
+		ctx,
+		le,
+		pluginMeta,
+		addFactoryFuncs,
+		configSetFuncs,
+		srpc.NewClientWithMuxedConn(muxedConn),
+		func(ctx context.Context, srv *srpc.Server, ready func()) error {
+			ready()
+			return srv.AcceptMuxedConn(ctx, muxedConn)
+		},
+	)
+}
+
+// readFile reads from a file using os.ReadFile.
+func readFile(filePath string) ([]byte, error) {
+	return os.ReadFile(filePath)
+}

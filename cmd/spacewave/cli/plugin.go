@@ -1,0 +1,629 @@
+//go:build !js
+
+package spacewave_cli
+
+import (
+	"context"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	devtool_store "github.com/s4wave/spacewave/bldr/devtool/store"
+
+	"github.com/aperturerobotics/cli"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller"
+	protojson "github.com/aperturerobotics/protobuf-go-lite/json"
+	"github.com/pkg/errors"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	"github.com/s4wave/spacewave/db/block"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	transform_gzip "github.com/s4wave/spacewave/db/block/transform/gzip"
+	"github.com/s4wave/spacewave/db/volume"
+	"github.com/s4wave/spacewave/db/world"
+	s4wave_space "github.com/s4wave/spacewave/sdk/space"
+)
+
+const defaultPluginHostObjectKey = "plugin-host"
+
+// newPluginCommand builds the plugin command group.
+func newPluginCommand(getBus func() cli_entrypoint.CliBus) *cli.Command {
+	return &cli.Command{
+		Name:    "plugin",
+		Aliases: []string{"plugins"},
+		Usage:   "manage space plugins",
+		Subcommands: []*cli.Command{
+			buildPluginListCommand(),
+			buildPluginSetCommand(true),
+			buildPluginSetCommand(false),
+			buildPluginBackgroundCommand(),
+			buildPluginImportManifestCommand(getBus),
+		},
+	}
+}
+
+// buildPluginImportManifestCommand builds the plugin import-manifest subcommand.
+func buildPluginImportManifestCommand(getBus func() cli_entrypoint.CliBus) *cli.Command {
+	// Declare the import flags and return the command.
+	var dbPath string
+	var manifestID string
+	var objectKey string
+	var targetDBPath string
+	return &cli.Command{
+		Name:  "import-manifest",
+		Usage: "import a built manifest into the local plugin host store, replacing earlier imports of it",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "db",
+				Usage:       "path to .bldr/ directory containing the devtool DB",
+				Required:    true,
+				Destination: &dbPath,
+			},
+			&cli.StringFlag{
+				Name:        "manifest-id",
+				Usage:       "manifest identifier",
+				Required:    true,
+				Destination: &manifestID,
+			},
+			&cli.StringFlag{
+				Name:        "object-key",
+				Usage:       "plugin host object key to import into",
+				Value:       defaultPluginHostObjectKey,
+				Destination: &objectKey,
+			},
+			&cli.StringFlag{
+				Name:        "target-db",
+				Usage:       "optional path to target .bldr/ devtool DB; defaults to the running daemon world",
+				Destination: &targetDBPath,
+			},
+		},
+		Action: func(c *cli.Context) error {
+			return runPluginImportManifest(c.Context, getBus, dbPath, targetDBPath, manifestID, objectKey)
+		},
+	}
+}
+
+func runPluginImportManifest(
+	ctx context.Context,
+	getBus func() cli_entrypoint.CliBus,
+	dbPath string,
+	targetDBPath string,
+	manifestID string,
+	objectKey string,
+) error {
+	// Require a CLI bus and an object key.
+	cliBus := getBus()
+	if cliBus == nil {
+		return errors.New("bus not initialized")
+	}
+	if objectKey == "" {
+		return errors.New("object-key is required")
+	}
+
+	// Open the devtool volume and look up the manifests.
+	le := cliBus.GetLogger()
+	src, err := devtool_store.OpenVolume(ctx, le, dbPath)
+	if err != nil {
+		return errors.Wrap(err, "open devtool storage")
+	}
+	defer src.Close()
+	collectedManifests, err := devtool_store.LookupManifests(ctx, le, src, manifestID)
+	if err != nil {
+		return errors.Wrap(err, "lookup manifest")
+	}
+
+	// Build the gzip block transformer.
+	sfs := block_transform.NewStepFactorySet()
+	sfs.AddStepFactory(transform_gzip.NewStepFactory())
+	transformConf, err := block_transform.NewConfig([]config.Config{&transform_gzip.Config{}})
+	if err != nil {
+		return errors.Wrap(err, "build transform config")
+	}
+	xfrm, err := block_transform.NewTransformer(
+		controller.ConstructOpts{Logger: le},
+		sfs,
+		transformConf,
+	)
+	if err != nil {
+		return errors.Wrap(err, "build block transformer")
+	}
+
+	// Open the destination volume and World engine.
+	var dest volume.Volume
+	var destEngine world.Engine
+	var destClose func() error
+	destBucketID := cliBus.GetWorldEngineID()
+	if targetDBPath == "" {
+		dest = cliBus.GetVolume()
+		destEngine = cliBus.GetWorldEngine()
+	} else {
+		dest, err = devtool_store.OpenVolume(ctx, le, targetDBPath)
+		if err != nil {
+			return errors.Wrap(err, "open target devtool storage")
+		}
+		defer dest.Close()
+		targetEng, err := devtool_store.OpenWorld(ctx, le, dest, false)
+		if err != nil {
+			return errors.Wrap(err, "open target devtool world")
+		}
+		destEngine = targetEng
+		destClose = targetEng.Close
+		destBucketID = devtool_store.BucketID
+	}
+	if destClose != nil {
+		defer destClose()
+	}
+
+	// Copy each manifest block DAG into the destination.
+	for _, collected := range collectedManifests {
+		rootRef := collected.ManifestRef.GetRootRef()
+		if err := copyManifestBlockDAG(ctx, rootRef, src, dest, xfrm); err != nil {
+			return errors.Wrap(err, "copy manifest blocks")
+		}
+	}
+
+	// Open a transaction and create the manifest store.
+	tx, err := destEngine.NewTransaction(ctx, true)
+	if err != nil {
+		return errors.Wrap(err, "new transaction")
+	}
+	defer tx.Discard()
+	if _, err := bldr_manifest_world.CreateManifestStore(ctx, tx, objectKey); err != nil {
+		return errors.Wrap(err, "create plugin host manifest store")
+	}
+
+	// Replace earlier imports of the manifest, such as another build type at
+	// the same revision, so the store selects exactly the imported builds.
+	imported := make([]string, 0, len(collectedManifests))
+	for _, collected := range collectedManifests {
+		imported = append(imported, bldr_manifest.NewManifestKey(objectKey, collected.Manifest.GetMeta()))
+	}
+	previous, _, err := bldr_manifest_world.CollectManifestsForManifestID(ctx, tx, manifestID, nil, objectKey)
+	if err != nil {
+		return errors.Wrap(err, "collect previous manifests")
+	}
+	for _, prev := range previous {
+		if slices.Contains(imported, prev.ManifestKey) {
+			continue
+		}
+		if _, err := tx.DeleteObject(ctx, prev.ManifestKey); err != nil {
+			return errors.Wrap(err, "remove previous manifest")
+		}
+	}
+
+	// Record each imported manifest.
+	for i, collected := range collectedManifests {
+		manifestKey := imported[i]
+		objRef := collected.ManifestRef.Clone()
+		objRef.BucketId = destBucketID
+		objRef.TransformConf = transformConf
+		if _, _, err := bldr_manifest_world.SetManifest(ctx, tx, "", manifestKey, objRef); err != nil {
+			return errors.Wrap(err, "set manifest")
+		}
+		if err := tx.SetGraphQuad(ctx, bldr_manifest_world.NewManifestQuad(objectKey, manifestKey, manifestID)); err != nil {
+			return errors.Wrap(err, "link manifest")
+		}
+	}
+
+	// Commit and sync the import, then print each manifest key.
+	if err := tx.Commit(ctx); err != nil {
+		return errors.Wrap(err, "commit manifest import")
+	}
+	if _, err := destEngine.Sync(ctx); err != nil {
+		return errors.Wrap(err, "sync manifest import")
+	}
+	for _, manifestKey := range imported {
+		os.Stdout.WriteString("imported: " + manifestKey + "\n")
+	}
+	return nil
+}
+
+func copyManifestBlockDAG(
+	ctx context.Context,
+	rootRef *block.BlockRef,
+	src block.StoreOps,
+	dest block.StoreOps,
+	xfrm block.Transformer,
+) error {
+	if rootRef.GetEmpty() {
+		return nil
+	}
+	visited := make(map[string]bool)
+	return copyManifestBlock(ctx, rootRef, bldr_manifest.NewManifestBlock, src, dest, xfrm, visited)
+}
+
+func copyManifestBlock(
+	ctx context.Context,
+	ref *block.BlockRef,
+	ctor block.Ctor,
+	src block.StoreOps,
+	dest block.StoreOps,
+	xfrm block.Transformer,
+	visited map[string]bool,
+) error {
+	// Skip an empty or already visited ref and check whether the destination has it.
+	if ref.GetEmpty() {
+		return nil
+	}
+	refStr := ref.MarshalString()
+	if visited[refStr] {
+		return nil
+	}
+	visited[refStr] = true
+	exists, err := dest.GetBlockExists(ctx, ref)
+	if err != nil {
+		return errors.Wrapf(err, "check block exists: %s", refStr)
+	}
+
+	// Read the block from the destination when it exists, otherwise from the source.
+	store := src
+	if exists {
+		store = dest
+	}
+	data, found, err := store.GetBlock(ctx, ref)
+	if err != nil {
+		return errors.Wrapf(err, "get block: %s", refStr)
+	}
+	if !found {
+		return errors.Wrapf(block.ErrNotFound, "block: %s", refStr)
+	}
+
+	// Decode before writing so the write records the block's refs.
+	var blk block.Block
+	if ctor != nil {
+		decoded := data
+		if xfrm != nil {
+			decoded, err = xfrm.DecodeBlock(data)
+			if err != nil {
+				return errors.Wrapf(err, "decode block: %s", refStr)
+			}
+		}
+		blk = ctor()
+		if err := blk.UnmarshalVT(decoded); err != nil {
+			return errors.Wrapf(err, "unmarshal block: %s", refStr)
+		}
+	}
+	if !exists {
+		refs, err := block.ExtractBlockRefs(blk)
+		if err != nil {
+			return errors.Wrapf(err, "get block refs: %s", refStr)
+		}
+		putOpts := &block.PutOpts{ForceBlockRef: ref, Refs: refs, RefsKnown: blk != nil}
+		if _, _, err := dest.PutBlock(ctx, data, putOpts); err != nil {
+			return errors.Wrapf(err, "put block: %s", refStr)
+		}
+	}
+	if blk == nil {
+		return nil
+	}
+	return followManifestBlockRefs(ctx, blk, src, dest, xfrm, visited)
+}
+
+func followManifestBlockRefs(
+	ctx context.Context,
+	blk any,
+	src block.StoreOps,
+	dest block.StoreOps,
+	xfrm block.Transformer,
+	visited map[string]bool,
+) error {
+	if withRefs, ok := blk.(block.BlockWithRefs); ok {
+		refs, err := withRefs.GetBlockRefs()
+		if err != nil {
+			return errors.Wrap(err, "get block refs")
+		}
+		for id, childRef := range refs {
+			childCtor := withRefs.GetBlockRefCtor(id)
+			if err := copyManifestBlock(ctx, childRef, childCtor, src, dest, xfrm, visited); err != nil {
+				return err
+			}
+		}
+	}
+	if withSubBlocks, ok := blk.(block.BlockWithSubBlocks); ok {
+		for _, sub := range withSubBlocks.GetSubBlocks() {
+			if sub == nil || sub.IsNil() {
+				continue
+			}
+			if err := followManifestBlockRefs(ctx, sub, src, dest, xfrm, visited); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func pluginLifecycleStateLabel(state s4wave_space.SpacePluginLifecycleState) string {
+	const prefix = "SpacePluginLifecycleState_"
+	return strings.ToLower(strings.TrimPrefix(state.String(), prefix))
+}
+
+func formatPluginStatus(p *s4wave_space.SpacePluginStatus) string {
+	fields := []string{p.GetPluginId(), pluginLifecycleStateLabel(p.GetState())}
+	if detail := p.GetDetail(); detail != "" {
+		fields = append(fields, detail)
+	}
+	if description := p.GetDescription(); description != "" {
+		fields = append(fields, description)
+	}
+	return strings.Join(fields, "  ") + "\n"
+}
+
+func marshalPluginListJSON(plugins []*s4wave_space.SpacePluginStatus) ([]byte, error) {
+	data, err := protojson.MarshalSlice(protojson.MarshalerConfig{}, plugins)
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal plugin list")
+	}
+	return data, nil
+}
+
+func writePluginListJSON(plugins []*s4wave_space.SpacePluginStatus, outputFormat string) error {
+	data, err := marshalPluginListJSON(plugins)
+	if err != nil {
+		return err
+	}
+	return formatOutput(data, outputFormat)
+}
+
+// buildPluginListCommand builds the plugin list subcommand.
+func buildPluginListCommand() *cli.Command {
+	var statePath string
+	var sessionIdx uint
+	var outputFormat string
+	return &cli.Command{
+		Name:  "list",
+		Usage: "list plugins and their load state",
+		Flags: append(clientFlags(&statePath, &sessionIdx),
+			&cli.StringFlag{
+				Name:    "space",
+				Usage:   "space ID (auto-detected if only one space)",
+				EnvVars: []string{"SPACEWAVE_SPACE"},
+			},
+			&cli.BoolFlag{
+				Name:    "watch",
+				Usage:   "watch for changes (append mode)",
+				EnvVars: []string{"SPACEWAVE_WATCH"},
+			},
+			&cli.StringFlag{
+				Name:        "output",
+				Aliases:     []string{"o"},
+				Usage:       "output format (text/json/yaml)",
+				EnvVars:     []string{"SPACEWAVE_OUTPUT"},
+				Value:       "text",
+				Destination: &outputFormat,
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Connect to the daemon for the Space contents watch.
+			ctx := c.Context
+			spaceID := c.String("space")
+			watch := c.Bool("watch")
+			client, err := connectDaemonFromContext(ctx, c, statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Resolve the Space ID.
+			spaceID, err = client.resolveSpaceID(ctx, sess, spaceID)
+			if err != nil {
+				return err
+			}
+
+			// Mount the Space service.
+			spaceSvc, spaceCleanup, err := client.mountSpace(ctx, sess, spaceID)
+			if err != nil {
+				return err
+			}
+			defer spaceCleanup()
+
+			// Mount the Space contents service.
+			contentsSvc, contentsCleanup, err := client.mountSpaceContents(ctx, spaceSvc)
+			if err != nil {
+				return err
+			}
+			defer contentsCleanup()
+
+			// Watch Space contents and print each plugin snapshot.
+			strm, err := contentsSvc.WatchState(ctx, &s4wave_space.WatchSpaceContentsStateRequest{})
+			if err != nil {
+				return errors.Wrap(err, "watch state")
+			}
+			defer strm.Close()
+			w := os.Stdout
+			for {
+				state, err := strm.Recv()
+				if err != nil {
+					return errors.Wrap(err, "recv state")
+				}
+
+				plugins := state.GetPlugins()
+				if outputFormat == "json" || outputFormat == "yaml" {
+					if err := writePluginListJSON(plugins, outputFormat); err != nil {
+						return err
+					}
+				} else {
+					requested := state.GetRequestedPluginIds()
+					if len(plugins) == 0 && len(requested) == 0 {
+						w.WriteString("no plugins\n")
+					}
+					for _, p := range plugins {
+						w.WriteString(formatPluginStatus(p))
+					}
+					for _, id := range requested {
+						w.WriteString(id + "  requested  not listed; a load is waiting for it\n")
+					}
+				}
+
+				if !watch {
+					return nil
+				}
+				w.WriteString("--- " + time.Now().Format(time.RFC3339) + " ---\n")
+			}
+		},
+	}
+}
+
+// buildPluginSetCommand builds the subcommand that adds a plugin to, or
+// removes it from, the Space settings or, with --account, the account plugin
+// list every Space of the account loads.
+func buildPluginSetCommand(add bool) *cli.Command {
+	// Name the subcommand for its direction.
+	var statePath string
+	var sessionIdx uint
+	name, usage, verb := "remove", "remove a plugin from space or account settings", "removed"
+	if add {
+		name, usage, verb = "add", "add a plugin to space or account settings", "added"
+	}
+	return &cli.Command{
+		Name:      name,
+		Usage:     usage,
+		ArgsUsage: "<manifest-id>",
+		Flags: append(clientFlags(&statePath, &sessionIdx),
+			&cli.StringFlag{
+				Name:    "space",
+				Usage:   "space ID (auto-detected if only one space)",
+				EnvVars: []string{"SPACEWAVE_SPACE"},
+			},
+			&cli.BoolFlag{
+				Name:  "account",
+				Usage: "change the account plugin list instead of one Space",
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Require a manifest ID.
+			manifestID := c.Args().First()
+			if manifestID == "" {
+				return errors.New("manifest ID required")
+			}
+
+			// Connect to the daemon.
+			ctx := c.Context
+			client, err := connectDaemonFromContext(ctx, c, statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Mount the selected session.
+			sess, err := client.mountSession(ctx, sessionIndex32(sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Change the account plugin list.
+			if c.Bool("account") {
+				if err := sess.SetAccountPlugin(ctx, manifestID, add); err != nil {
+					return errors.Wrap(err, "set account plugin")
+				}
+				os.Stdout.WriteString("account " + verb + ": " + manifestID + "\n")
+				return nil
+			}
+
+			// Resolve and mount the Space.
+			spaceID, err := client.resolveSpaceID(ctx, sess, c.String("space"))
+			if err != nil {
+				return err
+			}
+			spaceSvc, spaceCleanup, err := client.mountSpace(ctx, sess, spaceID)
+			if err != nil {
+				return err
+			}
+			defer spaceCleanup()
+
+			// Change the Space settings.
+			if add {
+				_, err = spaceSvc.AddSpacePlugin(ctx, &s4wave_space.AddSpacePluginRequest{PluginId: manifestID})
+			} else {
+				_, err = spaceSvc.RemoveSpacePlugin(ctx, &s4wave_space.RemoveSpacePluginRequest{PluginId: manifestID})
+			}
+			if err != nil {
+				return errors.Wrap(err, name+" space plugin")
+			}
+			os.Stdout.WriteString(verb + ": " + manifestID + "\n")
+			return nil
+		},
+	}
+}
+
+// buildPluginBackgroundCommand builds the plugin background subcommand.
+func buildPluginBackgroundCommand() *cli.Command {
+	var statePath string
+	var sessionIdx uint
+	return &cli.Command{
+		Name:      "background",
+		Usage:     "run a plugin in the background while the session runs",
+		ArgsUsage: "<manifest-id>",
+		Flags: append(clientFlags(&statePath, &sessionIdx),
+			&cli.StringFlag{
+				Name:    "space",
+				Usage:   "space ID (auto-detected if only one space)",
+				EnvVars: []string{"SPACEWAVE_SPACE"},
+			},
+			&cli.BoolFlag{
+				Name:  "off",
+				Usage: "withdraw the confirmation and stop running in the background",
+			},
+			&cli.BoolFlag{
+				Name:  "suspend",
+				Usage: "keep the confirmation but stop running in the background",
+			},
+		),
+		Action: func(c *cli.Context) error {
+			// Require the plugin's manifest ID.
+			manifestID := c.Args().First()
+			if manifestID == "" {
+				return errors.New("manifest ID required")
+			}
+
+			// Mount the Session through the daemon.
+			ctx := c.Context
+			client, err := connectDaemonFromContext(ctx, c, statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			sess, err := client.mountSession(ctx, sessionIndex32(sessionIdx))
+			if err != nil {
+				return err
+			}
+			defer sess.Release()
+
+			// Resolve the Space holding the plugin.
+			spaceID, err := client.resolveSpaceID(ctx, sess, c.String("space"))
+			if err != nil {
+				return err
+			}
+
+			// Record the choice in the Session.
+			enabled, suspended := !c.Bool("off"), c.Bool("suspend")
+			if !enabled && suspended {
+				return errors.New("--off and --suspend are exclusive")
+			}
+			if err := sess.SetBackgroundPlugin(ctx, spaceID, manifestID, enabled, suspended); err != nil {
+				return errors.Wrap(err, "set background plugin")
+			}
+
+			// Report the plugin's new mode.
+			switch {
+			case suspended:
+				os.Stdout.WriteString("suspended: " + manifestID + "\n")
+			case enabled:
+				os.Stdout.WriteString("background: " + manifestID + "\n")
+			default:
+				os.Stdout.WriteString("foreground: " + manifestID + "\n")
+			}
+			return nil
+		},
+	}
+}

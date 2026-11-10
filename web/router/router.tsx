@@ -1,0 +1,353 @@
+import { cleanPath, joinPath, splitPath } from '@aptre/bldr'
+import React, {
+  createContext,
+  use,
+  useCallback,
+  useMemo,
+  Fragment,
+  isValidElement,
+  ReactNode,
+  FC,
+  ReactElement,
+  Children,
+} from 'react'
+import { useLatestRef } from '@aptre/bldr-react'
+
+/**
+ * Type definition for the Router context.
+ */
+export interface RouterContextType {
+  /** The current path */
+  path: string
+  /** The current route parameters */
+  params: Record<string, string>
+  /** Function to navigate to a new path */
+  navigate: (to: To) => void
+  /** Array of parent paths in the routing hierarchy */
+  parentPaths: string[]
+  /**
+   * Raw (percent-encoded) remainder matched by the enclosing wildcard route.
+   * Nested Routes match against it so params are decoded exactly once.
+   */
+  wildcardPath?: string
+}
+
+/**
+ * Create the Router context.
+ */
+export const RouterContext = createContext<RouterContextType | null>(null)
+
+/**
+ * Resolves a relative path to an absolute path based on the current path.
+ *
+ * @param current - The current absolute path.
+ * @param to - The path to resolve, which can be absolute or relative.
+ * @returns The resolved absolute path.
+ */
+/**
+ * Type definition for navigation destination
+ */
+export interface To {
+  /** The path to navigate to */
+  path: string
+  /** Whether to replace the current history entry */
+  replace?: boolean
+  /** Named hash parameters retained independently of route matching */
+  params?: Record<string, string>
+}
+/**
+ * Resolves a relative path to an absolute path based on the current path.
+ */
+export const resolvePath = (current: string, to: To): string => {
+  const toPath = to.path
+
+  // Handle empty paths
+  const { pathParts: currSegments } = splitPath(current)
+  if (!toPath) {
+    return cleanPath(joinPath([...currSegments], true))
+  }
+
+  const { pathParts: toSegments, isAbsolute: toAbsolute } = splitPath(toPath)
+  if (toAbsolute) {
+    return cleanPath(joinPath([...toSegments], true))
+  }
+
+  return cleanPath(joinPath([...currSegments, ...toSegments], true))
+}
+
+function decodeRoutePart(part: string): string {
+  try {
+    return decodeURIComponent(part)
+  } catch {
+    return part
+  }
+}
+
+/**
+ * Matches a route pattern against a path and extracts parameters.
+ *
+ * @param pattern - The route pattern, which may include parameters starting with ':' and wildcard '*'.
+ * @param path - The current path to match against.
+ * @returns The extracted parameters if the pattern matches, or null if it doesn't.
+ */
+const matchRoute = (
+  pattern: string,
+  path: string,
+): { params: Record<string, string>; wildcardPath?: string } | null => {
+  const trimSlashes = (p: string) => p.replace(/^\/+|\/+$/g, '')
+  const parts = trimSlashes(pattern).split('/')
+  const pathParts = trimSlashes(path).split('/')
+
+  const params: Record<string, string> = {}
+
+  let i = 0
+  for (; i < parts.length; i++) {
+    const patternPart = parts[i]
+    const pathPart = pathParts[i]
+
+    if (patternPart === '*') {
+      // Wildcard matches the rest of the path.
+      const wildcardPath = pathParts.slice(i).join('/')
+      params['*'] = decodeRoutePart(wildcardPath)
+      return { params, wildcardPath }
+    }
+
+    if (pathPart === undefined) {
+      // The path is shorter than the pattern.
+      return null
+    }
+
+    if (patternPart.startsWith(':')) {
+      // Parameter segment; extract the value.
+      params[patternPart.slice(1)] = decodeRoutePart(pathPart)
+    } else if (patternPart !== pathPart) {
+      // Static segments do not match.
+      return null
+    }
+  }
+
+  if (i < pathParts.length) {
+    // The path has extra segments not accounted for in the pattern.
+    return null
+  }
+
+  return { params }
+}
+
+/**
+ * RouterProvider component that provides the routing context to its children.
+ *
+ * @param children - The child components.
+ * @param path - The current path.
+ * @param onNavigate - Callback function when navigation occurs.
+ */
+export const RouterProvider: FC<{
+  children: ReactNode
+  path: string
+  onNavigate: (to: To) => void
+}> = ({ children, path, onNavigate }) => {
+  const onNavigateRef = useLatestRef(onNavigate)
+
+  const navigate = useCallback(
+    (to: To) => {
+      onNavigateRef.current(to)
+    },
+    [onNavigateRef],
+  )
+
+  const value = useMemo<RouterContextType>(
+    () => ({
+      path,
+      params: {},
+      navigate,
+      parentPaths: [],
+    }),
+    [path, navigate],
+  )
+
+  return (
+    <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
+  )
+}
+
+/**
+ * Router component that initializes the router context.
+ * This is a convenience wrapper around RouterProvider.
+ */
+export const Router: FC<{
+  children: ReactNode
+  path: string
+  onNavigate: (to: To) => void
+}> = ({ children, path, onNavigate }) => {
+  return (
+    <RouterProvider path={path} onNavigate={onNavigate}>
+      {children}
+    </RouterProvider>
+  )
+}
+
+/**
+ * Type definition for Route properties.
+ */
+interface RouteProps {
+  /** The path pattern for this route */
+  path: string
+  /** The children to render when this route matches */
+  children: ReactNode
+}
+
+// collectRoutes recursively flattens children into Route elements.
+// Handles Fragments and wrapper elements whose props.children contain Routes.
+function collectRoutes(children: ReactNode): ReactElement<RouteProps>[] {
+  const result: ReactElement<RouteProps>[] = []
+  for (const child of Children.toArray(children)) {
+    if (!isValidElement(child)) continue
+    if ((child.props as RouteProps).path !== undefined) {
+      result.push(child as ReactElement<RouteProps>)
+    } else if (
+      child.type === Fragment ||
+      (child.props as { children?: ReactNode }).children
+    ) {
+      result.push(
+        ...collectRoutes((child.props as { children?: ReactNode }).children),
+      )
+    }
+  }
+  return result
+}
+
+/**
+ * Routes component that renders the first child Route that matches the current path.
+ *
+ * @param children - An array of Route components.
+ */
+export const Routes: FC<{
+  children: ReactNode
+  path?: string
+  fullPath?: boolean
+}> = ({ children, path: pathProp, fullPath }) => {
+  const router = useRouter()
+  const effectivePath = fullPath
+    ? (pathProp ?? router.path)
+    : (router.wildcardPath ?? pathProp ?? router.path)
+
+  const childElements = collectRoutes(children)
+  for (const child of childElements) {
+    const { path: routePattern, children } = child.props
+    const match = matchRoute(routePattern, effectivePath)
+    if (match) {
+      const { params, wildcardPath } = match
+      // Calculate the current path segment by removing the raw wildcard
+      // portion, which has the same encoding as effectivePath.
+      const currentPath = wildcardPath
+        ? effectivePath.slice(0, -wildcardPath.length - 1) // -1 for the trailing slash
+        : effectivePath
+
+      return (
+        <RouteScope
+          router={router}
+          params={params}
+          wildcardPath={wildcardPath}
+          parentPath={routePattern.endsWith('*') ? currentPath : undefined}
+        >
+          {children}
+        </RouteScope>
+      )
+    }
+  }
+
+  return null // No route matched; render nothing or a 'Not Found' component.
+}
+
+// RouteScope provides the router context of one matched route to its children.
+function RouteScope({
+  router,
+  params,
+  wildcardPath,
+  parentPath,
+  children,
+}: {
+  router: RouterContextType
+  params: RouterContextType['params']
+  wildcardPath: RouterContextType['wildcardPath']
+  parentPath?: string
+  children: ReactNode
+}) {
+  const value = useMemo(
+    () => ({
+      ...router,
+      params,
+      wildcardPath,
+      parentPaths:
+        parentPath === undefined
+          ? router.parentPaths
+          : [...router.parentPaths, parentPath],
+    }),
+    [router, params, wildcardPath, parentPath],
+  )
+
+  return (
+    <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
+  )
+}
+
+/**
+ * Route component that defines a route pattern and the children to render.
+ * This component is not rendered directly.
+ *
+ * @param path - The route pattern.
+ * @param children - The children to render when the route matches.
+ */
+export const Route: FC<RouteProps> = () => {
+  // This component does not render anything itself.
+  return null
+}
+
+/**
+ * Hook to access the routing context.
+ *
+ * @returns The RouterContextType object containing path, params, and navigate.
+ */
+export const useRouter = (): RouterContextType => {
+  const context = use(RouterContext)
+  if (!context) {
+    throw new Error('useRouter must be used within a RouterProvider')
+  }
+  return context
+}
+
+/**
+ * Hook to access the route parameters.
+ *
+ * @returns An object containing the route parameters.
+ */
+export const useParams = (): Record<string, string> => {
+  return useRouter().params
+}
+
+/**
+ * Hook to access the current path.
+ *
+ * @returns The current path as a string.
+ */
+export const usePath = (): string => {
+  return useRouter().path
+}
+
+/**
+ * Hook to navigate to a new path.
+ *
+ * @returns A function that accepts a path to navigate to.
+ */
+export const useNavigate = (): ((to: To) => void) => {
+  return useRouter().navigate
+}
+
+/**
+ * Hook to access the parent paths.
+ *
+ * @returns Array of parent paths in the routing hierarchy.
+ */
+export const useParentPaths = (): string[] => {
+  return useRouter().parentPaths
+}

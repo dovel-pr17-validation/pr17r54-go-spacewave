@@ -1,0 +1,50 @@
+package kvtx_prefixer
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/kvtx"
+)
+
+// Prefixer prefixes a kvtx store.
+type Prefixer struct {
+	base   kvtx.Store
+	prefix []byte
+}
+
+// NewPrefixer constructs a new object store prefixer.
+func NewPrefixer(base kvtx.Store, prefix []byte) kvtx.Store {
+	return &Prefixer{prefix: prefix, base: base}
+}
+
+// NewTransaction returns a new transaction against the store.
+// Indicate write if the transaction will not be read-only.
+// Always call Discard() after you are done with the transaction.
+func (p *Prefixer) NewTransaction(ctx context.Context, write bool) (kvtx.Tx, error) {
+	// Open the base transaction before applying the key prefix.
+	btx, err := p.base.NewTransaction(ctx, write)
+	if err != nil {
+		return nil, err
+	}
+
+	// Preserve write batching when wrapping a writable base transaction.
+	tx := newTx(btx, p.prefix)
+	if batch, ok := btx.(kvtx.WriteBatchTxOps); write && ok {
+		return &writeBatchTx{tx: tx, batch: batch}, nil
+	}
+
+	return tx, nil
+}
+
+// RefreshForCoordinationLock forwards coordination-boundary refreshes to the
+// underlying store when supported.
+func (p *Prefixer) RefreshForCoordinationLock() error {
+	refreshable, ok := p.base.(kvtx.CoordinationRefreshStore)
+	if !ok {
+		return nil
+	}
+	return refreshable.RefreshForCoordinationLock()
+}
+
+// _ is a type assertion
+var _ kvtx.Store = (*Prefixer)(nil)

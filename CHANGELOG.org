@@ -1,0 +1,1749 @@
+#+TITLE: Spacewave Changelog
+
+* v0.57.29
+<2026-10-26 Mon>
+
+Spacewave 0.57.29 moves desktop and command-line storage to a new format that
+makes cleanup much cheaper on large Spaces. It also adds Plugins from other
+Spaces, shows which devices a Space syncs with, and draws proper windows for
+Linux apps in virtual machines. Readers of a Space can no longer leave it blank,
+and departed members can no longer read stored data.
+
+** Features
+- Desktop and command-line Volumes move to a new storage format (format 4) the
+  first time 0.57.29 opens them. The conversion runs once, in place, and can
+  take a while on a large Volume, so let the first launch finish. Browser
+  storage is not affected.
+- Settings > Plugins can now add a plugin that is stored in another one of your
+  Spaces. The Plugins panel lists your other Spaces and the plugins they hold
+  that this Space has not installed. Adding one copies the newest build into
+  this Space.
+- A plugin can now be added to your account so it loads in every Space you open.
+  Account plugins appear in each Space's plugin list with an Account label
+  instead of a remove button.
+- Space settings now list each device your Space syncs with. Each row shows
+  whether its sync stream is connected, since when, and the error that ended its
+  last stream.
+- The Computers dashboard now shows a summary strip (devices, SSH hosts, online)
+  and a table of name, kind, platform, state and capability count.
+- Linux apps in a virtual machine now open in tabs of their own. The VM draws a
+  title bar and frame for apps that leave them out, and windows move when you
+  press and drag a title bar. The display follows the viewer's pixel ratio. The
+  VM header is more compact and shows the image download.
+- Files in a Drive open in their own tab at the file's path.
+- The command line can join a Space through its owner's address. `spacewave
+  space join` takes the new `--owner-addr` flag (host:port over UDP), so a
+  command-line session can join an owner on a private network without a browser.
+- Command-line commands now report pending uploads for every Space placement.
+- The Prometheus metrics plugin can scrape metrics targets on a desktop Device
+  and answer PromQL queries, with new Dashboard and Scrape target viewers. Its
+  metrics viewer is for the desktop app only.
+
+** Fixes
+- Fixed a blank Space for readers. A member who can only read a Space no longer
+  opens a write that other members reject, which made the Space plugin exit.
+- Fixed the loading flash when you open a second tab on a Session or Space that
+  another tab already has open. The new tab now shows its content on the first
+  render.
+- Fixed stale views after switching a desktop web app between ports. The app now
+  clears the old service worker and reloads once, so plugin assets no longer
+  fail with a 503 error.
+- Fixed a Wizard that stayed visible while Create was removing it. The Wizard
+  now shows a deleted state when its object is gone.
+- Fixed the setup banner showing when the app could not read onboarding state.
+  The banner is now hidden.
+- Fixed the connection view for a local session. It now names the peers as the
+  remote of a transfer, and the session health view shows current health first.
+- Fixed a Space that stopped syncing when a peer's connection ended or a
+  connection attempt failed. The app offers the sync protocol again to a peer
+  whose session ended, retries a block request on the replacement session, and
+  retries a connection that could not be set up.
+- Fixed a long wait on startup of an installed plugin, and a stuck plugin run.
+  Plugin executions that never answer now fail instead of waiting forever, and
+  an identical installed plugin is kept rather than replaced.
+- Fixed the tab rename field losing focus after its menu closed.
+- Fixed SQL statements that ignored the handle's default database.
+
+** Improvements
+- Storage cleanup in a Volume is much cheaper on large Spaces. Cleanup now reads
+  each block's list of child blocks, one per block, in short reads. A write that
+  arrives during cleanup no longer waits for a long scan, and a busy Volume no
+  longer holds back freed disk space for a long time.
+- Desktop storage files stay smaller and quieter. A background pass now compacts
+  free space, and small commits no longer wait for a slow background checkpoint.
+- Views and live queries wake only for the changes they watch, so busy Spaces
+  use less CPU.
+- Reads from large Spaces are faster. Read-only SQL queries reuse decoded data,
+  number-range queries use indexes, and large column values are read without
+  extra copies.
+- The app opens faster from an app route. It now loads only the startup view
+  that the address needs, rather than the public site with its license list.
+- Opening a window tab on an open Session no longer mounts the Session and Space
+  a second time.
+- Compressed (gzip) blocks decode faster in builds that include the fast
+  decoder.
+- Connections between devices use full-size packets and are more reliable.
+  Stalled connections, a Write blocked on a closed connection, and simultaneous
+  opens between two devices are fixed.
+- The command line daemon starts with a soft memory limit by default, and
+  `spacewave debug volume-usage` shows the free-space layout of a desktop
+  Volume.
+
+** Security
+- A device that has left a Space can no longer read blocks it stored. Both local
+  and Spacewave Cloud providers now check the requester's current role before
+  serving each block, and stop a transfer already in progress once access is
+  lost.
+- A Space now ignores incoming grants for removed readers and grants its current
+  configuration does not authorize.
+- A Space's World now refuses write operations from a member who is not allowed
+  to write.
+
+* v0.57.28
+<2026-10-14 Wed>
+
+Spacewave 0.57.28 brings a self-installing Windows download, plugins from
+GitHub, Flowgraphs that run on your Devices, and x86 virtual machines in the
+app, and makes large Spaces much cheaper to keep open.
+
+** Features
+- Windows downloads are now one signed program,
+  `spacewave-windows-<arch>.exe`. Its first run installs Spacewave for the current user, adds the Start menu
+  shortcut and the Settings > Apps entry, and opens the desktop. Uninstalling
+  from Settings > Apps asks whether to delete the local Spaces. The MSIX and
+  zip downloads are gone.
+- Settings > Plugins adds a plugin from a GitHub repository. Spacewave fetches
+  the repository into the account's developer Space, shows the commit for
+  review, and builds only that reviewed commit. Check for updates shows a newer
+  commit when one exists.
+- Flowgraphs are a new Space object. A Device runs the Flowgraph nodes placed
+  on it, limited to the node types its policy allows, and the command line can
+  author Flowgraphs, run them and manage a Device's allowed node types.
+- The app can create and run x86 virtual machines. The wizard boots the
+  published Aperture Linux image, reading its disk lazily from the release
+  CDN, and the viewer shows the VM screen and console. =spacewave vm stop
+  --wait= waits until a VM has stopped.
+- The main work views are usable by touch on a phone, with a compact bottom
+  bar.
+- Platform invites open at `/invite/<code>`.
+- Every sign-up, by Google, GitHub or passkey, asks the new account to agree
+  to the Terms of Service and Privacy Policy.
+- Chat messages carry their author, each author keeps its own read position,
+  and renaming a channel retitles its tab.
+- Tabs are named after the stored name of the object they show.
+- Desktop and command-line volumes convert once to a new block key layout the
+  first time this release opens them. `spacewave debug volume-copy` instead
+  copies a stopped volume into a new file at the current format, which is
+  faster for a large volume.
+
+** Improvements
+- Views, live queries and Devices rerun only when a change touches what they
+  read, instead of on every change to the Space. Busy Spaces use far less CPU.
+- After a reconnect, the app fetches again only the shared object metadata
+  that changed.
+- Large Spaces open faster: the gallery reads a server-side image index, the
+  object tree and Git file lists render only the visible rows, and the Space
+  filesystem lists a directory without scanning its siblings.
+- Desktop storage keeps up to 1 GiB of its index in memory per volume, keeping
+  the index's inner pages ahead of its leaves, so reads of a large volume touch
+  the disk less.
+- Storage cleanup and block reads do less work: the reference graph is stored
+  as compact edge records, and packs lay blocks out in the order readers fetch
+  them.
+- JavaScript plugins start faster, since the compiled QuickJS module is kept
+  on disk.
+
+** Fixes
+- Two owners changing a Space's configuration at the same time no longer
+  conflict; the changes merge.
+- When a Space's checkpointer stalls, the next owner takes over.
+- Removing a peer revokes the invites addressed to it, and the named peer of a
+  targeted invite can redeem it again.
+- Devices start a connection as soon as the other side is present, and end a
+  session whose data channel was lost, so they reconnect sooner.
+- Org notes with wrapped links or large documents parse correctly, and a note
+  is written only after an edit, leaving untouched blocks as they were.
+- Git submodules can clone `spacewave://` remotes.
+- On Windows, the first run starts the background service.
+
+* v0.57.27
+<2026-10-07 Wed>
+
+Spacewave 0.57.27 moves all local storage to a new single-file database on
+desktop and to a new storage format in the browser, fixes lost file data in
+shared Spaces, and makes devices reconnect more reliably.
+
+** Features
+- The browser keeps its local data in a new storage format, on OPFS or, where
+  that is unavailable, IndexedDB. Data a browser saved before this release is
+  not opened, so the browser starts with empty local storage. Spaces held in
+  Spacewave Cloud or on another device download again; data that existed only
+  in that browser is not carried over.
+- Desktop and command-line storage now uses s4db, a new database that keeps
+  each volume in one file. Several Spacewave processes can share a volume
+  safely, and readers never wait on a writer.
+- Existing desktop and command-line volumes convert to s4db in place the first
+  time this release opens them. The conversion keeps the volume's identity and
+  data, checks that every key and value matches, and needs free disk space equal
+  to the volume. A crash during conversion leaves the old file, which converts
+  on the next start.
+- The Badger storage engine and the `--badger-db` option are removed.
+- The command line can repair lost Space data on a stopped device:
+  `spacewave debug payload-restore` rebuilds a lost file payload from its
+  source, and `spacewave debug ref-repair` restores the block links that
+  storage cleanup relies on.
+- Forge now names the plugin a waiting Execution needs.
+- A Git remote URL can name its session, as in
+  `spacewave:///u/2/so/<space>/-/<object-key>`, so a remote on a session other
+  than the first needs no `--session-index`.
+
+** Fixes
+- Files written into a shared Space could lose their content on other
+  devices: storage cleanup removed data that replaying the Space still needed,
+  and replay stopped with "block not found". That data is now kept as long as
+  replay reads it.
+- Two devices could stay disconnected after one of them restarted, until one
+  restarted again. A lost connection offer is now sent again until it is
+  answered, and a device follows the signaling service across reconnects.
+- A device linked to a Space from the command line was not offered as a Forge
+  worker, because its setup never finished. It now reaches the ready state.
+- A returning browser visit after a release no longer starts Spacewave twice,
+  and a single failed network request no longer makes it fall back to the
+  cached release.
+- A browser out of storage now shows "Storage full" in the sync status, with
+  the number of Spaces it cannot store. Before, the copy of a newly linked
+  account retried silently and looked as if it was still copying.
+- A second browser tab could fail to load, because the first page looked
+  closed to the ServiceWorker. A page now registers with the ServiceWorker
+  only after it can show that it is open.
+- The command line now logs a warning when the connection to Spacewave Cloud
+  stops retrying, since cloud updates then stop until a restart.
+- A plugin that fails at start now waits longer between restarts, up to five
+  minutes, instead of restarting about once a minute forever.
+- Plugins running in the QuickJS host can use `crypto.getRandomValues`, and
+  have a larger stack.
+- `git push --force-with-lease` to a Spacewave Git remote now works. Before,
+  the remote refused the push.
+
+** Improvements
+- Saving a change to a Space takes one storage commit instead of five, and
+  checking a Space's history verifies only new changes.
+- A device catching up on a Space resumes where its last pass stopped instead
+  of replaying the Space's history each time.
+- The browser caches each plugin's files, so a returning visit no longer
+  downloads them again.
+- The billing page groups subscription management under Plan and lays out
+  extra storage spending more clearly.
+- Buttons and form fields across the app have accessible labels and native
+  semantics, and external links open without access to the app's window.
+- A long replay logs its progress every 30 seconds.
+- Saving a change to a large Space writes only the history added since the
+  last save, instead of rewriting a record of all of it each time.
+- s4db reads its index in key order and caches about 40% more of it in the
+  same memory, and rebuilding a large volume no longer takes time and memory
+  that grow with the square of its history.
+- Storage cleanup checks only removed links before it records a change, which
+  halves the index reads of copying a Space to a new device.
+
+* v0.57.26
+<2026-10-05 Mon>
+
+Spacewave 0.57.26 makes Spaces more reliable when a device is missing data, adds
+a way to open one Space in a local browser window, and speeds up saving changes.
+
+** Features
+- The command line can now open a single Space in a browser. `spacewave web
+  --space <id|name>` serves that Space from your device as a read-only view,
+  with no download of the browser runtime. The view reconnects after the
+  Spacewave daemon restarts.
+- `spacewave space trim` now shows how far a Space's history can be trimmed on
+  this device. It reports the checkpoint, the changes waiting above it, and
+  whether this device still needs to acknowledge.
+- Space owners can now remove writers that have stopped syncing from the
+  trimming group with `spacewave space roster`, so the Space can trim history
+  those writers have not caught up on. A removed writer returns once it catches
+  up.
+
+** Fixes
+- A Space that is missing a file or data block now stays open instead of
+  repeatedly restarting. It shows everything before the missing change, and it
+  resumes from that change once the data arrives.
+- A device that was catching up on a Space could fail to acknowledge changes,
+  which stopped the Space from trimming its history. Acknowledgment now
+  continues while the device catches up.
+- New devices joining a Space could stop partway with a "block not found" error.
+  This happened after a file was appended and its content was cleaned up too
+  early. The content is now kept until every device has read it.
+- A device copying an account's data no longer retries over and over when no
+  connected device has the data it needs. It waits until another device connects
+  or the Space changes.
+- A device that was refused a connection, or had its link revoked, now sees the
+  reason the connection closed. Before, it saw only "stream reset".
+- Errors about missing Space data now name the file or change involved, which
+  makes lost data easier to track down.
+- Command-line options such as `--remote-daemon` can now be placed before the
+  command, as in `spacewave --remote-daemon <peer>@<addr> space list`. A usage
+  error now prints to the error output only.
+
+** Improvements
+- Saving changes to a Space is faster. Committing a change now takes three
+  storage writes instead of seven, and storage cleanup runs in larger batches.
+- Catching up on a Space is faster and uses less storage activity, because each
+  pass now saves its changes together instead of after every change.
+- Opening a Space from the command line and reconnecting after a restart no
+  longer requires the browser runtime.
+
+** Security
+- When a device's access changes, links already open to it are now rechecked,
+  and links from devices that are no longer allowed are closed, including open
+  remote shells.
+- The read-only Space view in the browser allows only read requests. Each
+  request is checked against the bound Space and Session.
+
+* v0.57.25
+<2026-10-04 Sun>
+
+Spacewave 0.57.25 adds command-line tools for linking devices of the same
+account, fixes sign-in after logging out, and makes release updates and shared
+local storage more reliable.
+
+** Features
+- The command line can now link another device to a Session. `spacewave session
+  pair` issues a pairing code, shows the `login pair` command to run on the
+  other device, and approves the device after the emoji check. Add `--yes` to
+  approve without the prompt when scripting.
+- A Spacewave daemon can now be reached directly from another Session of the
+  same account. Run `spacewave serve --udp-listen host:port` on one device, then
+  pass `--remote-daemon <peer-id>@<host:port>` to any command on another device.
+  The Session key never leaves the device that holds it.
+
+** Fixes
+- Logging out and then signing back in to the same account now works. Before,
+  the old Session could stay active and block the new sign-in.
+- `session pair` now prints the ID of the Session that was actually linked, and
+  `session revoke` accepts that ID. Before, it printed a temporary pairing ID,
+  and revoking that ID reported success while leaving the linked Session in
+  place.
+- `session revoke` now works for local accounts, which have no password or
+  passkey, and refuses IDs that are not a Session or paired device of the
+  account.
+- A command run against the device's own Session now fails immediately instead
+  of hanging.
+- Long-running copies of Spacewave now keep following published updates. Before,
+  content changed by a release could fail to load until you restarted the app.
+
+** Improvements
+- When several Spacewave processes share the same local storage, a process
+  waiting for its turn to write now resumes as soon as the other process
+  finishes, without a fixed delay between checks.
+
+** Security
+- Remote shell access now requires the connecting device to be signed in to the
+  same account. Devices from other accounts that happen to share a Space are
+  refused.
+- Direct device-to-device connections between Sessions are admitted only for
+  active, unrevoked Sessions of the same account.
+
+* v0.57.24
+<2026-10-04 Sun>
+
+Spacewave 0.57.24 frees cloud storage held by deleted data and fixes Git pushes
+that could wait forever.
+
+** Improvements
+- Cloud Spaces now free the storage of data that is no longer referenced. A
+  device holding a complete copy of a Space marks unused storage for removal,
+  and the storage is removed a day later, after any data still in use is
+  copied out.
+- Released versions of Spacewave now free the storage of replaced files after
+  each publish.
+
+** Fixes
+- Git pushes to a Space and Git LFS uploads now wait only for that Space's
+  uploads, so a push no longer hangs while another Space is syncing.
+- Quitting the desktop app after reopening its window now exits cleanly.
+- Plugin tasks interrupted by a plugin reload now resume instead of failing,
+  and tasks left behind by a restart now finish or cancel.
+- Signing up for email updates on the blog now sends one request.
+
+* v0.57.23
+<2026-10-04 Sun>
+
+Spacewave 0.57.23 adds Space controls for edit syncing, group decisions, and
+offline storage, while improving sign-in, invites, file storage, and
+reconnection reliability.
+
+** Features
+- Space settings now let you choose whether edits merge or follow one order,
+  including selecting or replacing the main device.
+- Space owners can hand control to the group, where membership and settings
+  changes require agreement from more than two thirds of members.
+- Each device can download items on demand or keep the whole Space available
+  offline. The same choice is available when joining a Space.
+- New command-line tools create and accept invites, list and remove Space
+  members, and manage whole-Space downloads.
+
+** Fixes
+- Repeat browser sign-ins now reconnect the account’s existing Session
+  correctly.
+- Invites can now be accepted after an account change.
+- Spaces now catch up on changes made while they were closed, and Space lists
+  refresh when access changes.
+- File uploads no longer hang, file renames resolve their destination correctly,
+  and file watches recover after a released lookup.
+- Peer connections now recover when the remote device restarts.
+- Git Spaces now reuse retained local repository data, and Git LFS reports
+  startup failures instead of silently failing.
+
+** Improvements
+- Sign-in handoffs now finish on one confirmation screen with a direct option to
+  continue in the browser.
+- Space settings show who controls the Space, changes waiting for group
+  agreement, and edits waiting to be ordered.
+- Command-line Session lists now show usernames, and Space commands can resolve
+  Spaces by name.
+
+** Security
+- Command-line account changes can now be authorized with a passkey.
+- Removing Space members rotates access so removed members cannot read future
+  changes.
+
+* v0.57.22
+<2026-10-01 Thu>
+
+Spacewave 0.57.22 keeps signup handoffs available through interruptions, reduces
+Drive upload memory use, and lets Spaces continue when an owner leaves.
+
+** Features
+- Spaces now transfer ownership to a remaining member when their owner leaves.
+
+** Fixes
+- Signup handoff pages now show when a signup session has ended or been
+  canceled, and command-line signup reconnects after a dropped connection.
+- Signup sessions now stay open while you finish signing up.
+- Drive uploads no longer cause the browser tab’s memory use to grow with each
+  uploaded file.
+
+* v0.57.21
+<2026-10-01 Thu>
+
+Spacewave 0.57.21 restores key browser connections and improves plugin startup,
+local storage reliability, and sign-in handoff clarity.
+
+** Fixes
+- Browser builds now connect cloud requests to the correct Spacewave origin,
+  restoring passkey signup handoff, live session and checkout updates, and reads
+  of Space data stored in the cloud.
+- Spaces with many local stores no longer stall or fail to open after exhausting
+  system file watchers.
+- Plugins now start promptly even while a Space is receiving sustained updates.
+
+** Improvements
+- Local Space storage now returns freed database space to disk as data is
+  deleted instead of retaining its peak size.
+- Sign-in handoff screens show the account and device in compact labels that
+  keep long names readable.
+
+* v0.57.20
+<2026-10-01 Thu>
+
+Spacewave 0.57.20 restores browser startup for existing storage, adds controls
+for background plugins, and improves large-Space and file-storage reliability.
+
+** Features
+- Spacewave now asks permission before allowing a plugin to keep running after
+  its Space closes, with Suspend and Resume controls in the bottom bar.
+- Successful Space plugin builds are now installed automatically.
+
+** Fixes
+- Browsers holding storage from an earlier format can start Spacewave again.
+  Existing storage is preserved beside a fresh storage volume.
+- Saved multi-pane layouts no longer revert when overlapping updates finish out
+  of order.
+- File synchronization now completes more reliably during large writes and cloud
+  storage maintenance.
+
+** Improvements
+- Large Spaces now load and browse objects in bounded groups instead of loading
+  every object at once, improving responsiveness as Spaces grow.
+- File storage handles many small writes more efficiently, improving upload and
+  synchronization performance.
+- Exported Space recovery snapshots remain available while unused storage is
+  reclaimed.
+
+* v0.57.19
+<2026-09-29 Tue>
+
+Spacewave 0.57.19 improves desktop updates, update discovery, and Space
+dashboard usability.
+
+** Fixes
+- Desktop updates no longer offer the version already running, and the macOS app
+  now reopens reliably after an update.
+- Space lists now scroll within the dashboard, with compact rows and correctly
+  aligned copy buttons.
+
+** Improvements
+- Linked devices can now pass along Spacewave release information, helping
+  updates appear sooner and reach devices with limited connectivity.
+- Floating windows now rise when focused by keyboard or pointer and provide
+  clearer labels for assistive technologies.
+- Building a Space plugin now queues a job on the selected device, for that
+  device's platform by default, and the build dialog follows its progress.
+- Shared Spaces now reclaim cloud storage held by deleted data, and deleting
+  from a versioned S3-compatible bucket no longer leaves hidden copies behind.
+
+* v0.57.18
+<2026-09-29 Tue>
+
+Spacewave 0.57.18 restores reliable macOS startup and desktop updates, enables
+Space-deployed plugins in desktop and browser apps, and adds directory
+synchronization and snapshot recovery tools.
+
+** Features
+- Space-deployed plugins now run in the desktop and browser apps.
+- New command-line tools synchronize directories between local storage and
+  Spacewave file storage and restore snapshots directly from S3-compatible
+  storage.
+
+** Fixes
+- Installed macOS apps now start reliably after a cold launch.
+- Desktop updates now restart from the updated app, reopen the desktop
+  automatically, and no longer wait for the desktop that initiated the update.
+
+** Improvements
+- Desktop updates now show when other clients or services are delaying a restart
+  and offer a Restart now action.
+
+* v0.57.17
+<2026-09-28 Mon>
+
+Spacewave 0.57.17 improves desktop updates, sign-in and session selection, app
+startup, Forge Workers, and file storage reliability.
+
+** Fixes
+- Desktop updates now replace the installed Spacewave app that opened the
+  desktop, ensuring the updated version launches correctly.
+- Older Spacewave installations can fall back to compatible app components,
+  allowing them to start and receive updates instead of becoming stuck in a
+  restart loop.
+- App views and assets now load reliably after startup, and the desktop no
+  longer reports components as ready before they are available.
+- Approved Forge Workers remain available after their Space is reopened.
+- File storage no longer writes incomplete compressed data that can fail to
+  reopen.
+
+** Improvements
+- The session picker now keeps each storage location and its accounts together,
+  uses readable account names, and shows Spaces as compact links.
+- Added Spacewave storage locations now appear immediately even when they do not
+  contain a local session.
+- Narrow desktop windows retain compact mouse controls, while phones and tablets
+  continue to use larger touch targets.
+
+* v0.57.16
+<2026-09-28 Mon>
+
+Spacewave 0.57.16 fixes macOS desktop updates and makes device setup and peer
+reconnections more reliable.
+
+** Fixes
+- macOS desktop updates now receive and install the signed Spacewave app
+  correctly.
+- Adding a device now retries concurrent Space changes automatically instead of
+  requiring device setup to be completed a second time.
+- Device setup and other peer connections no longer stall when a connection
+  reopens while a message is still being delivered.
+
+* v0.57.15
+<2026-09-28 Mon>
+
+Spacewave 0.57.15 improves browser and desktop updates, shares saved Sessions
+between command-line tools and the desktop app, and adds Docker support for
+Forge Workers.
+
+** Features
+- Forge Workers can now run Docker targets on eligible devices.
+
+** Fixes
+- Browser and desktop updates now load plugins from the current Spacewave
+  release, preventing blank logos, connection failures, and startup errors
+  caused by stale cached plugins.
+- Command-line tools and the desktop app now use the same saved Session and
+  Spaces.
+- Plugin restarts no longer remove newly started replacements, keeping affected
+  views available during recovery.
+
+* v0.57.14
+<2026-09-27 Sun>
+
+Spacewave 0.57.14 lets the desktop app and command-line tools share one local
+session, improves phone and tablet usability, and makes chat, synchronization,
+Git Spaces, plugins, and desktop startup more reliable.
+
+** Features
+- Opening the desktop app now connects to the same local session and Spaces
+  already used by command-line tools instead of starting a separate copy.
+- The desktop can open, close, and reopen on demand without interrupting work
+  that is still using the shared session.
+
+** Fixes
+- Fresh desktop installations now start reliably instead of occasionally
+  selecting an incompatible app component and remaining unavailable.
+- Quitting the desktop app now closes its processes cleanly. An unused
+  background session stops immediately, while work still used by another client
+  continues running.
+- Messages sent concurrently from different sessions are preserved in their
+  accepted order instead of one message being lost.
+- Plugin changes no longer restart unrelated active plugins or mounted Spaces,
+  and replaced plugins no longer leave stale routes behind.
+- Browser-created virtual machines now load correctly, with default images
+  copying in seconds instead of minutes.
+- File storage operations using reverse-order browsing now work correctly in
+  Safari and other WebKit browsers.
+
+** Improvements
+- Phone and tablet controls are larger and remain reachable across sign-in,
+  session home, Drive, chat, notebooks, Forge, Space settings, and the app menu.
+- Drive keeps upload and file actions accessible on narrow screens, with
+  touch-friendly rows, breadcrumbs, sorting, search, and text editing.
+- Git Spaces use less memory and open large repositories with many packfiles
+  more efficiently.
+- Synchronization handles sustained upload activity with bounded memory use and
+  applies file-storage updates incrementally.
+- Forge executions now show when they are waiting for a plugin to load.
+- Peer-to-peer messages continue flowing while connection subscriptions are
+  being updated, reducing avoidable delays.
+
+** Security
+- Chat messages, channel creators, and read receipts are now attributed to
+  verified participants, preventing collaborators from claiming another
+  participant’s identity.
+
+* v0.57.13
+<2026-09-27 Sun>
+
+Spacewave 0.57.13 improves sign-in, session recovery, collaboration,
+synchronization, and file storage reliability, with additional safeguards for
+invites, links, and malformed data.
+
+** Fixes
+- Browser sign-in popups open reliably instead of being reported as blocked.
+- Reloading a PIN-locked session now shows the unlock screen instead of
+  remaining on a loading view.
+- Remote changes no longer revert to an older pending value after a local
+  setting has finished saving.
+- Routes containing encoded characters open correctly throughout nested app
+  views.
+- Copying or merging Spaces now resumes only from the matching transfer,
+  preventing stale progress from skipping data.
+- Moving a Space between storage locations now verifies that its files are
+  available before releasing the previous copy.
+- Spacewave Cloud synchronization reconnects after stalled connections and no
+  longer applies outdated results over newer changes.
+- Spaces remain valid and continue synchronizing after participants leave or are
+  removed.
+- Peer connections recover more reliably from signaling, WebSocket, and
+  transport failures.
+- Large stored files and plugin data remain readable when concurrent activity
+  puts pressure on the storage cache.
+- The command-line stop command now reaches daemons using a configured custom
+  socket.
+
+** Improvements
+- Failed app resources retry more narrowly, reducing unnecessary reloads of
+  working views.
+- File storage handles interrupted writes, truncation, iteration, and cleanup
+  more safely.
+- Leaving, exporting, or repeatedly updating a Space releases storage resources
+  more consistently during long sessions.
+
+** Security
+- Limited-use invites now enforce their usage limit when several people accept
+  at the same time.
+- Public-page links reject disguised unsafe URL schemes containing tabs or line
+  breaks.
+- Malformed identity keys, encrypted connection messages, and password settings
+  are rejected safely instead of causing crashes or excessive resource use.
+
+* v0.57.12
+<2026-09-26 Sat>
+
+Spacewave 0.57.12 improves Drive storage efficiency, Space recovery, plugin
+loading, and large-Space performance while strengthening network and web asset
+safeguards.
+
+** Fixes
+- Rejoining a Space through a new invite now clears stale access errors
+  immediately.
+- Native Spaces now load required app plugins reliably.
+- Devices connect to each other again through Spacewave Cloud, which now
+  relays each connection message on its own.
+- File changes are saved in a durable order, reducing the risk of incomplete
+  data after an interruption.
+- Local file storage shuts down safely if its database becomes unavailable.
+- The desktop app's tray, status and update notice now show when an update
+  is ready to install, and "Restart now" applies it.
+
+** Improvements
+- Drive uploads no longer store and synchronize a duplicate copy of larger
+  files, reducing upload and storage use.
+- Large Spaces use less memory when importing fresh snapshots.
+- Git Spaces read large files and packfiles faster by reusing recently read
+  data.
+- Cloud file storage combines small uploads more consistently, keeping
+  long-lived Spaces efficient.
+
+** Security
+- Oversized network messages are rejected safely before memory is allocated.
+- Static web assets are restricted to the intended release directory.
+
+* v0.57.11
+<2026-09-25 Fri>
+
+Spacewave 0.57.11 adds Git remotes for Git Spaces and improves storage,
+synchronization, connections, updates, and command-line reliability. This
+release includes a cloud storage upgrade that resets hosted beta content:
+accounts and billing are retained, but cloud Spaces and files must be recreated.
+
+** Features
+- Git Spaces can now be used as ordinary Git remotes for push, fetch, pull, and
+  clone with spacewave:// URLs.
+
+** Fixes
+- Copying a Space between devices and the cloud now completes even when a device
+  does not recognize every object type in the Space.
+- Drive quickstarts can finish while cloud connections are unavailable instead
+  of remaining on “Creating your space.”
+- Leaving a shared Space now succeeds when synchronization overlaps the request
+  or the device is behind on recent membership changes.
+- Interrupted cloud file-storage uploads retain completed progress, avoiding
+  unnecessary repeat uploads.
+- Cloud file storage can read older packs that do not include a lookup filter
+  and verifies downloaded content before use.
+- Connections close cleanly during session shutdown instead of occasionally
+  hanging.
+- Space updates no longer lose staged changes when nested content is refreshed.
+- Go plugins respond reliably during activation.
+- Desktop update status is available consistently to the app and desktop tray.
+- Command-line options now work after positional arguments, and options for
+  parent commands work from their subcommands.
+
+** Improvements
+- Cloud synchronization uploads more efficiently and can download updates
+  without waiting for an upload to finish.
+- Git and command-line file reads now stream data in order, improving
+  performance for large files and Git LFS downloads.
+- File storage consolidates small uploads over time, keeping long-lived Spaces
+  faster to open and read.
+- Removing or moving a Space now releases its file storage from the previous
+  storage location.
+- Local storage performs fewer filesystem checks during routine reads, reducing
+  CPU use.
+- Views can open related items directly while staying within the current Space.
+- The landing, Community, Pricing, and Blog pages have a cleaner, more
+  consistent design with stable launcher labels.
+
+* v0.57.10
+<2026-09-25 Fri>
+
+Spacewave 0.57.10 refreshes its public pages and improves storage, connections,
+updates, and command-line reliability. Cloud storage now keeps the links between
+blocks, so this release accompanies a reset of hosted beta content. Existing
+accounts and billing records are retained, but hosted Spaces and files must be
+recreated.
+
+** Fixes
+- Copying a Space between devices and the cloud completes for every Space,
+  including Spaces holding object types a device does not recognize.
+- Command-line options now work after positional arguments, and options for
+  parent commands work from their subcommands.
+- Interrupted cloud file-storage uploads retain completed progress, avoiding
+  unnecessary repeat uploads.
+- Cloud file storage can read packs that do not include a lookup filter.
+- Connections close cleanly during session shutdown instead of occasionally
+  hanging.
+- Space updates no longer lose staged changes when nested content is refreshed.
+- Go plugins respond reliably during activation.
+- Desktop update status is available consistently to the app and desktop tray.
+
+** Improvements
+- The landing, Community, Pricing, and Blog pages have a cleaner, more
+  consistent design with stable launcher labels.
+- Local storage performs fewer filesystem checks during routine reads, reducing
+  CPU use.
+- Views can open related items directly while staying within the current Space.
+
+* v0.57.9
+<2026-09-25 Fri>
+
+Spacewave 0.57.9 makes browser storage more reliable, and shows how much each
+storage backend holds.
+
+** Fixes
+- A browser storage write that fails, such as one over quota, now reports an
+  error instead of stopping the app.
+- Two tabs or workers can no longer open the same browser storage at once.
+- Creating a Drive from a quickstart no longer fails when several writes run at
+  the same time.
+- A storage bucket that blocks the app's origin is reported as unreachable
+  instead of failing with a server error.
+- Uploading many files no longer slows down as each upload keeps old file state
+  alive.
+- The top bar logo and menu text are their intended size again.
+- Plugin progress is recorded in the desktop log file.
+
+** Improvements
+- The storage settings show the number and total size of the objects each
+  backend holds.
+- Local Space edits write their state once instead of twice.
+
+* v0.57.8
+<2026-09-24 Thu>
+
+Spacewave 0.57.8 fixes signing in with the desktop and command-line apps, and
+makes the browser app start faster.
+
+** Fixes
+- The desktop and command-line apps accept connections again, so signing in no
+  longer hangs after installation.
+- Background web listeners keep the desktop daemon running.
+- Logs and helper processes stay inside the configured state directory.
+- Space plugins and their manifests load reliably in nested Spaces.
+- Pairing links open the pairing flow before the app finishes starting.
+- Synchronization handles interrupted journals, recovery and denied writes
+  more safely.
+- The browser app starts in Safari and other browsers without OPFS.
+
+** Improvements
+- The browser app downloads far fewer files at startup. Code highlighting loads
+  from a shared plugin only when a code view needs it.
+- Garbage collection sweeps in batches, reducing CPU and disk writes.
+- Blocks share one decoded cache, reducing memory use.
+
+* v0.57.7
+<2026-09-22 Tue>
+
+Spacewave 0.57.7 fixes startup in desktop and command-line release packages.
+
+** Fixes
+- Desktop and command-line executables now include the bootstrap data they need
+  to start after installation or an update.
+- Native plugin releases include the desktop renderer, and desktop status
+  reporting starts correctly when hosted in a plugin.
+
+* v0.57.6
+<2026-09-22 Tue>
+
+Spacewave 0.57.6 reduces unnecessary local storage growth, improves saving and
+synchronization, and adds more ways to open a session.
+
+** Improvements
+- Sign-in offers cloud accounts, local accounts, device pairing, and existing
+  database files.
+- Saving batches storage work and reuses unchanged snapshot indexes, reducing
+  repeated writes.
+- Git file reads seek directly into stored archives instead of loading entire
+  packfiles.
+- Browser startup defers optional viewers and preserves loading progress between
+  stages.
+- Developers can build isolated applications with persistent World-backed
+  storage and typed, recoverable synchronization.
+
+** Fixes
+- Obsolete storage roots are reclaimed while preserving current data, explicit
+  history, forks, and active readers.
+- Garbage collection avoids duplicate references and preserves blocks shared by
+  multiple owners.
+- Completed transactions and remote object handles release their resources
+  promptly.
+- Opening an ordinary Space no longer fetches unrelated public CDN content.
+- Device pairing and synchronization recover from reconnects, publication
+  conflicts, and interrupted enrollment.
+- Native plugins replace their executable before launch, and canceled Forge work
+  stops and drains before completion.
+- CLI tables render correctly, and terminal commands open independent tabs.
+
+* v0.57.5
+<2026-09-08 Tue>
+
+Spacewave 0.57.5 speeds up browser startup and local storage, improves
+connection recovery, and preserves more useful collaboration history. This
+release accompanies a reset of hosted beta content. Existing accounts and
+billing records are retained, but hosted Spaces and files must be recreated.
+
+** Improvements
+- Drive quickstarts load fewer modules and initialize files with fewer storage
+  operations.
+- Browser storage batches reads and writes more efficiently, and startup reuses
+  cached metadata and downloads related content together.
+- The loading animation uses less CPU.
+- Chat history now retains channel state and protocol events alongside messages.
+- Leaving a shared object preserves locally readable history while ending
+  synchronization access.
+
+** Fixes
+- Browser startup retains required plugins and retries invalid snapshots.
+- Connections renew signaling tickets and recover peer synchronization after
+  reconnects and accepted invitations.
+- Plugin updates retain newer revisions when local copies are incomplete.
+- Native command-line shutdown waits for storage to close.
+
+* v0.57.4
+<2026-09-07 Mon>
+
+Spacewave 0.57.4 refreshes the loading screen, improves browser startup and
+offline recovery, and makes invitations and desktop updates more reliable.
+
+** Improvements
+- Startup now shows animated artwork and clear progress through preparation,
+  connection, and opening your Space. The screen respects reduced-motion
+  preferences and keeps recovery actions available when loading fails.
+- Browser startup downloads less data and moves more preparation work off the
+  main thread.
+- Local file reads and writes use less copying and perform fewer redundant
+  storage operations.
+
+** Fixes
+- Browser updates preserve active sessions and recover more reliably when
+  starting offline or retrying a failed download.
+- Joining a Space now retains the accepted invitation state across session
+  refreshes.
+- Spaces added after sign-in now appear without restarting the session.
+- Desktop updates preserve the installed application when replacement or
+  relaunch fails, and retry temporary file-sharing conflicts on Windows.
+
+* v0.57.3
+<2026-09-04 Fri>
+
+Spacewave 0.57.3 restores native command-line and browser build compatibility,
+improves browser reliability, and reduces memory use during builds.
+
+** Fixes
+- Native command-line builds now complete successfully.
+- Browser builds now find required modules reliably when using packaged
+  dependencies.
+- Safari and other WebKit browser sessions now handle disposable resources
+  correctly.
+- After a connection becomes invalid, Spacewave now refreshes affected resources
+  instead of reusing stale state.
+
+** Improvements
+- Spacewave builds now use less memory, reducing failures on memory-constrained
+  systems.
+
+* v0.57.2
+<2026-09-04 Fri>
+
+Spacewave 0.57.2 adds a redesigned Keyboard Shortcuts workbench, a dedicated
+Secret viewer, managed-device support for Forge Workers, and local repository
+imports for Git Spaces. It also improves Notes, Drive, browser startup, invites,
+device linking, session recovery, and local file storage.
+
+** Features
+- Keyboard Shortcuts now has a redesigned workbench for searching commands and
+  shortcuts, recording combinations or sequences, resolving conflicts, and
+  saving changes to this device, your account, or the current Space.
+- Secrets now open in a dedicated viewer that shows redacted status and access
+  information while keeping secret values hidden.
+- Managed Devices can now join a Space as Forge Workers and reconnect after
+  restart.
+- Git Spaces can now import repositories from your local computer.
+
+** Fixes
+- Notes now saves edits in order, preserves drafts when a save must be retried,
+  and keeps the Saved confirmation visible when an edit produces identical
+  content.
+- Signed-out browser sessions now recover cleanly during startup instead of
+  getting stuck on stale app state.
+- Drive Home, linked paths, and Back and Forward navigation now remain inside
+  the current Drive and Space; newly created Drive Spaces also open at Files.
+- Device links, invites, and session recovery now remain connected through
+  overlapping attempts, restarts, and temporary connection failures.
+- Browser connections now recover more reliably when network routes or
+  connection details change.
+- Dropping a file outside a Drive upload target no longer navigates away from
+  Spacewave or reloads the app.
+- Quickstarts now reopen an existing matching Space instead of creating a
+  duplicate.
+- Closing the final tab in a split now removes the empty pane instead of leaving
+  a blank pane.
+- New Chat channels now open to an empty conversation, and failed sends retain
+  the draft for retry.
+- Browser startup now reports a clear failure with Retry when an app download or
+  loading step stalls.
+
+** Improvements
+- Local file storage now batches related writes more efficiently, improving save
+  performance and durability in browser sessions.
+- Returning users and direct links now show the loading screen immediately
+  instead of briefly showing the signed-out landing page.
+- Terminal connection failures now show actionable guidance, and Retry
+  reconnects with a clean session.
+- Managed Device setup now offers clearer setup, sign-in, approval, and recovery
+  steps.
+- Release pages now distinguish the latest release from the selected release and
+  show download details before installation.
+- Large browser sessions keep file-storage cache growth bounded and load nearby
+  file data with fewer reads.
+
+** Security
+- Spaces created in the browser now protect locally stored content with
+  authenticated encryption. Spaces created by earlier browser versions remain
+  readable but must be migrated before editing.
+- Browser sign-in completion links are tied to the browser session that started
+  sign-in.
+- Space sync rejects updates from peers that no longer have access.
+
+* v0.57.1
+<2026-08-29 Sat>
+
+Spacewave 0.57.1 adds a redesigned Keyboard Shortcuts workbench, a dedicated
+Secret viewer, and managed-device support for Forge Workers. It also improves
+browser startup, Drive navigation, Quickstarts, split layouts, invites and
+device linking, session recovery, Terminal, Forge workflows, and local file
+storage, with stronger protection for browser sign-in and saved content.
+
+** Features
+- Keyboard Shortcuts now has a redesigned workbench for searching commands and
+  shortcuts, recording key combinations or sequences, resolving conflicts, and
+  saving changes to this device, your account, or the current Space.
+- Secrets now open in a dedicated viewer that shows redacted status and access
+  information while keeping secret values hidden.
+- Managed Devices can now join a Space as Forge Workers and reconnect after
+  restart.
+
+** Fixes
+- Dropping a file outside a Drive upload target no longer navigates away from
+  Spacewave or reloads the app.
+- Drive Home, linked paths, and Back and Forward navigation now stay inside the
+  current Drive and Space.
+- Quickstarts now reopen an existing matching Space instead of creating a
+  duplicate and running setup over its contents.
+- Closing the final tab in a split now removes the empty pane instead of leaving
+  a blank pane or producing duplicate-tab layout errors.
+- New Chat channels now open to an empty conversation instead of loading
+  forever, and a failed send keeps the draft available for retry.
+- Local file storage no longer omits a newly created file when the same save
+  also updates another file.
+- Session setup, updates, and removal now recover automatically when another tab
+  or process changes local file storage.
+- Device links and invites now retain their connection and sync after
+  acceptance, restart, or reconnection instead of dropping shortly afterward.
+- Forge Cluster creation now accepts valid default names, reports failed or
+  empty data clearly, and prevents Job setup from getting stuck while loading
+  Clusters.
+- Browser startup now reports a clear failure with Retry if an app download or
+  loading step stalls, rather than leaving the progress screen indefinitely.
+
+** Improvements
+- Returning users and direct links now show the loading screen immediately
+  instead of briefly showing the signed-out landing page.
+- Space rows now open reliably, use a separate copy action, and keep closed Join
+  and Link dialogs from resurfacing stale progress or results.
+- Terminal connection failures now show safe, actionable guidance, and Retry
+  reconnects with a clean session.
+- Managed Device setup now offers a direct setup command or an install-and-run
+  option, with a clearer path to sign-in and approval.
+- Documentation navigation is denser and clearer on narrow screens, with the
+  current page kept visible and duplicate title bars removed.
+- Release pages now offer explicit Latest release and This release choices and
+  show the platform, architecture, file type, and version before a desktop
+  download.
+- Large browser sessions now keep file-storage cache growth bounded and load
+  nearby file data with fewer reads.
+
+** Security
+- Spaces created in the browser now protect locally stored content with
+  authenticated encryption. Spaces created by earlier browser versions remain
+  readable but must be migrated before they can be edited.
+- Browser sign-in completion links are now tied to the browser session that
+  started sign-in, so a copied link cannot complete the flow elsewhere.
+- Space sync now rejects updates from peers that no longer have access.
+
+* v0.57.0
+<2026-07-31 Fri>
+
+Spacewave 0.57.0 makes browser tabs, updates, local file storage, session
+recovery, and large Spaces more reliable. It also fixes Space exports and Drive
+split layouts, clarifies Storage Health, and improves Documentation.
+
+** Features
+- Forge tasks can now retry failed attempts while preserving their session
+  context and inputs.
+
+** Fixes
+- Space exports now download correctly in browser sessions instead of returning
+  a missing-file error, and opening files or exports no longer depends on the
+  Space already being open elsewhere.
+- Dragging a Drive file into a right-side split now creates only the requested
+  pane, without opening extra Drive Quickstarts or creating unintended Spaces.
+- Creating or collapsing a split layout no longer reloads the Space or cancels
+  an upload already in progress.
+- Opening a second Chrome tab no longer gets stuck while connecting, and each
+  browser tab now keeps its own active URL while sharing the Spacewave tab list.
+- Browser file storage now keeps saved data consistent while another tab writes,
+  preventing concurrent browser use from making files or app data appear
+  missing.
+- Account setup Back now returns to the page where setup began instead of
+  reopening the cloud sign-in step.
+- Session recovery and device linking now handle overlapping connection attempts
+  reliably, reducing stalls after sign-in, unlock, or reconnect; a later retry
+  also keeps a completed device link instead of starting over.
+- Live Space views now wake for every saved change instead of sometimes staying
+  stale until another edit.
+
+** Improvements
+- Storage Health now separates browser usage, device storage, and sync activity,
+  warns only after an actual save failure, and refreshes cleanup protection
+  immediately after you request it.
+- Browser updates now tie cached app files to the active release and revalidate
+  them, reducing stale or mixed-version views after an update.
+- Local saves now recover automatically from temporary storage conflicts,
+  reducing failed saves during concurrent activity.
+- Large Spaces are less likely to become unresponsive during storage cleanup,
+  which now saves progress in smaller steps.
+- Documentation now opens in the active split without replacing your layout.
+  Search covers user and self-hoster guides, ranks title matches first, supports
+  keyboard selection, and uses clearer controls in narrow panes.
+
+** Security
+- Device linking now grants access only after both devices confirm the same
+  verification code for that exact link.
+
+* v0.56.1
+<2026-07-18 Sat>
+
+Spacewave 0.56.1 adds new Canvas tools, Storage Health and recovery guidance,
+contextual browser tab titles, and version-specific release pages. It also
+improves Drive uploads, invites, device linking, multi-tab browser use, Terminal
+continuity, experimental V86 VM setup, and Windows desktop startup.
+
+** Features
+- Canvas now includes line, arrow, rectangle, and ellipse tools, plus an image
+  picker for placing pictures from Drive.
+- Session settings now include Storage Health, showing browser usage, cleanup
+  protection, sync activity, and recovery options for freeing space, linking
+  another device, using Spacewave Cloud, or exporting important Spaces.
+- Dragging several selected Drive items into a layout now opens one Spacewave
+  tab per item, in selection order.
+- The Command Palette now includes Select Account for switching directly between
+  available accounts.
+- Each changelog release now has its own page with desktop downloads pinned to
+  that version.
+
+** Fixes
+- Large Drive selections now upload up to three items at a time and publish each
+  completed file immediately; one failed file no longer stops the rest of the
+  selection.
+- When browser file storage is full, Drive now shows capacity and recovery
+  guidance and removes incomplete data instead of consuming more space on
+  repeated failures.
+- Invite links opened without an active session now survive sign-in and session
+  setup, then open the shared Space after acceptance.
+- Fixed multiple browser tabs and popouts so their Spacewave tab list stays in
+  sync while each page keeps its own active tab, URL, and layout.
+- Terminal command sessions now survive pane remounts when a split layout
+  collapses, instead of ending with a session failure.
+- Fixed Windows desktop startup so packaged releases open Spacewave normally
+  without stray console windows.
+- When a Space has no configured home object, Spacewave now shows its object
+  list instead of an empty view.
+
+** Improvements
+- Browser tab titles now follow the active section, Space, object, selected
+  viewer, or focused layout pane, making tabs and bookmarks easier to identify.
+- Device linking now lets you click the code to copy it, shows ordered
+  connection progress, and surfaces direct-link failures instead of leaving an
+  indefinite spinner.
+- Experimental V86 VM setup now stays in its wizard and reports real image-copy
+  and creation progress, with Retry for recoverable failures.
+- Terminal now shows a Connecting state while it opens, and Command Line output
+  renders more consistently across pane changes.
+- Browser file storage now requests protection from automatic cleanup after the
+  first successful save, reducing eviction risk without delaying startup.
+- Browser startup now waits until app features are fully ready before leaving
+  the loading flow, reducing blank or partially initialized views after updates.
+
+** Security
+- Password and backup recovery keys are now separate actions, so generating a
+  backup key no longer also adds the password entered for the session.
+
+* v0.56.0
+<2026-07-10 Fri>
+
+Spacewave 0.56.0 makes cold browser starts faster by making startup checksum
+processing 55.7× faster and eliminating the largest measured cold-boot
+bottleneck. It also removes repeated file-storage integrity work, restores
+Terminal in browser builds, and reduces byte-copying during browser startup and
+data loading.
+
+** Fixes
+- Fixed Terminal in browser builds so it opens and reaches the command prompt
+  again.
+- Object details now includes a permission-aware Danger Zone for permanently
+  deleting the selected object with explicit confirmation.
+- Keyboard shortcut recording now captures key combinations even after focus
+  moves away from the recorder, and Escape or clicking away cancels recording.
+
+** Improvements
+- Cold browser starts are faster: startup checksum processing is 55.7× faster,
+  eliminating the largest measured cold-boot bottleneck.
+- Local file storage now avoids duplicate integrity work while preserving
+  compatibility with existing stored data, reducing repeated work during startup
+  and file access.
+- The shortcut editor now shows held modifiers while recording, formats captured
+  keys like application menus, and identifies conflicting commands with a direct
+  replace action.
+- Browser startup and in-app data loading now avoid an unnecessary byte
+  conversion, reducing copying and memory pressure.
+- Release checks now verify existing local file storage compatibility and
+  confirm that browser builds include Terminal, reducing the chance of storage
+  or Terminal regressions.
+
+* v0.55.0
+<2026-07-10 Fri>
+
+Spacewave 0.55.0 completes the on-demand SQL Database tools work behind the
+smaller browser startup download. It also restores the desktop Command Line
+terminal, serves the app shell before browser development startup checks finish,
+adds Space type glyphs to session lists, and makes developer builds more
+reliable under load.
+
+** Features
+- Session Space lists now show each Space's registered type glyph, making Drive,
+  Git Spaces, and other Space types easier to identify.
+
+** Fixes
+- Browser development builds now serve the Spacewave app shell before plugin
+  startup checks finish, so the page can show useful status and errors instead
+  of remaining blocked.
+- Fixed File → Open CLI Terminal in desktop builds so the Command Line prompt
+  appears and commands run instead of leaving a blank Terminal.
+- Fixed Command Palette searches so selecting all filter text and deleting it
+  clears the entire search instead of a single character.
+- Fixed local CLI connections for custom data directories so Command Line tools
+  select the running Spacewave instance from the active data location.
+- Fixed public blog pages so author avatars and complete styling load reliably,
+  and corrected the launch post's closing-text formatting.
+
+** Improvements
+- Completed the on-demand SQL Database tools work, preserving the smaller
+  browser startup download while keeping SQL tools reliable when loaded.
+- Spacewave code generation now works with TypeScript 7 in fresh developer
+  installs.
+- Plugin builds now limit concurrent work, making Spacewave builds more reliable
+  under heavy load and on memory-constrained machines.
+
+* v0.54.0
+<2026-07-09 Thu>
+
+Spacewave 0.54.0 makes the first browser load dramatically faster: the core
+startup download is about 90% smaller, with SQL Database tools loaded only when
+you open them. It also adds honest startup download progress, a branded loading
+screen, richer Create Object choices, blog subscriptions, and broad reliability
+fixes for browser updates, Quickstarts, Drive, desktop startup, and peer-to-peer
+connections.
+
+** Features
+- Create Object now shows icons and one-line descriptions, includes registered
+  Chat Channel, Documentation, Blog, Forge Dashboard, and V86 VM choices, and
+  reliably refreshes the available choices when the palette opens.
+- The Spacewave blog now lets readers subscribe for development updates and
+  release announcements directly from the end of a post.
+- Command Line can now open in a Spacewave tab, with help, command history,
+  interrupt, and live watch support.
+- SQL Database saved queries now restore their parameters, including binary
+  values, and supported table views can update rows safely within the active
+  view.
+- System Status now includes a Network panel showing live connection and
+  transport state.
+
+** Fixes
+- Fixed browser startup paths that could stop at a completed download, wedge
+  after a reload, or fail to continue when a replacement browser tab was already
+  ready.
+- Fixed browser updates and reloads that could reuse stale app downloads,
+  reducing stuck loading screens and stale views after a new release.
+- Fixed desktop startup failures that could leave the app unable to connect to
+  its window or repeatedly retry a valid app screen.
+- Fixed the Home tab after Drive Quickstart so it opens the session instead of
+  showing a blank grey pane.
+- Fixed Drive drag-and-drop so files can be moved onto folders, root and parent
+  breadcrumbs, and Up controls without the drop silently disappearing.
+- Fixed Notebook, Docs, and Blog Quickstarts so their app content can load on
+  demand and open the seeded object; Forge Dashboard and V86 VM startup paths
+  also recover more reliably.
+- Fixed WebRTC connection teardown so pending channels close cleanly when the
+  browser connection disappears instead of leaving stalled peer-to-peer work
+  behind.
+- Fixed browser-based numeric operations for 32-bit multiplication and string
+  minimum/maximum comparisons, preventing incorrect results in affected apps.
+
+** Improvements
+- The browser's core startup download is about 90% smaller because SQL Database
+  tools are no longer part of every first load; shared app code is also cached
+  more effectively across reloads and updates.
+- Browser startup now appears immediately with Spacewave branding, clear phases,
+  live byte counts, per-download progress, and Retry or Back actions when
+  startup fails.
+- Drive uploads now show start and completion feedback near the upload
+  indicator, and first-run guidance presents one callout at a time without
+  hiding upload progress.
+- Git Spaces bring in large repositories more efficiently, reducing storage
+  overhead during clone and import operations.
+- Docs now adapt more cleanly to narrow windows and smaller screens.
+- Desktop development builds start faster by skipping browser-only startup work
+  that the desktop app does not need.
+
+** Security
+- Updated cryptographic dependencies to address reported security issues.
+
+* v0.53.1
+<2026-07-05 Sun>
+
+Spacewave 0.53.1 is a reliability patch for browser startup and local file
+storage. It helps older browser profiles recover from stale local app cache data
+and fixes a rare storage stall in ephemeral and browser sessions.
+
+** Fixes
+- Fixed browser startup for profiles created on older Spacewave versions. When
+  old local app cache data uses a hash format the current browser build cannot
+  read, Spacewave now resets that cache automatically and starts fresh instead
+  of staying on the loading screen.
+- Fixed a rare permanent stall in in-memory file storage where a cancelled write
+  could leave later reads blocked, affecting ephemeral and browser sessions.
+
+** Improvements
+- Browser sessions now switch context more smoothly under load, reducing cases
+  where busy work could delay other browser activity.
+
+* v0.53.0
+<2026-07-04 Sat>
+
+Spacewave 0.53.0 adds editable keyboard shortcuts, richer Command Palette
+discovery, and Org file support for notes and docs. It also improves Drive
+Quickstart reliability, browser startup, session recovery, desktop shortcut
+handling, and object-heavy Space responsiveness.
+
+** Features
+- Keyboard Shortcuts can now be edited from Tools, account settings, and Space
+  settings, with Local, Account, and Space scopes, conflict warnings, reset
+  actions, and custom leader-key settings.
+- Command Palette now combines command search and key-sequence discovery:
+  Cmd/Ctrl+K opens the palette, typing filters commands, and key paths show the
+  next available actions.
+- Notebooks and Docs now recognize Org files. You can create Org notes, open
+  index.org docs pages, and edit supported Org content in WYSIWYG or source mode
+  while preserving Org metadata.
+
+** Fixes
+- Fixed a Drive Quickstart stall where command setup could loop after the Space
+  was created, leaving a blank Space view instead of the file browser.
+- Fixed Quickstart wizard name fields so clearing a suggested name and typing a
+  replacement no longer restores or appends the old name.
+- Fixed local session recovery after unlock or reconnect so Spacewave retries
+  the current session connection instead of waiting on one that was already
+  replaced.
+- Fixed browser startup paths that could leave some Notebooks, Blog, and Forge
+  views stuck before the view appeared after browser updates.
+- Fixed desktop keyboard shortcuts so native menu accelerators no longer take
+  over Command Palette and custom shortcut keys before Spacewave can handle
+  them.
+
+** Improvements
+- Drive Quickstart, Space creation, and object-heavy views do fewer duplicate
+  storage lookups and writes, improving responsiveness during creation and
+  navigation.
+- Command Palette result matching and selection are more predictable, with
+  highlighted alias matches and clearer shortcut and conflict hints.
+- Keyboard shortcut lists, menus, and Command Palette rows now show the
+  effective shortcuts after Local, Account, or Space overrides.
+- Browser startup after updates is less likely to be blocked by stale local
+  startup state, reducing stuck loading screens.
+- Browser sessions start faster and use less memory, keeping Drive, object
+  views, and Quickstart flows more responsive during startup and navigation.
+
+** Security
+- Experimental VM file storage now rejects oversized filesystem strings instead
+  of crashing the VM file bridge, reducing an availability risk in VM file
+  sharing.
+
+* v0.52.0
+<2026-07-02 Thu>
+
+Spacewave 0.52.0 improves Drive file storage, browser startup and browser
+updates, Command Line setup, and experimental data workspaces. This release also
+makes large uploads, media previews, Canvas drawing, Git Spaces, and SSH Host
+connections more reliable.
+
+** Features
+- Experimental Key/Value Store Quickstart now creates a seeded data workspace
+  with a dedicated Key/Value Store viewer for browsing, filtering, creating,
+  editing, and deleting keys.
+- Experimental SQL Database Quickstart now creates a seeded SQL workspace with
+  database, schema, query, result, table view, and SQL Workbench viewers.
+- The desktop app can now guide Command Line install and update actions, show
+  the selected install target, and provide copyable commands for the active
+  session.
+- New Drive Spaces now open with a getting-started banner in the file browser,
+  with quick actions for uploading files, creating folders, opening the starter
+  guide, and inviting people when sharing is available.
+
+** Fixes
+- Fixed Drive files with spaces in their names so inline previews and downloads
+  open correctly instead of returning missing-file errors.
+- Fixed Drive video previews so scrubbing and seeking in uploaded videos works
+  reliably in browser sessions.
+- Fixed large Drive drag-and-drop uploads so multi-file uploads complete with
+  lower memory pressure and fewer stalls.
+- Fixed Command Line status on first run so it no longer hangs silently while a
+  session is mounting; it now returns useful status or a bounded startup
+  diagnostic.
+- Fixed Canvas drawing so rapid pen strokes stay visible while writes and synced
+  state catch up.
+- Fixed Git Spaces with empty repositories so they show an empty-repository
+  state instead of trying to open missing files or logs.
+- Fixed browser update recovery when local cached app files cannot be written,
+  reducing partial updates, unhandled startup errors, and stuck loading states.
+
+** Improvements
+- Browser startup and first-run Drive setup do less blocking file-storage work,
+  reducing time spent on initial loading screens in common fresh-start paths.
+- Shell tabs, split layouts, menu overlays, and bottom bars handle narrow panes,
+  restored tabs, and overflow actions more predictably.
+- Device and SSH Host setup forms now use clearer fields for host, port, user,
+  credentials, and setup target.
+- Command Line setup now explains the active session, local socket state,
+  install guidance, and next useful commands more clearly.
+- Drive and file viewers include better loading and recovery behavior for file
+  lookup, previews, and refreshed file lists.
+
+** Security
+- Terminal now asks you to review and trust an SSH Host key before connecting,
+  and remembers accepted keys for that Host.
+- Diagnostic logs avoid including private object identifiers, reducing
+  accidental exposure in support logs.
+
+* v0.51.8
+<2026-05-31 Sun>
+
+Spacewave 0.51.8 improves browser and desktop update recovery, Drive and
+first-run polish, billing visibility, desktop tray behavior, and file gallery
+refreshes. It also adds experimental Computers, SSH Host, and Terminal surfaces
+for early device workflows.
+
+** Features
+- Billing usage now warns when storage, write operations, or Cloud Reads
+  approach included usage, and shows clearer storage overage estimates.
+- Experimental Computers workspaces can now guide Add Device setup, list Devices
+  and SSH Hosts, and open Terminal tabs when terminal access is available.
+
+** Fixes
+- Fixed stale browser and desktop update state so Spacewave is less likely to
+  open a blank or broken app after an update.
+- Fixed Drive Gallery so image folders update live when files are added,
+  removed, or renamed.
+- Fixed stale split/grid layout tabs so old restored layouts no longer render
+  missing tabs or fall back to the wrong view.
+- Fixed first-run Get Started icon sizing and app font scaling so actions and
+  tabs stay readable in narrow layouts or with larger system text.
+- Fixed crowded bottom bars so overflow actions collapse into a menu instead of
+  squeezing upload progress, breadcrumbs, or viewer controls.
+- Fixed desktop tray/menu bar submenu and keyboard-focus edge cases so tray
+  actions stay reachable.
+
+** Improvements
+- The Drive landing page, demo, and Quickstart copy now explain private browser
+  files, offline work, device sync, and optional cloud backup more clearly.
+- Empty session dashboards now prioritize Create a Drive, blank Space creation,
+  device linking, and invite joining more clearly.
+- Object trees and file rows have cleaner spacing and alignment for easier
+  scanning.
+- Command Line status now includes clearer app recovery details for support when
+  startup or update recovery fails.
+- Desktop tray/menu bar presentation handles long labels, Session and Space
+  navigation, update actions, and fallback menus more reliably.
+
+** Security
+- SSH Host setup keeps private keys, passwords, and passphrases in Secrets and
+  shows only credential-link status in Host, Device, Terminal, and Computers
+  views.
+
+* v0.51.7
+<2026-05-29 Fri>
+
+Spacewave 0.51.7 improves the first-run Drive path, browser startup, local file
+storage, and app documentation. New Drive Spaces guide users into the file
+browser more clearly, returning browser sessions show better startup progress
+and recovery, and large file operations are more reliable across reloads,
+browser updates, and multi-tab use.
+
+** Features
+- Drive Quickstart now opens with a Drive intro step and starter guide, then
+  takes you into the file browser when you choose Open files.
+- The desktop app now includes standard Close Window and Quit commands.
+
+** Fixes
+- Fixed Drive Quickstart paths that could hang before the first file list
+  appeared, especially in browser sessions.
+- Fixed multi-tab browser startup so a second Spacewave tab can reach the app
+  instead of staying on the loading screen.
+- Fixed sign-in redirects so stale browser sign-in pages do not restart the
+  wrong SSO flow or loop back into sign-in.
+- Fixed large Drive uploads, directory reads, and file previews in browser
+  sessions so they are less likely to stall or fail after the page opens.
+- Fixed Git commit diffs so very large patches are bounded and still show the
+  available file changes.
+- Fixed Blog editing so saved posts refresh and source edits wait until the file
+  is ready.
+
+** Improvements
+- Returning browser sessions now show phase-by-phase startup progress with
+  clearer retry and back actions when startup fails.
+- Browser startup and browser updates load app files more efficiently, reducing
+  blank or slow first screens after reloads.
+- Browser file storage now does large upload and sync work with lower memory
+  pressure.
+- The setup banner waits until a local session contains meaningful stored data
+  before prompting users to finish account setup.
+- The in-app docs have been rewritten around Users, Self-Hosters, and
+  Developers, with clearer starting paths for Drive, Spaces, accounts, storage,
+  Command Line, plugins, and SDK work.
+- Session setup, link-device, local setup, and cloud setup flows now stay inside
+  the session frame with a consistent Back action.
+
+** Security
+- Public blog and static pages now handle embedded page data more safely when
+  opening in the browser.
+
+* v0.51.6
+<2026-05-11 Mon>
+
+Spacewave 0.51.6 is a reliability release for setup, Quickstart, browser
+startup, and public pages. Local setup progress is less likely to get lost
+during startup, plugin-backed Spaces recover more reliably after reloads or
+browser updates, and public blog/video pages behave better across browsers and
+theme extensions.
+
+** Fixes
+- Fixed local setup and Quickstart routing so Spacewave is less likely to stay
+  on the plan page, reopen the wrong setup step, or let an inactive split-view
+  panel change the active route.
+- Fixed browser startup for plugin-backed Spaces so already-loaded app files are
+  reused during startup, reducing blank shells and failed app loads after
+  reloads or browser updates.
+- Fixed the About dialog so it stays centered and visible in the app window.
+- Fixed Spacewave blog video embeds in Firefox and other isolated browsers by
+  showing a safe Watch on YouTube link when inline playback is blocked.
+- Fixed browser theme-extension conflicts so Dark Reader does not restyle
+  Spacewave into unreadable colors.
+
+** Improvements
+- Local file storage does less background work while Spaces open, reducing
+  delays before local Spaces become ready.
+- Object views in large Spaces can load only the linked items they need,
+  reducing stalls in relationship-heavy views.
+- Browser tabs with several plugin-backed viewers use lighter startup
+  communication, reducing startup failures when many viewers are active.
+- Published release notes now include direct desktop download links for macOS,
+  Windows, and Linux.
+
+* v0.51.5
+<2026-05-09 Sat>
+
+Spacewave 0.51.5 is a reliability release for browser startup, local setup,
+Drive, and session cleanup. Sign-in and local onboarding recover more reliably,
+plugin-backed Spaces are less likely to get stuck after reloads or browser
+updates, and Drive/file storage edge cases now produce fewer missing or stalled
+views.
+
+** Features
+- Command Line commands now accept plural aliases for Spaces, Canvases, and VMs,
+  matching the nouns users see in help and docs.
+
+** Fixes
+- Fixed sign-in and local setup startup so Spacewave is less likely to stay on a
+  static shell or blank page before the setup wizard appears.
+- Fixed browser startup for plugin-backed Spaces so missing app assets or
+  unready app workers are retried instead of leaving the page stuck.
+- Fixed Drive Quickstart and Drive views where bottom bar updates could crash
+  the page or prevent uploads and video previews from appearing.
+- Fixed logout and session close handling so local sign-out, stale-session
+  removal, and account-session revocation report the right state and close
+  cleanly.
+- Fixed local Space opening so Spacewave waits for local file storage to be
+  ready before continuing, reducing session recovery and settings loading races.
+- Fixed browser file storage edge cases that could hide matching entries from
+  folder/path views or leave nested copied content incomplete.
+- Fixed a Windows desktop build issue that could block the app from starting on
+  that platform.
+
+** Improvements
+- Browser startup and hard reloads now recover more reliably when app code is
+  still loading or needs to be recreated.
+- Command Line state-path commands can start the local Spacewave runtime
+  automatically, so status, session, Space, and sign-out commands reach useful
+  session state instead of stopping at a missing daemon.
+- Browser update recovery now includes more complete app content during rollout,
+  reducing broken or incomplete loads after an update.
+
+* v0.51.4
+<2026-05-09 Sat>
+
+Spacewave 0.51.4 is a reliability release for browser and desktop startup.
+Updates recover more reliably during rollout, browser tabs resume with fewer
+stale views, and cold browser loads do less work before the first useful screen
+appears.
+
+** Fixes
+- Fixed update checks so the desktop app keeps retrying when release information
+  is not ready at launch, instead of leaving update status stuck on an old
+  error.
+- Fixed release loading so Spacewave can recover when local update files are
+  incomplete, reducing blank or stuck loading screens during a rollout.
+- Fixed restored or foregrounded browser tabs so reconnect timing waits until
+  the page is ready, reducing stale views and unnecessary app reloads.
+- Fixed updater status for releases that do not include a desktop app update for
+  the current platform, so old update errors are cleared.
+
+** Improvements
+- Browser startup now loads less of the app before showing the first relevant
+  screen, improving cold-load performance for sign-in, Quickstart, docs, and
+  active sessions.
+- Browser resume handling now distinguishes a slow foregrounded tab from a
+  broken connection, making return-to-tab recovery less disruptive.
+- Release file recovery now reuses verified local files after a successful
+  fetch, reducing repeat work on later starts.
+
+* v0.51.3
+<2026-05-08 Fri>
+
+Spacewave 0.51.3 improves desktop and browser startup/update reliability, adds a
+tray/menu-bar update action, and fixes rough edges in Cloud setup, Drive video
+previews, and session recovery status.
+
+** Features
+- The desktop tray/menu bar now shows an Install Update action when a Spacewave
+  desktop update is ready.
+
+** Fixes
+- Fixed a desktop startup problem where Spacewave could keep running without
+  showing a window after an update.
+- Fixed Spacewave Cloud setup and billing actions in split views so checkout,
+  cancellation, and reactivation stay in the active panel instead of jumping to
+  the wrong session page.
+- Fixed browser updates and root-page reloads so fresh tabs are less likely to
+  show an old or blank Spacewave page.
+- Fixed Drive video previews so restored video tabs and back/forward navigation
+  return to playable previews.
+- Fixed the desktop tray Settings action so it opens Command Line settings for
+  the active session.
+
+** Improvements
+- Browser startup can show the app frame earlier, reducing time spent on the
+  initial loading screen during cold web loads.
+- Session recovery status now looks the same in the app and the desktop tray,
+  including pending Spaces, unlock prompts, retries, and failures.
+- Command Line guidance now reflects the tray/menu-bar runtime, making it
+  clearer when CLI commands can connect after all Spacewave windows are closed.
+
+* v0.51.2
+<2026-05-07 Thu>
+
+Spacewave 0.51.2 makes Drive workspaces, sharing, and desktop use easier while
+improving sign-in, session recovery, browser updates, and local file storage
+reliability.
+
+** Features
+- Drive workspaces now open directly into a file browser for folders, uploads,
+  downloads, and organization.
+- You can copy a public link to the current view from the app, making it easier
+  to share the exact Spacewave page you are using.
+- Space sharing can now invite someone by Spacewave username, with pending
+  invites shown in the app for accept or decline.
+- The desktop app now has a native desktop tray or menu bar item for reopening
+  Spacewave, checking sessions and Spaces, and quitting cleanly.
+- The desktop app can add and open existing local Spacewave data directories
+  from the sign-in and session screens.
+
+** Fixes
+- Fixed invite links copied from the desktop app so recipients open the shared
+  Space in Spacewave correctly.
+- Fixed newly created Spaces disappearing from the Space list after refresh.
+- Fixed browser startup paths that could leave the app stuck on the loading
+  screen after opening account emails.
+- Fixed desktop launch and quit behavior so the app no longer reopens
+  unexpectedly or stalls before showing a window after an update.
+- Fixed desktop file pickers so hidden local Spacewave folders can be selected
+  when needed.
+- Fixed the Space details object list so it updates while the details panel
+  stays open.
+- Fixed Space deletion so the confirmation dialog stays populated and the
+  visible delete step completes faster.
+- Download and other off-site links now open in a separate tab instead of
+  replacing the running Spacewave page.
+
+** Improvements
+- Sign-in now shows clearer in-progress feedback while passkey, browser, or SSO
+  authentication is running.
+- Session recovery after sign-in now runs in the background, with a compact
+  status indicator and unlock prompts only when a Space needs your account key.
+- Browser updates are more reliable when tabs reload, regain focus, or come back
+  online, reducing stale or mixed app versions after a release.
+- Browser file storage is more durable after interrupted writes or restored
+  tabs, reducing stale file views and startup failures.
+- Drive and file browser controls are clearer, with improved toolbar actions,
+  selected-row states, retryable file loading errors, and better
+  unavailable-preview messages.
+- The desktop tray shows session, Space, update, and attention status even when
+  all windows are closed.
+
+** Security
+- Username-addressed invites are tied to the intended Spacewave account and
+  require recipient acceptance before access is granted.
+
+* v0.51.0 Public Launch
+<2026-05-01 Fri>
+
+Spacewave is open-source, private, self-hosted, multiplayer Spaces (apps) that
+store data wherever you want, work offline through peer-to-peer networking, and
+sync instantly with real-time streaming multiplayer. v0.51 is the public launch:
+a suite of first-party Spaces, a plugin SDK to build your own, and desktop, web,
+and CLI clients, all Apache-2.0 licensed. Try it at [[https://spacewave.app][spacewave.app]] in one click
+with no account required, read the [[https://spacewave.app/blog/2026/04/launch][launch announcement]], grab the code at
+[[https://github.com/s4wave/spacewave][github.com/s4wave/spacewave]], or [[https://discord.gg/KJutMESRsT][join the community on Discord]] and let us know
+what you want added next.
+
+** Features
+
+- Spaces: shared multiplayer workspaces. Add your friends or coworkers and
+  collaborate live, with role-based access and invite flows.
+- Drive: store and access your files. Drag-and-drop upload, projected downloads,
+  zip export, and live file watching across linked devices.
+- Notes: write and collaborate with Markdown text files. Offline-first, with
+  inline previews and live editing.
+- Chat: communicate securely with humans or robots. End-to-end encrypted and
+  synced across linked devices, online or offline.
+- Canvas: an infinite 2D workspace for visual thinking, with embedded live
+  objects from any other Space.
+- Git: browse repositories with branches, tags, commit history, and tree views.
+  No clone or terminal needed.
+- Media: photo gallery and inline image previews wherever files appear in the
+  app.
+- Plugin SDK: write your own Spaces in TypeScript or Go with hot reload, or
+  install plugins from any Git repo. Same APIs the first-party plugins use.
+- Cross-platform: desktop apps for macOS, Windows, and Linux, a one-click web
+  app, and a CLI, all built from a single Go and TypeScript codebase.
+- Account and session management: passkeys, account recovery, multi-device
+  session linking, and session self-rejoin.
+- Spacewave Cloud (optional): encrypted 100GB backup for $8/mo. Private, secure,
+  fast (via Cloudflare), and dead simple. The app works fine without it.
+
+** Security
+
+- End-to-end encrypted storage and messaging across all linked devices. Keys
+  live on your devices and never leave them unless you explicitly export a
+  backup.
+- Spacewave Cloud backups are encrypted on your device before they are uploaded.
+  The cloud only ever sees encrypted data.

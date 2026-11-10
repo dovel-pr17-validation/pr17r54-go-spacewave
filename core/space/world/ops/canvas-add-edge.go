@@ -1,0 +1,104 @@
+package space_world_ops
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_canvas "github.com/s4wave/spacewave/sdk/canvas"
+	"github.com/sirupsen/logrus"
+)
+
+// NewCanvasAddEdgeOp constructs a new CanvasAddEdgeOp block.
+func NewCanvasAddEdgeOp(objKey string, edge *s4wave_canvas.CanvasEdge) *CanvasAddEdgeOp {
+	return &CanvasAddEdgeOp{
+		ObjectKey: objKey,
+		Edge:      edge,
+	}
+}
+
+// Validate performs cursory checks on the op.
+func (o *CanvasAddEdgeOp) Validate() error {
+	// Require a target object and an edge with both endpoint node IDs.
+	if len(o.GetObjectKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	edge := o.GetEdge()
+	if edge == nil {
+		return ErrEdgeNil
+	}
+	if len(edge.GetId()) == 0 {
+		return ErrEdgeEmptyId
+	}
+	if len(edge.GetSourceNodeId()) == 0 {
+		return ErrEdgeEmptySourceNodeId
+	}
+	if len(edge.GetTargetNodeId()) == 0 {
+		return ErrEdgeEmptyTargetNodeId
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *CanvasAddEdgeOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Validate the canvas edge addition before accessing its object.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+
+	// Select the canvas object and edge to add.
+	objKey := o.GetObjectKey()
+	edge := o.GetEdge()
+
+	// Open the canvas object state and require that it exists.
+	objState, found, err := worldHandle.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(objState)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, world.ErrObjectNotFound
+	}
+
+	// Update the canvas object with the requested edge.
+	_, _, err = world.AccessObjectState(ctx, objState, true, func(bcs *block.Cursor) error {
+		// Load the canvas state or prepare an empty state.
+		state, uerr := s4wave_canvas.UnmarshalCanvasState(ctx, bcs)
+		if uerr != nil {
+			return uerr
+		}
+		if state == nil {
+			state = &s4wave_canvas.CanvasState{}
+		}
+
+		// Verify source and target nodes exist.
+		if state.GetNodes() == nil {
+			return ErrEdgeNodeNotFound
+		}
+		if _, ok := state.GetNodes()[edge.GetSourceNodeId()]; !ok {
+			return ErrEdgeNodeNotFound
+		}
+		if _, ok := state.GetNodes()[edge.GetTargetNodeId()]; !ok {
+			return ErrEdgeNodeNotFound
+		}
+
+		// Preserve the previous canvas state and persist the new edge.
+		previous := state.CloneVT()
+		state.Edges = append(state.Edges, edge)
+		return s4wave_canvas.WriteCanvasState(ctx, bcs, previous, state)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+// _ is a type assertion
+var _ world.Operation = (*CanvasAddEdgeOp)(nil)

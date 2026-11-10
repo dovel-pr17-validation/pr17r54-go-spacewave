@@ -1,0 +1,115 @@
+//go:build !js
+
+package bldr_manifest_builder_controller
+
+import (
+	"context"
+	"sync"
+
+	"github.com/aperturerobotics/util/promise"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/pkg/errors"
+	bldr_manifest_builder "github.com/s4wave/spacewave/bldr/manifest/builder"
+	bldr_project "github.com/s4wave/spacewave/bldr/project"
+)
+
+// subManifestBuildOwner owns one sub-manifest's build lifecycle: config
+// state, result promise, and restart signaling.
+type subManifestBuildOwner struct {
+	tracker        *subManifestBuilderTracker
+	builderRoutine *routine.StateRoutineContainer[*bldr_project.ManifestConfig]
+	resultPc       *promise.PromiseContainer[*bldr_manifest_builder.BuilderResult]
+
+	mtx       sync.Mutex
+	restartFn func(string)
+	result    *bldr_manifest_builder.BuilderResult
+	resultErr error
+	observed  bool
+}
+
+// newSubManifestBuildOwner constructs a sub-manifest build owner bound to
+// the shared tracker.
+func newSubManifestBuildOwner(tracker *subManifestBuilderTracker) *subManifestBuildOwner {
+	owner := &subManifestBuildOwner{
+		tracker:  tracker,
+		resultPc: promise.NewPromiseContainer[*bldr_manifest_builder.BuilderResult](),
+	}
+	owner.builderRoutine = routine.NewStateRoutineContainerWithLoggerVT[*bldr_project.ManifestConfig](tracker.c.le)
+	owner.builderRoutine.SetStateRoutine(tracker.executeBuilderRoutine)
+	return owner
+}
+
+func (o *subManifestBuildOwner) setContext(ctx context.Context) {
+	o.builderRoutine.SetContext(ctx, true)
+}
+
+func (o *subManifestBuildOwner) setManifestConfig(
+	manifestConf *bldr_project.ManifestConfig,
+	restartFn func(string),
+) (*promise.PromiseContainer[*bldr_manifest_builder.BuilderResult], error) {
+	// Take the lock for the whole update.
+	o.mtx.Lock()
+	defer o.mtx.Unlock()
+
+	// Update the builder state and reject a changed configuration after a resolved value.
+	_, changed, _, _ := o.builderRoutine.SetState(manifestConf)
+	if changed && o.observed && (o.result != nil || o.resultErr != nil) {
+		// don't allow this, could cause infinite loops
+		return nil, errors.New("called BuildSubManifest with different configuration after a value was already resolved")
+	}
+
+	// Record the observation and restart hook, then return the result promise.
+	o.observed = true
+	if restartFn != nil {
+		o.restartFn = restartFn
+	}
+
+	return o.resultPc, nil
+}
+
+func (o *subManifestBuildOwner) prepareParentAttempt(restartFn func(string)) {
+	o.mtx.Lock()
+	o.restartFn = restartFn
+	o.observed = false
+	o.mtx.Unlock()
+}
+
+func (o *subManifestBuildOwner) observedInParentAttempt() bool {
+	o.mtx.Lock()
+	defer o.mtx.Unlock()
+	return o.observed
+}
+
+func (o *subManifestBuildOwner) observedResult() (*bldr_manifest_builder.BuilderResult, error, bool) {
+	o.mtx.Lock()
+	defer o.mtx.Unlock()
+	if !o.observed {
+		return nil, nil, false
+	}
+	return o.result.CloneVT(), o.resultErr, true
+}
+
+func (o *subManifestBuildOwner) setResult(val *bldr_manifest_builder.BuilderResult, err error) {
+	// Take the lock for the whole update.
+	o.mtx.Lock()
+	defer o.mtx.Unlock()
+
+	// Ignore an unchanged result and error.
+	if o.result.EqualVT(val) && o.resultErr == err {
+		return
+	}
+
+	// Restart the parent build when an observed result changes.
+	if o.observed && (o.result != nil || o.resultErr != nil) {
+		if o.restartFn != nil {
+			o.restartFn("sub-manifest changed: " + o.tracker.subManifestID)
+			o.restartFn = nil
+		}
+		o.observed = false
+	}
+
+	// Store the new result and publish it on the promise.
+	o.result = val
+	o.resultErr = err
+	o.resultPc.SetResult(val, err)
+}

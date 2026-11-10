@@ -1,0 +1,422 @@
+package resource_account
+
+import (
+	"context"
+	"maps"
+	"slices"
+	"time"
+
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/pkg/errors"
+	account_settings "github.com/s4wave/spacewave/core/account/settings"
+	provider_spacewave "github.com/s4wave/spacewave/core/provider/spacewave"
+	api "github.com/s4wave/spacewave/core/provider/spacewave/api"
+	"github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/core/sobject"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_account "github.com/s4wave/spacewave/sdk/account"
+)
+
+// WatchEntityKeypairs streams entity keypairs with their lock state.
+//
+// Account state and key-store unlock state are folded into one local broadcast
+// so the watch loop reads both inputs under the same HoldLock that obtains
+// the wait channel. This eliminates the missed-wakeup race that the previous
+// dual-channel select had to defend against and coalesces near-simultaneous
+// changes (e.g. an account-state update landing alongside a key-store unlock)
+// into a single emission instead of one per source.
+func (r *AccountResource) WatchEntityKeypairs(
+	req *s4wave_account.WatchEntityKeypairsRequest,
+	strm s4wave_account.SRPCAccountResourceService_WatchEntityKeypairsStream,
+) error {
+	// Select the local settings watch or prepare the cloud account and key store.
+	if r.localAccount != nil {
+		return r.watchLocalEntityKeypairs(strm)
+	}
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return err
+	}
+	ctx := strm.Context()
+	store := acc.GetEntityKeyStore()
+	state := &entityKeypairsWatchState{unlockedPeers: store.GetUnlockedPeerIDs()}
+	acc.GetAccountBroadcast().HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		state.keypairs = acc.KeypairsSnapshot()
+		state.valid = acc.AccountStateSnapshot() != nil
+	})
+
+	// Forward account and key-store changes into the combined watch state.
+	bridgeCtx, cancelBridges := context.WithCancel(ctx)
+	defer cancelBridges()
+	go state.bridgeAccount(bridgeCtx, acc)
+	go state.bridgeStore(bridgeCtx, store)
+
+	return state.runWatchLoop(ctx, strm.Send)
+}
+
+// entityKeypairsWatchState carries every input snapshot the keypairs watch
+// reads per emission, guarded by a single broadcast so the watch loop reads
+// all of them under the same HoldLock that obtains the wait channel. Both
+// bridge goroutines update fields under HoldLock and broadcast on change;
+// the watch never observes a stale wait channel paired with a fresh source
+// update.
+type entityKeypairsWatchState struct {
+	// bcast guards the fields below.
+	bcast broadcast.Broadcast
+	// keypairs is the account's entity keypair list.
+	keypairs []*session.EntityKeypair
+	// valid reports whether the account state has loaded.
+	valid bool
+	// unlockedPeers is the set of entity keys unlocked in the key store.
+	unlockedPeers map[peer.ID]bool
+}
+
+// bridgeAccount forwards account broadcast wakeups into the local broadcast,
+// re-snapshotting the keypair list and account validity on each update.
+func (s *entityKeypairsWatchState) bridgeAccount(
+	ctx context.Context,
+	acc *provider_spacewave.ProviderAccount,
+) {
+	accountBcast := acc.GetAccountBroadcast()
+	for {
+		// Read the account snapshot with the wait channel in one HoldLock.
+		var keypairs []*session.EntityKeypair
+		var valid bool
+		var waitCh <-chan struct{}
+		accountBcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+			keypairs = acc.KeypairsSnapshot()
+			valid = acc.AccountStateSnapshot() != nil
+			waitCh = getWaitCh()
+		})
+
+		// Publish the snapshot when it differs from the watch state.
+		s.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+			if valid == s.valid && slices.EqualFunc(s.keypairs, keypairs, (*session.EntityKeypair).EqualVT) {
+				return
+			}
+			s.keypairs = keypairs
+			s.valid = valid
+			broadcast()
+		})
+
+		// Wait for the next account change.
+		select {
+		case <-ctx.Done():
+			return
+		case <-waitCh:
+		}
+	}
+}
+
+// bridgeStore forwards key-store broadcast wakeups into the local broadcast,
+// re-snapshotting the unlocked peer set on each update.
+func (s *entityKeypairsWatchState) bridgeStore(
+	ctx context.Context,
+	store *provider_spacewave.EntityKeyStore,
+) {
+	storeBcast := store.GetBroadcast()
+	for {
+		// Take the wait channel before reading the unlocked peers, so an
+		// unlock during the read wakes the next iteration.
+		var waitCh <-chan struct{}
+		storeBcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+			waitCh = getWaitCh()
+		})
+
+		// Publish the unlocked peers when they differ from the watch state.
+		unlockedPeers := store.GetUnlockedPeerIDs()
+		s.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+			if maps.Equal(s.unlockedPeers, unlockedPeers) {
+				return
+			}
+			s.unlockedPeers = unlockedPeers
+			broadcast()
+		})
+
+		// Wait for the next key store change.
+		select {
+		case <-ctx.Done():
+			return
+		case <-waitCh:
+		}
+	}
+}
+
+// runWatchLoop emits a fresh WatchEntityKeypairsResponse whenever any folded
+// source changes. The state and wait channel are read in the same HoldLock
+// so a source update that lands between reading state and selecting on the
+// wait channel cannot be missed: the broadcast in the source bridge replaces
+// the wait channel before the watch loop blocks on it.
+func (s *entityKeypairsWatchState) runWatchLoop(
+	ctx context.Context,
+	send func(*s4wave_account.WatchEntityKeypairsResponse) error,
+) error {
+	var prev *s4wave_account.WatchEntityKeypairsResponse
+	for {
+		var (
+			keypairs      []*session.EntityKeypair
+			valid         bool
+			unlockedPeers map[peer.ID]bool
+			waitCh        <-chan struct{}
+		)
+		s.bcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+			keypairs = s.keypairs
+			valid = s.valid
+			unlockedPeers = s.unlockedPeers
+			waitCh = getWaitCh()
+		})
+
+		if valid {
+			states := make([]*s4wave_account.EntityKeypairState, 0, len(keypairs))
+			for _, kp := range keypairs {
+				pid, pidErr := peer.IDB58Decode(kp.GetPeerId())
+				unlocked := pidErr == nil && unlockedPeers[pid]
+				states = append(states, &s4wave_account.EntityKeypairState{
+					Keypair:  kp,
+					Unlocked: unlocked,
+				})
+			}
+			resp := &s4wave_account.WatchEntityKeypairsResponse{
+				Keypairs:      states,
+				UnlockedCount: uint32(len(unlockedPeers)), //nolint:gosec // the response count is the bounded unlocked-peer result.
+			}
+			if prev == nil || !resp.EqualVT(prev) {
+				if err := send(resp); err != nil {
+					return err
+				}
+				prev = resp
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-waitCh:
+		}
+	}
+}
+
+// UnlockEntityKeypair derives the entity private key from a credential
+// and holds it in memory for signing operations.
+func (r *AccountResource) UnlockEntityKeypair(
+	ctx context.Context,
+	req *s4wave_account.UnlockEntityKeypairRequest,
+) (*s4wave_account.UnlockEntityKeypairResponse, error) {
+	// Resolve the credential and unlock the matching entity keypair.
+	privKey, resolvedPeerID, err := r.ResolveEntityKey(ctx, req.GetCredential())
+	if err != nil {
+		return nil, err
+	}
+	requestedPeerID := req.GetPeerId()
+	if requestedPeerID != "" && resolvedPeerID.String() != requestedPeerID {
+		return nil, errors.Errorf("resolved peer ID %s does not match requested %s", resolvedPeerID.String(), requestedPeerID)
+	}
+	store, err := r.entityKeyStore()
+	if err != nil {
+		return nil, err
+	}
+	store.Unlock(resolvedPeerID, privKey)
+	return &s4wave_account.UnlockEntityKeypairResponse{}, nil
+}
+
+// SignWithEntityKeypair signs an arbitrary payload with an unlocked entity
+// keypair.
+func (r *AccountResource) SignWithEntityKeypair(
+	ctx context.Context,
+	req *s4wave_account.SignWithEntityKeypairRequest,
+) (*s4wave_account.SignWithEntityKeypairResponse, error) {
+	// Validate the requested peer and payload before signing.
+	pidStr := req.GetPeerId()
+	if pidStr == "" {
+		return nil, errors.New("peer_id is required")
+	}
+	if len(req.GetPayload()) == 0 {
+		return nil, errors.New("payload is required")
+	}
+
+	// Decode the peer ID and access the account entity key store.
+	pid, err := peer.IDB58Decode(pidStr)
+	if err != nil {
+		return nil, errors.Wrap(err, "decode peer ID")
+	}
+	store, err := r.entityKeyStore()
+	if err != nil {
+		return nil, err
+	}
+	sig, err := store.SignRaw(pid, req.GetPayload())
+	if err != nil {
+		return nil, errors.Wrap(err, "sign payload")
+	}
+	if len(sig) == 0 {
+		return nil, errors.New("entity keypair is locked")
+	}
+	return &s4wave_account.SignWithEntityKeypairResponse{Signature: sig}, nil
+}
+
+// LockEntityKeypair drops a previously unlocked entity private key.
+func (r *AccountResource) LockEntityKeypair(
+	ctx context.Context,
+	req *s4wave_account.LockEntityKeypairRequest,
+) (*s4wave_account.LockEntityKeypairResponse, error) {
+	// Decode the requested peer and lock its entity keypair.
+	pidStr := req.GetPeerId()
+	if pidStr == "" {
+		return nil, errors.New("peer_id is required")
+	}
+	pid, err := peer.IDB58Decode(pidStr)
+	if err != nil {
+		return nil, errors.Wrap(err, "decode peer ID")
+	}
+	store, err := r.entityKeyStore()
+	if err != nil {
+		return nil, err
+	}
+	store.Lock(pid)
+	return &s4wave_account.LockEntityKeypairResponse{}, nil
+}
+
+// LockAllEntityKeypairs drops all unlocked entity private keys.
+func (r *AccountResource) LockAllEntityKeypairs(
+	ctx context.Context,
+	_ *s4wave_account.LockAllEntityKeypairsRequest,
+) (*s4wave_account.LockAllEntityKeypairsResponse, error) {
+	store, err := r.entityKeyStore()
+	if err != nil {
+		return nil, err
+	}
+	store.LockAll()
+	return &s4wave_account.LockAllEntityKeypairsResponse{}, nil
+}
+
+// resolveOrSignWithStore builds the MultiSigActionEnvelope and produces
+// signatures over the envelope bytes using either a caller-supplied credential
+// or any keys currently unlocked in the key store. Returns the envelope
+// bytes plus the resolved signatures.
+//
+// The precedence is:
+//  1. credential != nil: resolve entity key, sign envelope
+//  2. key store has unlocked keys: sign envelope with all unlocked keys
+//  3. error: no credentials and no unlocked keys
+func (r *AccountResource) resolveOrSignWithStore(
+	ctx context.Context,
+	cred *session.EntityCredential,
+	kind api.MultiSigActionKind,
+	method, reqPath string,
+	actionBody []byte,
+) ([]byte, []*api.EntitySignature, error) {
+	// Encode the action envelope before selecting its signing credentials.
+	envelope, err := r.buildMultiSigEnvelope(kind, method, reqPath, actionBody)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Sign with the explicit credential or with every unlocked keypair.
+	if cred != nil {
+		entityPriv, entityPeerID, err := r.ResolveEntityKey(ctx, cred)
+		if err != nil {
+			return nil, nil, err
+		}
+		now := timestamppb.New(time.Now().Truncate(time.Millisecond))
+		payload := provider_spacewave.BuildMultiSigPayload(now, envelope)
+		sig, err := entityPriv.Sign(payload)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "sign envelope")
+		}
+		return envelope, []*api.EntitySignature{{
+			PeerId:    entityPeerID.String(),
+			Signature: sig,
+			SignedAt:  now,
+		}}, nil
+	}
+	store, err := r.entityKeyStore()
+	if err != nil {
+		return nil, nil, err
+	}
+	storeSigs, err := store.SignAll(envelope)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "key store sign")
+	}
+	if len(storeSigs) == 0 {
+		return nil, nil, errors.New("no credentials provided and no keypairs unlocked")
+	}
+	return envelope, storeSigs, nil
+}
+
+// watchLocalEntityKeypairs streams the entity keypairs of the local account
+// with its unlocked peers.
+func (r *AccountResource) watchLocalEntityKeypairs(
+	strm s4wave_account.SRPCAccountResourceService_WatchEntityKeypairsStream,
+) error {
+	// Mount the local account settings.
+	ctx, ctxCancel := context.WithCancel(strm.Context())
+	defer ctxCancel()
+	_, relSO, stateCtr, relStateCtr, err := r.mountLocalAccountSettingsState(ctx, ctxCancel)
+	if err != nil {
+		return err
+	}
+	defer relSO()
+	defer relStateCtr()
+
+	// Seed the watch state from the current settings and the key store.
+	store, err := r.entityKeyStore()
+	if err != nil {
+		return err
+	}
+	snapshot := stateCtr.GetValue()
+	settings, err := account_settings.ReadSnapshot(ctx, snapshot)
+	if err != nil {
+		return err
+	}
+	state := &entityKeypairsWatchState{
+		keypairs:      settings.GetEntityKeypairs(),
+		valid:         true,
+		unlockedPeers: store.GetUnlockedPeerIDs(),
+	}
+
+	// Bridge settings and key store changes into the watch loop.
+	bridgeCtx, cancelBridges := context.WithCancel(ctx)
+	defer cancelBridges()
+	go state.bridgeLocalAccountSettings(bridgeCtx, stateCtr, snapshot)
+	go state.bridgeStore(bridgeCtx, store)
+
+	return state.runWatchLoop(ctx, strm.Send)
+}
+
+// bridgeLocalAccountSettings publishes the entity keypairs of each settings
+// change after current, the snapshot the watch state was seeded from.
+func (s *entityKeypairsWatchState) bridgeLocalAccountSettings(
+	ctx context.Context,
+	stateCtr ccontainer.Watchable[sobject.SharedObjectStateSnapshot],
+	current sobject.SharedObjectStateSnapshot,
+) {
+	for {
+		next, err := stateCtr.WaitValueChange(ctx, current, nil)
+		if err != nil {
+			return
+		}
+		current = next
+		settings, err := account_settings.ReadSnapshot(ctx, next)
+		if err != nil {
+			return
+		}
+		s.bcast.HoldLock(func(broadcast func(), _ func() <-chan struct{}) {
+			s.keypairs = settings.GetEntityKeypairs()
+			s.valid = true
+			broadcast()
+		})
+	}
+}
+
+// entityKeyStore returns the entity key store of the account.
+func (r *AccountResource) entityKeyStore() (*provider_spacewave.EntityKeyStore, error) {
+	if r.localAccount != nil {
+		return r.localEntityKeyStore, nil
+	}
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	return acc.GetEntityKeyStore(), nil
+}

@@ -1,0 +1,567 @@
+//go:build !js
+
+package spacewave_cli
+
+import (
+	"bufio"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/aperturerobotics/cli"
+	protojson "github.com/aperturerobotics/protobuf-go-lite/json"
+	"github.com/pkg/errors"
+	cli_entrypoint "github.com/s4wave/spacewave/bldr/cli/entrypoint"
+	provider_local "github.com/s4wave/spacewave/core/provider/local"
+	core_session "github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_account "github.com/s4wave/spacewave/sdk/account"
+)
+
+// newSessionCommand builds the session command group.
+func newSessionCommand(_ func() cli_entrypoint.CliBus) *cli.Command {
+	return &cli.Command{
+		Name:    "session",
+		Aliases: []string{"sessions"},
+		Usage:   "manage sessions",
+		Subcommands: []*cli.Command{
+			newSessionListCommand(),
+			newSessionInfoCommand(),
+			newSessionAttachLocalCommand(),
+			newSessionPairCommand(),
+			newSessionLogoutCommand(),
+			newSessionRevokeCommand(),
+			newSessionMoveCommand(),
+		},
+	}
+}
+
+// newSessionListCommand builds the session list command.
+func newSessionListCommand() *cli.Command {
+	var statePath string
+	var sessionIdx uint
+	return &cli.Command{
+		Name:  "list",
+		Usage: "list sessions",
+		Flags: clientFlags(&statePath, &sessionIdx),
+		Action: func(c *cli.Context) error {
+			return runSessionList(c, statePath, c.String("output"))
+		},
+	}
+}
+
+// runSessionList implements the session list command logic.
+func runSessionList(c *cli.Context, statePath, outputFormat string) error {
+	// Connect to the daemon.
+	ctx := c.Context
+	client, err := connectDaemonFromContext(ctx, c, statePath)
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	// List the registered Sessions.
+	sessions, err := client.root.ListSessions(ctx)
+	if err != nil {
+		return errors.Wrap(err, "list sessions")
+	}
+
+	// Print structured output as is.
+	if outputFormat == "json" || outputFormat == "yaml" {
+		data, err := protojson.MarshalSlice(protojson.MarshalerConfig{}, sessions)
+		if err != nil {
+			return err
+		}
+		return formatOutput(data, outputFormat)
+	}
+
+	// Print the table, or a note when there are no Sessions.
+	if len(sessions) == 0 {
+		os.Stdout.WriteString("no sessions\n")
+		return nil
+	}
+	rows := [][]string{{"INDEX", "SESSION", "PROVIDER", "ACCOUNT", "USERNAME"}}
+	for _, s := range sessions {
+		// Spacewave Sessions store the account username as their display name.
+		ref := s.GetSessionRef().GetProviderResourceRef()
+		var username string
+		if ref.GetProviderId() == "spacewave" {
+			meta, _, err := client.root.GetSessionMetadata(ctx, s.GetSessionIndex())
+			if err != nil {
+				return errors.Wrap(err, "get session metadata")
+			}
+			username = meta.GetDisplayName()
+		}
+
+		// Add the Session row.
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(s.GetSessionIndex()), 10),
+			truncateID(ref.GetId(), 8),
+			ref.GetProviderId(),
+			ref.GetProviderAccountId(),
+			username,
+		})
+	}
+	writeTable(os.Stdout, "", rows)
+	return nil
+}
+
+// newSessionInfoCommand builds the session info command.
+func newSessionInfoCommand() *cli.Command {
+	var statePath string
+	var sessionIdx uint
+	return &cli.Command{
+		Name:  "info",
+		Usage: "show session details and peer info",
+		Flags: clientFlags(&statePath, &sessionIdx),
+		Action: func(c *cli.Context) error {
+			return runSessionInfo(c, statePath, c.String("output"), sessionIndex32(sessionIdx))
+		},
+	}
+}
+
+// runSessionInfo implements the session info command logic.
+// This is also called from the hidden "info" alias in cli.go.
+func runSessionInfo(c *cli.Context, statePath, outputFormat string, sessionIdx uint32) error {
+	// Connect to the daemon.
+	ctx := c.Context
+	client, err := connectDaemonFromContext(ctx, c, statePath)
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	// Mount the selected session.
+	sess, err := client.mountSession(ctx, sessionIdx)
+	if err != nil {
+		return err
+	}
+	defer sess.Release()
+
+	// Read the session info.
+	info, err := sess.GetSessionInfo(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get session info")
+	}
+
+	// Copy the session, peer, provider, and account IDs.
+	sessID := info.GetSessionRef().GetProviderResourceRef().GetId()
+	peerID := info.GetPeerId()
+	provID := info.GetSessionRef().GetProviderResourceRef().GetProviderId()
+	acctID := info.GetSessionRef().GetProviderResourceRef().GetProviderAccountId()
+
+	// Watch the session resource list.
+	strm, err := sess.WatchResourcesList(ctx)
+	if err != nil {
+		return errors.Wrap(err, "watch resources list")
+	}
+	defer strm.Close()
+
+	// Read the current resource list.
+	resp, err := strm.Recv()
+	if err != nil {
+		return errors.Wrap(err, "recv resources list")
+	}
+
+	// Take the Space list from the resource snapshot.
+	spaces := resp.GetSpacesList()
+
+	// Emit the session info as JSON or YAML when that output format was requested.
+	if outputFormat == "json" || outputFormat == "yaml" {
+		buf, ms := newMarshalBuf()
+		ms.WriteObjectStart()
+		var f bool
+		ms.WriteMoreIf(&f)
+		ms.WriteObjectField("sessionId")
+		ms.WriteString(sessID)
+		ms.WriteMoreIf(&f)
+		ms.WriteObjectField("peerId")
+		ms.WriteString(peerID)
+		ms.WriteMoreIf(&f)
+		ms.WriteObjectField("providerId")
+		ms.WriteString(provID)
+		ms.WriteMoreIf(&f)
+		ms.WriteObjectField("providerAccountId")
+		ms.WriteString(acctID)
+		ms.WriteMoreIf(&f)
+		ms.WriteObjectField("sessionIndex")
+		ms.WriteUint32(sessionIdx)
+		ms.WriteMoreIf(&f)
+		ms.WriteObjectField("spaceCount")
+		ms.WriteInt32(int32(len(spaces))) //nolint:gosec // the JSON writer's repeated-space count is bounded by the in-memory result.
+		ms.WriteMoreIf(&f)
+		ms.WriteObjectField("spaces")
+		ms.WriteArrayStart()
+		var sf bool
+		for _, sp := range spaces {
+			ms.WriteMoreIf(&sf)
+			ms.WriteObjectStart()
+			var spf bool
+			ms.WriteMoreIf(&spf)
+			ms.WriteObjectField("id")
+			ms.WriteString(sp.GetEntry().GetRef().GetProviderResourceRef().GetId())
+			ms.WriteMoreIf(&spf)
+			ms.WriteObjectField("name")
+			ms.WriteString(sp.GetSpaceMeta().GetName())
+			ms.WriteObjectEnd()
+		}
+		ms.WriteArrayEnd()
+		ms.WriteObjectEnd()
+		return formatOutput(buf.Bytes(), outputFormat)
+	}
+
+	// Write the session fields and the Space table.
+	w := os.Stdout
+	writeFields(w, [][2]string{
+		{"Session", sessID},
+		{"Peer", peerID},
+		{"Provider", provID},
+		{"Account", acctID},
+	})
+	if len(spaces) > 0 {
+		w.WriteString("\nSpaces (" + strconv.Itoa(len(spaces)) + ")\n")
+		rows := [][]string{{"ID", "NAME"}}
+		for _, sp := range spaces {
+			rows = append(rows, []string{
+				truncateID(sp.GetEntry().GetRef().GetProviderResourceRef().GetId(), 8),
+				sp.GetSpaceMeta().GetName(),
+			})
+		}
+		writeTable(w, "  ", rows)
+	}
+	return nil
+}
+
+// newSessionLogoutCommand builds the session logout subcommand.
+func newSessionLogoutCommand() *cli.Command {
+	// Declare the logout flags and return the command.
+	var statePath string
+	var sessionIdx uint
+	var yes bool
+	var sessionID string
+	var accountID string
+	return &cli.Command{
+		Name:      "logout",
+		Aliases:   []string{"signout"},
+		Usage:     "sign out a local session",
+		ArgsUsage: "[session-index|session-id|account-id]",
+		Flags:     sessionLogoutFlags(&statePath, &sessionIdx, &sessionID, &accountID, &yes),
+		Action: func(c *cli.Context) error {
+			return runSessionLogout(c, statePath, sessionIndex32(sessionIdx), sessionLogoutTarget{
+				Positional: c.Args().First(),
+				SessionID:  sessionID,
+				AccountID:  accountID,
+			}, yes)
+		},
+	}
+}
+
+// sessionLogoutTarget selects the session to sign out.
+type sessionLogoutTarget struct {
+	// Positional is the index, session ID, or account ID argument.
+	Positional string
+	// SessionID is the --session-id flag value.
+	SessionID string
+	// AccountID is the --account-id flag value.
+	AccountID string
+}
+
+func sessionLogoutFlags(statePath *string, sessionIdx *uint, sessionID *string, accountID *string, yes *bool) []cli.Flag {
+	return append(
+		clientFlags(statePath, sessionIdx),
+		&cli.StringFlag{
+			Name:        "session-id",
+			Usage:       "session id to sign out",
+			Destination: sessionID,
+		},
+		&cli.StringFlag{
+			Name:        "account-id",
+			Usage:       "provider account id to sign out",
+			Destination: accountID,
+		},
+		&cli.BoolFlag{
+			Name:        "yes",
+			Aliases:     []string{"y"},
+			Usage:       "confirm sign-out without prompting",
+			Destination: yes,
+		},
+	)
+}
+
+func runSessionLogout(c *cli.Context, statePath string, sessionIdx uint32, target sessionLogoutTarget, yes bool) error {
+	// Connect to the daemon.
+	ctx := c.Context
+	client, err := connectDaemonFromContext(ctx, c, statePath)
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	// List sessions on the daemon.
+	sessions, err := client.root.ListSessions(ctx)
+	if err != nil {
+		return errors.Wrap(err, "list sessions")
+	}
+
+	// Resolve the session entry to sign out.
+	entry, err := resolveSessionLogoutEntry(sessions, target, sessionIdx)
+	if err != nil {
+		return err
+	}
+
+	// Confirm the sign-out unless --yes was given.
+	if !yes {
+		ok, err := confirmSessionLogout(entry)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			os.Stdout.WriteString("sign out canceled\n")
+			return nil
+		}
+	}
+
+	// Delete the selected session.
+	if err := client.root.DeleteSession(ctx, entry.GetSessionIndex()); err != nil {
+		return errors.Wrap(err, "delete session")
+	}
+
+	// Report the signed-out session index, session, and account.
+	ref := entry.GetSessionRef().GetProviderResourceRef()
+	os.Stdout.WriteString("signed out session index " + strconv.FormatUint(uint64(entry.GetSessionIndex()), 10) +
+		" (" + ref.GetProviderId() + " " + ref.GetProviderAccountId() + ")\n")
+	return nil
+}
+
+func resolveSessionLogoutEntry(sessions []*core_session.SessionListEntry, target sessionLogoutTarget, sessionIdx uint32) (*core_session.SessionListEntry, error) {
+	// Resolve the logout target from flags, or from the selected session index.
+	if len(sessions) == 0 {
+		return nil, errors.New("no sessions")
+	}
+	if target.SessionID != "" && target.AccountID != "" {
+		return nil, errors.New("use only one of --session-id or --account-id")
+	}
+	if target.SessionID != "" {
+		return resolveSessionLogoutEntryByProviderRef(sessions, target.SessionID, false)
+	}
+	if target.AccountID != "" {
+		return resolveSessionLogoutEntryByProviderRef(sessions, target.AccountID, true)
+	}
+	if target.Positional == "" {
+		for _, entry := range sessions {
+			if entry.GetSessionIndex() == sessionIdx {
+				return entry, nil
+			}
+		}
+		return nil, errors.Errorf("no session found at index %d", sessionIdx)
+	}
+
+	// Match a numeric positional argument as a session index.
+	if idx, err := strconv.ParseUint(target.Positional, 10, 32); err == nil {
+		for _, entry := range sessions {
+			if entry.GetSessionIndex() == uint32(idx) {
+				return entry, nil
+			}
+		}
+		return nil, errors.Errorf("no session found at index %d", idx)
+	}
+
+	return resolveSessionLogoutEntryByProviderRef(sessions, target.Positional, true)
+}
+
+func resolveSessionLogoutEntryByProviderRef(sessions []*core_session.SessionListEntry, selector string, allowAccount bool) (*core_session.SessionListEntry, error) {
+	var match *core_session.SessionListEntry
+	for _, entry := range sessions {
+		ref := entry.GetSessionRef().GetProviderResourceRef()
+		if selector != ref.GetId() && (!allowAccount || selector != ref.GetProviderAccountId()) {
+			continue
+		}
+		if match != nil {
+			return nil, errors.Errorf("multiple sessions match %q; use a session index", selector)
+		}
+		match = entry
+	}
+	if match != nil {
+		return match, nil
+	}
+	return nil, errors.Errorf("no session found matching %q", selector)
+}
+
+func confirmSessionLogout(entry *core_session.SessionListEntry) (bool, error) {
+	// Print the session and ask for confirmation.
+	ref := entry.GetSessionRef().GetProviderResourceRef()
+	os.Stdout.WriteString("Sign out this local session?\n\n")
+	writeFields(os.Stdout, [][2]string{
+		{"Index", strconv.FormatUint(uint64(entry.GetSessionIndex()), 10)},
+		{"Session", ref.GetId()},
+		{"Provider", ref.GetProviderId()},
+		{"Account", ref.GetProviderAccountId()},
+	})
+	os.Stdout.WriteString("\nThis removes the session from this Spacewave state root. It does not revoke the provider-side session.\n")
+	os.Stdout.WriteString("Continue? [y/N]: ")
+
+	// Accept y or yes as confirmation.
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return false, errors.Wrap(err, "read confirmation")
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes", nil
+}
+
+// newSessionRevokeCommand builds the session revoke command.
+// newSessionMoveCommand builds the command that gives a session another index.
+func newSessionMoveCommand() *cli.Command {
+	var statePath string
+	return &cli.Command{
+		Name:      "move",
+		Usage:     "give a session another, free index",
+		ArgsUsage: "<from-index> <to-index>",
+		Description: "Moves a session to a free index, such as an account added back after a sign-out, so " +
+			"tools and links that name its old index find it again. Its mounts restart at the new index. " +
+			"A link that named the target index for a session signed out earlier names the moved one.",
+		Flags: []cli.Flag{statePathFlag(&statePath)},
+		Action: func(c *cli.Context) error {
+			// Require the two indexes.
+			if c.Args().Len() != 2 {
+				return errors.New("usage: session move <from-index> <to-index>")
+			}
+
+			// Parse the source and target indexes.
+			from, err := strconv.ParseUint(c.Args().Get(0), 10, 32)
+			if err != nil {
+				return errors.Wrap(err, "from index")
+			}
+			to, err := strconv.ParseUint(c.Args().Get(1), 10, 32)
+			if err != nil {
+				return errors.Wrap(err, "to index")
+			}
+
+			// Connect to the daemon.
+			ctx := c.Context
+			client, err := connectDaemonFromContext(ctx, c, statePath)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+
+			// Move the session and report where it went.
+			moved, err := client.root.MoveSession(ctx, uint32(from), uint32(to))
+			if err != nil {
+				return errors.Wrap(err, "move session")
+			}
+			ref := moved.GetSessionRef().GetProviderResourceRef()
+			os.Stdout.WriteString("moved session " + strconv.FormatUint(from, 10) + " to index " +
+				strconv.FormatUint(uint64(moved.GetSessionIndex()), 10) + " (" + ref.GetProviderId() + " " + ref.GetProviderAccountId() + ")\n")
+			return nil
+		},
+	}
+}
+
+func newSessionRevokeCommand() *cli.Command {
+	var statePath string
+	var sessionIdx uint
+	var pemFile string
+	return &cli.Command{
+		Name:      "revoke",
+		Usage:     "revoke a session of this account by peer ID",
+		ArgsUsage: "<session-peer-id>",
+		Flags:     append(clientFlags(&statePath, &sessionIdx), pemFileFlag(&pemFile)),
+		Action: func(c *cli.Context) error {
+			pid := c.Args().First()
+			if pid == "" {
+				return errors.New("session peer ID argument required")
+			}
+			return runSessionRevoke(c, statePath, sessionIndex32(sessionIdx), pemFile, pid)
+		},
+	}
+}
+
+// runSessionRevoke implements the session revoke command.
+func runSessionRevoke(c *cli.Context, statePath string, sessionIdx uint32, authPemFile, sessionPeerID string) error {
+	// Resolve the state path and validate the target peer ID.
+	ctx := c.Context
+	resolved, err := resolveStatePathFromContext(c, statePath)
+	if err != nil {
+		return err
+	}
+	if err := validateSessionPeerID(sessionPeerID); err != nil {
+		return err
+	}
+
+	// Connect to the daemon.
+	client, err := connectDaemonWithResolvedFallback(ctx, c, resolved)
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	// Mount the session that authorizes the revoke.
+	sess, err := client.mountSession(ctx, sessionIdx)
+	if err != nil {
+		return err
+	}
+	defer sess.Release()
+
+	// Identify the session's provider account.
+	info, err := sess.GetSessionInfo(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get session info")
+	}
+	provID := info.GetSessionRef().GetProviderResourceRef().GetProviderId()
+	acctID := info.GetSessionRef().GetProviderResourceRef().GetProviderAccountId()
+
+	// A local account revokes through the Session that holds its key.
+	if provID == provider_local.ProviderID {
+		if err := sess.UnlinkDevice(ctx, sessionPeerID); err != nil {
+			return errors.Wrap(err, "revoke session")
+		}
+		printSessionRevoked(sessionPeerID)
+		return nil
+	}
+
+	// Access the account service.
+	acctSvc, acctCleanup, err := client.accessAccount(ctx, provID, acctID)
+	if err != nil {
+		return err
+	}
+	defer acctCleanup()
+
+	// Collect the credential that authorizes the revoke.
+	cred, err := resolveCredential(ctx, sess, acctSvc, authPemFile)
+	if err != nil {
+		return err
+	}
+
+	// Revoke the target session.
+	_, err = acctSvc.RevokeSession(ctx, &s4wave_account.RevokeSessionRequest{
+		SessionPeerId: sessionPeerID,
+		Credential:    cred,
+	})
+	if err != nil {
+		return errors.Wrap(err, "revoke session")
+	}
+	printSessionRevoked(sessionPeerID)
+	return nil
+}
+
+// printSessionRevoked reports the revoked session by its shortened peer ID.
+func printSessionRevoked(sessionPeerID string) {
+	// Shorten the peer ID and print it.
+	pidStr := sessionPeerID
+	if len(pidStr) > 16 {
+		pidStr = pidStr[:16] + "..."
+	}
+	os.Stdout.WriteString("session revoked (" + pidStr + ")\n")
+}
+
+func validateSessionPeerID(value string) error {
+	pid, err := peer.IDB58Decode(value)
+	if err != nil || pid.String() != value {
+		return errors.Errorf(
+			"session revoke requires a session peer ID, got %q; run `spacewave sessions info --session-index <idx>` and use the Peer value",
+			value,
+		)
+	}
+	return nil
+}

@@ -1,0 +1,99 @@
+package resource_world
+
+import (
+	"context"
+	"time"
+
+	"github.com/s4wave/spacewave/core/sobject"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// WorldStateOperationRecord describes one WorldStateResource operation.
+type WorldStateOperationRecord struct {
+	// Name is the WorldStateResource method name.
+	Name string
+	// Duration is the elapsed wall-clock duration.
+	Duration time.Duration
+	// Error is set when the operation returned an error.
+	Error string
+	// FilterCount is the number of graph filters in the request.
+	FilterCount int
+	// Limit is the relevant request limit.
+	Limit int
+	// ResultSetCount is the number of result groups returned.
+	ResultSetCount int
+	// ResultQuadCount is the total number of graph quads returned.
+	ResultQuadCount int
+	// StartKeyCount is the number of graph path start keys.
+	StartKeyCount int
+	// StepCount is the number of graph path steps.
+	StepCount int
+	// PageSize is the requested page size for resource-backed operations.
+	PageSize int
+	// ResultObjectCount is the number of object keys returned by the operation.
+	ResultObjectCount int
+	// ResourceCreated indicates that the operation attached a resource.
+	ResourceCreated bool
+	// ReadCounterSnapshot is the block read-counter snapshot for the operation.
+	ReadCounterSnapshot block.ReadCounterSnapshot
+}
+
+// WorldStateOperationObserver observes WorldStateResource operation records.
+type WorldStateOperationObserver func(WorldStateOperationRecord)
+
+// WorldStateResourceOption configures a WorldStateResource.
+type WorldStateResourceOption func(*WorldStateResource)
+
+// WithWorldStateOperationObserver configures WorldStateResource operation accounting.
+func WithWorldStateOperationObserver(observer WorldStateOperationObserver) WorldStateResourceOption {
+	return func(r *WorldStateResource) {
+		r.operationObserver = observer
+	}
+}
+
+// WithSessionPeerID binds typed access and operation execution to the authenticated session peer.
+func WithSessionPeerID(sessionPeerID peer.ID) WorldStateResourceOption {
+	return func(r *WorldStateResource) {
+		r.sessionPeerID = sessionPeerID
+		r.sessionPeerIDBound = true
+	}
+}
+
+// WithCallerParticipantLookup reads accepted caller identity from the granting mount.
+// A nil lookup leaves the accepted participant unknown.
+func WithCallerParticipantLookup(lookup func(context.Context, peer.ID) (*sobject.SOParticipantConfig, error)) WorldStateResourceOption {
+	return func(r *WorldStateResource) { r.participantLookup = lookup }
+}
+
+// WithEngineID binds typed access to the registry scope selected by the granting mount.
+// An empty ID binds global scope; callers cannot override a trusted binding.
+func WithEngineID(engineID string) WorldStateResourceOption {
+	return func(r *WorldStateResource) {
+		r.engineID = engineID
+		r.engineIDBound = true
+	}
+}
+
+// WithOuterEngine grants OpenOuterWorld the Space Engine that authorized a
+// nested World mount. A nil Engine marks a top-level mount.
+func WithOuterEngine(engine world.Engine) WorldStateResourceOption {
+	return func(r *WorldStateResource) { r.outerEngine = engine }
+}
+
+// applyWorldStateResourceOptions applies the granting component's access options.
+func applyWorldStateResourceOptions(r *WorldStateResource, opts ...WorldStateResourceOption) {
+	for _, opt := range opts {
+		if opt != nil {
+			opt(r)
+		}
+	}
+}
+
+// worldStateResourceSessionPeerID reads the trusted session binding from resource options.
+func worldStateResourceSessionPeerID(opts ...WorldStateResourceOption) (peer.ID, bool) {
+	r := new(WorldStateResource)
+	applyWorldStateResourceOptions(r, opts...)
+	return r.sessionPeerID, r.sessionPeerIDBound
+}

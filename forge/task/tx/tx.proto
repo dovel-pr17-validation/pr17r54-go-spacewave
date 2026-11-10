@@ -1,0 +1,116 @@
+syntax = "proto3";
+package task.tx;
+
+import "github.com/s4wave/spacewave/forge/target/target.proto";
+import "github.com/s4wave/spacewave/forge/value/value.proto";
+import "github.com/aperturerobotics/common/typeid/typeid.proto";
+
+// Tx is the on-the-wire representation of a transaction.
+message Tx {
+  option (typeid.id) = "forge/task/tx";
+
+  // TxType is the kind of transaction this is.
+  TxType tx_type = 1;
+  // TaskObjectKey is the Task object ID this is associated with.
+  // The Task object must already exist.
+  string task_object_key = 2;
+
+  // TxUpdateInputs updates the Task with the latest Target and Inputs.
+  // TxType_UPDATE_INPUTS
+  TxUpdateInputs tx_update_inputs = 3;
+  // TxStart contains the start transaction tx.
+  // TxType_START
+  TxStart tx_start = 4;
+  // TxUpdatePassState contains the update pass state tx.
+  // TxType_UPDATE_WITH_PASS_STATE
+  TxUpdateWithPassState tx_update_with_pass_state = 5;
+  // TxComplete contains the complete tx.
+  // TxType_COMPLETE
+  TxComplete tx_complete = 6;
+  // TxRetry contains the explicit retry transaction.
+  // TxType_RETRY
+  TxRetry tx_retry = 7;
+
+}
+
+// TxType indicates the kind of transaction.
+enum TxType {
+  TxType_INVALID = 0;
+  // TxType_UPDATE_INPUTS updates the ValueSet inputs and target.
+  // If changed outside a live Pass, transitions to PENDING.
+  // If a Pass is live, requests cancellation and stays RUNNING until drain.
+  TxType_UPDATE_INPUTS = 1;
+  // TxType_START starts the Task when every predecessor Pass is complete.
+  // Transitions PENDING to RUNNING and creates the next Pass.
+  TxType_START = 2;
+  // TxType_UPDATE_WITH_PASS_STATE updates the Task from the current Pass.
+  // Canceled completion transitions to PENDING; other completion to CHECKING.
+  // A nonterminal Pass leaves the Task state unchanged.
+  TxType_UPDATE_WITH_PASS_STATE = 3;
+  // TxType_COMPLETE sets the result of the Task.
+  // If failed, can transition from any state.
+  // If success, must transition from CHECKING state.
+  // If success, all Execution states must be Successful.
+  TxType_COMPLETE = 4;
+  // TxType_RETRY authorizes one successor Pass for a failed predecessor.
+  // The expected pass nonce is the idempotency fence.
+  TxType_RETRY = 5;
+}
+
+// TxRetry authorizes a successor Pass after a terminal failed Pass.
+// The scheduler supplies the named inputs for the successor.
+message TxRetry {
+  // ExpectedPassNonce identifies the failed Pass being retried.
+  uint64 expected_pass_nonce = 1;
+  // NextInputs contains the named inputs for the successor Pass.
+  // Outputs must be empty.
+  .forge.target.ValueSet next_inputs = 2;
+}
+
+// TxUpdateInputs updates the Task with the latest Target and Inputs.
+// If changed outside a live Pass, transitions to PENDING.
+// If a Pass is live, requests cancellation and stays RUNNING until drain.
+//
+// TxType: TxType_UPDATE_INPUTS
+message TxUpdateInputs {
+  // UpdateTarget indicates to update the TargetRef if necessary.
+  bool update_target = 1;
+  // ResetInputs indicates to clear the existing inputs before setting.
+  bool reset_inputs = 2;
+  // ValueSet is the set of inputs to set for the task.
+  // Outputs must be empty.
+  // Any Value with Type=UNKNOWN (0) will be deleted.
+  .forge.target.ValueSet value_set = 3;
+}
+
+// TxStart starts a Task by creating a Pass.
+// Transitions PENDING to RUNNING only after every predecessor Pass is complete.
+// Requests cancellation without creating a successor while a predecessor lives.
+//
+// TxType: TxType_START
+message TxStart {
+  // AssignSelf assigns the sender of the tx to the new Pass.
+  bool assign_self = 1;
+}
+
+// TxUpdateWithPassState updates the Task from the current Pass.
+// Canceled completion transitions to PENDING; other completion to CHECKING.
+// A nonterminal Pass leaves the Task state unchanged.
+// TxType: TxType_UPDATE_WITH_PASS_STATE
+message TxUpdateWithPassState {
+}
+
+// TxComplete completes the execution by setting the result.
+// If failed, may transition from any state.
+// If success, must be in the CHECKING state.
+// If success, the most recent Pass must be in COMPLETE state and not failed.
+// TxType: TxType_COMPLETE
+message TxComplete {
+  // Result is information about the outcome of a completed pass.
+  .forge.value.Result result = 1;
+  // ValueSet is the set of outputs from the task.
+  // Inputs must be empty.
+  // Must match the outputs calculated from the Pass and Execution objects.
+  // Must be empty if the result is not success.
+  .forge.target.ValueSet value_set = 2;
+}

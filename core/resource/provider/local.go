@@ -1,0 +1,401 @@
+package resource_provider
+
+import (
+	"context"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/util/ulid"
+	"github.com/pkg/errors"
+	core_provider "github.com/s4wave/spacewave/core/provider"
+	provider_local "github.com/s4wave/spacewave/core/provider/local"
+	"github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/core/sobject"
+	"github.com/s4wave/spacewave/net/keypem"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_provider_local "github.com/s4wave/spacewave/sdk/provider/local"
+	"github.com/sirupsen/logrus"
+)
+
+// LocalProviderResource retains Device Sessions until its Resource is released.
+type LocalProviderResource struct {
+	// ProviderResource serves common provider operations.
+	*ProviderResource
+	// b resolves the local Session controller and mounted Sessions.
+	b bus.Bus
+	// provider creates and reopens independently keyed local accounts.
+	provider *provider_local.Provider
+
+	// deviceSessionsMu guards retained Sessions and the release fence.
+	deviceSessionsMu sync.Mutex
+	// deviceSessions bridges completed enrollment to other Session consumers.
+	deviceSessions map[string]directive.Reference
+	// released prevents an in-flight enrollment from retaining a late Session.
+	released bool
+}
+
+// AttachAccount registers the Session whose signing key is already stored in
+// the selected local account volume. It does not create or mount a Session.
+func (s *LocalProviderResource) AttachAccount(
+	ctx context.Context,
+	req *s4wave_provider_local.AttachAccountRequest,
+) (*s4wave_provider_local.AttachAccountResponse, error) {
+	// Require a valid local account ID before attaching its stored Session.
+	accountID := req.GetAccountId()
+	if _, err := ulid.ParseULID(accountID); err != nil {
+		return nil, errors.Wrap(err, "invalid local account ID")
+	}
+
+	// Retain the Session controller while attaching the local account.
+	sessionCtrl, sessionCtrlRef, err := session.ExLookupSessionController(ctx, s.b, "", false, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer sessionCtrlRef.Release()
+
+	// Reuse any Session already registered for the local account.
+	entries, err := sessionCtrl.ListSessions(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "list sessions")
+	}
+	for _, entry := range entries {
+		ref := entry.GetSessionRef().GetProviderResourceRef()
+		if ref.GetProviderId() == provider_local.ProviderID && ref.GetProviderAccountId() == accountID {
+			return &s4wave_provider_local.AttachAccountResponse{SessionListEntry: entry}, nil
+		}
+	}
+
+	// Open the local account and require one stored Session key.
+	account, release, err := s.provider.AccessProviderAccount(ctx, accountID, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "open local account")
+	}
+	defer release()
+	storedIDs, err := account.(*provider_local.ProviderAccount).ListStoredSessionIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(storedIDs) != 1 {
+		return nil, errors.Errorf("local account %s has %d stored Session keys; expected one", accountID, len(storedIDs))
+	}
+
+	// Register the stored Session with its local account metadata.
+	ref := &session.SessionRef{ProviderResourceRef: &core_provider.ProviderResourceRef{
+		Id: storedIDs[0], ProviderId: provider_local.ProviderID, ProviderAccountId: accountID,
+	}}
+	meta := &session.SessionMetadata{
+		ProviderDisplayName: "Local", ProviderId: provider_local.ProviderID,
+		ProviderAccountId: accountID,
+	}
+	entry, err := sessionCtrl.RegisterSession(ctx, ref, meta)
+	if err != nil {
+		return nil, errors.Wrap(err, "register stored Session")
+	}
+	return &s4wave_provider_local.AttachAccountResponse{SessionListEntry: entry}, nil
+}
+
+// NewLocalProviderResource creates a new LocalProviderResource.
+func NewLocalProviderResource(pr *ProviderResource, _ *logrus.Entry, b bus.Bus, prov *provider_local.Provider) *LocalProviderResource {
+	return &LocalProviderResource{
+		ProviderResource: pr,
+		b:                b,
+		provider:         prov,
+	}
+}
+
+// Release drops every Session retained by completed enrollment. An in-flight
+// completion must release its late mount instead of reviving this Resource.
+func (s *LocalProviderResource) Release() {
+	// Withdraw retained references before invoking their teardown callbacks.
+	s.deviceSessionsMu.Lock()
+	s.released = true
+	refs := s.deviceSessions
+	s.deviceSessions = nil
+	s.deviceSessionsMu.Unlock()
+
+	// Session teardown may resolve other resources and must run outside the lock.
+	for _, ref := range refs {
+		ref.Release()
+	}
+}
+
+// CreateAccount creates a ProviderAccount and Session on the local provider.
+func (s *LocalProviderResource) CreateAccount(
+	ctx context.Context,
+	req *s4wave_provider_local.CreateAccountRequest,
+) (*s4wave_provider_local.CreateAccountResponse, error) {
+	// Create an independent local account before registering its Session.
+	sessRef, err := s.provider.CreateLocalAccountAndSession(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if req.GetDeferRegistration() {
+		return &s4wave_provider_local.CreateAccountResponse{SessionRef: sessRef}, nil
+	}
+
+	// Publish the new Session metadata through the controller.
+	sessionCtrl, sessionCtrlRef, err := session.ExLookupSessionController(ctx, s.b, "", false, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer sessionCtrlRef.Release()
+	meta := &session.SessionMetadata{
+		ProviderDisplayName: "Local",
+		ProviderId:          "local",
+		ProviderAccountId:   sessRef.GetProviderResourceRef().GetProviderAccountId(),
+		CreatedAt:           time.Now().UnixMilli(),
+	}
+	listEntry, err := sessionCtrl.RegisterSession(ctx, sessRef, meta)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return the registered Session to the caller.
+	return &s4wave_provider_local.CreateAccountResponse{SessionListEntry: listEntry, SessionRef: sessRef}, nil
+}
+
+// CompleteSpaceLinkEnrollment creates or reopens the caller's own local
+// session from the supplied Device key and joins the target Space through the
+// one-use targeted invite from a local SpaceLink approval.
+func (s *LocalProviderResource) CompleteSpaceLinkEnrollment(
+	ctx context.Context,
+	req *s4wave_provider_local.CompleteSpaceLinkEnrollmentRequest,
+) (*s4wave_provider_local.CompleteSpaceLinkEnrollmentResponse, error) {
+	// Reject new enrollment after the Resource's retained Sessions were released.
+	s.deviceSessionsMu.Lock()
+	released := s.released
+	s.deviceSessionsMu.Unlock()
+	if released {
+		return nil, errors.New("provider resource is released")
+	}
+
+	// Require a targeted invitation and prove the supplied Session key matches it.
+	invite := req.GetInvite()
+	if invite == nil {
+		return nil, errors.New("invite is required")
+	}
+	if len(req.GetSessionPemPrivateKey()) == 0 {
+		return nil, errors.New("session_pem_private_key is required")
+	}
+	sessionKey, err := keypem.ParsePrivKeyPem(req.GetSessionPemPrivateKey())
+	if err != nil {
+		return nil, errors.Wrap(err, "parse session key")
+	}
+
+	// Verify that the Session key matches the requested peer and invitation.
+	sessionPeerID, err := peer.IDFromPrivateKey(sessionKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "derive session peer id")
+	}
+	if req.GetSessionPeerId() != "" && req.GetSessionPeerId() != sessionPeerID.String() {
+		return nil, errors.New("session key does not match expected session peer id")
+	}
+	if invite.GetTargetPeerId() != "" && invite.GetTargetPeerId() != sessionPeerID.String() {
+		return nil, errors.New("invite targets a different peer")
+	}
+
+	// Retain the Session inventory while resolving or registering this identity.
+	sessionCtrl, sessionCtrlRef, err := session.ExLookupSessionController(ctx, s.b, "", false, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer sessionCtrlRef.Release()
+
+	// Reuse this Device identity without replacing another account.
+	listEntry, err := s.lookupLocalSessionByPeerID(ctx, sessionCtrl, sessionPeerID.String())
+	if err != nil {
+		return nil, err
+	}
+	if listEntry == nil {
+		sessRef, err := s.provider.CreateLocalAccountAndSessionWithKey(ctx, "", req.GetSessionPemPrivateKey())
+		if err != nil {
+			return nil, errors.Wrap(err, "create local session")
+		}
+		meta := &session.SessionMetadata{
+			ProviderDisplayName: "Local",
+			ProviderId:          sessRef.GetProviderResourceRef().GetProviderId(),
+			ProviderAccountId:   sessRef.GetProviderResourceRef().GetProviderAccountId(),
+			CreatedAt:           time.Now().UnixMilli(),
+		}
+		listEntry, err = sessionCtrl.RegisterSession(ctx, sessRef, meta)
+		if err != nil {
+			return nil, errors.Wrap(err, "register session")
+		}
+	}
+
+	// Retain the selected account through invite redemption and transport setup.
+	sessRef := listEntry.GetSessionRef()
+	accountID := sessRef.GetProviderResourceRef().GetProviderAccountId()
+	accIface, accRel, err := s.provider.AccessProviderAccount(ctx, accountID, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "access provider account")
+	}
+	defer accRel()
+	localAcc, ok := accIface.(*provider_local.ProviderAccount)
+	if !ok {
+		return nil, errors.New("unexpected provider account type")
+	}
+
+	// Redeem each invite once; retries and daemon restarts reuse the account's
+	// grant and transport. An account that holds the Space under an older invite
+	// still redeems a fresh one, which brings its configuration up to date.
+	// The approving peer decides how long the join takes, so ctx alone bounds it.
+	redeemed, err := localAccountRedeemedInvite(ctx, localAcc, invite)
+	if err != nil {
+		return nil, err
+	}
+	if !redeemed {
+		if _, err := localAcc.JoinViaInvite(ctx, sessionKey, invite, ""); err != nil {
+			return nil, errors.Wrap(err, "join space via invite")
+		}
+	} else {
+		if err := localAcc.EnsureConfiguredSessionTransport(ctx, sessionKey); err != nil {
+			return nil, errors.Wrap(err, "start session transport")
+		}
+		if !localAcc.IsP2PSyncRunning() {
+			if err := localAcc.StartPersistentP2PSync(ctx, localAcc.GetSessionTransport()); err != nil {
+				return nil, errors.Wrap(err, "start P2P sync")
+			}
+		}
+	}
+
+	// Keep the approving peer reachable while the completed Session is retained.
+	ownerPeerID, err := peer.IDB58Decode(invite.GetOwnerPeerId())
+	if err != nil {
+		return nil, errors.Wrap(err, "parse invite owner peer id")
+	}
+	if err := localAcc.RetainP2PPeer(ctx, ownerPeerID); err != nil {
+		return nil, errors.Wrap(err, "retain invite owner link")
+	}
+	if err := s.retainDeviceSession(ctx, sessRef); err != nil {
+		return nil, errors.Wrap(err, "retain completed Device session")
+	}
+
+	// Publish enrollment only after its Session remains retained.
+	return &s4wave_provider_local.CompleteSpaceLinkEnrollmentResponse{SessionListEntry: listEntry}, nil
+}
+
+// retainDeviceSession keeps a completed Device session mounted for the local
+// provider resource lifetime. This bridges the RPC response to the daemon's
+// capacity observer without dropping its transport in between.
+func (s *LocalProviderResource) retainDeviceSession(ctx context.Context, sessRef *session.SessionRef) error {
+	// Acquire a Session reference before entering the release fence.
+	_, ref, err := session.ExMountSession(ctx, s.b, sessRef, false, nil)
+	if err != nil {
+		return err
+	}
+	if ref == nil {
+		return errors.New("completed Device session could not be mounted")
+	}
+
+	// Keep one mount per account, or release a late acquisition after closure.
+	key := sessRef.GetProviderResourceRef().GetProviderAccountId()
+	s.deviceSessionsMu.Lock()
+	if s.released {
+		s.deviceSessionsMu.Unlock()
+		ref.Release()
+		return errors.New("provider resource is released")
+	}
+	if s.deviceSessions == nil {
+		s.deviceSessions = make(map[string]directive.Reference)
+	}
+	if _, exists := s.deviceSessions[key]; exists {
+		s.deviceSessionsMu.Unlock()
+		ref.Release()
+		return nil
+	}
+	s.deviceSessions[key] = ref
+	s.deviceSessionsMu.Unlock()
+	return nil
+}
+
+// lookupLocalSessionByPeerID returns the registered local session whose
+// mounted identity matches peerID. Missing is not an error.
+func (s *LocalProviderResource) lookupLocalSessionByPeerID(
+	ctx context.Context,
+	sessionCtrl session.SessionController,
+	peerID string,
+) (*session.SessionListEntry, error) {
+	// Return no Session when no peer identity was supplied.
+	if peerID == "" {
+		return nil, nil
+	}
+
+	// Match identity against registered Sessions rather than caller-selected accounts.
+	entries, err := sessionCtrl.ListSessions(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "list sessions")
+	}
+	for _, entry := range entries {
+		ref := entry.GetSessionRef()
+		if ref == nil {
+			continue
+		}
+		provRef := ref.GetProviderResourceRef()
+		if provRef.GetProviderId() != "local" {
+			continue
+		}
+
+		// Retain each candidate account only while checking its Session identity.
+		accountID := provRef.GetProviderAccountId()
+		accIface, accRel, err := s.provider.AccessProviderAccount(ctx, accountID, nil)
+		if err != nil {
+			return nil, errors.Wrapf(err, "access local account %q while matching session identity", accountID)
+		}
+		localAcc, ok := accIface.(*provider_local.ProviderAccount)
+		if !ok {
+			accRel()
+			return nil, errors.Errorf("local account %q has unexpected type", accountID)
+		}
+		sess, sessRel, err := localAcc.MountSession(ctx, ref, nil)
+		if err != nil {
+			accRel()
+			return nil, errors.Wrapf(err, "mount local session for account %q while matching identity", accountID)
+		}
+		match := sess.GetPeerId().String() == peerID
+		sessRel()
+		accRel()
+		if match {
+			return entry, nil
+		}
+	}
+	return nil, nil
+}
+
+// localAccountRedeemedInvite reports whether the account's copy of the shared
+// object records the invite, which the approving peer's state carries once the
+// invite is redeemed.
+func localAccountRedeemedInvite(ctx context.Context, localAcc *provider_local.ProviderAccount, invite *sobject.SOInviteMessage) (bool, error) {
+	// Find the account's entry for the invite's shared object.
+	entries := localAcc.GetSOListCtr().GetValue().GetSharedObjects()
+	idx := slices.IndexFunc(entries, func(entry *sobject.SharedObjectListEntry) bool {
+		return entry.GetRef().GetProviderResourceRef().GetId() == invite.GetSharedObjectId()
+	})
+	if idx == -1 {
+		return false, nil
+	}
+
+	// Read the state the account holds.
+	so, release, err := localAcc.MountSharedObject(ctx, entries[idx].GetRef(), nil)
+	if err != nil {
+		return false, errors.Wrap(err, "mount shared object")
+	}
+	defer release()
+	localSO, ok := so.(*provider_local.SharedObject)
+	if !ok {
+		return false, errors.New("unexpected shared object type")
+	}
+	state, err := localSO.GetSOHostState(ctx)
+	if err != nil {
+		return false, errors.Wrap(err, "read shared object state")
+	}
+
+	// The invite is redeemed once the held state records it.
+	return sobject.FindInvite(state, invite.GetInviteId()) != nil, nil
+}
+
+// _ verifies the local provider Resource contract.
+var _ s4wave_provider_local.SRPCLocalProviderResourceServiceServer = (*LocalProviderResource)(nil)

@@ -1,0 +1,139 @@
+package kvtx_block
+
+import (
+	"fmt"
+	"math/rand/v2"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/s4wave/spacewave/db/block"
+)
+
+// TestChangedKeys checks inserts, removals, value edits, tree rotations, bounded
+// fallback, and the comparison restricted to key ranges.
+func TestChangedKeys(t *testing.T) {
+	for _, impl := range []KVImplType{KVImplType_KV_IMPL_TYPE_IAVL, KVImplType_KV_IMPL_TYPE_OKRA, KVImplType_KV_IMPL_TYPE_OKRA_INLINE} {
+		t.Run(impl.String(), func(t *testing.T) {
+			// Create a block store and deterministic KV mutation sequence.
+			ctx := t.Context()
+			store := newSelectorOkraStore()
+			var root *block.BlockRef
+			values := make(map[string]string)
+			rng := rand.New(rand.NewPCG(4, 9))
+
+			// Compare successive KV roots across randomized mutation rounds.
+			for round := range 12 {
+				// Open the next writable KV root.
+				previous := root
+				btx, cursor := block.NewTransaction(store, nil, root, nil)
+				if root == nil {
+					cursor.SetBlock(NewKeyValueStore(impl), true)
+				}
+				writer, err := BuildKvTransaction(ctx, cursor, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				// Apply mutations and track the expected changed KV keys.
+				changed := make(map[string]bool)
+				count := 1 + rng.IntN(10)
+				if round == 0 {
+					count = 1024
+				}
+				for i := 0; i < count; i++ {
+					key := fmt.Sprintf("key/%04d", rng.IntN(1500))
+					if round == 0 {
+						key = fmt.Sprintf("key/%04d", i)
+					}
+					if round != 0 && rng.IntN(3) == 0 {
+						if _, exists := values[key]; exists {
+							changed[key] = true
+						}
+						delete(values, key)
+						err = writer.Delete(ctx, []byte(key))
+					} else {
+						value := fmt.Sprintf("round-%d-value-%d", round, i)
+						values[key] = value
+						changed[key] = true
+						err = writer.Set(ctx, []byte(key), []byte(value))
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				// Commit the mutation round and retain its KV root.
+				if err := writer.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				writer.Discard()
+				root, _, err = btx.Write(ctx, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if previous == nil {
+					continue
+				}
+
+				// Compare the previous and current KV roots with read counting.
+				_, before := block.NewTransaction(store, nil, previous, nil)
+				_, after := block.NewTransaction(store, nil, root, nil)
+				readCtx, counter := block.WithReadCounter(ctx)
+				keys, complete, err := ChangedKeys(readCtx, before, after, 10000)
+				if err != nil || !complete {
+					t.Fatalf("compare: complete=%t err=%v", complete, err)
+				}
+
+				// Verify the reported KV changes match the mutated keys.
+				var got, want []string
+				for _, key := range keys {
+					got = append(got, string(key))
+				}
+				for key := range changed {
+					want = append(want, key)
+				}
+				slices.Sort(want)
+				if !slices.Equal(got, want) {
+					t.Fatalf("round %d: keys=%v want=%v", round, got, want)
+				}
+				t.Logf("round %d: changed=%d block reads=%d", round, len(keys), counter.Snapshot().BlockReadCount)
+				if len(want) > 1 {
+					if _, complete, err := ChangedKeys(ctx, before, after, 1); err != nil || complete {
+						t.Fatalf("limit: complete=%t err=%v", complete, err)
+					}
+				}
+
+				// Verify the comparison restricted to a prefix and a few keys
+				// reports exactly the changed keys within them.
+				ranges := []KeyRange{PrefixKeyRange([]byte("key/01"))}
+				inRanges := func(key string) bool { return strings.HasPrefix(key, "key/01") }
+				for range 3 {
+					key := fmt.Sprintf("key/%04d", rng.IntN(1500))
+					ranges = append(ranges, ExactKeyRange([]byte(key)))
+					prev := inRanges
+					inRanges = func(k string) bool { return k == key || prev(k) }
+				}
+				if len(want) != 0 {
+					ranges = append(ranges, ExactKeyRange([]byte(want[0])))
+					prev := inRanges
+					inRanges = func(k string) bool { return k == want[0] || prev(k) }
+				}
+				readCtx, inCounter := block.WithReadCounter(ctx)
+				inKeys, err := ChangedKeysIn(readCtx, before, after, ranges)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = got[:0]
+				for _, key := range inKeys {
+					got = append(got, string(key))
+				}
+				wantIn := slices.DeleteFunc(slices.Clone(want), func(key string) bool { return !inRanges(key) })
+				if !slices.Equal(got, wantIn) {
+					t.Fatalf("round %d: restricted keys=%v want=%v", round, got, wantIn)
+				}
+				t.Logf("round %d: restricted changed=%d block reads=%d", round, len(inKeys), inCounter.Snapshot().BlockReadCount)
+			}
+		})
+	}
+}

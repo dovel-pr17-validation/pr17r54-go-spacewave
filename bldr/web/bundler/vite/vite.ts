@@ -1,0 +1,888 @@
+import path, { resolve } from 'path'
+import fs from 'fs'
+import net from 'net'
+import tailwindcss from '@tailwindcss/vite'
+import { Server, StreamConn, createHandler, createMux } from 'starpc'
+
+import {
+  buildPipeName,
+  createSocketConnection,
+  startSocketSender,
+} from '@go/github.com/aperturerobotics/util/pipesock/pipesock.js'
+import { ViteBundler, ViteBundlerDefinition } from './vite_srpc.pb.js'
+import {
+  BuildRequest,
+  BuildResponse,
+  BuildWebPkgRequest,
+  BuildWebPkgResponse,
+  ChangeDevelopmentRequest,
+  ChangeDevelopmentResponse,
+  DevelopmentConfig,
+  DevelopmentResult,
+} from './vite.pb.js'
+import {
+  Event,
+  WatchRequest,
+  SendRequest,
+  SendResponse,
+} from '../../../frontend/frontend.pb.js'
+import { DevelopmentEnvironment } from './development.js'
+import {
+  buildAndAnalyze,
+  buildConfig,
+  createSilentViteLogger,
+  isBundleError,
+  isRollupError,
+  isVirtualModuleId,
+} from './build.js'
+import {
+  createExternalRequirePlugin,
+  createWebPkgRemapPlugin,
+  isExternalWebPkgImport,
+  readPackageRootServedName,
+} from './plugin.js'
+import {
+  build as viteBuild,
+  type UserConfig,
+  type InlineConfig,
+  type Rollup,
+} from 'vite'
+import { buildGoAliases, goTsResolver } from './go-ts-resolver.js'
+import { createWorkerSafeModulePreloadPlugin } from './module-preload.js'
+import { buildStableEntryFileName } from './output-naming.js'
+import {
+  buildWebPkgImportSpecifier,
+  isTypeScriptEntry,
+  servedEntryName,
+} from './web-pkg-naming.js'
+
+// verboseDebug is the verbose debugging flag
+const verboseDebug = process.env.BLDR_VITE_VERBOSE === 'true'
+
+// stableMinifyOutput minifies while keeping top-level and cross-chunk export
+// names. Rolldown assigns mangled names by use frequency, so any source change
+// renames symbols throughout a chunk and in every chunk that imports it, which
+// defeats block sharing between releases.
+const stableMinifyOutput = {
+  minify: { compress: true, mangle: { toplevel: false } },
+  minifyInternalExports: false,
+} as const
+
+// Parse command line arguments
+function parseArgs() {
+  const args = process.argv.slice(2)
+  const result: { [key: string]: string } = {}
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg.startsWith('--')) {
+      const key = arg.substring(2)
+      const value =
+        args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : 'true'
+      result[key] = value
+      if (value !== 'true') {
+        i++ // Skip the next item as it's the value
+      }
+    }
+  }
+
+  return result
+}
+
+// Implementation of the ViteBundler service
+class ViteBundlerService implements ViteBundler {
+  private development?: Promise<DevelopmentEnvironment>
+
+  /** StartDevelopment retains exactly one environment in this dedicated process. */
+  async StartDevelopment(
+    request: DevelopmentConfig,
+  ): Promise<DevelopmentResult> {
+    if (this.development)
+      throw new Error('Vite development environment already started')
+    const environment = new DevelopmentEnvironment(request)
+    let result: DevelopmentResult
+    this.development = environment.start().then((ready) => {
+      result = ready
+      return environment
+    })
+    await this.development
+    return result!
+  }
+
+  /** WatchDevelopment forwards ordered upstream events until cancellation. */
+  async *WatchDevelopment(
+    _request: WatchRequest,
+    signal?: AbortSignal,
+  ): AsyncGenerator<Event> {
+    const environment = await this.development
+    if (!environment)
+      throw new Error('Vite development environment is not started')
+    yield* environment.watch(signal)
+  }
+
+  /** SendDevelopment validates session identity before delivering client events. */
+  async SendDevelopment(request: SendRequest): Promise<SendResponse> {
+    const environment = await this.development
+    if (!environment)
+      throw new Error('Vite development environment is not started')
+    environment.send(request)
+    return SendResponse.create({})
+  }
+
+  /** ChangeDevelopment applies source edits reported by the source owner. */
+  async ChangeDevelopment(
+    request: ChangeDevelopmentRequest,
+  ): Promise<ChangeDevelopmentResponse> {
+    const environment = await this.development
+    if (!environment)
+      throw new Error('Vite development environment is not started')
+    environment.change(request.changes ?? [])
+    return ChangeDevelopmentResponse.create({})
+  }
+
+  async Build(request: BuildRequest): Promise<BuildResponse> {
+    if (this.development)
+      throw new Error('Snapshot builds require a separate Vite process')
+    return await buildBundle(request)
+  }
+
+  async BuildWebPkg(request: BuildWebPkgRequest): Promise<BuildWebPkgResponse> {
+    if (this.development)
+      throw new Error('Package builds require a separate Vite process')
+    return await buildWebPkg(request)
+  }
+}
+
+function resolveTrackedSourceFile(
+  pkgRoot: string,
+  moduleId: string,
+): string | null {
+  if (isVirtualModuleId(moduleId)) {
+    return null
+  }
+
+  const clean = moduleId.split('?')[0]
+  const filePath = path.isAbsolute(clean) ? clean : path.resolve(pkgRoot, clean)
+
+  try {
+    const stat = fs.statSync(filePath)
+    if (!stat.isFile()) {
+      return null
+    }
+    return filePath
+  } catch {
+    return null
+  }
+}
+
+function findNearestGoModRoot(startDir: string): string | null {
+  let dir = path.resolve(startDir)
+  while (true) {
+    if (fs.existsSync(path.join(dir, 'go.mod'))) {
+      return dir
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) {
+      return null
+    }
+    dir = parent
+  }
+}
+
+/**
+ * Core build function that processes Vite bundling requests
+ * @param {BuildRequest} request - The build configuration request
+ * @returns {Promise<BuildResponse>} The build results
+ */
+async function buildBundle(request: BuildRequest): Promise<BuildResponse> {
+  if (verboseDebug) {
+    console.log(`[vite] build request: ${JSON.stringify(request)}`)
+  }
+
+  let mergedConfig: UserConfig = {}
+  try {
+    const configPaths = request.configPaths || []
+    const mode = request.mode || 'development'
+    const rootDir = request.rootDir || process.cwd()
+    const projectRoot =
+      request.projectRoot || findNearestGoModRoot(rootDir) || rootDir
+    const outDir = request.outDir || resolve(rootDir, 'dist')
+    const distDir = request.distDir || resolve(rootDir, '.bldr/src')
+    const publicPath = request.publicPath || null
+    const jsMinification = request.jsMinification || false
+    const jsSourcemaps = request.jsSourcemaps || false
+
+    // Store web package references
+    const webPkgRefs: Map<string, { root: string; subPaths: Set<string> }> =
+      new Map()
+
+    // set env vars to indicate the project root path
+    // these are used in vite-base.config.ts
+    process.env['BLDR_DIST_ROOT'] = distDir
+    process.env['BLDR_PROJECT_ROOT'] = projectRoot
+    process.env['BLDR_OUT_ROOT'] = outDir
+
+    // set node env
+    process.env['NODE_ENV'] = mode
+
+    // disable colors
+    process.env['NO_COLOR'] = '1'
+    process.env['NODE_DISABLE_COLORS'] = '1'
+    process.env['CI'] = '1'
+
+    // configPaths are relative to rootDir, make them absolute paths.
+    const absoluteConfigPaths = configPaths.map((configPath) =>
+      path.resolve(rootDir, configPath),
+    )
+
+    // Build the merged configuration
+    mergedConfig = await buildConfig(
+      { mode, command: 'build' },
+      ...absoluteConfigPaths,
+    )
+    if (!mergedConfig.build) {
+      mergedConfig.build = {}
+    }
+    // Bldr plugin bundles can execute in Web Workers. Vite's modulepreload
+    // helper assumes a document and fails before worker dynamic imports run.
+    mergedConfig.build.modulePreload = {
+      polyfill: false,
+      resolveDependencies: () => [],
+    }
+    mergedConfig.customLogger = createSilentViteLogger()
+    mergedConfig.build.outDir = outDir
+    mergedConfig.build.minify = jsMinification ? 'oxc' : false
+    mergedConfig.build.sourcemap =
+      request.sourcemapMode === 'external'
+        ? true
+        : request.sourcemapMode === 'inline'
+          ? 'inline'
+          : request.sourcemapMode === 'none'
+            ? false
+            : jsSourcemaps
+              ? 'inline'
+              : false
+    mergedConfig.define = {
+      ...mergedConfig.define,
+      ...request.defines,
+    }
+
+    // Set the root dir
+    mergedConfig.root = rootDir
+
+    // Ensure CSS is split into separate files per entry
+    mergedConfig.build.cssCodeSplit = true
+    // Write manifest.json to the output
+    mergedConfig.build.manifest = true
+
+    // Set the base path (public path for assets). Built asset URLs are relative
+    // to the file that references them, so a pinned module loads the assets of
+    // its own release.
+    if (publicPath != null) {
+      mergedConfig.base = publicPath
+      mergedConfig.experimental = {
+        renderBuiltUrl: () => ({ relative: true }),
+        ...mergedConfig.experimental,
+      }
+    }
+
+    // Set the cache dir
+    if (request.cacheDir) {
+      mergedConfig.cacheDir = request.cacheDir
+    }
+
+    if (!mergedConfig.build.rolldownOptions) {
+      mergedConfig.build.rolldownOptions = {}
+    }
+    if (jsMinification) {
+      mergedConfig.build.rolldownOptions.output = {
+        ...mergedConfig.build.rolldownOptions.output,
+        ...stableMinifyOutput,
+      }
+    }
+
+    // Externalize BldrExternal packages (react, etc.) and webPkg packages
+    // (@s4wave/web, etc.) via rolldownOptions.external.
+    //
+    // BldrExternal: served via import map, specifiers kept as-is. WebPkgs:
+    // served at /b/pkg/ URLs, specifiers rewritten by the bldr-pkg-resolve
+    // plugin's renderChunk hook.
+    //
+    // Project imports of both must use rolldownOptions.external because
+    // Rolldown's built-in vite-resolve plugin resolves tsconfig paths before
+    // user plugin resolveId hooks fire. The external require plugin owns
+    // imports from installed dependencies.
+    const externalPkgs = request.externalPkgs ?? []
+    const webPkgIDs: string[] = (request.webPkgs ?? []).flatMap((pkg) =>
+      pkg.id ? [pkg.id] : [],
+    )
+
+    // Per-package declared entry imports (relative to each package's web pkg
+    // root). When present, the remap derives served names from these instead of
+    // the package's on-disk layout, matching buildWebPkg's output naming.
+    const webPkgImports: Record<string, string[]> = {}
+    for (const pkg of request.webPkgs ?? []) {
+      if (pkg.id && pkg.imports && pkg.imports.length > 0) {
+        webPkgImports[pkg.id] = pkg.imports
+      }
+    }
+
+    // Keep runtime packages and web package imports bare through Rolldown
+    // resolution. Vite 8 resolves tsconfig aliases before the package remap
+    // plugin's resolveId hook, so web package IDs must be externalized here and
+    // then rewritten by renderChunk.
+    const allExternal = [...externalPkgs, ...webPkgIDs]
+    if (allExternal.length > 0) {
+      mergedConfig.build.rolldownOptions.external = (id, importer) =>
+        isExternalWebPkgImport(allExternal, id, importer)
+    }
+
+    // Rewrite app-owned web pkg import specifiers to /b/pkg/ URLs in the
+    // output. External runtime packages stay bare so the entrypoint import map
+    // provides one React/Bldr singleton instance for the whole document.
+    // Entry point discovery is handled by the Go side from config, not here.
+    if (!mergedConfig.plugins) {
+      mergedConfig.plugins = []
+    }
+
+    // Config-free renderers still compile injected startup stylesheets.
+    if (configPaths.length === 0) {
+      mergedConfig.build.emptyOutDir = false
+      mergedConfig.plugins.push(
+        tailwindcss(),
+        goTsResolver(projectRoot, distDir),
+      )
+      mergedConfig.resolve = {
+        ...mergedConfig.resolve,
+        alias: buildGoAliases(projectRoot, distDir),
+      }
+    }
+    mergedConfig.plugins.push(
+      createWorkerSafeModulePreloadPlugin(),
+      ...(allExternal.length > 0
+        ? [createExternalRequirePlugin(allExternal)]
+        : []),
+      createWebPkgRemapPlugin({
+        webPkgIDs,
+        preserveWebPkgIDs: externalPkgs,
+        webPkgImports,
+        addWebPkgRoot: (webPkgID, webPkgRoot) => {
+          if (!webPkgRefs.has(webPkgID)) {
+            webPkgRefs.set(webPkgID, {
+              root: webPkgRoot,
+              subPaths: new Set<string>(),
+            })
+          }
+        },
+        debug: verboseDebug,
+      }),
+    )
+
+    // Add entrypoints if provided
+    if (request.entrypoints && request.entrypoints.length > 0) {
+      // Build a Rollup input map (name -> absolute path)
+      const input: Record<string, string> = {} // InputOption
+      for (const entrypoint of request.entrypoints) {
+        if (entrypoint.inputPath) {
+          const name =
+            entrypoint.name ||
+            path.basename(
+              entrypoint.inputPath,
+              path.extname(entrypoint.inputPath),
+            )
+          input[name] = resolve(rootDir, entrypoint.inputPath)
+        }
+      }
+
+      // Ensure rolldownOptions exists
+      if (!mergedConfig.build.rolldownOptions) {
+        mergedConfig.build.rolldownOptions = {}
+      }
+
+      // Merge the input map and guarantee we output ES-modules.
+      mergedConfig.build.rolldownOptions = {
+        ...mergedConfig.build.rolldownOptions,
+        input,
+        preserveEntrySignatures: 'strict',
+        output: {
+          ...mergedConfig.build.rolldownOptions.output,
+          format: 'es',
+          comments: false,
+          entryFileNames: (chunkInfo) =>
+            request.flatEntryNames
+              ? `${chunkInfo.name}.mjs`
+              : buildStableEntryFileName(
+                  rootDir,
+                  chunkInfo.facadeModuleId,
+                  chunkInfo.name,
+                ),
+          // Plugin frontends load below their manifest root, which already
+          // tells releases apart. A content hash would change whenever any
+          // imported chunk changes and rewrite every importer.
+          chunkFileNames: '[name].mjs',
+          assetFileNames: '[name][extname]',
+        },
+      }
+
+      // Disable library mode entirely so assets are not inlined
+      delete mergedConfig.build.lib
+    }
+
+    // Run the build process with the merged config
+    const { analysis, viteOutput, result } = await buildAndAnalyze(
+      mergedConfig,
+      rootDir,
+      webPkgRefs,
+    )
+
+    if (verboseDebug) {
+      // Ensure .vite directory exists
+      const viteDir = path.join(outDir, '.vite')
+      if (!fs.existsSync(viteDir)) {
+        fs.mkdirSync(viteDir, { recursive: true })
+      }
+
+      // Write all JSON files to .vite/ subdirectory
+      fs.writeFileSync(
+        path.join(viteDir, 'vite-config.json'),
+        JSON.stringify(mergedConfig, null, 2),
+      )
+      fs.writeFileSync(
+        path.join(viteDir, 'vite-output.json'),
+        JSON.stringify(viteOutput, null, 2),
+      )
+      fs.writeFileSync(
+        path.join(viteDir, 'vite-analysis.json'),
+        JSON.stringify(analysis, null, 2),
+      )
+      fs.writeFileSync(
+        path.join(viteDir, 'vite-result.json'),
+        JSON.stringify(result, null, 2),
+      )
+    }
+
+    return result
+  } catch (err) {
+    let errorMessage: string
+    let inputFiles: string[] = []
+    if (isBundleError(err)) {
+      // Vite 8 BundleError: extract structured errors from the errors array
+      const messages = err.errors.map((e) => {
+        const loc = e.loc
+          ? ` (${e.loc.file}:${e.loc.line}:${e.loc.column})`
+          : ''
+        return `${e.message}${loc}`
+      })
+      errorMessage = messages.join('\n')
+    } else if (isRollupError(err)) {
+      errorMessage = err.message
+      inputFiles = err.watchFiles ?? []
+    } else {
+      errorMessage = err instanceof Error ? err.message : String(err)
+    }
+
+    const failureResp = {
+      success: false,
+      error: errorMessage,
+      inputFiles,
+      webPkgRefs: [],
+    }
+
+    if (verboseDebug) {
+      const errorOutDir = request.outDir || process.cwd()
+      const viteDir = path.join(errorOutDir, '.vite')
+      if (!fs.existsSync(viteDir)) {
+        fs.mkdirSync(viteDir, { recursive: true })
+      }
+
+      fs.writeFileSync(
+        path.join(viteDir, 'vite-config.json'),
+        JSON.stringify(mergedConfig, null, 2),
+      )
+      fs.writeFileSync(
+        path.join(viteDir, 'vite-error.json'),
+        JSON.stringify(failureResp, null, 2),
+      )
+    }
+
+    return failureResp
+  }
+}
+
+// buildWebPkg builds a single web package using Vite.
+async function buildWebPkg(
+  request: BuildWebPkgRequest,
+): Promise<BuildWebPkgResponse> {
+  const pkgId = request.pkgId || ''
+  const pkgRoot = request.pkgRoot || ''
+  const imports = request.imports || []
+  const siblingPkgIds = request.siblingPkgIds || []
+  const externalPkgs = request.externalPkgs || []
+  const outDir = request.outDir || ''
+  const isRelease = request.isRelease || false
+  const jsMinification = request.jsMinification || false
+  const jsSourcemaps = request.jsSourcemaps || false
+  const cacheDir = request.cacheDir || ''
+  const projectRoot =
+    process.env['BLDR_PROJECT_ROOT'] || findNearestGoModRoot(pkgRoot) || pkgRoot
+  const distRoot = process.env['BLDR_DIST_ROOT'] || projectRoot
+
+  if (!pkgId || !pkgRoot || imports.length === 0 || !outDir) {
+    return {
+      success: false,
+      error: 'pkgId, pkgRoot, imports, and outDir are required',
+    }
+  }
+
+  if (verboseDebug) {
+    console.log(`[vite] buildWebPkg: ${pkgId} imports=${imports}`)
+  }
+
+  try {
+    // Build the Rolldown input map from imports. Each import becomes a named
+    // input keyed by its served entry name (see servedEntryName).
+    //
+    // Imports that end with .mjs are CJS ESM wrappers generated by the
+    // Go side (determine-cjs-exports). They use absolute paths internally.
+    const input: Record<string, string> = {}
+    const typescriptEntries = new Set<string>()
+    const rootServedName = readPackageRootServedName(pkgRoot)
+
+    // Detect the CJS wrapper directory from absolute imports.
+    // All absolute imports share a common wrapper dir parent.
+    let wrapperDir = ''
+    for (const imp of imports) {
+      if (path.isAbsolute(imp)) {
+        // The wrapper dir is the .cjs-wrappers directory.
+        // Walk up from the import path to find it.
+        let dir = path.dirname(imp)
+        while (dir && dir !== path.dirname(dir)) {
+          if (path.basename(dir) === '.cjs-wrappers') {
+            wrapperDir = dir
+            break
+          }
+          dir = path.dirname(dir)
+        }
+        if (wrapperDir) break
+      }
+    }
+
+    for (const imp of imports) {
+      // For absolute paths (CJS wrappers from Go side), derive the name
+      // relative to the wrapper directory to preserve path structure.
+      let nameBase: string
+      if (path.isAbsolute(imp) && wrapperDir) {
+        nameBase = path.relative(wrapperDir, imp)
+      } else {
+        nameBase = imp
+      }
+      const name = servedEntryName(nameBase)
+      input[name] = path.isAbsolute(imp) ? imp : path.resolve(pkgRoot, imp)
+      if (isTypeScriptEntry(nameBase)) {
+        typescriptEntries.add(name)
+      }
+    }
+
+    // All packages to externalize: BldrExternal + siblings (excluding self).
+    const allExternal = [
+      ...externalPkgs,
+      ...siblingPkgIds.filter((id) => id !== pkgId),
+    ]
+
+    // Sibling IDs that are NOT BldrExternal need /b/pkg/ URL remapping.
+    // BldrExternal packages use the import map (bare specifiers preserved).
+    const externalSet = new Set(externalPkgs)
+    const remapSiblingIds = siblingPkgIds.filter(
+      (id) => id !== pkgId && !externalSet.has(id),
+    )
+
+    const config: InlineConfig = {
+      root: pkgRoot,
+      cacheDir: cacheDir || undefined,
+      customLogger: createSilentViteLogger(),
+      logLevel: 'warn',
+      mode: isRelease ? 'production' : 'development',
+      base: './',
+
+      // Explicitly define process.env.NODE_ENV so Rolldown replaces it
+      // correctly in CJS conditional entries (e.g. react's index.js).
+      // Vite defaults NODE_ENV to "production" for build commands
+      // regardless of the mode setting.
+      define: {
+        BLDR_DEBUG: JSON.stringify(!isRelease),
+        'process.env.NODE_ENV': JSON.stringify(
+          isRelease ? 'production' : 'development',
+        ),
+      },
+
+      // Disable config file lookup for web pkg builds.
+      configFile: false,
+
+      // The external require plugin is the sole externalizer for these
+      // packages and converts their require() calls to ESM imports. Also
+      // remap non-BldrExternal sibling web packages to /b/pkg/ URLs.
+      plugins: [
+        goTsResolver(projectRoot, distRoot),
+        createWorkerSafeModulePreloadPlugin(),
+        ...(allExternal.length > 0
+          ? [createExternalRequirePlugin(allExternal)]
+          : []),
+        ...(remapSiblingIds.length > 0
+          ? [
+              createWebPkgRemapPlugin({
+                webPkgIDs: remapSiblingIds,
+                webPkgBasePath: request.webPkgBasePath || '/b/pkg',
+                debug: verboseDebug,
+              }),
+            ]
+          : []),
+      ],
+      resolve: {
+        alias: buildGoAliases(projectRoot, distRoot),
+      },
+
+      build: {
+        outDir,
+        emptyOutDir: true,
+        modulePreload: {
+          polyfill: false,
+          resolveDependencies: () => [],
+        },
+        manifest: true,
+        cssCodeSplit: true,
+        minify: jsMinification ? 'oxc' : false,
+        sourcemap: jsSourcemaps ? 'inline' : false,
+        write: true,
+
+        rolldownOptions: {
+          input,
+          preserveEntrySignatures: 'strict',
+
+          output: {
+            format: 'es',
+            exports: 'named',
+            entryFileNames: '[name].mjs',
+            chunkFileNames: '[name].mjs',
+            assetFileNames: '[name][extname]',
+            ...(jsMinification ? stableMinifyOutput : {}),
+          },
+        },
+      },
+    }
+
+    // Disable color/noise.
+    process.env['NO_COLOR'] = '1'
+    process.env['NODE_DISABLE_COLORS'] = '1'
+    process.env['CI'] = '1'
+    process.env['FORCE_COLOR'] = '0'
+
+    const viteOutput = (await viteBuild(config)) as
+      | Rollup.RolldownOutput[]
+      | Rollup.RolldownOutput
+    const rollupOutputs: Rollup.RolldownOutput[] = Array.isArray(viteOutput)
+      ? viteOutput
+      : [viteOutput]
+    const outputChunks = rollupOutputs.flatMap((o) => o.output)
+
+    // Build import map entries from the output chunks.
+    // Use chunk.name (the named input key) and chunk.fileName (hashed output).
+    const importMapEntries: Array<{ specifier: string; outputPath: string }> =
+      []
+    for (const chunk of outputChunks) {
+      if (chunk.type !== 'chunk' || !chunk.isEntry) continue
+
+      // chunk.name is the named input key (e.g. "index", "jsx-runtime", "client").
+      const baseName = chunk.name
+
+      // The root entry maps the bare package id; TypeScript entries map the
+      // emitted ".js" path consumers import.
+      const specifier = buildWebPkgImportSpecifier(
+        pkgId,
+        baseName,
+        rootServedName,
+        typescriptEntries.has(baseName),
+      )
+
+      importMapEntries.push({
+        specifier,
+        outputPath: chunk.fileName,
+      })
+    }
+
+    // Collect source files from output chunks.
+    const sourceFiles = new Set<string>()
+    for (const chunk of outputChunks) {
+      if (chunk.type !== 'chunk') continue
+      if (chunk.moduleIds) {
+        for (const id of chunk.moduleIds) {
+          const filePath = resolveTrackedSourceFile(pkgRoot, id)
+          if (filePath) {
+            sourceFiles.add(filePath)
+          }
+        }
+      }
+    }
+
+    if (verboseDebug) {
+      console.log(
+        `[vite] buildWebPkg ${pkgId}: ${importMapEntries.length} import map entries, ${sourceFiles.size} source files`,
+      )
+    }
+
+    return {
+      success: true,
+      sourceFiles: Array.from(sourceFiles),
+      importMapEntries,
+    }
+  } catch (err) {
+    let errorMessage: string
+    if (isBundleError(err)) {
+      const messages = err.errors.map((e) => {
+        const loc = e.loc
+          ? ` (${e.loc.file}:${e.loc.line}:${e.loc.column})`
+          : ''
+        return `${e.message}${loc}`
+      })
+      errorMessage = messages.join('\n')
+    } else if (isRollupError(err)) {
+      errorMessage = err.message
+    } else {
+      errorMessage = err instanceof Error ? err.message : String(err)
+    }
+    return { success: false, error: errorMessage }
+  }
+}
+
+// sleep returns a promise that resolves after the specified milliseconds.
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// connectWithRetry attempts to connect to the pipe with exponential backoff.
+async function connectWithRetry(
+  ipcPath: string,
+  maxRetries = 5,
+): Promise<net.Socket> {
+  let lastError: Error | null = null
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms (capped at 2000ms)
+    const backoffMs = Math.min(100 * Math.pow(2, attempt), 2000)
+
+    if (attempt > 0) {
+      if (verboseDebug) {
+        console.log(
+          `[vite] retrying connection in ${backoffMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+        )
+      }
+      await sleep(backoffMs)
+    }
+
+    const result = await new Promise<{ socket: net.Socket } | { error: Error }>(
+      (resolve) => {
+        const sock = net.connect(ipcPath, () => {
+          resolve({ socket: sock })
+        })
+        sock.once('error', (err) => {
+          lastError = err
+          sock.destroy()
+          resolve({ error: err })
+        })
+      },
+    )
+
+    if ('socket' in result) {
+      if (verboseDebug) {
+        console.log(`[vite] connected to pipe: ${ipcPath}`)
+      }
+      return result.socket
+    }
+
+    if (verboseDebug) {
+      console.warn(
+        `[vite] connection attempt ${attempt + 1} failed: ${result.error}`,
+      )
+    }
+  }
+
+  throw lastError || new Error('failed to connect after retries')
+}
+
+async function main() {
+  const args = parseArgs()
+  const bundleId = args['bundle-id'] || ''
+  const pipeUuid = args['pipe-uuid'] || ''
+  const pipeRoot = args['pipe-root'] || ''
+
+  // Validate required parameters
+  if (!bundleId) {
+    if (verboseDebug) {
+      console.error('[vite] Error: Missing required parameter --bundle-id')
+    }
+    process.exit(1)
+  }
+
+  if (!pipeUuid) {
+    if (verboseDebug) {
+      console.error('[vite] Error: Missing required parameter --pipe-uuid')
+    }
+    process.exit(1)
+  }
+
+  if (!pipeRoot) {
+    if (verboseDebug) {
+      console.error('[vite] Error: Missing required parameter --pipe-root')
+    }
+    process.exit(1)
+  }
+
+  const workdir = process.cwd()
+
+  if (verboseDebug) {
+    console.log(
+      `[vite] bundler starting with bundle-id: ${bundleId}, pipe-uuid: ${pipeUuid}, workdir: ${workdir}`,
+    )
+  }
+
+  // Create SRPC server with the ViteBundler service
+  const service = new ViteBundlerService()
+  const srpcMux = createMux()
+  srpcMux.register(createHandler(ViteBundlerDefinition, service))
+  const srpcServer = new Server(srpcMux.lookupMethod)
+
+  // Connect to the pipe created by the Go process
+  // Use the pipe UUID passed from the Go process
+  const ipcPath = buildPipeName(pipeRoot, pipeUuid)
+
+  if (verboseDebug) {
+    console.log(`[vite] connecting to pipe: ${ipcPath}`)
+  }
+
+  // Create stream connection
+  const streamConn = new StreamConn(srpcServer, { direction: 'inbound' })
+
+  // Connect to the pipe
+  const socket = await connectWithRetry(ipcPath)
+
+  // Set up bidirectional communication after successful connection
+  const connection = createSocketConnection(socket, streamConn)
+  startSocketSender(connection)
+
+  // The native owner is the only client; its pipe ending ends this process.
+  socket.once('close', () => process.exit(0))
+
+  // Handle socket errors after connection is established
+  socket.on('error', (err) => {
+    if (verboseDebug) {
+      console.error(`[vite] socket error: ${err}`)
+    }
+    process.exit(1)
+  })
+}
+
+main().catch((err) => {
+  if (verboseDebug) {
+    console.error(`[vite] fatal error: ${err}`)
+  }
+  process.exit(1)
+})

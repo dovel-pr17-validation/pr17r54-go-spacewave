@@ -1,0 +1,603 @@
+import { useCallback, useRef, useState, useEffect, memo } from 'react'
+import { useDrag } from '@use-gesture/react'
+
+import { cn } from '@s4wave/web/style/utils.js'
+
+// MIN_NODE_WIDTH is the minimum width a node can be resized to.
+const MIN_NODE_WIDTH = 80
+
+// MIN_NODE_HEIGHT is the minimum height a node can be resized to.
+const MIN_NODE_HEIGHT = 60
+
+import type { CanvasNodeData, CanvasCallbacks } from './types.js'
+import type { SelectionFocus } from './useCanvasSelection.js'
+import {
+  SEMANTIC_ZOOM_OUTLINE,
+  SIZE_THRESHOLD_WIDTH,
+  SIZE_THRESHOLD_HEIGHT,
+  UNMOUNT_DEBOUNCE_MS,
+} from './types.js'
+import { CanvasTextNode } from './CanvasTextNode.js'
+import { CanvasGeometryNode } from './CanvasGeometryNode.js'
+
+// ResizeDirection indicates which corner is being dragged for resize.
+type ResizeDirection = 'nw' | 'ne' | 'sw' | 'se'
+
+// CanvasNodeProps are the props for CanvasNode.
+interface CanvasNodeProps {
+  node: CanvasNodeData
+  scale: number
+  selected: boolean
+  focus: SelectionFocus
+  visible: boolean
+  callbacks: CanvasCallbacks
+  onSelectWithFocus: (id: string, shift: boolean, focus: SelectionFocus) => void
+  onMove: (id: string, dx: number, dy: number) => void
+  onMoveEnd: () => void
+  onResize?: (id: string, node: CanvasNodeData) => void
+}
+
+// ResizeHandleProps are the props for ResizeHandle.
+interface ResizeHandleProps {
+  direction: ResizeDirection
+  scale: number
+  onResizeDelta: (
+    dir: ResizeDirection,
+    dx: number,
+    dy: number,
+    last: boolean,
+  ) => void
+}
+
+// DragEdgeHandle renders a thin invisible border strip that can initiate node drag.
+function DragEdgeHandle({ className }: { className: string }) {
+  return (
+    <div
+      aria-hidden="true"
+      data-drag-handle=""
+      className={cn('absolute z-10 bg-transparent', className)}
+    />
+  )
+}
+
+// ResizeHandle renders an interactive corner resize handle.
+function ResizeHandle({ direction, scale, onResizeDelta }: ResizeHandleProps) {
+  const bind = useDrag(
+    ({ delta: [dx, dy], last, event }) => {
+      event?.stopPropagation()
+      onResizeDelta(direction, dx / scale, dy / scale, last)
+    },
+    { filterTaps: true, pointer: { touch: true } },
+  )
+
+  const posClass = {
+    nw: '-left-1.5 -top-1.5 cursor-nwse-resize',
+    ne: '-right-1.5 -top-1.5 cursor-nesw-resize',
+    se: '-bottom-1.5 -right-1.5 cursor-nwse-resize',
+    sw: '-bottom-1.5 -left-1.5 cursor-nesw-resize',
+  }[direction]
+
+  const handlers = bind()
+  const origPointerDown = handlers.onPointerDown
+  handlers.onPointerDown = (e: React.PointerEvent) => {
+    e.stopPropagation()
+    origPointerDown?.(e)
+  }
+
+  return (
+    <div
+      {...handlers}
+      className={cn(
+        'border-brand/60 bg-background touch-none absolute h-2.5 w-2.5 rounded-full border',
+        posClass,
+      )}
+    />
+  )
+}
+
+// useCanvasNodeController owns visibility debounce, drag selection, and resize
+// projection for one canvas node.
+function useCanvasNodeController({
+  node,
+  scale,
+  selected,
+  focus,
+  visible,
+  callbacks,
+  onSelectWithFocus,
+  onMove,
+  onMoveEnd,
+  onResize,
+}: CanvasNodeProps) {
+  const [mountedAfterHide, setMountedAfterHide] = useState(false)
+  const wasVisible = useRef(visible)
+  const unmountTimer = useRef<number | null>(null)
+
+  // Debounced unmount keeps a node alive briefly after it leaves the viewport so
+  // fast pan/zoom updates do not churn embedded object viewers.
+  useEffect(() => {
+    if (visible) {
+      if (unmountTimer.current) {
+        clearTimeout(unmountTimer.current)
+        unmountTimer.current = null
+      }
+      setMountedAfterHide(false)
+      wasVisible.current = true
+      return
+    }
+
+    if (wasVisible.current) {
+      setMountedAfterHide(true)
+    }
+    wasVisible.current = false
+    unmountTimer.current = window.setTimeout(() => {
+      setMountedAfterHide(false)
+      unmountTimer.current = null
+    }, UNMOUNT_DEBOUNCE_MS)
+    return () => {
+      if (unmountTimer.current) {
+        clearTimeout(unmountTimer.current)
+        unmountTimer.current = null
+      }
+    }
+  }, [visible])
+
+  const hasInteractiveContent =
+    node.type === 'world_object' || node.type === 'text'
+
+  const bind = useDrag(
+    ({ delta: [dx, dy], first, last, event }) => {
+      if (first) {
+        const shiftKey =
+          event instanceof MouseEvent || event instanceof PointerEvent
+            ? event.shiftKey
+            : false
+        onSelectWithFocus(node.id, shiftKey, 'border')
+      }
+      if (dx !== 0 || dy !== 0) {
+        onMove(node.id, dx / scale, dy / scale)
+      }
+      if (last) {
+        onMoveEnd()
+      }
+    },
+    { filterTaps: true, pointer: { touch: true } },
+  )
+
+  // Wrap bind() handlers for nodes with interactive content. Two things:
+  // 1. Skip the gesture on pointerdown inside [data-interactive-content] so
+  //    @use-gesture doesn't capture the pointer and steal events.
+  // 2. Remove onClickCapture which @use-gesture adds for filterTaps. That
+  //    capture-phase handler fires parent-to-child and blocks clicks from
+  //    reaching embedded content (e.g. UnixFS browser rows).
+  // Selection is NOT triggered here; handleClick handles it after children
+  // have processed the click event.
+  const wrappedBind = useCallback(() => {
+    const handlers = bind()
+    if (!hasInteractiveContent) return handlers
+    // Remove the capture-phase click handler that @use-gesture adds for
+    // filterTaps. It fires before children and would block their onClick.
+    delete (handlers as Record<string, unknown>).onClickCapture
+    const origPointerDown = handlers.onPointerDown
+    handlers.onPointerDown = (e: React.PointerEvent) => {
+      const target = e.target
+      if (target instanceof Element) {
+        // Drag handles always initiate drag, even inside interactive content,
+        // unless the target is an interactive element (button, input, etc.).
+        const dragHandle = target.closest('[data-drag-handle]')
+        if (
+          dragHandle &&
+          !target.closest('button, input, select, textarea, a, [role="button"]')
+        ) {
+          origPointerDown?.(e)
+          return
+        }
+        // Don't start drag inside interactive content.
+        if (target.closest('[data-interactive-content]')) {
+          return
+        }
+      }
+      origPointerDown?.(e)
+    }
+    return handlers
+  }, [bind, hasInteractiveContent])
+
+  const handleNodeSelect = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation()
+      const target = e.target
+      const isContent =
+        hasInteractiveContent &&
+        target instanceof Element &&
+        !!target.closest('[data-interactive-content]') &&
+        !target.closest('[data-drag-handle]')
+      onSelectWithFocus(node.id, e.shiftKey, isContent ? 'content' : 'border')
+    },
+    [node.id, hasInteractiveContent, onSelectWithFocus],
+  )
+
+  const handleNodeKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return
+      e.preventDefault()
+      e.stopPropagation()
+      onSelectWithFocus(node.id, e.shiftKey, 'border')
+    },
+    [node.id, onSelectWithFocus],
+  )
+
+  const isOutlineOnly = scale < SEMANTIC_ZOOM_OUTLINE
+  const isCompact =
+    node.width < SIZE_THRESHOLD_WIDTH || node.height < SIZE_THRESHOLD_HEIGHT
+  const isContentFocused =
+    selected && focus === 'content' && hasInteractiveContent
+  const showsBorderDragHandles = node.type === 'world_object' && !isOutlineOnly
+
+  // When zoomed past 100%, counter-scale the content so it stays at native
+  // pixel size. The node border grows from the canvas zoom, giving the
+  // content more room to render at 1:1 instead of scaling up.
+  const internalScale = scale > 1 ? 1 / scale : 1
+
+  const handleTextChange = useCallback(
+    (content: string) => {
+      callbacks.onNodesChange?.(
+        new Map([[node.id, { ...node, textContent: content }]]),
+      )
+    },
+    [node, callbacks],
+  )
+
+  // Local resize state accumulates deltas during drag.
+  const resizeRef = useRef<{
+    dx: number
+    dy: number
+    dw: number
+    dh: number
+  } | null>(null)
+  const [resizeOverride, setResizeOverride] = useState<{
+    x: number
+    y: number
+    w: number
+    h: number
+  } | null>(null)
+
+  const handleResizeDelta = useCallback(
+    (dir: ResizeDirection, dx: number, dy: number, last: boolean) => {
+      const prev = resizeRef.current ?? { dx: 0, dy: 0, dw: 0, dh: 0 }
+      let ddx = 0,
+        ddy = 0,
+        ddw = 0,
+        ddh = 0
+      if (dir === 'se') {
+        ddw = dx
+        ddh = dy
+      } else if (dir === 'sw') {
+        ddx = dx
+        ddw = -dx
+        ddh = dy
+      } else if (dir === 'ne') {
+        ddw = dx
+        ddy = dy
+        ddh = -dy
+      } else if (dir === 'nw') {
+        ddx = dx
+        ddy = dy
+        ddw = -dx
+        ddh = -dy
+      }
+
+      const next = {
+        dx: prev.dx + ddx,
+        dy: prev.dy + ddy,
+        dw: prev.dw + ddw,
+        dh: prev.dh + ddh,
+      }
+
+      const newW = Math.max(MIN_NODE_WIDTH, node.width + next.dw)
+      const newH = Math.max(MIN_NODE_HEIGHT, node.height + next.dh)
+      const clampedDw = newW - node.width
+      const clampedDh = newH - node.height
+
+      resizeRef.current = next
+
+      if (last) {
+        resizeRef.current = null
+        setResizeOverride(null)
+        if (
+          onResize &&
+          (clampedDw !== 0 || clampedDh !== 0 || next.dx !== 0 || next.dy !== 0)
+        ) {
+          onResize(node.id, {
+            ...node,
+            x: node.x + next.dx,
+            y: node.y + next.dy,
+            width: newW,
+            height: newH,
+          })
+        }
+      } else {
+        setResizeOverride({
+          x: node.x + next.dx,
+          y: node.y + next.dy,
+          w: newW,
+          h: newH,
+        })
+      }
+    },
+    [node, onResize],
+  )
+
+  return {
+    callbacks,
+    handleNodeKeyDown,
+    handleNodeSelect,
+    handleResizeDelta,
+    handleTextChange,
+    hasInteractiveContent,
+    internalScale,
+    isCompact,
+    isContentFocused,
+    isOutlineOnly,
+    mountedAfterHide,
+    node,
+    scale,
+    selected,
+    showsBorderDragHandles,
+    resizeOverride,
+    visible,
+    wasVisible,
+    wrappedBind,
+  }
+}
+
+interface CanvasNodeContentProps {
+  node: CanvasNodeData
+  callbacks: CanvasCallbacks
+  isOutlineOnly: boolean
+  isCompact: boolean
+  onTextChange: (content: string) => void
+}
+
+/** CanvasNodeContent renders the body of a node by its type and zoom level. */
+function CanvasNodeContent({
+  node,
+  callbacks,
+  isOutlineOnly,
+  isCompact,
+  onTextChange,
+}: CanvasNodeContentProps) {
+  if (isOutlineOnly) {
+    // The short label shown in outline-only mode.
+    return (
+      <div className="flex h-full items-center justify-center overflow-hidden p-1">
+        <span className="text-foreground-alt/60 truncate text-center text-xs font-medium">
+          {node.objectKey ?? node.type}
+        </span>
+      </div>
+    )
+  }
+
+  if (node.type === 'text') {
+    return (
+      <CanvasTextNode
+        content={node.textContent ?? ''}
+        onChange={onTextChange}
+      />
+    )
+  }
+
+  if ((node.type === 'drawing' || node.type === 'shape') && node.shapeData) {
+    return <CanvasGeometryNode node={node} />
+  }
+
+  if (node.type === 'world_object' && callbacks.renderNodeContent) {
+    return callbacks.renderNodeContent(node)
+  }
+
+  if (isCompact) {
+    return (
+      <div className="text-foreground-alt/40 flex h-full items-center justify-center text-xs">
+        {node.type}
+      </div>
+    )
+  }
+
+  return null
+}
+
+/** nodeTypeBackgroundClass returns the card background for a node type. */
+function nodeTypeBackgroundClass(
+  type: CanvasNodeData['type'],
+  isOutlineOnly: boolean,
+): string | null {
+  if (isOutlineOnly) return 'bg-background-card/50'
+  if (type === 'world_object') {
+    return 'bg-background-card/30 shadow-sm backdrop-blur-sm'
+  }
+  if (type === 'text') return 'bg-background-card/20'
+  return null
+}
+
+/** isInkNode reports whether the node is a drawing, shape, or text node. */
+function isInkNode(type: CanvasNodeData['type']): boolean {
+  return type === 'drawing' || type === 'shape' || type === 'text'
+}
+
+/** nodeClassName returns the surface classes for a node. */
+function nodeClassName(
+  node: CanvasNodeData,
+  isOutlineOnly: boolean,
+  selected: boolean,
+): string {
+  const unselectedInk = !isOutlineOnly && !selected
+  return cn(
+    'canvas-node-position canvas-node-transform canvas-node-size canvas-node-input text-card-foreground border-foreground/6 pointer-events-auto box-border cursor-grab rounded-lg border transition-shadow duration-150 select-none',
+    nodeTypeBackgroundClass(node.type, isOutlineOnly),
+    selected && 'shadow-md',
+    unselectedInk &&
+      isInkNode(node.type) &&
+      'border-transparent bg-transparent shadow-none',
+    unselectedInk && node.type === 'drawing' && 'pointer-events-none',
+  )
+}
+
+/** CanvasNodeBorderHandles renders the invisible edges that start a node drag. */
+function CanvasNodeBorderHandles() {
+  return (
+    <>
+      <DragEdgeHandle className="top-0 right-2 left-2 h-1.5 rounded-t-lg" />
+      <DragEdgeHandle className="right-2 bottom-0 left-2 h-1.5 rounded-b-lg" />
+      <DragEdgeHandle className="top-2 bottom-2 left-0 w-1.5 rounded-l-lg" />
+      <DragEdgeHandle className="top-2 right-0 bottom-2 w-1.5 rounded-r-lg" />
+    </>
+  )
+}
+
+interface CanvasNodeSelectionProps {
+  scale: number
+  isContentFocused: boolean
+  onResizeDelta: ResizeHandleProps['onResizeDelta']
+}
+
+/** CanvasNodeSelection renders the selection ring and the resize handles. */
+function CanvasNodeSelection({
+  scale,
+  isContentFocused,
+  onResizeDelta,
+}: CanvasNodeSelectionProps) {
+  return (
+    <>
+      <div
+        className={cn(
+          'pointer-events-none absolute inset-0 rounded-lg ring-1',
+          isContentFocused ? 'ring-brand/30' : 'ring-brand/50',
+        )}
+      />
+      {(['ne', 'se', 'sw', 'nw'] as const).map((direction) => (
+        <ResizeHandle
+          key={direction}
+          direction={direction}
+          scale={scale}
+          onResizeDelta={onResizeDelta}
+        />
+      ))}
+    </>
+  )
+}
+
+interface CanvasNodeContentFrameProps {
+  hasInteractiveContent: boolean
+  internalScale: number
+  isContentFocused: boolean
+  children: React.ReactNode
+}
+
+/** CanvasNodeContentFrame counter-scales node content to its native pixel size. */
+function CanvasNodeContentFrame({
+  hasInteractiveContent,
+  internalScale,
+  isContentFocused,
+  children,
+}: CanvasNodeContentFrameProps) {
+  const contentSize =
+    internalScale < 1 ? `${(100 / internalScale).toFixed(2)}%` : '100%'
+
+  return (
+    <div
+      data-interactive-content={hasInteractiveContent ? '' : undefined}
+      style={{
+        '--canvas-content-transform':
+          internalScale < 1 ? `scale(${internalScale})` : 'none',
+        '--canvas-content-transform-origin': 'top left',
+        '--canvas-content-width': contentSize,
+        '--canvas-content-height': contentSize,
+        '--canvas-content-touch-action': isContentFocused ? 'auto' : 'none',
+      }}
+      className={cn(
+        'canvas-content-transform h-full w-full overflow-hidden',
+        isContentFocused && 'cursor-default select-auto',
+      )}
+    >
+      {children}
+    </div>
+  )
+}
+
+// CanvasNode renders a single positioned node on the canvas.
+export const CanvasNode = memo(function CanvasNode(props: CanvasNodeProps) {
+  const {
+    callbacks,
+    handleNodeKeyDown,
+    handleNodeSelect,
+    handleResizeDelta,
+    handleTextChange,
+    hasInteractiveContent,
+    internalScale,
+    isCompact,
+    isContentFocused,
+    isOutlineOnly,
+    mountedAfterHide,
+    node,
+    scale,
+    selected,
+    showsBorderDragHandles,
+    resizeOverride,
+    visible,
+    wasVisible,
+    wrappedBind,
+  } = useCanvasNodeController(props)
+
+  if (!visible && !mountedAfterHide && !wasVisible.current) return null
+
+  const content = (
+    <CanvasNodeContent
+      node={node}
+      callbacks={callbacks}
+      isOutlineOnly={isOutlineOnly}
+      isCompact={isCompact}
+      onTextChange={handleTextChange}
+    />
+  )
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      data-canvas-node={node.id}
+      {...wrappedBind()}
+      onClick={handleNodeSelect}
+      onKeyDown={handleNodeKeyDown}
+      style={{
+        '--canvas-node-left': `${resizeOverride?.x ?? node.x}px`,
+        '--canvas-node-top': `${resizeOverride?.y ?? node.y}px`,
+        '--canvas-node-width': `${resizeOverride?.w ?? node.width}px`,
+        '--canvas-node-height': `${resizeOverride?.h ?? node.height}px`,
+        '--canvas-node-z-index': node.zIndex,
+      }}
+      className={nodeClassName(node, isOutlineOnly, selected)}
+    >
+      {/* Invisible hit area extending outward from the border for easier clicking.
+          z-[-1] keeps it behind node content so it doesn't steal clicks. */}
+      <div className="pointer-events-auto absolute -inset-1.5 -z-1 rounded-lg" />
+      {showsBorderDragHandles && <CanvasNodeBorderHandles />}
+      {isOutlineOnly ? (
+        content
+      ) : (
+        <CanvasNodeContentFrame
+          hasInteractiveContent={hasInteractiveContent}
+          internalScale={internalScale}
+          isContentFocused={isContentFocused}
+        >
+          {content}
+        </CanvasNodeContentFrame>
+      )}
+      {selected && (
+        <CanvasNodeSelection
+          scale={scale}
+          isContentFocused={isContentFocused}
+          onResizeDelta={handleResizeDelta}
+        />
+      )}
+    </div>
+  )
+})

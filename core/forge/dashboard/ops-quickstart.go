@@ -1,0 +1,197 @@
+package forge_dashboard
+
+import (
+	"context"
+
+	space_exec_noop "github.com/s4wave/spacewave/core/forge/exec/noop"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	forge_cluster "github.com/s4wave/spacewave/forge/cluster"
+	forge_job "github.com/s4wave/spacewave/forge/job"
+	forge_target "github.com/s4wave/spacewave/forge/target"
+	forge_worker "github.com/s4wave/spacewave/forge/worker"
+	identity_world "github.com/s4wave/spacewave/identity/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+	s4wave_layout "github.com/s4wave/spacewave/sdk/layout"
+	s4wave_layout_world "github.com/s4wave/spacewave/sdk/layout/world"
+	s4wave_web_object "github.com/s4wave/spacewave/web/object"
+	"github.com/sirupsen/logrus"
+)
+
+// Validate performs cursory checks on the op.
+func (o *InitForgeQuickstartOp) Validate() error {
+	// Reject empty layout, dashboard, cluster, or session peer identifiers.
+	if len(o.GetLayoutKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	if len(o.GetDashboardKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	if len(o.GetClusterKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	if len(o.GetSessionPeerId()) == 0 {
+		return peer.ErrEmptyPeerID
+	}
+	return o.GetTimestamp().Validate(false)
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *InitForgeQuickstartOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Validate the operation before applying any world state changes.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+
+	// Parse the session peer ID that authors every world op below.
+	sessionPeerID, err := confparse.ParsePeerID(o.GetSessionPeerId())
+	if err != nil {
+		return false, err
+	}
+
+	// Read the dashboard and cluster keys the op targets.
+	dashKey := o.GetDashboardKey()
+	clusterKey := o.GetClusterKey()
+
+	// Create the dashboard.
+	dashboard := &ForgeDashboard{
+		Name:      "Forge Dashboard",
+		CreatedAt: o.GetTimestamp(),
+	}
+	var createdObject world.ObjectState
+	createdObject, _, err = world.CreateWorldObject(ctx, ws, dashKey, func(bcs *block.Cursor) error {
+		bcs.SetBlock(dashboard, true)
+		return nil
+	})
+	world.ReleaseObjectState(createdObject)
+	if err != nil {
+		return false, err
+	}
+	if err := world_types.SetObjectType(ctx, ws, dashKey, ForgeDashboardTypeID); err != nil {
+		return false, err
+	}
+
+	// Create the cluster with the session peer ID as the cluster identity.
+	clusterCreateOp := forge_cluster.NewClusterCreateOp(clusterKey, o.GetClusterName(), sessionPeerID)
+	if _, _, err := ws.ApplyWorldOp(ctx, clusterCreateOp, sessionPeerID); err != nil {
+		return false, err
+	}
+
+	// Create a sample job for the quickstart cluster.
+	jobKey := "sample-job"
+	tasks := map[string]*forge_target.Target{
+		"compile": space_exec_noop.NewTarget(),
+		"link":    space_exec_noop.NewTarget(),
+		"test":    space_exec_noop.NewTarget(),
+	}
+	var createdObject2 world.ObjectState
+	createdObject2, _, err = forge_job.CreateJobWithTasks(ctx, ws, sessionPeerID, jobKey, tasks, "", nil, o.GetTimestamp())
+	world.ReleaseObjectState(createdObject2)
+	if err != nil {
+		return false, err
+	}
+
+	// Assign the job to the cluster.
+	assignJobOp := forge_cluster.NewClusterAssignJobOp(clusterKey, jobKey)
+	if _, _, err := ws.ApplyWorldOp(ctx, assignJobOp, sessionPeerID); err != nil {
+		return false, err
+	}
+
+	// Link cluster and job to dashboard.
+	linkClusterOp := NewLinkForgeDashboardOp(dashKey, clusterKey)
+	if _, _, err := ws.ApplyWorldOp(ctx, linkClusterOp, sessionPeerID); err != nil {
+		return false, err
+	}
+	linkJobOp := NewLinkForgeDashboardOp(dashKey, jobKey)
+	if _, _, err := ws.ApplyWorldOp(ctx, linkJobOp, sessionPeerID); err != nil {
+		return false, err
+	}
+
+	// Create the worker if requested.
+	workerKey := o.GetWorkerKey()
+	if workerKey != "" {
+		workerCreateOp := forge_worker.NewWorkerCreateOp(workerKey, "session-worker", nil)
+		if _, _, err := ws.ApplyWorldOp(ctx, workerCreateOp, sessionPeerID); err != nil {
+			return false, err
+		}
+
+		// Link the worker to the session's keypair.
+		kpKey := identity_world.NewKeypairKey(o.GetSessionPeerId())
+		if err := ws.SetGraphQuad(ctx, identity_world.NewObjectToKeypairQuad(workerKey, kpKey)); err != nil {
+			return false, err
+		}
+
+		// Assign worker to the cluster.
+		assignWorkerOp := forge_cluster.NewClusterAssignWorkerOp(clusterKey, workerKey)
+		if _, _, err := ws.ApplyWorldOp(ctx, assignWorkerOp, sessionPeerID); err != nil {
+			return false, err
+		}
+
+		// Link worker to dashboard.
+		linkWorkerOp := NewLinkForgeDashboardOp(dashKey, workerKey)
+		if _, _, err := ws.ApplyWorldOp(ctx, linkWorkerOp, sessionPeerID); err != nil {
+			return false, err
+		}
+	}
+
+	// Create the ObjectLayout with a dashboard tab.
+	layoutKey := o.GetLayoutKey()
+	layout := &s4wave_layout_world.ObjectLayout{
+		LayoutModel: &s4wave_layout.LayoutModel{
+			Layout: &s4wave_layout.RowDef{
+				Id: "root",
+				Children: []*s4wave_layout.RowOrTabSetDef{
+					{
+						Node: &s4wave_layout.RowOrTabSetDef_TabSet{
+							TabSet: &s4wave_layout.TabSetDef{
+								Id:     "main-tabset",
+								Weight: 100,
+								Children: []*s4wave_layout.TabDef{
+									{
+										Id:   "dashboard",
+										Name: "Dashboard",
+										Data: s4wave_layout_world.NewObjectLayoutTab(
+											"",
+											&s4wave_web_object.ObjectInfo{
+												Info: &s4wave_web_object.ObjectInfo_WorldObjectInfo{
+													WorldObjectInfo: &s4wave_web_object.WorldObjectInfo{
+														ObjectKey: dashKey,
+													},
+												},
+											},
+											"",
+										).Marshal(),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	var createdObject3 world.ObjectState
+	createdObject3, _, err = world.CreateWorldObject(ctx, ws, layoutKey, func(bcs *block.Cursor) error {
+		bcs.SetBlock(layout, true)
+		return nil
+	})
+	world.ReleaseObjectState(createdObject3)
+	if err != nil {
+		return false, err
+	}
+	if err := world_types.SetObjectType(ctx, ws, layoutKey, s4wave_layout_world.ObjectLayoutTypeID); err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+// _ is a type assertion
+var _ world.Operation = (*InitForgeQuickstartOp)(nil)

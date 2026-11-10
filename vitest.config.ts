@@ -1,0 +1,64 @@
+import { configDefaults, defineConfig, mergeConfig } from 'vitest/config'
+import { resolve } from 'path'
+import { access } from 'node:fs/promises'
+import viteConfig from './vite.config'
+
+export default mergeConfig(
+  viteConfig,
+  defineConfig({
+    test: {
+      environment: 'happy-dom',
+      // Tests read same-origin iframe windows, which happy-dom loads only on request.
+      environmentOptions: {
+        happyDOM: { settings: { enableIframePageLoading: true } },
+      },
+      setupFiles: ['./web/test/setup.ts'],
+      include: [
+        '{app,web,core,sdk,plugin,cmd,forge,net}/**/*.test.{ts,tsx}',
+        // Bldr's broader unit and browser suites use bldr/vitest.config.ts.
+        'bldr/web/bldr/storage-durability-owner.test.ts',
+      ],
+      exclude: [
+        ...configDefaults.exclude,
+        'dist/**',
+        'vendor/**',
+        '**/.bldr/**',
+        '.tmp/**',
+        '**/prototypes/**',
+        // E2E tests require browser environment, run separately via test:browser
+        '**/*.e2e.test.{ts,tsx}',
+        '**/*.e2e.spec.{ts,tsx}',
+        '**/*.spec.{ts,tsx}',
+        // Go-based end-to-end harnesses live under e2e/ and run separately.
+        'e2e/**',
+      ],
+    },
+    plugins: [
+      {
+        // This plugin fixes issues with resolving paths like @go/foo/bar/baz.js where baz.ts exists only.
+        name: 'go-ts-resolver',
+        async resolveId(source) {
+          // Handle only @go/ paths that end in .js
+          if (!source.startsWith('@go/') || !source.endsWith('.js')) {
+            return null
+          }
+
+          // Convert @go/ path to vendor path
+          const vendorPath = resolve(
+            __dirname,
+            'vendor',
+            source.slice('@go/'.length),
+          )
+          const tsPath = vendorPath.replace(/\.js$/, '.ts')
+
+          try {
+            await access(tsPath)
+            return tsPath
+          } catch {
+            return null
+          }
+        },
+      },
+    ],
+  }),
+)

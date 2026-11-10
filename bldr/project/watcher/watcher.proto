@@ -1,0 +1,23 @@
+syntax = "proto3";
+package bldr.project.watcher;
+
+import "github.com/s4wave/spacewave/bldr/project/controller/config.proto";
+import "github.com/s4wave/spacewave/bldr/project/project.proto";
+
+// Config configures the project file watcher.
+message Config {
+  // ConfigPath is the path to load the bldr.yaml configuration.
+  // If the path is empty, starts the project controller with a blank config.
+  string config_path = 1;
+  // ProjectControllerConfig configures the project controller.
+  // The loaded project controller config will be merged into this config.
+  .bldr.project.controller.Config project_controller_config = 2;
+  // DisableWatch disables watching the file (loads once only).
+  bool disable_watch = 3;
+  // BoundRemotes are caller-supplied World capabilities. These bindings take
+  // precedence over source configuration, including watched configuration edits.
+  map<string, .bldr.project.RemoteConfig> bound_remotes = 4;
+  // Vars are the named inputs a bldr.star reads with var(name, default). They
+  // are the only state the caller passes into the evaluation.
+  map<string, string> vars = 5;
+}

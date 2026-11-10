@@ -1,0 +1,28 @@
+//go:build !js && !wasip1
+
+package main
+
+import (
+	"os"
+
+	"github.com/aperturerobotics/cli"
+)
+
+// Commands are the CLI commands
+var commands []*cli.Command
+
+func main() {
+	// Configure the Hydra command-line application.
+	app := cli.NewApp()
+	app.Name = "hydra"
+	app.HideVersion = true
+	app.Usage = "command-line node and tools for hydra"
+	app.Commands = commands
+
+	// Run the command and report failures to stderr.
+	if err := app.Run(os.Args); err != nil {
+		os.Stderr.WriteString(err.Error())
+		os.Stderr.WriteString("\n")
+		os.Exit(1)
+	}
+}

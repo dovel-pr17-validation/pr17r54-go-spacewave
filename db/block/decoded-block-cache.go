@@ -1,0 +1,711 @@
+package block
+
+import (
+	"context"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/pkg/errors"
+)
+
+const (
+	// DecodedBlockCacheNoTransformKey identifies untransformed decoded-cache entries.
+	DecodedBlockCacheNoTransformKey = "transform:none"
+	// decodedBlockCacheTrustKey marks entries decoded from a verified block ref.
+	decodedBlockCacheTrustKey = "trust:verified-block-ref"
+)
+
+// DecodedBlockCacheable identifies a block type for decoded-block caching.
+type DecodedBlockCacheable interface {
+	// DecodedBlockCacheTypeKey returns the block type's cache identity.
+	DecodedBlockCacheTypeKey() string
+}
+
+// DecodedBlockCacheTransformer identifies a transform boundary for decoded-block caching.
+type DecodedBlockCacheTransformer interface {
+	// DecodedBlockCacheTransformKey returns the transform's cache identity.
+	DecodedBlockCacheTransformKey() string
+}
+
+// DecodedBlockHeapSizer reports the heap bytes a decoded block retains. The
+// decoded-block cache charges this size against its budget. Implement it for
+// block types whose decoded form is much larger than their encoding, such as
+// pages of many small messages.
+type DecodedBlockHeapSizer interface {
+	// DecodedHeapSize returns the heap bytes the decoded block retains.
+	DecodedHeapSize() int
+}
+
+// DecodedBlockShareable marks a block type that reads and cursor traversal
+// never mutate in place. Transactions take the cached instance without a
+// clone. Only transaction writes change a decoded instance (ApplyBlockRef,
+// ApplySubBlock), and the cursor position copies a shared instance first.
+// Writers build replacement blocks instead of changing a loaded one.
+type DecodedBlockShareable interface {
+	// SharesDecodedBlock marks the type as shareable.
+	SharesDecodedBlock()
+}
+
+// DecodedBlockReadShareable marks a block type that reads and cursor traversal
+// never mutate in place, but whose writers change a loaded instance before
+// handing it back to the cursor. Read-only transactions take the cached
+// instance without a clone; other transactions take a private copy.
+type DecodedBlockReadShareable interface {
+	// SharesDecodedBlockWithReaders marks the type as shareable with readers.
+	SharesDecodedBlockWithReaders()
+}
+
+// decodedBlockCacheSizer reports a decoded block's size without marshaling it.
+type decodedBlockCacheSizer interface {
+	// SizeVT returns the block's encoded size.
+	SizeVT() int
+}
+
+// decodedBlockCacheEntryOverheadCost charges the pool's per-entry map slot and
+// queue links.
+const decodedBlockCacheEntryOverheadCost int64 = 256
+
+// decodedBlockCacheStripes is the number of ref invalidation epochs per
+// scope. InvalidateRef advances the stripe its ref hashes to, so other refs in
+// that stripe miss once; the fixed array bounds invalidation state.
+const decodedBlockCacheStripes = 4096
+
+// sharedDecodedBlockPool is the process-wide pool behind NewDecodedBlockCache.
+// It lives for the process, so one budget bounds every block store.
+var sharedDecodedBlockPool = sync.OnceValue(func() *decodedBlockPool {
+	pool, err := newDecodedBlockPool(DefaultDecodedBlockCacheOptions())
+	if err != nil {
+		panic(err)
+	}
+	if pool.shards != nil {
+		pool.budget = SharedReadCacheBudget()
+		pool.budget.Join(ReadCacheDecoded, pool)
+	}
+	return pool
+})
+
+// newDecodedBlockPool constructs a pool with opts.
+func newDecodedBlockPool(opts DecodedBlockCacheOptions) (*decodedBlockPool, error) {
+	// Normalize the decoded-cache budget and preserve disabled pools.
+	opts = opts.normalize()
+	if opts.Disabled {
+		pool := &decodedBlockPool{}
+		pool.maxCost.Store(opts.MaxCost)
+		return pool, nil
+	}
+	return newDecodedBlockPoolShards(opts.MaxCost), nil
+}
+
+// DecodedBlockCache is one owner's scope in a decoded-block pool. Keys carry
+// the scope prefix, so owners never see each other's blocks. Each entry
+// records the invalidation epochs current when it was stored; Lookup treats an
+// entry with an outdated epoch as a miss, and stale entries age out of the
+// pool's queues.
+type DecodedBlockCache struct {
+	// pool holds the entries and budget.
+	pool *decodedBlockPool
+	// ownsPool is set when Close must clear pool.
+	ownsPool bool
+	// scope prefixes every key of this owner.
+	scope string
+	// closed disables lookups and stores after Close.
+	closed atomic.Bool
+	// clearEpoch advances on InvalidateAll and Close.
+	clearEpoch atomic.Uint64
+	// refEpochs advance on InvalidateRef, one per stripe.
+	refEpochs [decodedBlockCacheStripes]atomic.Uint64
+}
+
+// decodedBlockCacheKey identifies one decoded form of a block: its ref, type,
+// transform, and trust.
+type decodedBlockCacheKey struct {
+	ref       string
+	blockType string
+	transform string
+	trust     string
+}
+
+// decodedBlockCacheEpochs identifies the invalidation state an entry was
+// stored under.
+type decodedBlockCacheEpochs struct {
+	ref   uint64
+	clear uint64
+}
+
+// decodedBlockCacheEntry is a cached block, the epochs it was stored under,
+// and the removal generation of the durable read that admitted it.
+type decodedBlockCacheEntry struct {
+	block Block
+	// read is an optional evictable slot for immutable reader traversal.
+	read       *decodedBlockReadSlot
+	epochs     decodedBlockCacheEpochs
+	durableGen uint64
+}
+
+// decodedBlockCacheStoreToken captures the epochs at the start of a read so a
+// store after an intervening invalidation is skipped.
+type decodedBlockCacheStoreToken struct {
+	cache  *DecodedBlockCache
+	epochs decodedBlockCacheEpochs
+	ok     bool
+}
+
+// SetSharedDecodedBlockCacheMaxCost sets the budget of the process-wide pool
+// behind NewDecodedBlockCache. The default suits a desktop; a server with
+// memory to spare can hold a larger working set. Lowering the budget evicts
+// entries from each shard at its next store. A non-positive budget is ignored.
+//
+// The value is also the limit of SharedReadCacheBudget, so it bounds the
+// decoded pool together with the resident pack bytes of every store that
+// joined the budget, and the pool may hold all of it while those stay at their
+// floor. The pool and the budget are sized from this one setting.
+func SetSharedDecodedBlockCacheMaxCost(maxCost int64) {
+	pool := sharedDecodedBlockPool()
+	if maxCost <= 0 || pool.shards == nil {
+		return
+	}
+	pool.maxCost.Store(maxCost)
+	SharedReadCacheBudget().SetLimit(maxCost)
+}
+
+// DisableSharedDecodedBlockCache stops the process-wide pool behind
+// NewDecodedBlockCache from serving or retaining blocks, so every read
+// decodes what the store returns. A read operation still reuses the blocks it
+// decoded itself.
+func DisableSharedDecodedBlockCache() {
+	sharedDecodedBlockPool().off.Store(true)
+}
+
+// NewDecodedBlockCache constructs a scope in the process-wide pool.
+func NewDecodedBlockCache() *DecodedBlockCache {
+	return newDecodedBlockCacheScope(sharedDecodedBlockPool(), false)
+}
+
+// NewDecodedBlockCacheWithOptions constructs a scope in a private pool with
+// opts. Close releases the pool.
+func NewDecodedBlockCacheWithOptions(opts DecodedBlockCacheOptions) (*DecodedBlockCache, error) {
+	pool, err := newDecodedBlockPool(opts)
+	if err != nil {
+		return nil, err
+	}
+	return newDecodedBlockCacheScope(pool, true), nil
+}
+
+// newDecodedBlockCacheScope allocates a scope in pool.
+func newDecodedBlockCacheScope(pool *decodedBlockPool, ownsPool bool) *DecodedBlockCache {
+	id := pool.nextScope.Add(1)
+	return &DecodedBlockCache{
+		pool:     pool,
+		ownsPool: ownsPool,
+		scope:    strconv.FormatUint(id, 36) + "/",
+	}
+}
+
+// WithDecodedBlockCache attaches a decoded-block cache to ctx.
+func WithDecodedBlockCache(ctx context.Context, cache *DecodedBlockCache) context.Context {
+	if cache == nil {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, decodedBlockCacheContextKey{}, cache)
+}
+
+// MaxCost returns the pool's decoded-cache budget.
+func (c *DecodedBlockCache) MaxCost() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.pool.maxCost.Load()
+}
+
+// Close ends the scope. Its entries in a shared pool become stale and age out.
+func (c *DecodedBlockCache) Close() {
+	if c == nil || c.closed.Swap(true) {
+		return
+	}
+	c.clearEpoch.Add(1)
+	if c.ownsPool && c.pool.shards != nil {
+		c.pool.clear()
+	}
+}
+
+// Snapshot returns the pool's decoded-cache metrics. A scope in the shared
+// pool reports the metrics of every scope.
+func (c *DecodedBlockCache) Snapshot() DecodedBlockCacheSnapshot {
+	// Return an empty metrics snapshot for a missing cache scope.
+	if c == nil {
+		return DecodedBlockCacheSnapshot{}
+	}
+
+	// Capture the pool budget, its retained cost and its event counters.
+	st := c.pool.stats()
+	return DecodedBlockCacheSnapshot{
+		MaxCost:       c.MaxCost(),
+		RemainingCost: c.MaxCost() - st.retained,
+		RetainedCost:  st.retained,
+		Entries:       st.entries,
+		ReadCost:      st.readCost,
+		ReadSlots:     st.readSlots,
+		Hits:          st.hits,
+		Misses:        st.misses,
+		Stores:        st.stores,
+		Rejections:    st.rejections,
+		Evictions:     st.evictions,
+		CostAdded:     st.costAdded,
+		CostEvicted:   st.costEvicted,
+	}
+}
+
+// Lookup returns the cached decoded block for the key, recording a cache
+// hit or miss. The returned block is a clone safe for the caller to keep,
+// or with share the shared cached instance, which the caller must not mutate.
+func (c *DecodedBlockCache) Lookup(
+	ctx context.Context,
+	front *decodedBlockFrontCache,
+	key decodedBlockCacheKey,
+	share bool,
+) (Block, bool, error) {
+	// Reuse the decoded block retained in the read-operation cache.
+	if cached := front.lookup(key); cached != nil {
+		return decodedBlockHit(ctx, cached, share)
+	}
+
+	// Record a miss when the shared decoded-block pool is disabled.
+	if !c.enabled() {
+		if front != nil {
+			recordDecodedBlockCacheMiss(ctx)
+		}
+		return nil, false, nil
+	}
+
+	// Look up the shared entry and reject stale invalidation epochs and
+	// entries a durable store removed after admitting them.
+	cacheKey := c.cacheKey(key)
+	cached, ok := c.pool.get(cacheKey)
+	if ok && (cached.epochs != c.epochs(key.ref) || removedSince(key.ref, cached.durableGen)) {
+		c.pool.del(cacheKey)
+		ok = false
+	}
+
+	// Record a cache miss when no current shared entry exists.
+	if !ok {
+		recordDecodedBlockCacheMiss(ctx)
+		return nil, false, nil
+	}
+
+	// Retain the shared block in the read cache and hand it to the caller.
+	front.store(key, cached.block)
+	return decodedBlockHit(ctx, cached.block, share)
+}
+
+// Store caches the decoded block under the key when the store token is
+// still current. blk must decode stored bytes of length size that the caller
+// verified against the block ref, and that a durable store served from a
+// snapshot opened at removal generation durableGen. With share the caller
+// keeps blk unmutated, so the cache retains blk itself instead of a clone.
+func (c *DecodedBlockCache) Store(
+	ctx context.Context,
+	front *decodedBlockFrontCache,
+	token decodedBlockCacheStoreToken,
+	key decodedBlockCacheKey,
+	blk Block,
+	size int,
+	durableGen uint64,
+	share bool,
+) error {
+	// Require a block and a cache scope before retaining decoded content.
+	if blk == nil {
+		return nil
+	}
+	if c == nil && front == nil {
+		RecordDecodedBlockUncacheable(ctx)
+		return nil
+	}
+
+	// Clone the decoded block unless the caller shares it, so cache readers
+	// cannot mutate it.
+	cloned := blk
+	if !share {
+		var ok bool
+		var err error
+		cloned, ok, err = cloneDecodedBlock(blk)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			RecordDecodedBlockUncloneable(ctx)
+			return nil
+		}
+	}
+
+	// Reject cache writes whose read token predates an invalidation.
+	var epochs decodedBlockCacheEpochs
+	if c != nil {
+		epochs = c.epochs(key.ref)
+		if token.ok && (token.cache != c || token.epochs != epochs) {
+			return nil
+		}
+	}
+
+	// Retain the cloned block in the read-operation cache, and keep a block a
+	// durable store removed since the read out of the shared pool.
+	front.store(key, cloned)
+	if !c.enabled() || removedSince(key.ref, durableGen) {
+		return nil
+	}
+
+	// Compute the shared entry cost before storing it.
+	cacheKey := c.cacheKey(key)
+	cost, ok := decodedBlockCacheCost(cacheKey, blk, size)
+	if !ok {
+		RecordDecodedBlockUncacheable(ctx)
+		return nil
+	}
+
+	// An invalidation or removal after the checks above leaves this entry
+	// stale, and Lookup then treats it as a miss.
+	var read *decodedBlockReadSlot
+	if _, ok := cloned.(DecodedBlockShareable); ok {
+		read = &decodedBlockReadSlot{}
+	} else if _, ok := cloned.(DecodedBlockReadShareable); ok {
+		read = &decodedBlockReadSlot{}
+	}
+	accepted := c.pool.put(cacheKey, decodedBlockCacheEntry{
+		read:       read,
+		block:      cloned,
+		epochs:     epochs,
+		durableGen: durableGen,
+	}, cost)
+	recordDecodedBlockCacheStore(ctx, accepted, cost)
+	if !accepted {
+		recordDecodedBlockCacheRejected(ctx)
+	}
+	return nil
+}
+
+// InvalidateRef makes cached entries for ref stale.
+func (c *DecodedBlockCache) InvalidateRef(ctx context.Context, ref *BlockRef) {
+	// Resolve the block reference to invalidate in both cache layers.
+	refKey, ok := decodedBlockCacheRefKey(ref)
+	if !ok {
+		return
+	}
+
+	// Invalidate the read cache and advance the shared reference epoch.
+	decodedBlockFrontCacheFromContext(ctx).invalidateRef(refKey)
+	if c == nil {
+		return
+	}
+	c.refEpoch(refKey).Add(1)
+}
+
+// InvalidateAll makes every cached entry of this scope stale.
+func (c *DecodedBlockCache) InvalidateAll(ctx context.Context) {
+	decodedBlockFrontCacheFromContext(ctx).clear()
+	if c == nil {
+		return
+	}
+	c.clearEpoch.Add(1)
+}
+
+// enabled reports whether the scope can read and write its pool.
+func (c *DecodedBlockCache) enabled() bool {
+	return c != nil && c.pool.shards != nil && !c.pool.off.Load() && !c.closed.Load()
+}
+
+// epochs returns the current invalidation epochs for refKey.
+func (c *DecodedBlockCache) epochs(refKey string) decodedBlockCacheEpochs {
+	return decodedBlockCacheEpochs{
+		ref:   c.refEpoch(refKey).Load(),
+		clear: c.clearEpoch.Load(),
+	}
+}
+
+// cacheKey returns the pool key for key in this scope: the scope, then the
+// reference, block type, transform, and trust identities, each length-prefixed
+// so no part can be confused with a neighbor. Every lookup builds one, so it
+// allocates once, at the key's exact length.
+func (c *DecodedBlockCache) cacheKey(key decodedBlockCacheKey) string {
+	// Size the scope plus each part with its decimal length prefix.
+	parts := [...]string{key.ref, key.blockType, key.transform, key.trust}
+	size := len(c.scope)
+	for _, part := range parts {
+		size += decimalLen(len(part)) + 1 + len(part)
+	}
+
+	// Encode the scope and the length-prefixed parts.
+	var b strings.Builder
+	b.Grow(size)
+	b.WriteString(c.scope)
+	var prefix [20]byte
+	for _, part := range parts {
+		b.Write(strconv.AppendInt(prefix[:0], int64(len(part)), 10))
+		b.WriteByte(':')
+		b.WriteString(part)
+	}
+	return b.String()
+}
+
+// decimalLen returns the number of decimal digits of n, which is not
+// negative.
+func decimalLen(n int) int {
+	digits := 1
+	for ; n >= 10; n /= 10 {
+		digits++
+	}
+	return digits
+}
+
+// storeToken captures the current epochs for refKey.
+func (c *DecodedBlockCache) storeToken(refKey string) decodedBlockCacheStoreToken {
+	if c == nil || refKey == "" {
+		return decodedBlockCacheStoreToken{}
+	}
+	return decodedBlockCacheStoreToken{cache: c, epochs: c.epochs(refKey), ok: true}
+}
+
+// refEpoch returns the invalidation epoch of the stripe refKey hashes to.
+func (c *DecodedBlockCache) refEpoch(refKey string) *atomic.Uint64 {
+	return &c.refEpochs[decodedBlockRefHash(refKey)%decodedBlockCacheStripes]
+}
+
+// decodedBlockHit records the hit and returns the cached block itself with
+// share, or a clone otherwise. It reports a miss when the block cannot be
+// cloned.
+func decodedBlockHit(ctx context.Context, cached Block, share bool) (Block, bool, error) {
+	// Share the cached block with a caller that never mutates it.
+	if share {
+		RecordDecodedBlockCacheHit(ctx, false)
+		return cached, true, nil
+	}
+
+	// Clone the cached block and classify unavailable clone support.
+	cloned, ok, err := cloneDecodedBlock(cached)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		RecordDecodedBlockUncloneable(ctx)
+		return nil, false, nil
+	}
+
+	// Record the successful decoded-cache hit for the caller.
+	RecordDecodedBlockCacheHit(ctx, true)
+	return cloned, true, nil
+}
+
+// decodedBlockCacheRefKey marshals the ref into its cache key prefix.
+func decodedBlockCacheRefKey(ref *BlockRef) (string, bool) {
+	if ref == nil || ref.GetEmpty() {
+		return "", false
+	}
+	refKey, err := ref.MarshalKey()
+	if err != nil || len(refKey) == 0 {
+		return "", false
+	}
+	return string(refKey), true
+}
+
+// decodedBlockHitObserver is called with the ref of each block a read takes
+// from a decoded-block cache, as SetDecodedBlockHitObserver describes.
+var decodedBlockHitObserver atomic.Pointer[func(*BlockRef)]
+
+// SetDecodedBlockHitObserver sets fn to be called with the ref of each block
+// a read takes from a decoded-block cache instead of its store. A store that
+// ages blocks by their reads, such as eviction, counts these reads too, since
+// its own read path never sees them. fn runs on the read path, so it must be
+// cheap and must not block. A nil fn removes the observer.
+func SetDecodedBlockHitObserver(fn func(*BlockRef)) {
+	if fn == nil {
+		decodedBlockHitObserver.Store(nil)
+		return
+	}
+	decodedBlockHitObserver.Store(&fn)
+}
+
+// lookupDecodedBlock looks the key of ref up in the context's caches and
+// reports a hit to the decoded-block hit observer and the context's hold.
+func lookupDecodedBlock(ctx context.Context, ref *BlockRef, key decodedBlockCacheKey, share bool) (Block, bool, error) {
+	blk, ok, err := decodedBlockCacheFromContext(ctx).Lookup(ctx, decodedBlockFrontCacheFromContext(ctx), key, share)
+	if ok {
+		observeDecodedBlockHit(ctx, ref)
+	}
+	return blk, ok, err
+}
+
+// observeDecodedBlockHit preserves store read-retention contracts when bytes
+// come from decoded memory. Callers hold no cache or transaction lock: the
+// observer records local eviction recency and the context retains live refs.
+func observeDecodedBlockHit(ctx context.Context, ref *BlockRef) {
+	if fn := decodedBlockHitObserver.Load(); fn != nil {
+		(*fn)(ref)
+	}
+	holdRead(ctx, ref)
+}
+
+// decodedBlockCacheStoreTokenFromContext returns a store token bound to
+// the context's cache and ref.
+func decodedBlockCacheStoreTokenFromContext(ctx context.Context, refKey string) decodedBlockCacheStoreToken {
+	return decodedBlockCacheFromContext(ctx).storeToken(refKey)
+}
+
+// storeDecodedBlock stores the block in the context's caches. The read mark
+// admits it to the shared pool only when a durable store served it; otherwise
+// only the read operation's front cache keeps it.
+func storeDecodedBlock(
+	ctx context.Context,
+	key decodedBlockCacheKey,
+	token decodedBlockCacheStoreToken,
+	blk Block,
+	size int,
+	share bool,
+	mark *blockReadMark,
+) error {
+	var cache *DecodedBlockCache
+	durableGen, durable := mark.admission()
+	if durable {
+		cache = decodedBlockCacheFromContext(ctx)
+	}
+	return cache.Store(ctx, decodedBlockFrontCacheFromContext(ctx), token, key, blk, size, durableGen, share)
+}
+
+// decodedBlockCacheContextKey is the context key of the attached cache.
+type decodedBlockCacheContextKey struct{}
+
+// decodedBlockCacheFromContext returns the shared decoded block cache
+// from the context, or nil.
+func decodedBlockCacheFromContext(ctx context.Context) *DecodedBlockCache {
+	if ctx != nil {
+		if cache, _ := ctx.Value(decodedBlockCacheContextKey{}).(*DecodedBlockCache); cache != nil {
+			return cache
+		}
+	}
+	return nil
+}
+
+// decodedBlockFrontCacheFromContext returns the read operation's front
+// cache from the context, or nil.
+func decodedBlockFrontCacheFromContext(ctx context.Context) *decodedBlockFrontCache {
+	op := readOperationContextFromContext(ctx)
+	if op == nil {
+		return nil
+	}
+	return op.decodedBlocks
+}
+
+// decodedBlockCacheCost computes the cost of a cached entry: its pool key, the
+// heap its decoded block retains, and a fixed charge for the pool's
+// bookkeeping. A block without DecodedBlockHeapSizer is charged its stored
+// size plus its encoded decoded size as a heap estimate. It returns false when
+// the block size is unknown.
+func decodedBlockCacheCost(cacheKey string, blk Block, size int) (int64, bool) {
+	// Charge the reported heap size when the block knows it.
+	keyCost := int64(len(cacheKey)) + decodedBlockCacheEntryOverheadCost
+	if sizer, ok := blk.(DecodedBlockHeapSizer); ok {
+		if heapCost := int64(sizer.DecodedHeapSize()); heapCost > 0 {
+			return keyCost + heapCost, true
+		}
+	}
+
+	// Otherwise estimate the heap from the raw and decoded sizes.
+	rawCost := int64(size)
+	if rawCost <= 0 {
+		return 0, false
+	}
+	decodedCost := int64(0)
+	if sizer, ok := blk.(decodedBlockCacheSizer); ok {
+		decodedCost = int64(sizer.SizeVT())
+	}
+	if decodedCost <= 0 {
+		decodedData, err := blk.MarshalVT()
+		if err != nil {
+			return 0, false
+		}
+		decodedCost = int64(len(decodedData))
+	}
+	if decodedCost <= 0 {
+		return 0, false
+	}
+	return keyCost + rawCost + decodedCost, true
+}
+
+// decodedBlockCacheKeyFor builds the cache key for a block, or false
+// when the block type is not cacheable.
+func decodedBlockCacheKeyFor(ref *BlockRef, blk Block, xfrm Transformer) (decodedBlockCacheKey, bool) {
+	// Require a nonempty reference and block for cache identity.
+	if ref == nil || ref.GetEmpty() || blk == nil {
+		return decodedBlockCacheKey{}, false
+	}
+
+	// Resolve the concrete block type used by the decoded cache.
+	typeKeyer, ok := blk.(DecodedBlockCacheable)
+	if !ok {
+		return decodedBlockCacheKey{}, false
+	}
+	blockType := typeKeyer.DecodedBlockCacheTypeKey()
+	if blockType == "" {
+		return decodedBlockCacheKey{}, false
+	}
+
+	// Resolve the transform identity used by the decoded cache.
+	transform, ok := decodedBlockCacheTransformKey(xfrm)
+	if !ok {
+		return decodedBlockCacheKey{}, false
+	}
+
+	// Encode the block reference used by the decoded cache.
+	refKey, ok := decodedBlockCacheRefKey(ref)
+	if !ok {
+		return decodedBlockCacheKey{}, false
+	}
+	return decodedBlockCacheKey{
+		ref:       refKey,
+		blockType: blockType,
+		transform: transform,
+		trust:     decodedBlockCacheTrustKey,
+	}, true
+}
+
+// decodedBlockCacheTransformKey returns the transformer's cache identity,
+// or the no-transform key.
+func decodedBlockCacheTransformKey(xfrm Transformer) (string, bool) {
+	// Use the untransformed cache identity when no transformer applies.
+	if xfrm == nil {
+		return DecodedBlockCacheNoTransformKey, true
+	}
+
+	// Require a transformer with a nonempty decoded-cache identity.
+	keyer, ok := xfrm.(DecodedBlockCacheTransformer)
+	if !ok {
+		return "", false
+	}
+	key := keyer.DecodedBlockCacheTransformKey()
+	if key == "" {
+		return "", false
+	}
+	return key, true
+}
+
+// cloneDecodedBlock deep-clones a block, returning false when the block
+// type cannot be cloned.
+func cloneDecodedBlock(blk Block) (Block, bool, error) {
+	// Clone the decoded block and distinguish unsupported block types.
+	cloned, err := CloneBlock(blk)
+	if err != nil {
+		if errors.Is(err, ErrNotClonable) || errors.Is(err, ErrUnexpectedType) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+
+	// Require the clone to preserve the block interface.
+	out, ok := cloned.(Block)
+	if !ok {
+		return nil, false, nil
+	}
+	return out, true, nil
+}

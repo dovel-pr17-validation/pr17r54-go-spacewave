@@ -1,0 +1,192 @@
+package bldr_manifest_pack
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+
+	kvfile "github.com/aperturerobotics/go-kvfile"
+	"github.com/pkg/errors"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	"github.com/s4wave/spacewave/db/packfile"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+)
+
+// ImportManifestPack verifies and imports a manifest-pack artifact.
+func ImportManifestPack(
+	ctx context.Context,
+	ws world.WorldState,
+	sender peer.ID,
+	meta *ManifestPackMetadata,
+	packBytes []byte,
+) error {
+	// Verify the metadata and pack bytes before importing.
+	if err := meta.Validate(); err != nil {
+		return err
+	}
+	if err := verifyPackBytes(meta, packBytes); err != nil {
+		return err
+	}
+
+	// Import the blocks through a stage held until the bundle adopts them.
+	stage, err := ws.StageWorldState(ctx)
+	if err != nil {
+		return err
+	}
+	defer stage.Release()
+	if err := importPackBlocks(ctx, stage, packBytes); err != nil {
+		return err
+	}
+	if err := applyManifestBundle(ctx, ws, sender, meta); err != nil {
+		return err
+	}
+	_, err = ws.Sync(ctx)
+	return err
+}
+
+// verifyPackBytes checks the pack length and SHA-256 against the metadata.
+func verifyPackBytes(meta *ManifestPackMetadata, packBytes []byte) error {
+	if uint64(len(packBytes)) != meta.GetPack().GetSizeBytes() {
+		return errors.Errorf("pack size mismatch: got %d want %d", len(packBytes), meta.GetPack().GetSizeBytes())
+	}
+	sum := sha256.Sum256(packBytes)
+	if !bytes.Equal(sum[:], meta.GetPackSha256()) {
+		return errors.New("pack sha256 mismatch")
+	}
+	return nil
+}
+
+// importPackBlocks imports every block from the pack bytes into storage with
+// its refs. PutBlock verifies each block against its key.
+func importPackBlocks(ctx context.Context, storage world.WorldStorage, packBytes []byte) error {
+	rdr, err := kvfile.BuildReader(bytes.NewReader(packBytes), uint64(len(packBytes)))
+	if err != nil {
+		return err
+	}
+	return storage.AccessWorldState(ctx, nil, func(bls *bucket_lookup.Cursor) error {
+		return rdr.ScanPrefixEntries(nil, func(entry *kvfile.IndexEntry, idx int) error {
+			// Stop on context cancellation between entries.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			// Decode the entry's block ref and value.
+			ref, err := parsePackBlockRef(entry)
+			if err != nil {
+				return errors.Wrapf(err, "pack entry %d", idx)
+			}
+			value, err := rdr.GetWithEntry(entry, idx)
+			if err != nil {
+				return errors.Wrapf(err, "read pack entry %d", idx)
+			}
+			stored, err := block.DecodeBlockObject(value)
+			if err != nil {
+				return errors.Wrapf(err, "pack entry %d", idx)
+			}
+
+			// Put the block into the cursor's store, which verifies the key.
+			_, _, err = bls.GetBlockStore().PutBlock(ctx, stored.Data, stored.PutOpts(ref))
+			return err
+		})
+	})
+}
+
+// applyManifestBundle reads the manifest bundle referenced by the metadata and applies it to the world state.
+func applyManifestBundle(
+	ctx context.Context,
+	ws world.WorldState,
+	sender peer.ID,
+	meta *ManifestPackMetadata,
+) error {
+	// Read the bundle and require one ref per manifest tuple.
+	bundle, err := readManifestBundle(ctx, ws, meta.GetManifestBundleRef())
+	if err != nil {
+		return err
+	}
+	if len(bundle.GetManifestRefs()) != len(meta.GetManifests()) {
+		return errors.Errorf("manifest bundle count mismatch: got %d want %d", len(bundle.GetManifestRefs()), len(meta.GetManifests()))
+	}
+
+	// Create or update the bundle object at the first tuple's key.
+	obj, objOk, err := ws.GetObject(ctx, meta.GetManifests()[0].GetObjectKey())
+	defer world.ReleaseObjectState(obj)
+	if err != nil {
+		return err
+	}
+	if objOk {
+		_, err = obj.SetRootRef(ctx, meta.GetManifestBundleRef())
+	} else {
+		created, createErr := ws.CreateObject(ctx, meta.GetManifests()[0].GetObjectKey(), meta.GetManifestBundleRef())
+		world.ReleaseObjectState(created)
+		err = createErr
+	}
+	if err != nil {
+		return errors.Wrap(err, "store manifest bundle")
+	}
+
+	// Store each bundle manifest and link it to its object key.
+	for i, tuple := range meta.GetManifests() {
+		manifestRef := bundle.GetManifestRefs()[i]
+		if err := validateManifestRefMatchesTuple(manifestRef, tuple, meta.GetBuildType()); err != nil {
+			return errors.Wrapf(err, "manifest %d", i)
+		}
+		manifestObjKey, err := bldr_manifest.NewManifestBundleEntryKey(tuple.GetObjectKey(), manifestRef.GetMeta())
+		if err != nil {
+			return err
+		}
+		_, _, err = bldr_manifest_world.SetManifest(ctx, ws, sender, manifestObjKey, manifestRef.GetManifestRef())
+		if err != nil {
+			return errors.Wrap(err, "store manifest")
+		}
+		quad := bldr_manifest_world.NewManifestQuad(tuple.GetObjectKey(), manifestObjKey, manifestRef.GetMeta().GetManifestId())
+		if err := ws.SetGraphQuad(ctx, quad); err != nil {
+			return errors.Wrap(err, "link bundle manifest")
+		}
+	}
+
+	// Link each linked object key to the manifest object.
+	for _, tuple := range meta.GetManifests() {
+		for _, objKey := range tuple.GetLinkObjectKeys() {
+			if _, err := bldr_manifest_world.CreateManifestStore(ctx, ws, objKey); err != nil {
+				return errors.Wrap(err, "create manifest link store")
+			}
+			quad := bldr_manifest_world.NewManifestQuad(objKey, tuple.GetObjectKey(), "")
+			if err := ws.SetGraphQuad(ctx, quad); err != nil {
+				return errors.Wrap(err, "link manifest bundle")
+			}
+		}
+	}
+	return nil
+}
+
+// readManifestBundle reads and validates a manifest bundle at the ref.
+func readManifestBundle(
+	ctx context.Context,
+	ws world.WorldState,
+	ref *bucket.ObjectRef,
+) (*bldr_manifest.ManifestBundle, error) {
+	var bundle *bldr_manifest.ManifestBundle
+	_, err := world.AccessObject(ctx, ws.AccessWorldState, ref, func(bcs *block.Cursor) error {
+		var err error
+		bundle, err = bldr_manifest.UnmarshalManifestBundle(ctx, bcs)
+		if err == nil {
+			err = bundle.Validate()
+		}
+		return err
+	})
+	return bundle, err
+}
+
+// parsePackBlockRef parses a pack index entry key into a block ref.
+func parsePackBlockRef(entry *kvfile.IndexEntry) (*block.BlockRef, error) {
+	h, err := packfile.ParseBlockKey(entry.GetKey())
+	if err != nil {
+		return nil, err
+	}
+	return block.NewBlockRef(h), nil
+}

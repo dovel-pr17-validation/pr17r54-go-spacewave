@@ -1,0 +1,91 @@
+package volume
+
+import (
+	"context"
+	"crypto"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/net/hash"
+	"github.com/s4wave/spacewave/net/keypem"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// NewVolumeInfo constructs volume info from a volume.
+func NewVolumeInfo(ctx context.Context, ci *controller.Info, vol Volume) (*VolumeInfo, error) {
+	// Read the volume peer identity and public key.
+	peerID := vol.GetPeerID().String()
+	peerInfo, err := vol.GetPeer(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	peerPub := peerInfo.GetPubKey()
+
+	// Encode the peer public key for the volume information record.
+	pkPem, err := keypem.MarshalPubKeyPem(peerPub)
+	if err != nil {
+		return nil, err
+	}
+
+	return &VolumeInfo{
+		VolumeId:       vol.GetID(),
+		PeerId:         peerID,
+		PeerPub:        string(pkPem),
+		ControllerInfo: ci.Clone(),
+		HashType:       ResolveHashType(vol.GetHashType()),
+	}, nil
+}
+
+// ResolveHashType resolves the volume hash choice.
+func ResolveHashType(hashType hash.HashType) hash.HashType {
+	if hashType != 0 {
+		return hashType
+	}
+	return block.DefaultHashType
+}
+
+// ResolveHashType resolves the volume info hash choice.
+func (i *VolumeInfo) ResolveHashType() hash.HashType {
+	return ResolveHashType(i.GetHashType())
+}
+
+// Validate validates the VolumeInfo object.
+func (i *VolumeInfo) Validate() error {
+	// Require a valid, nonempty peer identity in the volume information.
+	peerID, err := i.ParsePeerID()
+	if err == nil && len(peerID) == 0 {
+		err = peer.ErrEmptyPeerID
+	}
+	if err != nil {
+		return err
+	}
+
+	// Validate the volume peer identity together with its public key.
+	if _, err := i.ParseToPeer(); err != nil {
+		return err
+	}
+
+	// Validate the volume hash choice while allowing the default.
+	// note: allows zero value
+	if err := i.GetHashType().Validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ParsePeerID parses the peer ID.
+func (i *VolumeInfo) ParsePeerID() (peer.ID, error) {
+	return confparse.ParsePeerID(i.GetPeerId())
+}
+
+// ParsePeerPub parses the public key.
+func (i *VolumeInfo) ParsePeerPub() (crypto.PublicKey, error) {
+	return confparse.ParsePublicKey(i.GetPeerPub())
+}
+
+// ParseToPeer parses the fields and builds the corresponding Peer.
+func (i *VolumeInfo) ParseToPeer() (peer.Peer, error) {
+	return confparse.ParsePeer("", i.GetPeerPub(), i.GetPeerId())
+}

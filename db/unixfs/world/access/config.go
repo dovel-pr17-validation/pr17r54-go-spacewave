@@ -1,0 +1,63 @@
+package unixfs_world_access
+
+import (
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/pkg/errors"
+	unixfs_errors "github.com/s4wave/spacewave/db/unixfs/errors"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// ConfigID is the string used to identify this config object.
+const ConfigID = ControllerID
+
+// Validate validates the configuration.
+// This is a cursory validation to see if the values "look correct."
+func (c *Config) Validate() error {
+	// Require the filesystem identity for access resolution.
+	if c.GetFsId() == "" {
+		return unixfs_errors.ErrEmptyUnixFsId
+	}
+
+	// Require the World engine identity for filesystem access.
+	if c.GetEngineId() == "" {
+		return world.ErrEmptyEngineID
+	}
+
+	// Validate the World reference for the filesystem root.
+	if err := c.GetFsRef().Validate(); err != nil {
+		return errors.Wrap(err, "fs_ref")
+	}
+
+	// Validate the sender peer used for World changes.
+	if _, err := c.ParsePeerID(); err != nil {
+		return err
+	}
+
+	// Validate the timestamp for filesystem metadata.
+	if err := c.GetTimestamp().Validate(true); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// GetConfigID returns the unique string for this configuration type.
+// This string is stored with the encoded config.
+func (c *Config) GetConfigID() string {
+	return ConfigID
+}
+
+// EqualsConfig checks if the other config is equal.
+func (c *Config) EqualsConfig(other config.Config) bool {
+	return config.EqualsConfig[*Config](c, other)
+}
+
+// ParsePeerID parses the target peer ID constraint.
+func (c *Config) ParsePeerID() (peer.ID, error) {
+	return confparse.ParsePeerID(c.GetPeerId())
+}
+
+// _ is a type assertion
+var _ config.Config = (*Config)(nil)

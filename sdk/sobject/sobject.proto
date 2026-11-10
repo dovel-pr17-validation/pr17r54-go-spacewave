@@ -1,0 +1,113 @@
+syntax = "proto3";
+package s4wave.sobject;
+
+import "github.com/s4wave/spacewave/core/sobject/sobject.proto";
+
+// SharedObjectResourceService exposes retained native state independently of readable body access.
+service SharedObjectResourceService {
+  rpc WatchSharedObjectHealth(WatchSharedObjectHealthRequest) returns (stream WatchSharedObjectHealthResponse);
+  // WatchSharedObjectParticipation observes held native authority without mounting content.
+  rpc WatchSharedObjectParticipation(WatchSharedObjectParticipationRequest) returns (stream SharedObjectParticipation);
+
+  // OpenReadCheckpoint opens immutable World history retained before departure.
+  rpc OpenReadCheckpoint(OpenReadCheckpointRequest) returns (OpenReadCheckpointResponse);
+
+  rpc MountSharedObjectBody(MountSharedObjectBodyRequest) returns (MountSharedObjectBodyResponse);
+
+  // GetSharedObjectTrim reports, from this device's state, how far the history
+  // can be trimmed and which members hold it back.
+  rpc GetSharedObjectTrim(GetSharedObjectTrimRequest) returns (SharedObjectTrim);
+}
+
+// GetSharedObjectTrimRequest selects the already mounted SharedObject.
+message GetSharedObjectTrimRequest {}
+
+// SharedObjectTrim is this device's view of the checkpoint and the history above
+// it.
+message SharedObjectTrim {
+  // ViewerPeerId identifies this device's participant.
+  string viewer_peer_id = 1;
+  // CheckpointHeight is the height of the held checkpoint.
+  uint64 checkpoint_height = 2;
+  // Operations is the number of operations held above the checkpoint.
+  int64 operations = 3;
+  // Placed is the number of them in the replay order.
+  int64 placed = 4;
+  // Stable is the length of the order prefix every roster member built on.
+  int64 stable = 5;
+  // SequencerPeerId is the appointed sequencer, empty under Merge.
+  string sequencer_peer_id = 6;
+  // CheckpointerPeerId is the peer that signs checkpoints.
+  string checkpointer_peer_id = 7;
+  // NeedsAcknowledgment is true when this device should acknowledge now.
+  bool needs_acknowledgment = 8;
+  // UnplacedHeads are the heads outside the order. Any of them stops every
+  // acknowledgment.
+  repeated .sobject.SOOperationPosition unplaced_heads = 9;
+  // Writers are the writers with their place on the trimming roster.
+  repeated SharedObjectTrimWriter writers = 10;
+}
+
+// SharedObjectTrimWriter is one writer's share in the stable point.
+message SharedObjectTrimWriter {
+  // PeerId identifies the writer.
+  string peer_id = 1;
+  // Dropped is true when the writer is off the trimming roster.
+  bool dropped = 2;
+  // LatestNonce is the nonce of the writer's latest held operation, or 0.
+  uint64 latest_nonce = 3;
+  // BuiltOnCheckpointer is true when the writer built on the checkpointer's
+  // latest operation.
+  bool built_on_checkpointer = 4;
+}
+
+// WatchSharedObjectParticipationRequest selects the already mounted SharedObject.
+message WatchSharedObjectParticipationRequest {
+}
+
+// SharedObjectParticipation is the configuration accepted by the native host for its own participant.
+// It grants no content access and does not treat a remote refusal as a configuration change.
+message SharedObjectParticipation {
+  // ViewerPeerId identifies the native participant bound to this mounted SharedObject.
+  string viewer_peer_id = 1;
+  // Config is the retained native configuration, including an accepted departure.
+  .sobject.SharedObjectConfig config = 2;
+  // ConfigHistoryBase is the native trust checkpoint when retained lineage is available.
+  .sobject.SharedObjectConfig config_history_base = 3;
+  // ConfigHistoryChanges is the verified oldest-first suffix from the checkpoint through Config.
+  repeated .sobject.SOConfigChange config_history_changes = 4;
+}
+
+// WatchSharedObjectHealthRequest is the request type for WatchSharedObjectHealth.
+message WatchSharedObjectHealthRequest {}
+
+// WatchSharedObjectHealthResponse is the response type for WatchSharedObjectHealth.
+message WatchSharedObjectHealthResponse {
+  // Health is the current SharedObject health snapshot.
+  .sobject.SharedObjectHealth health = 1;
+}
+
+// MountSharedObjectBodyRequest is the request type for MountSharedObjectBody.
+message MountSharedObjectBodyRequest {}
+
+// MountSharedObjectBodyResponse is the response type for MountSharedObjectBody.
+message MountSharedObjectBodyResponse {
+  // Result is either the mounted body resource or typed body health.
+  oneof result {
+    // ResourceId is the ID of the mounted shared object body resource.
+    uint32 resource_id = 1;
+    // Health is returned when body construction failed with typed SharedObject health.
+    .sobject.SharedObjectHealth health = 2;
+  }
+}
+
+// OpenReadCheckpointRequest selects the native participant's retained history.
+message OpenReadCheckpointRequest {}
+
+// OpenReadCheckpointResponse returns a read-only World engine when history exists.
+message OpenReadCheckpointResponse {
+  // ResourceId is zero when no checkpoint was retained.
+  uint32 resource_id = 1;
+  // Config is the historical audience at the retained root, not current authority.
+  .sobject.SharedObjectConfig config = 2;
+}

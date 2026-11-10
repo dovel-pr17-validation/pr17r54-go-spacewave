@@ -1,0 +1,126 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"sync"
+	"testing"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/packfile/writer"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+type memIndexCache struct {
+	mu      sync.Mutex
+	entries map[string][]byte
+}
+
+type errorIndexCache struct {
+	getErr error
+	setErr error
+}
+
+type packItem struct {
+	h    *hash.Hash
+	data []byte
+	refs []*block.BlockRef
+}
+
+func newMemIndexCache() *memIndexCache {
+	return &memIndexCache{entries: make(map[string][]byte)}
+}
+
+func (c *memIndexCache) Get(_ context.Context, packID string) ([]byte, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[packID]
+	return bytes.Clone(e), ok, nil
+}
+
+func (c *memIndexCache) Set(_ context.Context, packID string, entries []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[packID] = bytes.Clone(entries)
+	return nil
+}
+
+func (c *errorIndexCache) Get(_ context.Context, _ string) ([]byte, bool, error) {
+	return nil, false, c.getErr
+}
+
+func (c *errorIndexCache) Set(_ context.Context, _ string, _ []byte) error {
+	return c.setErr
+}
+
+func buildTestPack(t *testing.T, blocks map[string][]byte) ([]byte, []byte) {
+	t.Helper()
+	var items []packItem
+	for _, data := range blocks {
+		h, err := hash.Sum(hash.HashType_HashType_SHA256, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, packItem{h: h, data: data})
+	}
+	return packItems(t, items)
+}
+
+func buildTestPackOrdered(t *testing.T, ordered []struct{ Name, Data string }) ([]byte, []byte) {
+	t.Helper()
+	items := make([]packItem, len(ordered))
+	for i, o := range ordered {
+		h, err := hash.Sum(hash.HashType_HashType_SHA256, []byte(o.Data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		items[i] = packItem{h: h, data: []byte(o.Data)}
+	}
+	return packItems(t, items)
+}
+
+// testPackItem returns a leaf pack item holding data.
+func testPackItem(t testing.TB, data string) packItem {
+	t.Helper()
+	h, err := hash.Sum(hash.HashType_HashType_SHA256, []byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return packItem{h: h, data: []byte(data)}
+}
+
+func packItems(t testing.TB, items []packItem) ([]byte, []byte) {
+	// Pack fixture blocks and collect their generated bloom filter.
+	t.Helper()
+	var buf bytes.Buffer
+	idx := 0
+	result, err := writer.PackBlocks(&buf, func() (*hash.Hash, *block.StoredBlock, error) {
+		if idx >= len(items) {
+			return nil, nil, nil
+		}
+		e := items[idx]
+		idx++
+		return e.h, &block.StoredBlock{Data: e.data, Refs: e.refs, RefsKnown: true}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes(), result.BloomFilter
+}
+
+// setTransportWindows sets the minimum fetch size, the alignment quantum, and
+// the maximum fetch size. Zero keeps the current value.
+func (e *PackReader) setTransportWindows(minWindow, quantum, maxWindow int) {
+	e.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		if minWindow > 0 {
+			e.minWindow = minWindow
+		}
+		if quantum > 0 {
+			e.transportQuantum = quantum
+		}
+		if maxWindow > 0 {
+			e.maxWindow = maxWindow
+		}
+		e.normalizeTransportLocked()
+	})
+}

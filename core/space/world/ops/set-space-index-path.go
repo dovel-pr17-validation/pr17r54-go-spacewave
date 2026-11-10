@@ -1,0 +1,50 @@
+package space_world_ops
+
+import (
+	"context"
+
+	space_world "github.com/s4wave/spacewave/core/space/world"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// Validate checks the operation timestamp.
+func (o *SetSpaceIndexPathOp) Validate() error {
+	return o.GetTimestamp().Validate(false)
+}
+
+// ApplyWorldOp changes only the index path in the transaction's current settings.
+// Conditional repairs preserve a path another operation has already selected.
+func (o *SetSpaceIndexPathOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	sender peer.ID,
+) (bool, error) {
+	// Read the transaction's current settings.
+	current, err := space_world.LookupSpaceSettingsBody(ctx, ws)
+	if err != nil {
+		return false, err
+	}
+
+	// Conditional repairs preserve a path another operation has already selected.
+	if o.ExpectedIndexPath != nil && current.GetIndexPath() != o.GetExpectedIndexPath() {
+		return false, nil
+	}
+
+	// Apply the new index path through a SetSpaceSettings operation.
+	settings := &space_world.SpaceSettings{}
+	if current != nil {
+		settings = current.CloneVT()
+	}
+	settings.IndexPath = o.GetIndexPath()
+	update := &SetSpaceSettingsOp{
+		Settings:  settings,
+		Overwrite: true,
+		Timestamp: o.GetTimestamp(),
+	}
+	return update.ApplyWorldOp(ctx, le, ws, sender)
+}
+
+var _ world.Operation = (*SetSpaceIndexPathOp)(nil)

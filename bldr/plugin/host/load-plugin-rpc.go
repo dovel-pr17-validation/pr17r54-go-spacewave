@@ -1,0 +1,119 @@
+package plugin_host
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/util/ccontainer"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+)
+
+// HandleLoadPluginRpc handles an incoming LoadPlugin RPC request.
+func HandleLoadPluginRpc(
+	b bus.Bus,
+	req *bldr_plugin.LoadPluginRequest,
+	strm bldr_plugin.SRPCPluginHost_LoadPluginStream,
+) error {
+	// Build the LoadPlugin directive from the request's manifests, manifest
+	// root, or instance key, and hold the streamed response container.
+	pluginID := req.GetPluginId()
+	instanceKey := req.GetInstanceKey()
+	var dir bldr_plugin.LoadPlugin
+	if len(req.GetManifests()) != 0 {
+		dir = bldr_plugin.NewLoadPluginWithManifests(pluginID, instanceKey, req.GetManifests()...)
+	} else if req.GetManifestRoot() != "" {
+		dir = bldr_plugin.NewLoadPluginAtManifest(pluginID, instanceKey, req.GetManifestRoot())
+	} else if instanceKey != "" {
+		dir = bldr_plugin.NewLoadPluginInstanced(pluginID, instanceKey)
+	} else {
+		dir = bldr_plugin.NewLoadPlugin(pluginID)
+	}
+	resp := ccontainer.NewCContainerVT[*bldr_plugin.LoadPluginResponse](nil)
+
+	// Create the error channel and the push helper for directive errors.
+	errCh := make(chan error, 1)
+	pushErr := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	// Derive the request context from the stream and cancel it on return.
+	ctx := strm.Context()
+	reqCtx, reqCtxCancel := context.WithCancel(ctx)
+	defer reqCtxCancel()
+
+	// Track the attached directive values and publish the plugin status.
+	var vals []directive.AttachedValue
+	updResp := func() {
+		resp.SetValue(&bldr_plugin.LoadPluginResponse{
+			PluginStatus: &bldr_plugin.PluginStatus{
+				PluginId: pluginID,
+				Running:  len(vals) != 0,
+			},
+		})
+	}
+
+	// Add the LoadPlugin directive with value add and remove callbacks.
+	di, ref, err := b.AddDirective(
+		ctx,
+		dir,
+		bus.NewCallbackHandler(
+			func(av directive.AttachedValue) {
+				vals = append(vals, av)
+				if len(vals) == 1 {
+					updResp()
+				}
+			},
+			func(av directive.AttachedValue) {
+				for i, val := range vals {
+					if val == av {
+						vals = append(vals[:i], vals[i+1:]...)
+						updResp()
+						break
+					}
+				}
+			},
+			func() {
+				reqCtxCancel()
+			},
+		),
+	)
+	if err != nil {
+		return err
+	}
+	defer ref.Release()
+
+	// Push the first directive error or the idle status when the directive
+	// goes idle.
+	defer di.AddIdleCallback(func(isIdle bool, errs []error) {
+		if !isIdle {
+			return
+		}
+		for _, err := range errs {
+			if err != nil && err != context.Canceled {
+				pushErr(err)
+				return
+			}
+		}
+		updResp()
+	})()
+
+	// Stream each response value change back over the RPC until the request
+	// context is canceled.
+	var prevTx *bldr_plugin.LoadPluginResponse
+	for {
+		val, err := resp.WaitValueChange(reqCtx, prevTx, errCh)
+		if err != nil {
+			return err
+		}
+		prevTx = val
+		if val != nil {
+			if err := strm.Send(val); err != nil {
+				return err
+			}
+		}
+	}
+}

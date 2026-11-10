@@ -1,0 +1,112 @@
+import { useCallback, useMemo } from 'react'
+import { useBldrContext } from '@aptre/bldr-react'
+import { Client as SRPCClient } from 'starpc'
+import type { MessageStream } from 'starpc'
+import { LuTerminal } from 'react-icons/lu'
+
+import {
+  CliTerminalServiceClient,
+  CliTerminalServiceServiceName,
+} from '@s4wave/sdk/cli/terminal/terminal_srpc.pb.js'
+import {
+  TerminalFrameKind,
+  type TerminalFrame,
+} from '@s4wave/sdk/terminal/terminal.pb.js'
+import {
+  TerminalPane,
+  type TerminalPaneConnector,
+} from '@s4wave/app/terminal/TerminalPane.js'
+import { useCliTerminalSession } from '@s4wave/app/terminal/CliTerminalSessionProvider.js'
+import { SessionFrame } from '@s4wave/app/session/SessionFrame.js'
+import { BottomBarLevel } from '@s4wave/web/frame/bottom-bar-level.js'
+import { BottomBarItem } from '@s4wave/web/frame/bottom-bar-item.js'
+import { useSessionIndex } from '@s4wave/web/contexts/contexts.js'
+
+const cliTerminalServiceId =
+  'plugin/spacewave-cli-plugin/' + CliTerminalServiceServiceName
+
+// singleTerminalFrame routes a local connection failure through the same stream
+// lifecycle as terminal RPC output.
+function singleTerminalFrame(
+  frame: TerminalFrame,
+): MessageStream<TerminalFrame> {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<TerminalFrame> {
+      let pendingFrame: TerminalFrame | null = frame
+      return {
+        next(): Promise<IteratorResult<TerminalFrame>> {
+          if (pendingFrame) {
+            const value = pendingFrame
+            pendingFrame = null
+            return Promise.resolve({ done: false, value })
+          }
+          return Promise.resolve({ done: true, value: undefined })
+        },
+      }
+    },
+  }
+}
+
+// CliTerminalPage renders the session-local browser CLI terminal in the shell frame.
+export function CliTerminalPage() {
+  const sessionIndex = useSessionIndex()
+  const bldrContext = useBldrContext()
+  const webDocument = bldrContext?.webDocument ?? null
+  const webViewUuid = bldrContext?.webView?.getUuid() ?? null
+
+  const cliTerminal = useMemo(() => {
+    if (!webDocument || !webViewUuid) return null
+    const rpcClient = new SRPCClient(
+      webDocument.buildWebViewHostOpenStream(webViewUuid),
+    )
+    return new CliTerminalServiceClient(rpcClient, {
+      service: cliTerminalServiceId,
+    })
+  }, [webDocument, webViewUuid])
+
+  const openTerminal = useMemo<TerminalPaneConnector>(() => {
+    if (!cliTerminal) {
+      return () =>
+        singleTerminalFrame({
+          kind: TerminalFrameKind.ERROR,
+          error: 'runtime-unavailable',
+        })
+    }
+    return (frames, signal) => cliTerminal.RunCli(frames, signal)
+  }, [cliTerminal])
+
+  const connectTerminal = useCliTerminalSession(sessionIndex, openTerminal)
+
+  const renderTerminalBarItem = useCallback(
+    (selected: boolean, onClick: () => void, className?: string) => (
+      <BottomBarItem
+        selected={selected}
+        onClick={onClick}
+        className={className}
+      >
+        <LuTerminal className="mr-1.5 size-3.5 shrink-0" />
+        <div className="flex-shrink flex-grow truncate">Terminal</div>
+        <div className="bg-border mx-2 h-3 w-px" />
+        <div className="text-muted-foreground truncate text-xs">CLI</div>
+      </BottomBarItem>
+    ),
+    [],
+  )
+
+  return (
+    <SessionFrame>
+      <BottomBarLevel
+        id="sessionCliTerminal"
+        button={renderTerminalBarItem}
+        menuLabel="Terminal"
+      >
+        <div className="bg-background-dark flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="border-foreground/8 text-foreground-alt/70 flex h-7 shrink-0 items-center border-b px-3 text-xs">
+            Spacewave CLI · This session
+          </div>
+          <TerminalPane session="cli" connectTerminal={connectTerminal} />
+        </div>
+      </BottomBarLevel>
+    </SessionFrame>
+  )
+}

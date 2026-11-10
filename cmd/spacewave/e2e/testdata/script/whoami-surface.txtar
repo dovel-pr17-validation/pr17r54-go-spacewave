@@ -1,0 +1,9 @@
+# Whoami exposes the current-session identity command and autostarts the daemon
+# when needed.
+spacewave whoami --help
+stdout "show current session identity"
+stdout "--state-path value"
+stdout "--session-index value"
+
+! spacewave whoami --state-path $WORK/state
+stderr "no session found at index 1"

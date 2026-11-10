@@ -1,0 +1,269 @@
+syntax = "proto3";
+package s4wave.status;
+
+option go_package = "github.com/s4wave/spacewave/sdk/status;s4wave_status";
+
+import "github.com/s4wave/spacewave/bldr/plugin/plugin.proto";
+
+service SystemStatusService {
+  rpc WatchControllers(WatchControllersRequest) returns (stream WatchControllersResponse);
+
+  rpc WatchDirectives(WatchDirectivesRequest) returns (stream WatchDirectivesResponse);
+
+  rpc WatchPlugins(WatchPluginsRequest) returns (stream WatchPluginsResponse);
+
+  rpc WatchNetworkStats(WatchNetworkStatsRequest) returns (stream WatchNetworkStatsResponse);
+
+  rpc ReportRecoveryStatus(ReportRecoveryStatusRequest) returns (ReportRecoveryStatusResponse);
+
+  rpc WatchRecoveryStatus(WatchRecoveryStatusRequest) returns (stream WatchRecoveryStatusResponse);
+}
+
+// ControllerInfo describes a running controller.
+message ControllerInfo {
+  // Id is the controller identifier.
+  string id = 1;
+  // Version is the controller version string.
+  string version = 2;
+  // Description is a human-readable description.
+  string description = 3;
+  // Store is the block store the controller built itself, outside the bus.
+  // Unset when the controller holds no store or has not built it yet.
+  StoreInfo store = 4;
+}
+
+// StoreInfo describes a block store and the stores it is built from.
+message StoreInfo {
+  // Label is the store's role in its parent, such as "lower" or "upper".
+  // Empty for a controller's top store.
+  string label = 1;
+  // Type is the Go type implementing the store.
+  string type = 2;
+  // Id is the store id, when the store has one.
+  string id = 3;
+  // Parts are the stores this one is built from.
+  repeated StoreInfo parts = 4;
+}
+
+// DirectiveInfo describes an active directive.
+message DirectiveInfo {
+  // Name is the directive type name.
+  string name = 1;
+  // Ident is the human-readable directive identification string.
+  string ident = 2;
+  // Id identifies the directive within one WatchDirectivesResponse.
+  // Ids start at 1 and are not stable across responses.
+  uint32 id = 3;
+  // References lists the directive's live references and their origins.
+  repeated DirectiveReference references = 4;
+}
+
+// DirectiveReference describes one live reference to a directive.
+message DirectiveReference {
+  // OriginDirectiveId is the id of the origin directive in the same response.
+  // Zero when there is no origin directive or it is on another bus.
+  uint32 origin_directive_id = 1;
+  // OriginDirectiveIdent is the ident of the origin directive, if any.
+  // Set even when the origin directive is on another bus.
+  string origin_directive_ident = 2;
+  // OriginControllerId is the id of the origin controller, if known.
+  string origin_controller_id = 3;
+  // ConfigKey is the ConfigSet entry key the reference was added under.
+  string config_key = 4;
+  // Weak is true for a reference that observes without holding the directive.
+  bool weak = 5;
+}
+
+// PluginInfo describes a runtime plugin load request.
+message PluginInfo {
+  // Id is the plugin identifier.
+  string id = 1;
+  // InstanceKey is the optional instance key for instanced plugins.
+  string instance_key = 2;
+  // State is the plugin runtime state.
+  string state = 3;
+  // SpaceId is the engine ID of the Space the plugin instance serves: the
+  // hosting Space runtime, or the Space named by a root host instance key.
+  // Empty for system plugins.
+  string space_id = 4;
+}
+
+// NetworkLinkInfo describes a live bifrost link.
+message NetworkLinkInfo {
+  // LocalPeerId is the local peer ID for the link.
+  string local_peer_id = 1;
+  // RemotePeerId is the remote peer ID for the link.
+  string remote_peer_id = 2;
+  // LinkId is the host-unique link ID.
+  uint64 link_id = 3;
+  // TransportId is the local transport UUID for the link.
+  uint64 transport_id = 4;
+  // RemoteTransportId is the remote transport UUID reported by the link.
+  uint64 remote_transport_id = 5;
+}
+
+// NetworkPeerInfo describes a peer with active bifrost links.
+message NetworkPeerInfo {
+  // PeerId is the peer ID.
+  string peer_id = 1;
+  // LinkCount is the number of active links to the peer.
+  uint32 link_count = 2;
+  // Links is the active link list for the peer.
+  repeated NetworkLinkInfo links = 3;
+}
+
+// LauncherRecoveryStatus reports launcher-owned release/config recovery facts.
+message LauncherRecoveryStatus {
+  // SelectedConfigRev is the accepted distribution revision.
+  uint64 selected_config_rev = 1;
+  // SelectedConfigSource identifies where the accepted config came from.
+  string selected_config_source = 2;
+  // FetchedConfigRev is the newest fetched distribution revision.
+  uint64 fetched_config_rev = 3;
+  // FetchedConfigSource identifies the endpoint for FetchedConfigRev.
+  string fetched_config_source = 4;
+  // ReleaseMetadataOutcome is the latest release resolution result.
+  string release_metadata_outcome = 5;
+  // ReleaseWorldHeadRef identifies the resolved Release World snapshot.
+  string release_world_head_ref = 6;
+  // SelectedChannelKey is the release channel selected by the launcher.
+  string selected_channel_key = 7;
+  // SelectedEntrypointManifestId identifies the desktop artifact.
+  string selected_entrypoint_manifest_id = 8;
+  // SelectedEntrypointPlatformId is the desktop artifact platform.
+  string selected_entrypoint_platform_id = 9;
+  // SelectedEntrypointManifestRev is the desktop artifact revision.
+  uint64 selected_entrypoint_manifest_rev = 10;
+  // SelectedEntrypointManifestRef is the desktop artifact reference.
+  string selected_entrypoint_manifest_ref = 11;
+  // UpdatePhase is the installed-app update phase.
+  string update_phase = 12;
+  // UpdateVersion is the selected installed-app release version.
+  string update_version = 13;
+  // StagedPath is the verified installed-app artifact path.
+  string staged_path = 14;
+  // UpdateError is the installed-app update error.
+  string update_error = 15;
+  // SelectedCliManifestId identifies the daemon artifact.
+  string selected_cli_manifest_id = 16;
+  // SelectedCliBinaryPath is the verified daemon artifact path.
+  string selected_cli_binary_path = 17;
+  // DaemonUpdatePhase is the separately staged daemon update phase.
+  string daemon_update_phase = 18;
+  // DaemonUpdateVersion is the selected daemon release version.
+  string daemon_update_version = 19;
+  // DaemonStagedPath is the verified daemon update artifact path.
+  string daemon_staged_path = 20;
+}
+
+// NativePackageRecoveryStatus reports process-host dist materialization facts.
+message NativePackageRecoveryStatus {
+  string plugin_id = 1;
+  string dist_dir = 2;
+  bool materialized = 3;
+  bool invalidated = 4;
+  string last_action = 5;
+  string last_error = 6;
+  string updated_at = 7;
+}
+
+// BrowserBootRecoveryStatus reports browser/desktop boot compatibility facts
+// when a renderer has published them to the daemon status owner.
+message BrowserBootRecoveryStatus {
+  string compatibility_version = 1;
+  string last_reset_decision = 2;
+  string status = 3;
+}
+
+// RuntimeAssetRecoveryStatus reports the latest typed root plugin asset result
+// when a renderer has published it to the daemon status owner.
+message RuntimeAssetRecoveryStatus {
+  string script_path = 1;
+  uint32 status_code = 2;
+  bool ok = 3;
+  string classification = 4;
+  string fetch_source = 5;
+  string runtime_error = 6;
+  string plugin_asset_result = 7;
+  string content_type = 8;
+  string body_prefix = 9;
+  string status = 10;
+}
+
+// RecoveryStatus composes runtime recovery facts without owning decisions.
+message RecoveryStatus {
+  LauncherRecoveryStatus launcher = 1;
+  // Plugins lists the scheduler-owned Manifest recovery facts per plugin.
+  repeated bldr.plugin.PluginManifestRecoveryStatus plugins = 2;
+  repeated NativePackageRecoveryStatus native_packages = 3;
+  BrowserBootRecoveryStatus boot = 4;
+  RuntimeAssetRecoveryStatus runtime_asset = 5;
+}
+
+// WatchControllersRequest is the request type for WatchControllers.
+message WatchControllersRequest {}
+
+// WatchControllersResponse is the response type for WatchControllers.
+message WatchControllersResponse {
+  // Controllers is the current list of active controllers.
+  repeated ControllerInfo controllers = 1;
+  // ControllerCount is the total number of active controllers.
+  uint32 controller_count = 2;
+}
+
+// WatchDirectivesRequest is the request type for WatchDirectives.
+message WatchDirectivesRequest {}
+
+// WatchDirectivesResponse is the response type for WatchDirectives.
+message WatchDirectivesResponse {
+  // Directives is the current list of active directives.
+  repeated DirectiveInfo directives = 1;
+  // DirectiveCount is the total number of active directives.
+  uint32 directive_count = 2;
+}
+
+// WatchPluginsRequest is the request type for WatchPlugins.
+message WatchPluginsRequest {}
+
+// WatchPluginsResponse is the response type for WatchPlugins.
+message WatchPluginsResponse {
+  // Plugins lists the plugin load requests of every reachable plugin host,
+  // sorted by space_id, then id, then instance_key.
+  repeated PluginInfo plugins = 1;
+  // PluginCount is the total number of plugin load requests.
+  uint32 plugin_count = 2;
+}
+
+// WatchNetworkStatsRequest is the request type for WatchNetworkStats.
+message WatchNetworkStatsRequest {}
+
+// WatchNetworkStatsResponse is the response type for WatchNetworkStats.
+message WatchNetworkStatsResponse {
+  // TransportRunning reports whether the session transport owner is active.
+  bool transport_running = 1;
+  // LocalPeerId is the local bifrost peer ID when the transport is active.
+  string local_peer_id = 2;
+  // Peers is the list of peers with at least one active link.
+  repeated NetworkPeerInfo peers = 3;
+  // PeerCount is the total number of linked peers.
+  uint32 peer_count = 4;
+  // LinkCount is the total number of active links.
+  uint32 link_count = 5;
+}
+
+// WatchRecoveryStatusRequest is the request type for WatchRecoveryStatus.
+message WatchRecoveryStatusRequest {}
+
+// ReportRecoveryStatusRequest publishes renderer-owned recovery facts.
+message ReportRecoveryStatusRequest {
+  BrowserBootRecoveryStatus boot = 1;
+  RuntimeAssetRecoveryStatus runtime_asset = 2;
+}
+
+// ReportRecoveryStatusResponse is the response type for ReportRecoveryStatus.
+message ReportRecoveryStatusResponse {}
+
+// WatchRecoveryStatusResponse is the response type for WatchRecoveryStatus.
+message WatchRecoveryStatusResponse {
+  RecoveryStatus status = 1;
+}

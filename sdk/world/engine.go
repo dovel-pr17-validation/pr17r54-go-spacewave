@@ -1,0 +1,137 @@
+package s4wave_world
+
+import (
+	"context"
+
+	resource_client "github.com/s4wave/spacewave/bldr/resource/client"
+	"github.com/s4wave/spacewave/db/bucket"
+)
+
+// Engine is the top-level resource for the World data structure.
+// Engine implements a transactional world state container.
+// Provides:
+// - NewTransaction(ctx, write bool) (Tx, error)
+// - WorldStorage for bucket cursor access (BuildStorageCursor, AccessWorldState)
+// - WorldWaitSeqno for sequence number waiting (GetSeqno, WaitSeqno)
+//
+// This Go SDK implementation wraps EngineResourceService and WatchWorldStateResourceService.
+type Engine struct {
+	client       *resource_client.Client
+	ref          resource_client.ResourceRef
+	service      SRPCEngineResourceServiceClient
+	watchService SRPCWatchWorldStateResourceServiceClient
+}
+
+// NewEngine creates a new Engine resource wrapper.
+func NewEngine(client *resource_client.Client, ref resource_client.ResourceRef) (*Engine, error) {
+	srpcClient, err := ref.GetClient()
+	if err != nil {
+		return nil, err
+	}
+	return &Engine{
+		client:       client,
+		ref:          ref,
+		service:      NewSRPCEngineResourceServiceClient(srpcClient),
+		watchService: NewSRPCWatchWorldStateResourceServiceClient(srpcClient),
+	}, nil
+}
+
+// GetResourceRef returns the resource reference.
+func (e *Engine) GetResourceRef() resource_client.ResourceRef {
+	return e.ref
+}
+
+// Release releases the resource reference.
+func (e *Engine) Release() {
+	e.ref.Release()
+}
+
+// GetEngineInfo returns information about the world engine.
+func (e *Engine) GetEngineInfo(ctx context.Context) (*GetEngineInfoResponse, error) {
+	return e.service.GetEngineInfo(ctx, &GetEngineInfoRequest{})
+}
+
+// GetWorldRootSnapshot returns the current committed World root.
+func (e *Engine) GetWorldRootSnapshot(ctx context.Context) (*WorldRootSnapshot, error) {
+	return e.service.GetWorldRootSnapshot(ctx, &GetWorldRootSnapshotRequest{})
+}
+
+// WatchWorldRootSnapshots streams committed World root snapshots.
+func (e *Engine) WatchWorldRootSnapshots(ctx context.Context) (SRPCEngineResourceService_WatchWorldRootSnapshotsClient, error) {
+	return e.service.WatchWorldRootSnapshots(ctx, &WatchWorldRootSnapshotsRequest{})
+}
+
+// NewTransaction creates a new transaction against the world state.
+// Set write=true if the transaction will perform write operations.
+// Always call Release() when done with the transaction.
+// Note: Engine might return a read-only transaction even if write=true.
+func (e *Engine) NewTransaction(ctx context.Context, write bool) (*Tx, error) {
+	// Request a World transaction with the desired write access.
+	resp, err := e.service.NewTransaction(ctx, &NewTransactionRequest{Write: write})
+	if err != nil {
+		return nil, err
+	}
+
+	// Create resource reference and wrapper for the transaction
+	txRef := e.client.CreateResourceReference(resp.ResourceId)
+	tx, err := NewTx(e.client, txRef, resp.ReadOnly)
+	if err != nil {
+		txRef.Release()
+		return nil, err
+	}
+	return tx, nil
+}
+
+// GetSeqno returns the current sequence number of the world state.
+// This is also the sequence number of the most recent change.
+// Initializes at 0 for initial world state.
+func (e *Engine) GetSeqno(ctx context.Context) (uint64, error) {
+	resp, err := e.service.GetSeqno(ctx, &GetSeqnoRequest{})
+	if err != nil {
+		return 0, err
+	}
+	return resp.Seqno, nil
+}
+
+// WaitSeqno waits for the world state sequence number to reach or exceed the specified value.
+// Returns the seqno when the condition is reached.
+// If seqno == 0, this might return immediately unconditionally.
+func (e *Engine) WaitSeqno(ctx context.Context, seqno uint64) (uint64, error) {
+	resp, err := e.service.WaitSeqno(ctx, &WaitSeqnoRequest{Seqno: seqno})
+	if err != nil {
+		return 0, err
+	}
+	return resp.Seqno, nil
+}
+
+// BuildStorageCursor builds a cursor to the world storage with an empty ref.
+// The cursor should be released independently of the Engine.
+// Be sure to call Release on the cursor resource when done.
+// Returns the resource ID of the cursor.
+func (e *Engine) BuildStorageCursor(ctx context.Context) (uint32, error) {
+	resp, err := e.service.BuildStorageCursor(ctx, &BuildStorageCursorRequest{})
+	if err != nil {
+		return 0, err
+	}
+	return resp.ResourceId, nil
+}
+
+// AccessWorldState builds a bucket lookup cursor with an optional ref.
+// If the ref is empty, returns a cursor pointing to the root world state.
+// The lookup cursor must be released when done.
+// Returns the resource ID of the cursor.
+func (e *Engine) AccessWorldState(ctx context.Context, ref *bucket.ObjectRef) (uint32, error) {
+	resp, err := e.service.AccessWorldState(ctx, &AccessWorldStateRequest{Ref: ref})
+	if err != nil {
+		return 0, err
+	}
+	return resp.ResourceId, nil
+}
+
+// WatchWorldState creates a streaming watch of the WorldState.
+// Returns a stream that sends a tracked snapshot resource ID whenever a tracked
+// access changes. Each replacement is sent before its predecessor is released;
+// see WatchWorldStateResponse for the supersession contract.
+func (e *Engine) WatchWorldState(ctx context.Context) (SRPCWatchWorldStateResourceService_WatchWorldStateClient, error) {
+	return e.watchService.WatchWorldState(ctx, &WatchWorldStateRequest{})
+}

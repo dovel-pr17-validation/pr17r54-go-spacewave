@@ -1,0 +1,1652 @@
+//go:build !js
+
+package handoff
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"image"
+	"image/png"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+	bldr_devtool "github.com/s4wave/spacewave/bldr/devtool"
+	bldr_manifest_pack "github.com/s4wave/spacewave/bldr/manifest/pack"
+	"github.com/s4wave/spacewave/cmd/internal/releaseconfig"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	usageText                    = "usage: entrypoint-handoff --version X.Y.Z --platforms p1,p2 [--include-browser|--browser-only] --out-dir /path/to/out"
+	manifestPackFilename         = "manifest.pack.kvf"
+	manifestPackMetadataFilename = "manifest-pack.bin"
+)
+
+// Args configures the entrypoint-handoff command.
+type Args struct {
+	// Version is the release version recorded in staged handoff manifests.
+	Version string
+	// Rev is the release revision recorded in staged handoff manifests.
+	Rev string
+	// Tag is the release tag recorded in staged handoff manifests.
+	Tag string
+	// ReleaseEnvironment identifies the target release environment.
+	ReleaseEnvironment string
+	// GitSHA identifies the source revision recorded in staged artifacts.
+	GitSHA string
+	// RunID identifies the release workflow run.
+	RunID string
+	// RunAttempt identifies the attempt within the release workflow run.
+	RunAttempt string
+	// SourceRepo identifies the source repository for the release.
+	SourceRepo string
+	// Workflow identifies the release workflow.
+	Workflow string
+	// PlatformsCSV lists desktop target platforms separated by commas.
+	PlatformsCSV string
+	// OutDir is the directory receiving staged handoff artifacts.
+	OutDir string
+	// BrowserStagingDir is the browser staging tree recorded in a handoff manifest.
+	BrowserStagingDir string
+	// CLIArtifactsDir is the public CLI artifact directory for a CLI handoff manifest.
+	CLIArtifactsDir string
+	// ReactDev builds browser entrypoints in development mode.
+	ReactDev bool
+	// SkipNotarize skips Apple notarization during desktop packaging.
+	SkipNotarize bool
+	// IncludeBrowser includes browser outputs in a desktop handoff.
+	IncludeBrowser bool
+	// BrowserOnly builds and stages only browser outputs.
+	BrowserOnly bool
+	// WriteHandoffManifest writes an entrypoint-handoff manifest and exits.
+	WriteHandoffManifest bool
+	// WriteCLIHandoffManifest writes a CLI handoff manifest and exits.
+	WriteCLIHandoffManifest bool
+	// SkipBuild packages existing helper and entrypoint artifacts.
+	SkipBuild bool
+	// SkipPackage leaves built artifacts unpackaged.
+	SkipPackage bool
+	// StageBuildInputs stages raw build inputs in OutDir.
+	StageBuildInputs bool
+	// ManifestPackProduce produces one manifest-pack artifact and exits.
+	ManifestPackProduce bool
+	// ManifestPackImportDirsCSV lists manifest-pack artifact directories separated by commas.
+	ManifestPackImportDirsCSV string
+	// ManifestID identifies the produced manifest-pack manifest.
+	ManifestID string
+	// ManifestPlatformID identifies the produced manifest-pack platform.
+	ManifestPlatformID string
+	// ManifestObjectKey identifies the produced manifest-pack bundle object.
+	ManifestObjectKey string
+	// ManifestLinkObjectKeysCSV lists produced manifest-pack link object keys separated by commas.
+	ManifestLinkObjectKeysCSV string
+	// ManifestProducerTarget identifies the producer build target.
+	ManifestProducerTarget string
+	// ManifestCacheSchema identifies the producer cache schema.
+	ManifestCacheSchema string
+	// ManifestDistDir replaces the produced manifest contents with a
+	// packaged directory, such as the signed macOS app bundle.
+	ManifestDistDir string
+	// ManifestEntrypoint is the entrypoint path within ManifestDistDir.
+	ManifestEntrypoint string
+}
+
+// FillDefaults fills default argument values.
+func (a *Args) FillDefaults() {
+	if a.ManifestCacheSchema == "" {
+		a.ManifestCacheSchema = "manifest-pack-v1"
+	}
+}
+
+// Run runs the entrypoint handoff command.
+func Run(ctx context.Context, args *Args) error {
+	// Validate the arguments and apply defaults before running.
+	if args == nil {
+		return errors.New("args is nil")
+	}
+	args.FillDefaults()
+	if args.WriteHandoffManifest && args.WriteCLIHandoffManifest {
+		return errors.New("--write-handoff-manifest and --write-cli-handoff-manifest cannot be combined")
+	}
+
+	// Write the entrypoint handoff manifest when requested.
+	if args.WriteHandoffManifest {
+		return WriteEntrypointHandoffManifest(EntrypointHandoffOptions{
+			RootDir:            args.OutDir,
+			BrowserStagingDir:  args.BrowserStagingDir,
+			Version:            args.Version,
+			Rev:                args.Rev,
+			GitSHA:             args.GitSHA,
+			Tag:                args.Tag,
+			ReleaseEnvironment: args.ReleaseEnvironment,
+			RunID:              args.RunID,
+			RunAttempt:         args.RunAttempt,
+			SourceRepo:         args.SourceRepo,
+			Workflow:           args.Workflow,
+		})
+	}
+
+	// Resolve the repository directory and the shared logger.
+	repoDir, err := os.Getwd()
+	if err != nil {
+		return errors.Wrap(err, "resolve repo dir")
+	}
+	le := logrus.NewEntry(logrus.StandardLogger())
+
+	// Write the CLI handoff manifest when requested.
+	if args.WriteCLIHandoffManifest {
+		return WriteCLIHandoffManifest(ctx, le, repoDir, CLIHandoffOptions{
+			RootDir:             args.OutDir,
+			CLIArtifactsDir:     args.CLIArtifactsDir,
+			ManifestPackDirsCSV: args.ManifestPackImportDirsCSV,
+			CLIRev:              args.Rev,
+			GitSHA:              args.GitSHA,
+			Tag:                 args.Tag,
+			ReleaseEnvironment:  args.ReleaseEnvironment,
+			RunID:               args.RunID,
+			RunAttempt:          args.RunAttempt,
+			SourceRepo:          args.SourceRepo,
+			Workflow:            args.Workflow,
+		})
+	}
+
+	// Validate the flag combinations for the build path.
+	if args.Version == "" || args.OutDir == "" {
+		return errors.New(usageText)
+	}
+	if !args.BrowserOnly && !args.ManifestPackProduce && args.PlatformsCSV == "" {
+		return errors.New(usageText)
+	}
+	if args.BrowserOnly && args.PlatformsCSV != "" {
+		return errors.New("--browser-only does not accept --platforms")
+	}
+	if args.BrowserOnly && args.IncludeBrowser {
+		return errors.New("--browser-only and --include-browser cannot be combined")
+	}
+	if args.ManifestPackProduce && (args.BrowserOnly || args.IncludeBrowser || args.SkipBuild || args.SkipPackage || args.StageBuildInputs || args.PlatformsCSV != "") {
+		return errors.New("--manifest-pack-produce cannot be combined with remote/browser/platform packaging flags")
+	}
+
+	// Split the platform list and require at least one desktop platform.
+	platforms := splitCSV(args.PlatformsCSV)
+	if !args.BrowserOnly && !args.ManifestPackProduce && len(platforms) == 0 {
+		return errors.New("at least one platform is required")
+	}
+
+	// Apply the release authority to executables and their immutable manifest packs.
+	configPath, err := releaseconfig.Prepare(repoDir, args.ReleaseEnvironment)
+	if err != nil {
+		return err
+	}
+
+	// Log the planned handoff slice.
+	le.WithField("platforms", strings.Join(platforms, ",")).
+		WithField("include_browser", args.IncludeBrowser).
+		Info("building entrypoint handoff slice")
+
+	// Clean the output directory.
+	if err := os.RemoveAll(args.OutDir); err != nil {
+		return errors.Wrap(err, "clean out dir")
+	}
+
+	// Run the manifest-pack production phase when requested.
+	if args.ManifestPackProduce {
+		return runPhase(le, "produce-manifest-pack", func() error {
+			return produceManifestPack(
+				ctx,
+				le,
+				repoDir,
+				configPath,
+				args.OutDir,
+				args.ReactDev,
+				args.ManifestID,
+				args.ManifestPlatformID,
+				args.ManifestObjectKey,
+				splitCSV(args.ManifestLinkObjectKeysCSV),
+				args.ManifestProducerTarget,
+				args.ManifestCacheSchema,
+				args.ManifestDistDir,
+				args.ManifestEntrypoint,
+			)
+		})
+	}
+
+	// Run the browser-only build, verify, and staging phases.
+	if args.BrowserOnly {
+		if err := runPhase(le, "build-browser", func() error {
+			return buildBrowser(ctx, repoDir, args.ReactDev)
+		}); err != nil {
+			return err
+		}
+		if err := runPhase(le, "verify-browser-artifacts", func() error {
+			return validateBrowserBundleArtifacts(repoDir)
+		}); err != nil {
+			return err
+		}
+		if err := runPhase(le, "stage-browser-outputs", func() error {
+			return stageBrowserOutputs(repoDir, args.OutDir)
+		}); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Clean the per-platform desktop build outputs.
+	for _, rel := range []string{
+		filepath.Join(".tmp", "dist"),
+		filepath.Join(".tmp", "Spacewave.app"),
+		filepath.Join(".tmp", "Spacewave-amd64.zip"),
+		filepath.Join(".tmp", "Spacewave-arm64.zip"),
+		filepath.Join(".tmp", "Spacewave.AppDir-amd64"),
+		filepath.Join(".tmp", "Spacewave.AppDir-arm64"),
+		filepath.Join(".tmp", "macos-helper-plists"),
+		"staging",
+		filepath.Join("dist", "installers"),
+	} {
+		if err := os.RemoveAll(filepath.Join(repoDir, rel)); err != nil {
+			return errors.Wrap(err, "clean "+rel)
+		}
+	}
+
+	// Generate the desktop support files for the platforms.
+	if err := runPhase(le, "prepare-support-files", func() error {
+		return prepareSupportFiles(ctx, repoDir, platforms)
+	}); err != nil {
+		return err
+	}
+
+	// Ensure the builder image when cross-building linux or windows.
+	if !args.SkipBuild && needsBuilderImage(runtime.GOOS, platforms) {
+		if err := runPhase(le, "ensure-builder-image", func() error {
+			return runScript(ctx, repoDir, filepath.Join("scripts", "release", "ensure-builder-image.sh"))
+		}); err != nil {
+			return errors.Wrap(err, "ensure builder image")
+		}
+	}
+
+	// Import prebuilt manifest packs when directories are provided.
+	if args.ManifestPackImportDirsCSV != "" {
+		if err := runPhase(le, "import-manifest-packs", func() error {
+			return importManifestPacks(ctx, le, repoDir, splitCSV(args.ManifestPackImportDirsCSV))
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Build the helper, desktop, CLI, and macOS CLI binaries.
+	if !args.SkipBuild {
+		if err := runPhase(le, "build-helpers", func() error {
+			return buildHelpers(ctx, repoDir, platforms)
+		}); err != nil {
+			return err
+		}
+		if err := runPhase(le, "stamp-windows-version", func() error {
+			return stampWindowsVersion(ctx, repoDir, args.Version, platforms)
+		}); err != nil {
+			return err
+		}
+		if err := runPhase(le, "build-entrypoints", func() error {
+			return buildEntrypoints(ctx, repoDir, configPath, platforms)
+		}); err != nil {
+			return err
+		}
+		if err := runPhase(le, "build-cli-entrypoints", func() error {
+			return buildCliEntrypoints(ctx, repoDir, configPath, platforms)
+		}); err != nil {
+			return err
+		}
+		if err := runPhase(le, "sign-macos-cli-entrypoints", func() error {
+			return signMacOSCliEntrypoints(ctx, repoDir, platforms)
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Verify the built platform bundle inputs.
+	if err := runPhase(le, "verify-build-artifacts", func() error {
+		return validatePlatformBundleInputs(repoDir, platforms)
+	}); err != nil {
+		return err
+	}
+
+	// Stage raw build inputs when requested.
+	if args.StageBuildInputs {
+		if err := runPhase(le, "stage-build-inputs", func() error {
+			return stageBuildInputsTree(repoDir, args.OutDir, platforms)
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Stop before packaging when SkipPackage is set.
+	if args.SkipPackage {
+		return nil
+	}
+
+	// Build the platform bundles.
+	if err := runPhase(le, "build-bundles", func() error {
+		return buildBundles(repoDir, platforms)
+	}); err != nil {
+		return err
+	}
+
+	// Package the platform installers.
+	if err := runPhase(le, "package-installers", func() error {
+		return packageInstallers(ctx, repoDir, args.Version, platforms, args.SkipNotarize)
+	}); err != nil {
+		return err
+	}
+
+	// Package the CLI archives.
+	if err := runPhase(le, "package-cli-artifacts", func() error {
+		return packageCliArtifacts(repoDir, platforms)
+	}); err != nil {
+		return err
+	}
+
+	// Notarize the macOS CLI archives.
+	if err := runPhase(le, "notarize-macos-cli-archives", func() error {
+		return notarizeMacOSCliArchives(ctx, repoDir, platforms, args.SkipNotarize)
+	}); err != nil {
+		return err
+	}
+
+	// Verify the packaged artifacts.
+	if err := runPhase(le, "verify-package-artifacts", func() error {
+		return validatePackagedArtifacts(repoDir, platforms)
+	}); err != nil {
+		return err
+	}
+
+	// Build and verify browser outputs when included.
+	if args.IncludeBrowser {
+		if err := runPhase(le, "build-browser", func() error {
+			return buildBrowser(ctx, repoDir, args.ReactDev)
+		}); err != nil {
+			return err
+		}
+		if err := runPhase(le, "verify-browser-artifacts", func() error {
+			return validateBrowserBundleArtifacts(repoDir)
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Stage the handoff outputs.
+	if err := runPhase(le, "stage-outputs", func() error {
+		return stageOutputs(repoDir, args.OutDir, args.IncludeBrowser)
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func runPhase(le *logrus.Entry, name string, fn func() error) error {
+	// Record the phase start and log that it began.
+	start := time.Now()
+	le.WithField("phase", name).Info("entrypoint handoff phase started")
+	if err := fn(); err != nil {
+		le.WithField("phase", name).
+			WithField("duration", time.Since(start).String()).
+			WithError(err).
+			Error("entrypoint handoff phase failed")
+		return err
+	}
+
+	// Log the phase completion with its duration.
+	le.WithField("phase", name).
+		WithField("duration", time.Since(start).String()).
+		Info("entrypoint handoff phase completed")
+	return nil
+}
+
+func splitCSV(v string) []string {
+	var out []string
+	for item := range strings.SplitSeq(v, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func needsBuilderImage(hostGOOS string, platforms []string) bool {
+	for _, platform := range platforms {
+		goos, _ := splitPlatform(platform)
+		if goos == "linux" {
+			return true
+		}
+		if goos == "windows" && hostGOOS != "windows" {
+			return true
+		}
+	}
+	return false
+}
+
+func splitPlatform(platform string) (string, string) {
+	for i := len(platform) - 1; i >= 0; i-- {
+		if platform[i] == '-' {
+			return platform[:i], platform[i+1:]
+		}
+	}
+	return platform, ""
+}
+
+func prepareSupportFiles(ctx context.Context, repoDir string, platforms []string) error {
+	// Generate the desktop scripts and icon assets for the platforms.
+	if err := runScript(ctx, repoDir, filepath.Join("scripts", "release", "gen-desktop.sh")); err != nil {
+		return errors.Wrap(err, "gen-desktop")
+	}
+	iconPath := filepath.Join(repoDir, "web", "images", "spacewave-icon.png")
+	needsDarwin := false
+	for _, platform := range platforms {
+		goos, _ := splitPlatform(platform)
+		if goos == "darwin" {
+			needsDarwin = true
+			break
+		}
+	}
+	if !needsDarwin {
+		return generateHostIcons(repoDir, iconPath)
+	}
+	if err := runScript(ctx, repoDir, filepath.Join("scripts", "release", "gen-icons.sh"), iconPath); err != nil {
+		return errors.Wrap(err, "gen-icons")
+	}
+	return nil
+}
+
+// buildHelpers runs one helper build per requested platform. Darwin arches
+// build independently: build-helper.sh builds exactly the requested
+// architecture, so a universal macOS release lists both darwin platforms.
+func buildHelpers(ctx context.Context, repoDir string, platforms []string) error {
+	for _, platform := range platforms {
+		goos, goarch := splitPlatform(platform)
+		if err := runScript(ctx, repoDir, filepath.Join("scripts", "release", "build-helper.sh"), goos, goarch); err != nil {
+			return errors.Wrap(err, "build helper "+platform)
+		}
+	}
+	return nil
+}
+
+// stampWindowsVersion regenerates the Windows launcher resources with the
+// release version, which the desktop reads from an installed launcher to tell
+// whether a staged update is newer.
+func stampWindowsVersion(ctx context.Context, repoDir, version string, platforms []string) error {
+	// Skip the generator when no Windows launcher is built.
+	if !slices.ContainsFunc(platforms, func(platform string) bool {
+		return strings.HasPrefix(platform, "windows-")
+	}) {
+		return nil
+	}
+
+	// Build the resource generator command with the version in its environment.
+	args := []string{"go", "generate", "./core/launcher/install"}
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Dir = repoDir
+	cmd.Env = append(os.Environ(), "SPACEWAVE_VERSION="+version)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run the generator and log its completion.
+	logCommandStart("go", args)
+	start := time.Now()
+	err := cmd.Run()
+	logCommandFinish("go", args, start, err)
+	return errors.Wrap(err, "stamp Windows launcher version")
+}
+
+// buildEntrypoints produces desktop executables from the selected release overlay.
+func buildEntrypoints(ctx context.Context, repoDir, configPath string, platforms []string) error {
+	for _, platform := range platforms {
+		goos, goarch := splitPlatform(platform)
+		buildID := "release-desktop-" + goos + "-" + goarch
+		if err := runBldr(ctx, repoDir, "--config", configPath, "--build-type=release", "build", "-b", buildID); err != nil {
+			return errors.Wrap(err, "run bldr "+platform)
+		}
+
+		binName := "spacewave"
+		if goos == "windows" {
+			binName += ".exe"
+		}
+		srcBin := filepath.Join(
+			repoDir, ".bldr", "build", "desktop", goos, goarch,
+			"spacewave-dist", "dist", binName,
+		)
+		dstDir := filepath.Join(repoDir, ".tmp", "dist", platform)
+		dstBin := filepath.Join(dstDir, binName)
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			return errors.Wrap(err, "mkdir dist dir "+platform)
+		}
+		if err := copyFile(srcBin, dstBin); err != nil {
+			return errors.Wrap(err, "copy dist binary "+platform)
+		}
+		if err := os.Chmod(dstBin, 0o755); err != nil {
+			return errors.Wrap(err, "chmod dist binary "+platform)
+		}
+	}
+	return nil
+}
+
+// produceManifestPack binds the packaged executable to its producer configuration.
+func produceManifestPack(
+	ctx context.Context,
+	le *logrus.Entry,
+	repoDir string,
+	configPath string,
+	outDir string,
+	reactDev bool,
+	manifestID string,
+	platformID string,
+	objectKey string,
+	linkObjectKeys []string,
+	producerTarget string,
+	cacheSchema string,
+	distDir string,
+	entrypoint string,
+) error {
+	// Validate the manifest-pack arguments and start the devtool bus.
+	if manifestID == "" || platformID == "" || objectKey == "" || producerTarget == "" {
+		return errors.New("--manifest-pack-produce requires --manifest-id, --manifest-platform, --manifest-object-key, and --manifest-producer-target")
+	}
+	gitSHA, err := currentGitSHA(ctx)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return errors.Wrap(err, "create manifest-pack out dir")
+	}
+	busHandle, err := startDevtoolBus(ctx, le, repoDir, false)
+	if err != nil {
+		return err
+	}
+	defer busHandle.Release()
+
+	// Start the project controller and wait for it to be ready.
+	projWatcher, projWatcherRef, err := busHandle.StartProjectController(
+		ctx,
+		busHandle.GetBus(),
+		repoDir,
+		configPath,
+		"devtool",
+		nil,
+	)
+	if err != nil {
+		return errors.Wrap(err, "start project controller")
+	}
+	defer projWatcherRef.Release()
+	if _, err := projWatcher.GetProjectController().WaitValue(ctx, nil); err != nil {
+		return errors.Wrap(err, "wait project controller")
+	}
+
+	// Create the manifest pack file.
+	packPath := filepath.Join(outDir, manifestPackFilename)
+	packFile, err := os.Create(packPath)
+	if err != nil {
+		return errors.Wrap(err, "create manifest pack")
+	}
+
+	// Produce the manifest pack and close the file.
+	meta, produceErr := bldr_manifest_pack.ProduceManifestPack(ctx, &bldr_manifest_pack.ProducerConfig{
+		Bus:        busHandle.GetBus(),
+		WorldState: busHandle.GetWorldState(),
+		Sender:     busHandle.GetVolume().GetPeerID(),
+		Tuple: &bldr_manifest_pack.ManifestTuple{
+			ManifestId:     manifestID,
+			PlatformId:     platformID,
+			ObjectKey:      objectKey,
+			LinkObjectKeys: linkObjectKeys,
+		},
+		BuildType:      "release",
+		GitSHA:         gitSHA,
+		ProducerTarget: producerTarget,
+		ReactDev:       reactDev,
+		CacheSchema:    cacheSchema,
+		Writer:         packFile,
+		DistDir:        distDir,
+		Entrypoint:     entrypoint,
+	})
+	closeErr := packFile.Close()
+	if produceErr != nil {
+		return errors.Wrap(produceErr, "produce manifest pack")
+	}
+	if closeErr != nil {
+		return errors.Wrap(closeErr, "close manifest pack")
+	}
+
+	// Write the manifest-pack metadata.
+	data, err := meta.MarshalVT()
+	if err != nil {
+		return errors.Wrap(err, "marshal manifest-pack metadata")
+	}
+	if err := os.WriteFile(filepath.Join(outDir, manifestPackMetadataFilename), data, 0o644); err != nil {
+		return errors.Wrap(err, "write manifest-pack metadata")
+	}
+	return nil
+}
+
+func importManifestPacks(ctx context.Context, le *logrus.Entry, repoDir string, dirs []string) error {
+	// Import the manifest-pack artifacts into a devtool bus.
+	if len(dirs) == 0 {
+		return errors.New("--manifest-pack-import-dirs is empty")
+	}
+	dirs, err := expandManifestPackDirs(dirs)
+	if err != nil {
+		return err
+	}
+	if len(dirs) == 0 {
+		return errors.New("no manifest-pack artifacts found")
+	}
+	busHandle, err := startDevtoolBus(ctx, le, repoDir, false)
+	if err != nil {
+		return err
+	}
+	defer busHandle.Release()
+	return importManifestPacksIntoBus(ctx, busHandle, dirs)
+}
+
+func importManifestPacksIntoBus(ctx context.Context, busHandle *bldr_devtool.DevtoolBus, dirs []string) error {
+	for _, dir := range dirs {
+		metaData, err := os.ReadFile(filepath.Join(dir, manifestPackMetadataFilename))
+		if err != nil {
+			return errors.Wrap(err, "read manifest-pack metadata")
+		}
+		meta := &bldr_manifest_pack.ManifestPackMetadata{}
+		if err := meta.UnmarshalVT(metaData); err != nil {
+			return errors.Wrap(err, "unmarshal manifest-pack metadata")
+		}
+		packBytes, err := os.ReadFile(filepath.Join(dir, manifestPackFilename))
+		if err != nil {
+			return errors.Wrap(err, "read manifest pack")
+		}
+		if err := bldr_manifest_pack.ImportManifestPack(ctx, busHandle.GetWorldState(), busHandle.GetVolume().GetPeerID(), meta, packBytes); err != nil {
+			return errors.Wrap(err, "import manifest pack")
+		}
+		if err := bldr_manifest_pack.VerifyImportedManifests(ctx, busHandle.GetWorldState(), meta); err != nil {
+			return errors.Wrap(err, "verify imported manifest pack")
+		}
+	}
+	return nil
+}
+
+func expandManifestPackDirs(dirs []string) ([]string, error) {
+	var out []string
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		metaPath := filepath.Join(dir, manifestPackMetadataFilename)
+		if _, err := os.Stat(metaPath); err == nil {
+			out = append(out, dir)
+			continue
+		} else if !os.IsNotExist(err) {
+			return nil, errors.Wrap(err, "stat manifest-pack metadata")
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, errors.Wrap(err, "read manifest-pack dir")
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			child := filepath.Join(dir, entry.Name())
+			if _, err := os.Stat(filepath.Join(child, manifestPackMetadataFilename)); err == nil {
+				out = append(out, child)
+			} else if !os.IsNotExist(err) {
+				return nil, errors.Wrap(err, "stat manifest-pack metadata")
+			}
+		}
+	}
+	return out, nil
+}
+
+func startDevtoolBus(
+	ctx context.Context,
+	le *logrus.Entry,
+	repoDir string,
+	watch bool,
+) (*bldr_devtool.DevtoolBus, error) {
+	// Configure the devtool args and build the bus.
+	args := bldr_devtool.NewDevtoolArgs()
+	args.Logger = le
+	args.BuildType = "release"
+	args.Watch = watch
+	args.UseGitRoot = false
+	defer args.CloseLogFiles()
+
+	// Build the devtool bus for the repository.
+	stateDir := filepath.Join(repoDir, ".bldr")
+	busHandle, err := bldr_devtool.BuildDevtoolBus(ctx, le, repoDir, stateDir, watch, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "build devtool bus")
+	}
+
+	// Sync the dist sources into the bus.
+	if err := busHandle.SyncDistSources(args.BldrVersion, args.BldrVersionSum, args.BldrSrcPath); err != nil {
+		busHandle.Release()
+		return nil, errors.Wrap(err, "sync dist sources")
+	}
+	return busHandle, nil
+}
+
+func currentGitSHA(ctx context.Context) (string, error) {
+	// Prefer the GITHUB_SHA environment variable.
+	sha := strings.TrimSpace(os.Getenv("GITHUB_SHA"))
+	if sha != "" {
+		return sha, nil
+	}
+
+	// Fall back to the local git revision.
+	out, err := exec.CommandContext(ctx, "git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", errors.Wrap(err, "resolve git sha")
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func fileSHA256(path string) (string, error) {
+	// Open the file and hash its contents.
+	f, err := os.Open(path)
+	if err != nil {
+		return "", errors.Wrap(err, "open "+path)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", errors.Wrap(err, "hash "+path)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// buildCliEntrypoints cross-compiles the standalone spacewave binary
+// for each requested platform and stages the result at
+// .tmp/dist-cli/<platform>/spacewave[.exe].
+// It uses the same release overlay as desktop and manifest-pack production.
+func buildCliEntrypoints(ctx context.Context, repoDir, configPath string, platforms []string) error {
+	for _, platform := range platforms {
+		goos, goarch := splitPlatform(platform)
+		buildID := "release-cli-" + goos + "-" + goarch
+		if err := runBldr(ctx, repoDir, "--config", configPath, "--build-type=release", "build", "-b", buildID); err != nil {
+			return errors.Wrap(err, "run bldr "+platform)
+		}
+
+		srcBinName := "spacewave"
+		dstBinName := "spacewave"
+		if goos == "windows" {
+			srcBinName += ".exe"
+			dstBinName += ".exe"
+		}
+		srcBin := cliEntrypointBinaryPath(repoDir, goos, goarch, srcBinName)
+		dstDir := filepath.Join(repoDir, ".tmp", "dist-cli", platform)
+		dstBin := filepath.Join(dstDir, dstBinName)
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			return errors.Wrap(err, "mkdir cli dist dir "+platform)
+		}
+		if err := copyFile(srcBin, dstBin); err != nil {
+			return errors.Wrap(err, "copy cli binary "+platform)
+		}
+		if err := os.Chmod(dstBin, 0o755); err != nil {
+			return errors.Wrap(err, "chmod cli binary "+platform)
+		}
+	}
+	return nil
+}
+
+func cliEntrypointBinaryPath(repoDir, goos, goarch, binName string) string {
+	return filepath.Join(repoDir, ".bldr", "build", "desktop", goos, goarch, "spacewave-cli", "dist", binName)
+}
+
+// signMacOSCliEntrypoints applies the same Developer ID signing identity used
+// for the desktop .app to standalone macOS CLI binaries before they are
+// archived. Windows CLI binaries are signed in the GitHub workflow with Azure
+// Trusted Signing after the staged build-input artifact is downloaded.
+func signMacOSCliEntrypoints(ctx context.Context, repoDir string, platforms []string) error {
+	signingID := strings.TrimSpace(os.Getenv("BLDR_MACOS_SIGN_IDENTITY"))
+	for _, platform := range platforms {
+		goos, _ := splitPlatform(platform)
+		if goos != "darwin" {
+			continue
+		}
+		if signingID == "" {
+			return errors.New("BLDR_MACOS_SIGN_IDENTITY is required to sign macOS CLI artifacts")
+		}
+		binPath := filepath.Join(repoDir, ".tmp", "dist-cli", platform, "spacewave")
+		// #nosec G702 -- fixed program name, no shell; arguments are repo-relative build paths.
+		cmd := exec.CommandContext(
+			ctx,
+			"codesign",
+			"--force",
+			"--sign", signingID,
+			"--options", "runtime",
+			binPath,
+		)
+		cmd.Dir = repoDir
+		cmd.Env = os.Environ()
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return errors.Wrap(err, "codesign cli "+platform)
+		}
+		verify := exec.CommandContext(ctx, "codesign", "--verify", "--strict", binPath)
+		verify.Dir = repoDir
+		verify.Env = os.Environ()
+		verify.Stdout = os.Stdout
+		verify.Stderr = os.Stderr
+		if err := verify.Run(); err != nil {
+			return errors.Wrap(err, "verify cli signature "+platform)
+		}
+	}
+	return nil
+}
+
+func buildBundles(repoDir string, platforms []string) error {
+	// Clean and create the bundles directory.
+	bundlesDir := filepath.Join(repoDir, ".tmp", "dist", "bundles")
+	if err := os.RemoveAll(bundlesDir); err != nil {
+		return errors.Wrap(err, "clean bundles dir")
+	}
+	if err := os.MkdirAll(bundlesDir, 0o755); err != nil {
+		return errors.Wrap(err, "mkdir bundles dir")
+	}
+
+	// Archive each platform dist directory.
+	for _, platform := range platforms {
+		goos, _ := splitPlatform(platform)
+		srcDir := filepath.Join(repoDir, ".tmp", "dist", platform)
+		archivePath := filepath.Join(bundlesDir, archiveName(goos, platform))
+		if goos == "windows" {
+			if _, err := archiveDir(srcDir, archivePath, archiveZip); err != nil {
+				return errors.Wrap(err, "zip "+platform)
+			}
+			continue
+		}
+		if _, err := archiveDir(srcDir, archivePath, archiveTarGz); err != nil {
+			return errors.Wrap(err, "tar.gz "+platform)
+		}
+	}
+	return nil
+}
+
+func generateHostIcons(repoDir, iconPath string) error {
+	// Open the source icon image.
+	f, err := os.Open(iconPath)
+	if err != nil {
+		return errors.Wrap(err, "open icon source")
+	}
+	defer f.Close()
+
+	// Decode the source icon.
+	src, _, err := image.Decode(f)
+	if err != nil {
+		return errors.Wrap(err, "decode icon source")
+	}
+
+	// Create the icons directory and write each resized PNG icon.
+	iconsDir := filepath.Join(repoDir, ".tmp", "icons")
+	if err := os.MkdirAll(iconsDir, 0o755); err != nil {
+		return errors.Wrap(err, "mkdir icons dir")
+	}
+	for _, size := range []int{16, 32, 48, 64, 128, 256, 512} {
+		dst := resizeImage(src, size)
+		outPath := filepath.Join(iconsDir, "icon-"+strconv.Itoa(size)+".png")
+		outFile, err := os.Create(outPath)
+		if err != nil {
+			return errors.Wrap(err, "create "+outPath)
+		}
+		if err := png.Encode(outFile, dst); err != nil {
+			_ = outFile.Close()
+			return errors.Wrap(err, "encode "+outPath)
+		}
+		if err := outFile.Close(); err != nil {
+			return errors.Wrap(err, "close "+outPath)
+		}
+	}
+	return nil
+}
+
+func resizeImage(src image.Image, size int) *image.RGBA {
+	// Allocate the destination and sample each source pixel.
+	dst := image.NewRGBA(image.Rect(0, 0, size, size))
+	bounds := src.Bounds()
+	sw := bounds.Dx()
+	sh := bounds.Dy()
+	for y := range size {
+		sy := bounds.Min.Y + ((2*y+1)*sh)/(2*size)
+		for x := range size {
+			sx := bounds.Min.X + ((2*x+1)*sw)/(2*size)
+			dst.Set(x, y, src.At(sx, sy))
+		}
+	}
+	return dst
+}
+
+func archiveName(goos, platform string) string {
+	if goos == "windows" {
+		return "spacewave-" + platform + ".zip"
+	}
+	return "spacewave-" + platform + ".tar.gz"
+}
+
+// cliArchiveName returns the per-platform CLI archive filename. macOS and
+// Windows targets get zip archives; Linux targets get tar.gz. macOS uses the
+// user-facing "macos" label rather than the Go GOOS "darwin" so the filename
+// matches the URLs declared in app/download/manifest.ts and the existing
+// installer naming (spacewave-macos-*.dmg).
+func cliArchiveName(goos, platform string) string {
+	label := userFacingPlatformLabel(goos, platform)
+	if goos == "darwin" || goos == "windows" {
+		return "spacewave-cli-" + label + ".zip"
+	}
+	return "spacewave-cli-" + label + ".tar.gz"
+}
+
+// userFacingPlatformLabel returns the human-facing platform label for a
+// given goos/platform tuple. macOS gets "macos" everywhere it appears
+// in user-visible filenames; other platforms keep their Go GOOS name.
+func userFacingPlatformLabel(goos, platform string) string {
+	if goos != "darwin" {
+		return platform
+	}
+	_, goarch := splitPlatform(platform)
+	return "macos-" + goarch
+}
+
+// packageCliArtifacts archives each per-platform CLI binary staged by
+// buildCliEntrypoints into the named archive expected by the public
+// /download manifest. Output lands in dist/cli/.
+func packageCliArtifacts(repoDir string, platforms []string) error {
+	// Clean and create the CLI output directory.
+	cliDir := filepath.Join(repoDir, "dist", "cli")
+	if err := os.RemoveAll(cliDir); err != nil {
+		return errors.Wrap(err, "clean cli dir")
+	}
+	if err := os.MkdirAll(cliDir, 0o755); err != nil {
+		return errors.Wrap(err, "mkdir cli dir")
+	}
+
+	// Archive each platform CLI dist directory.
+	for _, platform := range platforms {
+		goos, _ := splitPlatform(platform)
+		srcDir := filepath.Join(repoDir, ".tmp", "dist-cli", platform)
+		archivePath := filepath.Join(cliDir, cliArchiveName(goos, platform))
+		if goos == "darwin" || goos == "windows" {
+			if _, err := archiveDir(srcDir, archivePath, archiveZip); err != nil {
+				return errors.Wrap(err, "zip cli "+platform)
+			}
+			continue
+		}
+		if _, err := archiveDir(srcDir, archivePath, archiveTarGz); err != nil {
+			return errors.Wrap(err, "tar.gz cli "+platform)
+		}
+	}
+	return nil
+}
+
+// notarizeMacOSCliArchives submits the signed macOS CLI zip archives to Apple
+// notarization. Plain command-line tools cannot be stapled like .app/.dmg/.pkg
+// payloads, so the distributable zip is the notarized artifact.
+func notarizeMacOSCliArchives(ctx context.Context, repoDir string, platforms []string, skipNotarize bool) error {
+	// Resolve the notarization profile and submit each macOS archive.
+	if skipNotarize {
+		return nil
+	}
+	profile := strings.TrimSpace(os.Getenv("BLDR_MACOS_NOTARIZE_PROFILE"))
+	if profile == "" {
+		profile = "spacewave-notarize"
+	}
+	for _, platform := range platforms {
+		goos, _ := splitPlatform(platform)
+		if goos != "darwin" {
+			continue
+		}
+		archivePath := filepath.Join(repoDir, "dist", "cli", cliArchiveName(goos, platform))
+		// #nosec G702 -- fixed program name, no shell; arguments are repo-relative build paths.
+		cmd := exec.CommandContext(
+			ctx,
+			"xcrun",
+			"notarytool",
+			"submit",
+			archivePath,
+			"--keychain-profile", profile,
+			"--wait",
+		)
+		cmd.Dir = repoDir
+		cmd.Env = os.Environ()
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return errors.Wrap(err, "notarize cli "+platform)
+		}
+	}
+	return nil
+}
+
+func packageInstallers(ctx context.Context, repoDir, version string, platforms []string, skipNotarize bool) error {
+	for _, platform := range platforms {
+		goos, goarch := splitPlatform(platform)
+		switch goos {
+		case "darwin":
+			args := []string{filepath.Join("scripts", "release", "build-macos.sh"), goarch, version}
+			if skipNotarize {
+				args = append(args, "--skip-notarize")
+			}
+			if err := runScript(ctx, repoDir, args[0], args[1:]...); err != nil {
+				return errors.Wrap(err, "build-macos "+platform)
+			}
+		case "windows":
+			if err := packageWindowsLauncher(repoDir, goarch); err != nil {
+				return err
+			}
+		case "linux":
+			if err := runScript(ctx, repoDir, filepath.Join("scripts", "release", "build-appimage.sh"), goarch); err != nil {
+				return errors.Wrap(err, "build-appimage "+platform)
+			}
+		default:
+			return errors.New("unknown platform " + platform)
+		}
+	}
+	return nil
+}
+
+// packageWindowsLauncher publishes the desktop executable as the Windows
+// download. The launcher installs itself on first run, so the signed
+// executable is the whole installer.
+func packageWindowsLauncher(repoDir, goarch string) error {
+	// Copy the signed launcher into the installers directory.
+	outDir := filepath.Join(repoDir, "dist", "installers")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return errors.Wrap(err, "mkdir installers dir")
+	}
+	src := filepath.Join(repoDir, ".tmp", "dist", "windows-"+goarch, "spacewave.exe")
+	dst := filepath.Join(outDir, "spacewave-windows-"+goarch+".exe")
+	return errors.Wrap(copyFile(src, dst), "copy Windows launcher "+goarch)
+}
+
+func validatePlatformBundleInputs(repoDir string, platforms []string) error {
+	for _, platform := range platforms {
+		goos, goarch := splitPlatform(platform)
+		binName := "spacewave"
+		helperName := "spacewave-helper"
+		if goos == "windows" {
+			binName += ".exe"
+			helperName += ".exe"
+		}
+
+		if err := requireNonEmptyFile(
+			filepath.Join(repoDir, ".tmp", "dist", platform, binName),
+			"runtime binary "+platform,
+		); err != nil {
+			return err
+		}
+		if err := requireNonEmptyFile(
+			filepath.Join(repoDir, ".tmp", "dist-cli", platform, binName),
+			"cli runtime binary "+platform,
+		); err != nil {
+			return err
+		}
+		if err := requireNonEmptyFile(
+			filepath.Join(repoDir, "dist", "helper", platform, helperName),
+			"helper binary "+platform,
+		); err != nil {
+			return err
+		}
+
+		switch goos {
+		case "darwin":
+			if err := requireNonEmptyFile(filepath.Join(repoDir, ".tmp", "icons", "icon.icns"), "macOS app icon"); err != nil {
+				return err
+			}
+		case "linux":
+			if err := requireNonEmptyFile(filepath.Join(repoDir, ".tmp", "icons", "icon-256.png"), "Linux app icon"); err != nil {
+				return err
+			}
+			if err := requireNonEmptyFile(filepath.Join(repoDir, ".tmp", "spacewave.desktop"), "Linux desktop file"); err != nil {
+				return err
+			}
+		case "windows":
+		default:
+			return errors.New("unknown platform " + platform)
+		}
+
+		if goarch != "amd64" && goarch != "arm64" {
+			return errors.Errorf("unsupported arch for %s: %s", platform, goarch)
+		}
+	}
+	return nil
+}
+
+func validatePackagedArtifacts(repoDir string, platforms []string) error {
+	for _, platform := range platforms {
+		goos, goarch := splitPlatform(platform)
+		if err := requireNonEmptyFile(
+			filepath.Join(repoDir, ".tmp", "dist", "bundles", archiveName(goos, platform)),
+			"runtime bundle "+platform,
+		); err != nil {
+			return err
+		}
+		if err := requireNonEmptyFile(
+			filepath.Join(repoDir, "dist", "cli", cliArchiveName(goos, platform)),
+			"cli archive "+platform,
+		); err != nil {
+			return err
+		}
+
+		installersDir := filepath.Join(repoDir, "dist", "installers")
+		switch goos {
+		case "darwin":
+			if err := requireNonEmptyFile(filepath.Join(installersDir, "spacewave-macos-"+goarch+".dmg"), "macOS installer "+platform); err != nil {
+				return err
+			}
+		case "linux":
+			if err := requireNonEmptyFile(filepath.Join(installersDir, "spacewave-linux-"+goarch+".AppImage"), "Linux installer "+platform); err != nil {
+				return err
+			}
+		case "windows":
+			if err := requireNonEmptyFile(filepath.Join(installersDir, "spacewave-windows-"+goarch+".exe"), "Windows launcher "+platform); err != nil {
+				return err
+			}
+		default:
+			return errors.New("unknown platform " + platform)
+		}
+	}
+	return nil
+}
+
+func validateBrowserBundleArtifacts(repoDir string) error {
+	if err := requireNonEmptyFile(
+		filepath.Join(repoDir, "staging", "app", "browser-release.json"),
+		"browser release manifest",
+	); err != nil {
+		return err
+	}
+	return requireNonEmptyFile(filepath.Join(repoDir, "staging", "static", "index.html"), "browser index html")
+}
+
+func requireNonEmptyFile(path, label string) error {
+	// Require a non-empty regular file at the path.
+	info, err := os.Stat(path)
+	if err != nil {
+		return errors.Wrap(err, "missing "+label)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Errorf("%s is not a regular file: %s", label, path)
+	}
+	if info.Size() == 0 {
+		return errors.Errorf("%s is empty: %s", label, path)
+	}
+	return nil
+}
+
+func buildBrowser(ctx context.Context, repoDir string, reactDev bool) error {
+	// Clean the previous browser build outputs.
+	for _, rel := range []string{".bldr-dist", filepath.Join("app", "prerender", "dist")} {
+		if err := os.RemoveAll(filepath.Join(repoDir, rel)); err != nil {
+			return errors.Wrap(err, "clean "+rel)
+		}
+	}
+
+	// Run the release web, hydrate, and prerender builds.
+	buildScript := "build:release:web"
+	if reactDev {
+		buildScript = "build:release:web:debug"
+	}
+	if err := runBun(ctx, repoDir, "run", buildScript); err != nil {
+		return errors.Wrap(err, "build release web")
+	}
+	if err := runBun(ctx, repoDir, "run", "vite", "build", "--config", "app/prerender/vite.hydrate.config.ts"); err != nil {
+		return errors.Wrap(err, "build hydrate bundle")
+	}
+	if err := runBun(ctx, repoDir, "run", "vite", "build", "--config", "app/prerender/vite.ssr.config.ts"); err != nil {
+		return errors.Wrap(err, "build prerender bundle")
+	}
+
+	// Run the prerender over the built dist.
+	bldrDistDir := filepath.Join(repoDir, ".bldr-dist", "build", "js", "spacewave-browser", "dist")
+	if err := runBun(ctx, repoDir, "./app/prerender/ssr-dist/build.js", "--dist-dir", bldrDistDir); err != nil {
+		return errors.Wrap(err, "prerender")
+	}
+
+	// Stage the web dist and static HTML.
+	stagingDir := filepath.Join(repoDir, "staging")
+	if err := os.RemoveAll(stagingDir); err != nil {
+		return errors.Wrap(err, "clean staging")
+	}
+	if err := stageWebDist(bldrDistDir, stagingDir); err != nil {
+		return errors.Wrap(err, "stage web dist")
+	}
+	if err := stageStaticHTML(filepath.Join(repoDir, "app", "prerender", "dist"), stagingDir); err != nil {
+		return errors.Wrap(err, "stage static html")
+	}
+	return nil
+}
+
+func stageOutputs(repoDir, outDir string, includeBrowser bool) error {
+	// Create the output directories.
+	installersOut := filepath.Join(outDir, "installers")
+	bundlesOut := filepath.Join(outDir, "bundles")
+	cliOut := filepath.Join(outDir, "cli")
+	if err := os.MkdirAll(installersOut, 0o755); err != nil {
+		return errors.Wrap(err, "mkdir installers out")
+	}
+	if err := os.MkdirAll(bundlesOut, 0o755); err != nil {
+		return errors.Wrap(err, "mkdir bundles out")
+	}
+	if err := os.MkdirAll(cliOut, 0o755); err != nil {
+		return errors.Wrap(err, "mkdir cli out")
+	}
+
+	// Copy the installers and bundles into the output.
+	if err := copyDirContents(filepath.Join(repoDir, "dist", "installers"), installersOut); err != nil {
+		return errors.Wrap(err, "stage installers")
+	}
+	if err := copyDirContents(filepath.Join(repoDir, ".tmp", "dist", "bundles"), bundlesOut); err != nil {
+		return errors.Wrap(err, "stage bundles")
+	}
+
+	// Copy the CLI archives when present.
+	cliDir := filepath.Join(repoDir, "dist", "cli")
+	if _, err := os.Stat(cliDir); err == nil {
+		if err := copyDirContents(cliDir, cliOut); err != nil {
+			return errors.Wrap(err, "stage cli")
+		}
+	}
+
+	// Stage the browser outputs when included.
+	if !includeBrowser {
+		return nil
+	}
+	return stageBrowserOutputs(repoDir, outDir)
+}
+
+func stageBrowserOutputs(repoDir, outDir string) error {
+	if err := copyTree(filepath.Join(repoDir, "staging"), filepath.Join(outDir, "browser-staging")); err != nil {
+		return errors.Wrap(err, "stage browser tree")
+	}
+	return nil
+}
+
+func stageBuildInputsTree(repoDir, outDir string, platforms []string) error {
+	for _, platform := range platforms {
+		if err := copyTree(
+			filepath.Join(repoDir, ".tmp", "dist", platform),
+			filepath.Join(outDir, ".tmp", "dist", platform),
+		); err != nil {
+			return errors.Wrap(err, "stage dist "+platform)
+		}
+		if err := copyTree(
+			filepath.Join(repoDir, ".tmp", "dist-cli", platform),
+			filepath.Join(outDir, ".tmp", "dist-cli", platform),
+		); err != nil {
+			return errors.Wrap(err, "stage dist-cli "+platform)
+		}
+		if err := copyTree(
+			filepath.Join(repoDir, "dist", "helper", platform),
+			filepath.Join(outDir, "dist", "helper", platform),
+		); err != nil {
+			return errors.Wrap(err, "stage helper "+platform)
+		}
+	}
+	if err := copyTree(
+		filepath.Join(repoDir, ".tmp", "icons"),
+		filepath.Join(outDir, ".tmp", "icons"),
+	); err != nil {
+		return errors.Wrap(err, "stage icons")
+	}
+	return nil
+}
+
+func runScript(ctx context.Context, repoDir, script string, args ...string) error {
+	// Build the bash command and log its start.
+	cmdArgs := append([]string{script}, args...)
+	logCommandStart("script", append([]string{"bash"}, cmdArgs...))
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "bash", cmdArgs...)
+	cmd.Dir = repoDir
+	cmd.Env = os.Environ()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run the script and log its completion.
+	err := cmd.Run()
+	logCommandFinish("script", append([]string{"bash"}, cmdArgs...), start, err)
+	return err
+}
+
+func runBldr(ctx context.Context, repoDir string, args ...string) error {
+	// Build the go run command and log its start.
+	cmdArgs := append([]string{"run", "github.com/s4wave/spacewave/bldr/cmd/bldr"}, args...)
+	logCommandStart("bldr", append([]string{"go"}, cmdArgs...))
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
+	cmd.Dir = repoDir
+	cmd.Env = os.Environ()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run bldr and log its completion.
+	err := cmd.Run()
+	logCommandFinish("bldr", append([]string{"go"}, cmdArgs...), start, err)
+	return err
+}
+
+func runBun(ctx context.Context, repoDir string, args ...string) error {
+	// Build the bun command and log its start.
+	logCommandStart("bun", append([]string{"bun"}, args...))
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "bun", args...)
+	cmd.Dir = repoDir
+	cmd.Env = os.Environ()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run bun and log its completion.
+	err := cmd.Run()
+	logCommandFinish("bun", append([]string{"bun"}, args...), start, err)
+	return err
+}
+
+func logCommandStart(kind string, args []string) {
+	logrus.WithField("kind", kind).
+		WithField("cmd", strings.Join(args, " ")).
+		Info("entrypoint handoff command started")
+}
+
+func logCommandFinish(kind string, args []string, start time.Time, err error) {
+	ent := logrus.WithField("kind", kind).
+		WithField("cmd", strings.Join(args, " ")).
+		WithField("duration", time.Since(start).String())
+	if err != nil {
+		ent.WithError(err).Error("entrypoint handoff command failed")
+		return
+	}
+	ent.Info("entrypoint handoff command completed")
+}
+
+func copyFile(src, dst string) error {
+	// Open the source file.
+	in, err := os.Open(src)
+	if err != nil {
+		return errors.Wrap(err, "open "+src)
+	}
+	defer in.Close()
+
+	// Create the destination directory and file.
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return errors.Wrap(err, "mkdir "+filepath.Dir(dst))
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return errors.Wrap(err, "create "+dst)
+	}
+	defer out.Close()
+
+	// Copy the bytes and close the destination.
+	if _, err := io.Copy(out, in); err != nil {
+		return errors.Wrap(err, "copy "+src)
+	}
+	return out.Close()
+}
+
+func copyDirContents(srcDir, dstDir string) error {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return errors.Wrap(err, "read "+srcDir)
+	}
+	for _, entry := range entries {
+		src := filepath.Join(srcDir, entry.Name())
+		dst := filepath.Join(dstDir, entry.Name())
+		if entry.IsDir() {
+			if err := copyTree(src, dst); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := copyFile(src, dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyTree(srcRoot, dstRoot string) error {
+	return filepath.Walk(srcRoot, func(path string, info fs.FileInfo, err error) error {
+		// Propagate walk errors and resolve the entry path.
+		if err != nil {
+			return errors.Wrap(err, "walk "+path)
+		}
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return errors.Wrap(err, "rel path")
+		}
+		if rel == "." {
+			return os.MkdirAll(dstRoot, 0o755)
+		}
+
+		// Recreate directories and symlinks at the destination.
+		dst := filepath.Join(dstRoot, rel)
+		if info.IsDir() {
+			return os.MkdirAll(dst, 0o755)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return errors.Wrap(err, "readlink "+path)
+			}
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return errors.Wrap(err, "mkdir "+filepath.Dir(dst))
+			}
+			if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+				return errors.Wrap(err, "remove "+dst)
+			}
+			// #nosec G122 -- dst is the walked destination path inside the release bundle.
+			if err := os.Symlink(target, dst); err != nil {
+				return errors.Wrap(err, "symlink "+dst)
+			}
+			return nil
+		}
+
+		// Copy regular files and preserve their mode.
+		if err := copyFile(path, dst); err != nil {
+			return err
+		}
+		return os.Chmod(dst, info.Mode())
+	})
+}
+
+// archiveFormat identifies the archive format produced by archiveDir.
+type archiveFormat int
+
+const (
+	archiveTarGz archiveFormat = iota
+	archiveZip
+)
+
+// archiveDir streams srcDir into destPath in the requested format and
+// returns the hex-encoded sha256 of the archive bytes. Both tar.gz and
+// zip share the same walk + per-entry contract; only the writer
+// construction and entry-header layout differ.
+func archiveDir(srcDir, destPath string, format archiveFormat) (string, error) {
+	// Create the output archive file.
+	outFile, err := os.Create(destPath)
+	if err != nil {
+		return "", errors.Wrap(err, "create output")
+	}
+	defer outFile.Close()
+
+	// Set up the hash and multiwriter for the archive.
+	hash := sha256.New()
+	mw := io.MultiWriter(outFile, hash)
+
+	// Declare the entry writer and archive closer.
+	var writeEntry func(relPath string, info fs.FileInfo, path string) error
+	var closeArchive func() error
+
+	// Build the writers for the requested archive format.
+	switch format {
+	case archiveTarGz:
+		gw := gzip.NewWriter(mw)
+		tw := tar.NewWriter(gw)
+		writeEntry = func(relPath string, info fs.FileInfo, path string) error {
+			// Write the tar header and contents for each entry.
+			header, err := tar.FileInfoHeader(info, "")
+			if err != nil {
+				return errors.Wrap(err, "file info header")
+			}
+			header.Name = relPath
+			if info.IsDir() {
+				header.Name += "/"
+			}
+			if err := tw.WriteHeader(header); err != nil {
+				return errors.Wrap(err, "write header")
+			}
+			if info.IsDir() {
+				return nil
+			}
+			return copyFileTo(tw, path, relPath)
+		}
+		closeArchive = func() error {
+			if err := tw.Close(); err != nil {
+				return errors.Wrap(err, "close tar")
+			}
+			if err := gw.Close(); err != nil {
+				return errors.Wrap(err, "close gzip")
+			}
+			return nil
+		}
+	case archiveZip:
+		zw := zip.NewWriter(mw)
+		writeEntry = func(relPath string, info fs.FileInfo, path string) error {
+			// Create directory entries and copy files into the zip.
+			if info.IsDir() {
+				_, err := zw.Create(relPath + "/")
+				return err
+			}
+			header, err := zip.FileInfoHeader(info)
+			if err != nil {
+				return errors.Wrap(err, "file info header")
+			}
+			header.Name = relPath
+			header.Method = zip.Deflate
+			w, err := zw.CreateHeader(header)
+			if err != nil {
+				return errors.Wrap(err, "create header")
+			}
+			return copyFileTo(w, path, relPath)
+		}
+		closeArchive = func() error {
+			if err := zw.Close(); err != nil {
+				return errors.Wrap(err, "close zip")
+			}
+			return nil
+		}
+	default:
+		return "", errors.Errorf("unsupported archive format: %d", format)
+	}
+
+	// Walk the source directory and write each entry.
+	err = filepath.Walk(srcDir, func(path string, info fs.FileInfo, walkErr error) error {
+		// Resolve each entry path relative to the source.
+		if walkErr != nil {
+			return walkErr
+		}
+		relPath, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+		return writeEntry(filepath.ToSlash(relPath), info, path)
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "walk")
+	}
+	if err := closeArchive(); err != nil {
+		return "", err
+	}
+	if err := outFile.Close(); err != nil {
+		return "", errors.Wrap(err, "close file")
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// copyFileTo opens path and copies its bytes into w with wrapped error context.
+func copyFileTo(w io.Writer, path, relPath string) error {
+	// Open the source file and copy it into the writer.
+	f, err := os.Open(path)
+	if err != nil {
+		return errors.Wrap(err, "open "+relPath)
+	}
+	defer f.Close()
+	if _, err := io.Copy(w, f); err != nil {
+		return errors.Wrap(err, "copy "+relPath)
+	}
+	return nil
+}
+
+func stageWebDist(distDir, stagingDir string) error {
+	return filepath.WalkDir(distDir, func(path string, d os.DirEntry, err error) error {
+		// Copy each dist file into the staging tree.
+		if err != nil {
+			return errors.Wrap(err, "walk "+path)
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		// Resolve the destination path for each file.
+		relPath, err := filepath.Rel(distDir, path)
+		if err != nil {
+			return errors.Wrap(err, "rel path")
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		// Route packed messages into the dist tree.
+		destPath := filepath.Join(stagingDir, "app", relPath)
+		if strings.HasSuffix(d.Name(), ".packedmsg") {
+			destPath = filepath.Join(stagingDir, "dist", d.Name())
+		}
+		return copyFile(path, destPath)
+	})
+}
+
+func stageStaticHTML(prerenderDir, stagingDir string) error {
+	return filepath.WalkDir(prerenderDir, func(path string, d os.DirEntry, err error) error {
+		// Filter the walked files to static assets.
+		if err != nil {
+			return errors.Wrap(err, "walk "+path)
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		// Skip files outside the static asset extensions.
+		switch filepath.Ext(d.Name()) {
+		case ".html", ".css", ".js", ".woff2", ".png", ".svg", ".ico", ".xml", ".txt":
+		default:
+			return nil
+		}
+
+		// Copy the asset into the static staging tree.
+		relPath, err := filepath.Rel(prerenderDir, path)
+		if err != nil {
+			return errors.Wrap(err, "rel path")
+		}
+		return copyFile(path, filepath.Join(stagingDir, "static", relPath))
+	})
+}

@@ -1,0 +1,399 @@
+package provider_local
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/csync"
+	"github.com/aperturerobotics/util/keyed"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/pkg/errors"
+	storage_volume "github.com/s4wave/spacewave/bldr/storage/volume"
+	"github.com/s4wave/spacewave/core/bstore"
+	provider "github.com/s4wave/spacewave/core/provider"
+	provider_gccleanup "github.com/s4wave/spacewave/core/provider/gccleanup"
+	"github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/core/sobject"
+	block_store_writeback "github.com/s4wave/spacewave/db/block/store/writeback"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	"github.com/s4wave/spacewave/db/volume"
+	volume_controller "github.com/s4wave/spacewave/db/volume/controller"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// providerAccountTracker tracks a ProviderAccount in the world.
+type providerAccountTracker struct {
+	// p is the provider
+	p *Provider
+	// accCtr is the provider account container
+	accCtr *ccontainer.CContainer[*ProviderAccount]
+	// accountInfo is the account info to create if not exists in the world
+	accountInfo *provider.ProviderAccountInfo
+}
+
+// ProviderAccount implements the local provider account.
+type ProviderAccount struct {
+	// t is the tracker
+	t *providerAccountTracker
+	// le is the logger
+	le *logrus.Entry
+	// vol is the parent volume for storage for the account
+	vol volume.Volume
+	// lifecycleCtx ends when the provider account loses its final reference.
+	lifecycleCtx context.Context
+
+	// bstores contains the set of mounted block stores.
+	bstores *keyed.KeyedRefCount[string, *bstoreTracker]
+	// sobjects contains the set of mounted shared objects.
+	sobjects *keyed.KeyedRefCount[string, *sobjectTracker]
+	// sessions contains the set of mounted sessions (usually only one).
+	sessions *keyed.KeyedRefCount[string, *sessionTracker]
+
+	// mtx guards /changing/ below fields
+	mtx csync.Mutex
+	// replicaAuth serializes local account enrollment, checkpoint grants, and revocation.
+	replicaAuth csync.Mutex
+	// soListCtr is the list of shared objects.
+	soListCtr *ccontainer.CContainer[*sobject.SharedObjectList]
+	// p2pSyncBcast guards p2pSync lifecycle and wakes status watchers.
+	p2pSyncBcast broadcast.Broadcast
+	// p2pSync holds current P2P sync startup or running state, nil when inactive.
+	p2pSync *p2pSyncState
+	// p2pSyncCur mirrors p2pSync for block reads that resolve their store
+	// without p2pSyncBcast. Set with p2pSync under p2pSyncBcast.
+	p2pSyncCur atomic.Pointer[p2pSyncState]
+	// serveStores holds each mounted block store's reads for a peer's request,
+	// keyed by bucket ID: the store without peers, filling nothing. Each value
+	// is a *serveStore its block store sets on mount and deletes on exit.
+	serveStores sync.Map
+	// p2pPeerIDs are enrollment peers retained across P2P sync state restarts.
+	p2pPeerIDs map[string]peer.ID
+	// p2pPendingEnrollPeers are device peers recorded by SpaceLink approval that
+	// have not joined through their invite yet. The Device dials the owner via
+	// the invite, so auto-start must not dial these peers first. Memory-only:
+	// after a daemon restart the devices are dialed again for recovery.
+	p2pPendingEnrollPeers map[string]struct{}
+	// sessionTransport is the running session transport, nil when not active.
+	sessionTransport *sessionTransportState
+	// transportBcast guards sessionTransport state changes.
+	transportBcast broadcast.Broadcast
+	// accountSettingsCloudSync mirrors local account settings to a linked cloud
+	// account settings SO when a linked cloud account is available.
+	accountSettingsCloudSync *routine.StateRoutineContainer[string]
+	// linkedCloudAccountDiscovery discovers an existing linked cloud account
+	// after the ProviderAccount is published.
+	linkedCloudAccountDiscovery *routine.RoutineContainer
+	// envelopeRewrapWatcher watches for envelope rewrap work.
+	envelopeRewrapWatcher *routine.RoutineContainer
+	// placedUploads keeps placed block stores mounted so their writes upload.
+	placedUploads *routine.RoutineContainer
+	// gcCleanup runs block GC cleanup after foreground delete paths unroot data.
+	gcCleanup *routine.RoutineContainer
+	// gcCleanupRunner serializes provider-account cleanup sweeps.
+	gcCleanupRunner *provider_gccleanup.Runner
+	// gcCleanupCollect overrides cleanup collection in tests.
+	gcCleanupCollect provider_gccleanup.CollectFunc
+	// evictAdmit paces the eviction passes of the placed block stores, or
+	// holds nil.
+	evictAdmit atomic.Pointer[block_store_writeback.EvictAdmit]
+	// uploadAdmit paces the upload rounds of the placed block stores, or
+	// holds nil.
+	uploadAdmit atomic.Pointer[block_store_writeback.UploadAdmit]
+	// sqlPrimary makes a block store placed on an SQL backend write to that
+	// backend and read the local bucket, read only, before it.
+	sqlPrimary atomic.Bool
+}
+
+// GetVolume returns the parent volume for the account.
+func (a *ProviderAccount) GetVolume() volume.Volume {
+	return a.vol
+}
+
+// GetAccountID returns the provider account identifier.
+func (a *ProviderAccount) GetAccountID() string {
+	return a.t.accountInfo.GetProviderAccountId()
+}
+
+// GetProviderID returns the provider identifier.
+func (a *ProviderAccount) GetProviderID() string {
+	return a.t.accountInfo.GetProviderId()
+}
+
+// GetSOListCtr returns the shared object list container.
+func (a *ProviderAccount) GetSOListCtr() *ccontainer.CContainer[*sobject.SharedObjectList] {
+	return a.soListCtr
+}
+
+// GetStepFactorySet returns the block transform step factory set.
+func (a *ProviderAccount) GetStepFactorySet() *block_transform.StepFactorySet {
+	return a.t.p.sfs
+}
+
+// NewProviderAccountInfo constructs a new provider account info object for the local provider.
+func NewProviderAccountInfo(providerID, accountID string) *provider.ProviderAccountInfo {
+	return &provider.ProviderAccountInfo{
+		ProviderId:            providerID,
+		ProviderAccountId:     accountID,
+		ProviderFeatures:      getLocalProviderFeatures(),
+		ProviderAccountStatus: provider.ProviderAccountStatus_ProviderAccountStatus_READY,
+		ProviderAccountState:  nil,
+	}
+}
+
+// buildProviderAccountTracker builds a new providerAccountTracker for an account id.
+func (p *Provider) buildProviderAccountTracker(accountID string) (keyed.Routine, *providerAccountTracker) {
+	accCtr := ccontainer.NewCContainer[*ProviderAccount](nil)
+	tracker := &providerAccountTracker{
+		p:           p,
+		accCtr:      accCtr,
+		accountInfo: NewProviderAccountInfo(p.info.GetProviderId(), accountID),
+	}
+	return tracker.executeProviderAccountTracker, tracker
+}
+
+// executeProviderAccountTracker executes the provider account tracker routine.
+func (t *providerAccountTracker) executeProviderAccountTracker(rctx context.Context) error {
+	// Initialize the account tracker context.
+	ctx, ctxCancel := context.WithCancel(rctx)
+	defer ctxCancel()
+
+	// Resolve provider and account identity.
+	providerID := t.p.info.GetProviderId()
+	accountID := t.accountInfo.GetProviderAccountId()
+
+	// Select the storage volume identity.
+	storageID := t.p.storageID
+	if storageID == "" {
+		storageID = "default"
+	}
+
+	// Storage volume id
+	storageVolumeID := StorageVolumeID(providerID, accountID)
+	volumeID := storageVolumeID
+
+	// Start the storage volume controller.
+	volCtrl, volCtrlRef, err := waitExecVolumeController(
+		ctx,
+		t.p.b,
+		resolver.NewLoadControllerWithConfig(&storage_volume.Config{
+			StorageId:       storageID,
+			StorageVolumeId: storageVolumeID,
+			VolumeConfig: &volume_controller.Config{
+				VolumeIdAlias: []string{volumeID},
+			},
+		}),
+		ctxCancel,
+	)
+	if err != nil {
+		return err
+	}
+	defer volCtrlRef.Release()
+
+	// Acquire the mounted volume.
+	vol, err := volCtrl.GetVolume(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Construct the ProviderAccount and keyed trackers.
+	le := t.p.le.WithField("account-id", t.accountInfo.GetProviderAccountId())
+	providerAcc := &ProviderAccount{
+		t:            t,
+		vol:          vol,
+		le:           le,
+		lifecycleCtx: ctx,
+	}
+
+	// Build the block store, shared object and session trackers.
+	providerAcc.bstores = keyed.NewKeyedRefCountWithLogger(
+		providerAcc.buildBlockStoreTracker,
+		t.p.le,
+		keyed.WithRetry[string, *bstoreTracker](providerBackoff),
+	)
+	providerAcc.sobjects = keyed.NewKeyedRefCountWithLogger(
+		providerAcc.buildSharedObjectTracker,
+		t.p.le,
+		keyed.WithRetry[string, *sobjectTracker](providerBackoff),
+	)
+	providerAcc.sessions = keyed.NewKeyedRefCountWithLogger(
+		providerAcc.buildSessionTracker,
+		t.p.le,
+		keyed.WithRetry[string, *sessionTracker](providerBackoff),
+	)
+
+	// Build the cloud settings sync and linked account discovery routines.
+	providerAcc.accountSettingsCloudSync = routine.NewStateRoutineContainerWithLogger[string](
+		func(v1, v2 string) bool { return v1 == v2 },
+		le.WithField("routine", "account-settings-cloud-sync"),
+		routine.WithRetry(providerBackoff),
+	)
+	providerAcc.accountSettingsCloudSync.SetStateRoutine(providerAcc.runAccountSettingsCloudSync)
+	providerAcc.linkedCloudAccountDiscovery = routine.NewRoutineContainerWithLogger(
+		le.WithField("routine", "linked-cloud-account-discovery"),
+		routine.WithRetry(providerBackoff),
+	)
+	providerAcc.linkedCloudAccountDiscovery.SetRoutine(providerAcc.runLinkedCloudAccountDiscovery)
+
+	// Build the envelope rewrap and placed upload routines.
+	providerAcc.envelopeRewrapWatcher = routine.NewRoutineContainerWithLogger(
+		le.WithField("routine", "envelope-rewrap-watcher"),
+		routine.WithRetry(providerBackoff),
+	)
+	providerAcc.envelopeRewrapWatcher.SetRoutine(providerAcc.watchAndRewrapEnvelope)
+	providerAcc.placedUploads = routine.NewRoutineContainerWithLogger(
+		le.WithField("routine", "placed-uploads"),
+		routine.WithRetry(providerBackoff),
+	)
+	providerAcc.placedUploads.SetRoutine(providerAcc.runPlacedUploads)
+
+	// Build the GC cleanup routine.
+	providerAcc.gcCleanupRunner = providerAcc.newGCCleanupRunner()
+	providerAcc.gcCleanup = routine.NewRoutineContainerWithLogger(
+		le.WithField("routine", "gc-cleanup-runner"),
+		routine.WithRetry(providerBackoff),
+	)
+	providerAcc.gcCleanup.SetRoutine(providerAcc.runGCCleanup)
+
+	// initialize the shared object list
+	providerAcc.soListCtr = ccontainer.NewCContainer[*sobject.SharedObjectList](nil)
+
+	// Load the shared object soList
+	soList, err := providerAcc.readSharedObjectList(ctx)
+	if err != nil {
+		return err
+	}
+	providerAcc.soListCtr.SetValue(soList)
+
+	// Ensure the account settings binding exists.
+	if _, err := providerAcc.EnsureAccountSettingsSO(ctx); err != nil {
+		return err
+	}
+
+	// Start the block stores tracker
+	providerAcc.bstores.SetContext(ctx, true)
+	defer providerAcc.bstores.ClearContext()
+
+	// Start the shared objects tracker
+	providerAcc.sobjects.SetContext(ctx, true)
+	defer providerAcc.sobjects.ClearContext()
+
+	// Start the sessions tracker
+	providerAcc.sessions.SetContext(ctx, true)
+	defer providerAcc.sessions.ClearContext()
+
+	// Cleanup on exit.
+	defer providerAcc.StopSessionTransport()
+	defer providerAcc.StopP2PSync()
+
+	// Publish the account and wake the Session account waiters, and again
+	// once it is withdrawn.
+	t.accCtr.SetValue(providerAcc)
+	t.p.wakeSessionWaiters()
+	defer t.p.wakeSessionWaiters()
+	defer t.accCtr.SetValue(nil)
+
+	// Start the cloud account discovery and settings sync.
+	providerAcc.linkedCloudAccountDiscovery.SetContext(ctx, true)
+	defer providerAcc.linkedCloudAccountDiscovery.ClearContext()
+	providerAcc.accountSettingsCloudSync.SetContext(ctx, true)
+	defer providerAcc.accountSettingsCloudSync.ClearContext()
+
+	// Start the envelope rewrap, placed upload and GC cleanup routines.
+	providerAcc.envelopeRewrapWatcher.SetContext(ctx, true)
+	defer providerAcc.envelopeRewrapWatcher.ClearContext()
+	providerAcc.placedUploads.SetContext(ctx, true)
+	defer providerAcc.placedUploads.ClearContext()
+	providerAcc.gcCleanup.SetContext(ctx, true)
+	defer providerAcc.gcCleanup.ClearContext()
+
+	// Run until the account stops.
+	<-ctx.Done()
+	return context.Canceled
+}
+
+// GetProviderAccountFeature returns the implementation of a specific provider feature.
+//
+// Implements one of SpaceProvider, BlockStoreProvider, ...
+// Check GetProviderInfo()=>features in advance before calling this.
+// Returns ErrUnimplementedProviderFeature if the feature is not implemented.
+func (a *ProviderAccount) GetProviderAccountFeature(ctx context.Context, feature provider.ProviderFeature) (provider.ProviderAccountFeature, error) {
+	switch feature {
+	case provider.ProviderFeature_ProviderFeature_BLOCK_STORE:
+		return bstore.BlockStoreProvider(a), nil
+	case provider.ProviderFeature_ProviderFeature_SHARED_OBJECT:
+		return sobject.SharedObjectProvider(a), nil
+	case provider.ProviderFeature_ProviderFeature_SESSION:
+		return session.SessionProvider(a), nil
+	default:
+		return nil, provider.ErrUnimplementedProviderFeature
+	}
+}
+
+// GetStorageStats returns storage usage statistics for the account volume.
+func (a *ProviderAccount) GetStorageStats(ctx context.Context) (*volume.StorageStats, error) {
+	return a.vol.GetStorageStats(ctx)
+}
+
+// GetStorageStatsSnapshotWithWait returns current storage statistics and a
+// change channel for storage stats updates.
+func (a *ProviderAccount) GetStorageStatsSnapshotWithWait(
+	ctx context.Context,
+) (*volume.StorageStats, <-chan struct{}, error) {
+	statsProvider, ok := a.vol.(provider.StorageStatsWatchProvider)
+	if !ok {
+		stats, err := a.GetStorageStats(ctx)
+		return stats, nil, err
+	}
+	return statsProvider.GetStorageStatsSnapshotWithWait(ctx)
+}
+
+// waitExecVolumeController waits for a storage-volume controller without the
+// generated typed loader helper so browser builds do not depend on its callback
+// select lowering.
+func waitExecVolumeController(
+	ctx context.Context,
+	b bus.Bus,
+	dir directive.Directive,
+	disposeCb func(),
+) (volume.Controller, directive.Reference, error) {
+	// Wait for a constructed controller while preserving startup errors.
+	execValue, _, ref, err := bus.ExecWaitValue[loader.ExecControllerValue](
+		ctx,
+		b,
+		dir,
+		nil,
+		disposeCb,
+		func(val loader.ExecControllerValue) (bool, error) {
+			if err := val.GetError(); err != nil {
+				return false, err
+			}
+			return val.GetController() != nil, nil
+		},
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Keep the typed controller and release an unexpected result.
+	volCtrl, ok := execValue.GetController().(volume.Controller)
+	if !ok {
+		ref.Release()
+		return nil, nil, errors.New("exec controller constructed unexpected controller type")
+	}
+	return volCtrl, ref, nil
+}
+
+// _ is a type assertion
+var (
+	_ provider.ProviderAccount           = (*ProviderAccount)(nil)
+	_ provider.StorageStatsProvider      = (*ProviderAccount)(nil)
+	_ provider.StorageStatsWatchProvider = (*ProviderAccount)(nil)
+)

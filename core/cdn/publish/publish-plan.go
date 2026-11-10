@@ -1,0 +1,42 @@
+package publish
+
+import (
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/packfile"
+)
+
+// PublishPlan describes the pack and checkpoint delta between a source and destination Space.
+type PublishPlan struct {
+	MissingPackIDs []string
+	NeedCheckpoint bool
+}
+
+// BuildPublishPlan computes whether the destination needs a new checkpoint. Pack IDs are resource-scoped, so source IDs cannot be compared
+// directly to destination IDs; when the World differs, all source packs are
+// copied and destination-side v1 IDs make retries idempotent.
+func BuildPublishPlan(
+	srcPacks []*packfile.PackfileEntry,
+	_ []*packfile.PackfileEntry,
+	srcHeadRef *bucket.ObjectRef,
+	dstHeadRef *bucket.ObjectRef,
+) *PublishPlan {
+	// Post a checkpoint unless both heads are nil or already identical.
+	needCheckpoint := true
+	if srcHeadRef == nil && dstHeadRef == nil {
+		needCheckpoint = false
+	} else if srcHeadRef != nil && dstHeadRef != nil && srcHeadRef.EqualVT(dstHeadRef) {
+		needCheckpoint = false
+	}
+
+	// Collect every source pack ID when the checkpoint must be posted.
+	missingPackIDs := make([]string, 0, len(srcPacks))
+	if needCheckpoint {
+		for _, entry := range srcPacks {
+			missingPackIDs = append(missingPackIDs, entry.GetId())
+		}
+	}
+	return &PublishPlan{
+		MissingPackIDs: missingPackIDs,
+		NeedCheckpoint: needCheckpoint,
+	}
+}

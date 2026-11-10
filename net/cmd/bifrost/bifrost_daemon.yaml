@@ -1,0 +1,12 @@
+hold-open:
+  id: bifrost/link/hold-open
+  config: {}
+
+pubsub:
+  id: bifrost/floodsub
+  config: {}
+
+udp:
+  id: bifrost/udp
+  config:
+    listenAddr: :5112

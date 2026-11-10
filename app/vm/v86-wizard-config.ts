@@ -1,0 +1,91 @@
+import type { V86Image } from '@s4wave/sdk/vm/v86.pb.js'
+import type { V86WizardConfig } from '@s4wave/sdk/vm/v86-wizard.pb.js'
+import { V86WizardConfig_Source } from '@s4wave/sdk/vm/v86-wizard.pb.js'
+
+import { wizardObjectKey } from '@s4wave/app/space/create-op-builders.js'
+
+export interface ExistingV86ImageSource {
+  imageKey: string
+}
+
+export interface InSpaceV86ImageSource {
+  objectKey: string
+}
+
+export const V86_WIZARD_TYPE_ID = 'wizard/vm/v86'
+export const V86_WIZARD_TARGET_KEY_PREFIX = 'vm/v86/'
+
+export const V86_USER_IMAGE_OBJECT_KEY = 'vm-image/default'
+export const V86_DEFAULT_CDN_IMAGE_OBJECT_KEY =
+  'vm-image/aperture-linux/2026-10-11-r1'
+
+export const DEFAULT_V86_MEMORY_MB = 256
+export const DEFAULT_V86_VGA_MEMORY_MB = 8
+
+export const V86_DEFAULT_IMAGE_PLATFORM = 'v86'
+export const V86_DEFAULT_IMAGE_TAG = 'default'
+
+export function buildV86QuickstartWizardConfig(): V86WizardConfig {
+  return {
+    name: '',
+    memoryMb: DEFAULT_V86_MEMORY_MB,
+    vgaMemoryMb: DEFAULT_V86_VGA_MEMORY_MB,
+    networking: false,
+    imageObjectKey: V86_USER_IMAGE_OBJECT_KEY,
+    source: V86WizardConfig_Source.LINK_FROM_CDN,
+    cdnSourceObjectKey: V86_DEFAULT_CDN_IMAGE_OBJECT_KEY,
+    cdnId: '',
+  }
+}
+
+export function buildV86QuickstartWizardKey(now: Date): string {
+  return wizardObjectKey('VM ' + now.getTime().toString(36))
+}
+
+export function seedV86WizardConfig(
+  cfg: V86WizardConfig,
+  existingDefault: ExistingV86ImageSource | undefined,
+  inSpaceImages: InSpaceV86ImageSource[],
+): V86WizardConfig {
+  if (
+    (cfg.source ?? V86WizardConfig_Source.SOURCE_UNSPECIFIED) !==
+    V86WizardConfig_Source.SOURCE_UNSPECIFIED
+  ) {
+    return cfg
+  }
+
+  const next: V86WizardConfig = { ...cfg }
+  if (existingDefault?.imageKey) {
+    next.source = V86WizardConfig_Source.EXISTING_IN_SPACE
+    next.imageObjectKey = existingDefault.imageKey
+  } else if (inSpaceImages[0]) {
+    next.source = V86WizardConfig_Source.EXISTING_IN_SPACE
+    next.imageObjectKey = inSpaceImages[0].objectKey
+  } else {
+    next.source = V86WizardConfig_Source.LINK_FROM_CDN
+    next.imageObjectKey = V86_USER_IMAGE_OBJECT_KEY
+  }
+  if (!next.memoryMb) next.memoryMb = DEFAULT_V86_MEMORY_MB
+  if (!next.vgaMemoryMb) next.vgaMemoryMb = DEFAULT_V86_VGA_MEMORY_MB
+  return next
+}
+
+export function compareV86ImageNewestFirst(
+  a: { image: V86Image; objectKey: string },
+  b: { image: V86Image; objectKey: string },
+): number {
+  const ta = a.image.createdAt?.getTime() ?? 0
+  const tb = b.image.createdAt?.getTime() ?? 0
+  if (ta !== tb) return tb - ta
+  const va = a.image.version ?? ''
+  const vb = b.image.version ?? ''
+  if (va !== vb) return vb.localeCompare(va)
+  return a.objectKey.localeCompare(b.objectKey)
+}
+
+export function isDefaultV86Image(image: V86Image): boolean {
+  if (image.platform !== V86_DEFAULT_IMAGE_PLATFORM) {
+    return false
+  }
+  return (image.tags ?? []).includes(V86_DEFAULT_IMAGE_TAG)
+}

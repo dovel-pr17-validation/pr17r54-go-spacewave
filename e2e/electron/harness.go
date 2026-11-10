@@ -1,0 +1,603 @@
+//go:build !skip_e2e && !js
+
+// Package electron provides an opt-in Electron E2E harness backed by the
+// existing Bldr desktop runtime.
+package electron
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aperturerobotics/util/gitroot"
+	playwright "github.com/mxschmitt/playwright-go"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/bldr/devtool"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	defaultCDPReadyTimeout = 10 * time.Minute
+	defaultCDPConnectRetry = 45 * time.Second
+	cdpReadyTimeoutEnv     = "E2E_ELECTRON_CDP_READY_TIMEOUT"
+	cdpShutdownTimeout     = 15 * time.Second
+)
+
+// Harness owns a Bldr desktop runtime plus a Playwright CDP attachment to the
+// Electron renderer.
+type Harness struct {
+	ctx context.Context
+
+	cancel context.CancelFunc
+
+	repoRoot          string
+	stateRoot         string
+	artifactDir       string
+	spacewaveDataRoot string
+	cdpPort           int
+	controlPort       int
+	bldrSrc           string
+	le                *logrus.Entry
+	startSeq          int
+	logFiles          []string
+
+	done    chan struct{}
+	doneErr error
+
+	restoreEnv []func()
+
+	pw      *playwright.Playwright
+	browser playwright.Browser
+}
+
+// Boot starts Bldr's current desktop runtime and waits until Electron exposes
+// its debug-only CDP endpoint.
+func Boot(ctx context.Context, le *logrus.Entry) (_ *Harness, retErr error) {
+	// Locate the repository that supplies the Electron runtime.
+	repoRoot, err := gitroot.FindRepoRoot()
+	if err != nil {
+		return nil, errors.Wrap(err, "find repo root")
+	}
+
+	// Recreate the isolated Electron state directory.
+	stateRoot := filepath.Join(repoRoot, ".bldr", "e2e-electron")
+	if err := os.RemoveAll(stateRoot); err != nil {
+		return nil, errors.Wrap(err, "clear electron e2e state root")
+	}
+	if err := os.MkdirAll(stateRoot, 0o755); err != nil {
+		return nil, errors.Wrap(err, "create electron e2e state root")
+	}
+
+	// Create the Electron runtime artifact and data directories.
+	artifactDir := filepath.Join(stateRoot, "artifacts", "runtime")
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		return nil, errors.Wrap(err, "create electron e2e artifact dir")
+	}
+	spacewaveDataRoot := filepath.Join(stateRoot, "sw")
+	if err := os.MkdirAll(spacewaveDataRoot, 0o755); err != nil {
+		return nil, errors.Wrap(err, "create electron e2e spacewave data root")
+	}
+
+	// Reserve ports for the Electron CDP and test control endpoints.
+	port, err := findFreePort()
+	if err != nil {
+		return nil, errors.Wrap(err, "find CDP port")
+	}
+	controlPort, err := findFreePort()
+	if err != nil {
+		return nil, errors.Wrap(err, "find Electron e2e control port")
+	}
+
+	// Resolve the runtime source path relative to its isolated state.
+	bldrSrcPath, err := filepath.Rel(filepath.Join(stateRoot, "src"), repoRoot)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve bldr source path")
+	}
+
+	// Construct the Electron harness and release it if startup fails.
+	hctx, cancel := context.WithCancel(ctx)
+	h := &Harness{
+		ctx:               ctx,
+		cancel:            cancel,
+		repoRoot:          repoRoot,
+		stateRoot:         stateRoot,
+		artifactDir:       artifactDir,
+		spacewaveDataRoot: spacewaveDataRoot,
+		cdpPort:           port,
+		controlPort:       controlPort,
+		bldrSrc:           bldrSrcPath,
+		le:                le,
+		done:              make(chan struct{}),
+	}
+	defer func() {
+		if retErr != nil {
+			h.Release()
+		}
+	}()
+
+	// Configure Electron debugging and isolate its saved test state.
+	h.restoreEnv = append(h.restoreEnv,
+		setEnv("BLDR_PLUGIN_WEB_SKIP_ELECTRON", "false"),
+		setEnv("BLDR_ELECTRON_REMOTE_DEBUGGING_PORT", strconv.Itoa(port)),
+		setEnv("BLDR_ELECTRON_E2E_CONTROL_PORT", strconv.Itoa(controlPort)),
+		setEnv("BLDR_PLUGIN_STATE_PATH", filepath.Join(stateRoot, "electron-user-data")),
+		setEnv("SPACEWAVE_DATA_DIR", spacewaveDataRoot),
+	)
+
+	// Start the Electron desktop runtime and wait for its CDP endpoint.
+	if err := h.startDesktopRuntime(ctx, hctx, cancel); err != nil {
+		return nil, err
+	}
+
+	return h, nil
+}
+
+// ConnectDriver attaches Playwright to Electron through the Chrome DevTools
+// Protocol endpoint exposed by the Electron main process.
+func (h *Harness) ConnectDriver() error {
+	ctx, cancel := context.WithTimeout(h.ctx, defaultCDPConnectRetry)
+	defer cancel()
+	return h.connectDriver(ctx)
+}
+
+func (h *Harness) connectDriver(ctx context.Context) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		// Electron can answer /json/version before the CDP websocket is ready to
+		// survive a full Playwright attach, especially immediately after relaunch.
+		if err := h.connectDriverOnce(); err != nil {
+			lastErr = err
+			h.disconnectDriver()
+			h.le.WithError(err).Debug("playwright CDP connect failed; retrying")
+		} else {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return errors.Wrap(lastErr, "connect playwright over CDP before timeout")
+			}
+			return errors.Wrap(ctx.Err(), "connect playwright over CDP")
+		case <-h.done:
+			return h.desktopRuntimeErr("desktop runtime exited before playwright CDP driver connected")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *Harness) connectDriverOnce() error {
+	// Start the Playwright driver for the Electron attachment.
+	pw, err := playwright.Run()
+	if err != nil {
+		return errors.Wrap(err, "start playwright")
+	}
+	h.pw = pw
+
+	// Attach Playwright Chromium to the Electron CDP endpoint.
+	browser, err := pw.Chromium.ConnectOverCDP(h.CDPEndpoint())
+	if err != nil {
+		_ = pw.Stop()
+		h.pw = nil
+		return errors.Wrap(err, "connect playwright over CDP")
+	}
+	h.browser = browser
+	return nil
+}
+
+// Relaunch terminates the current Electron runtime, starts it again with the
+// same state root, and reconnects the Playwright CDP driver.
+func (h *Harness) Relaunch(ctx context.Context) error {
+	// Disconnect Playwright and stop the current Electron runtime.
+	h.disconnectDriver()
+	if err := h.stopDesktopRuntime(); err != nil {
+		return err
+	}
+
+	// Restart Electron with the retained state and reconnect Playwright.
+	hctx, cancel := context.WithCancel(h.ctx)
+	if err := h.startDesktopRuntime(ctx, hctx, cancel); err != nil {
+		return err
+	}
+	if err := h.connectDriver(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CDPEndpoint returns the local Electron CDP HTTP endpoint.
+func (h *Harness) CDPEndpoint() string {
+	return "http://127.0.0.1:" + strconv.Itoa(h.cdpPort)
+}
+
+// E2EControlEndpoint returns the local Electron-main e2e control endpoint.
+func (h *Harness) E2EControlEndpoint() string {
+	return "http://127.0.0.1:" + strconv.Itoa(h.controlPort)
+}
+
+// ControlEndpoint returns the local Electron main e2e control endpoint.
+func (h *Harness) ControlEndpoint() string {
+	return h.E2EControlEndpoint()
+}
+
+// StateRoot returns the isolated Bldr state root used by the harness.
+func (h *Harness) StateRoot() string { return h.stateRoot }
+
+// ArtifactDir returns the E2E artifact directory.
+func (h *Harness) ArtifactDir() string { return h.artifactDir }
+
+// SpacewaveDataRoot returns the short scratch SPACEWAVE_DATA_DIR.
+func (h *Harness) SpacewaveDataRoot() string { return h.spacewaveDataRoot }
+
+// LastLogFilePath returns the devtool log path for the latest runtime start.
+func (h *Harness) LastLogFilePath() string {
+	if len(h.logFiles) == 0 {
+		return ""
+	}
+	return h.logFiles[len(h.logFiles)-1]
+}
+
+// RepoRoot returns the project repository root used by the harness.
+func (h *Harness) RepoRoot() string { return h.repoRoot }
+
+// pageContextReady reports whether the page has a live JavaScript execution
+// context over a parsed document.
+//
+// An app:// URL appears as soon as the renderer commits the navigation, while
+// the execution context behind it is still replaced one or more times during
+// startup. Evaluating against a context that is about to be destroyed fails
+// with "Execution context was destroyed", so a page is only usable once an
+// evaluate against it succeeds.
+func pageContextReady(page playwright.Page) bool {
+	state, err := page.Evaluate(`() => document.readyState`)
+	if err != nil {
+		return false
+	}
+	readyState, _ := state.(string)
+	return readyState == "interactive" || readyState == "complete"
+}
+
+// WaitForPage waits until a renderer page is usable through the CDP driver.
+func (h *Harness) WaitForPage(ctx context.Context) (playwright.Page, error) {
+	if h.browser == nil {
+		return nil, errors.New("playwright CDP browser is not connected")
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		for _, browserCtx := range h.browser.Contexts() {
+			for _, page := range browserCtx.Pages() {
+				if page.IsClosed() {
+					continue
+				}
+				if strings.HasPrefix(page.URL(), "app://") && pageContextReady(page) {
+					return page, nil
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-h.done:
+			return nil, h.desktopRuntimeErr("desktop runtime exited before renderer page appeared")
+		case <-ticker.C:
+		}
+	}
+}
+
+// AppPages returns the renderer pages visible through the CDP driver.
+func (h *Harness) AppPages() []playwright.Page {
+	if h.browser == nil {
+		return nil
+	}
+	var pages []playwright.Page
+	for _, browserCtx := range h.browser.Contexts() {
+		for _, page := range browserCtx.Pages() {
+			if page.IsClosed() {
+				continue
+			}
+			if strings.HasPrefix(page.URL(), "app://") {
+				pages = append(pages, page)
+			}
+		}
+	}
+	return pages
+}
+
+// WaitForNoAppPages waits until no app renderer pages are visible.
+func (h *Harness) WaitForNoAppPages(ctx context.Context) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if len(h.AppPages()) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-h.done:
+			return h.desktopRuntimeErr("desktop runtime exited before renderer pages closed")
+		case <-ticker.C:
+		}
+	}
+}
+
+// WaitForAppPages waits until at least count renderer pages are visible.
+func (h *Harness) WaitForAppPages(
+	ctx context.Context,
+	count int,
+) ([]playwright.Page, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		pages := h.AppPages()
+		if len(pages) >= count {
+			return pages, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-h.done:
+			return nil, h.desktopRuntimeErr("desktop runtime exited before renderer pages appeared")
+		case <-ticker.C:
+		}
+	}
+}
+
+// WaitForAppPageCount waits until exactly count renderer pages are visible.
+func (h *Harness) WaitForAppPageCount(
+	ctx context.Context,
+	count int,
+) ([]playwright.Page, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		pages := h.AppPages()
+		if len(pages) == count {
+			return pages, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-h.done:
+			return nil, h.desktopRuntimeErr("desktop runtime exited before renderer page count matched")
+		case <-ticker.C:
+		}
+	}
+}
+
+// ActivateApp triggers the Electron app activation path through the opt-in e2e
+// control endpoint.
+func (h *Harness) ActivateApp(ctx context.Context) error {
+	// Prepare an activation request for the Electron control endpoint.
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		h.ControlEndpoint()+"/activate",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Send the Electron activation request and require a successful response.
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("activate app returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// Release stops Playwright, cancels the Bldr desktop runtime, and restores env.
+func (h *Harness) Release() {
+	h.disconnectDriver()
+	_ = h.stopDesktopRuntime()
+	for _, v := range slices.Backward(h.restoreEnv) {
+		v()
+	}
+	h.restoreEnv = nil
+}
+
+func (h *Harness) startDesktopRuntime(
+	ctx context.Context,
+	hctx context.Context,
+	cancel context.CancelFunc,
+) error {
+	// Prepare the completion state for this Electron runtime launch.
+	h.cancel = cancel
+	h.done = make(chan struct{})
+	h.doneErr = nil
+
+	// Configure Bldr to launch the Electron renderer from the harness state.
+	args := devtool.NewDevtoolArgs()
+	args.Logger = h.le
+	args.LogLevel = "debug"
+	args.StatePath = h.stateRoot
+	args.Watch = false
+	args.WebRenderer = "electron"
+	args.BldrSrcPath = h.bldrSrc
+	args.MinifyEntrypoint = false
+
+	// Create a distinct log file for this Electron runtime launch.
+	h.startSeq++
+	logPath := filepath.Join(h.artifactDir, fmt.Sprintf("devtool-start-%02d.log", h.startSeq))
+	if err := args.LogFiles.Set("level=DEBUG;path=" + logPath); err != nil {
+		return err
+	}
+	h.logFiles = append(h.logFiles, logPath)
+
+	// Run Bldr until the desktop runtime exits and publish its completion.
+	go func() {
+		h.doneErr = args.ExecuteNativeProject(hctx)
+		args.CloseLogFiles()
+		close(h.done)
+	}()
+
+	// Wait for the Electron CDP endpoint within the configured startup bound.
+	cdpReadyTimeout, err := resolveCDPReadyTimeout()
+	if err != nil {
+		return err
+	}
+	waitCtx, waitCancel := context.WithTimeout(ctx, cdpReadyTimeout)
+	defer waitCancel()
+	if err := h.waitForCDP(waitCtx); err != nil {
+		_ = h.stopDesktopRuntime()
+		return err
+	}
+	return nil
+}
+
+func (h *Harness) stopDesktopRuntime() error {
+	// Skip shutdown when the Electron harness has no runtime to stop.
+	if h.done == nil {
+		return nil
+	}
+
+	// Report a prior Electron runtime exit before requesting shutdown.
+	select {
+	case <-h.done:
+		err := h.doneErr
+		h.done = nil
+		h.cancel = nil
+		if err != nil {
+			return errors.Wrap(err, "desktop runtime exited before it was stopped")
+		}
+		return nil
+	default:
+	}
+
+	// Cancel the Electron runtime and wait for its process and CDP endpoint to stop.
+	if h.cancel != nil {
+		h.cancel()
+		h.cancel = nil
+	}
+	<-h.done
+	h.done = nil
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cdpShutdownTimeout)
+	defer shutdownCancel()
+	if err := h.waitForCDPClosed(shutdownCtx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *Harness) disconnectDriver() {
+	if h.browser != nil {
+		_ = h.browser.Close()
+		h.browser = nil
+	}
+	if h.pw != nil {
+		_ = h.pw.Stop()
+		h.pw = nil
+	}
+}
+
+func (h *Harness) waitForCDP(ctx context.Context) error {
+	// Query the Electron CDP endpoint until startup succeeds or ends.
+	url := h.CDPEndpoint() + "/json/version"
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait for Electron CDP endpoint")
+		case <-h.done:
+			return h.desktopRuntimeErr("desktop runtime exited before CDP endpoint became ready")
+		case <-ticker.C:
+		}
+	}
+}
+
+// waitForCDPClosed prevents relaunch from treating a previous Electron process
+// as the newly started runtime when both launches reuse the same debug port.
+func (h *Harness) waitForCDPClosed(ctx context.Context) error {
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(h.cdpPort))
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		if err != nil {
+			return nil
+		}
+		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait for stale Electron CDP endpoint to close")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *Harness) desktopRuntimeErr(msg string) error {
+	if h.doneErr != nil {
+		return errors.Wrap(h.doneErr, msg)
+	}
+	return errors.New(msg)
+}
+
+func resolveCDPReadyTimeout() (time.Duration, error) {
+	// Read the configured Electron CDP startup timeout or use its default.
+	raw := strings.TrimSpace(os.Getenv(cdpReadyTimeoutEnv))
+	if raw == "" {
+		return defaultCDPReadyTimeout, nil
+	}
+
+	// Parse and require a positive Electron CDP startup timeout.
+	timeout, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, errors.Wrapf(err, "unsupported %s value %q", cdpReadyTimeoutEnv, raw)
+	}
+	if timeout <= 0 {
+		return 0, errors.Errorf("%s must be a positive duration, got %q", cdpReadyTimeoutEnv, raw)
+	}
+	return timeout, nil
+}
+
+func findFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func setEnv(key, value string) func() {
+	prev, ok := os.LookupEnv(key)
+	_ = os.Setenv(key, value)
+	return func() {
+		if ok {
+			_ = os.Setenv(key, prev)
+			return
+		}
+		_ = os.Unsetenv(key)
+	}
+}

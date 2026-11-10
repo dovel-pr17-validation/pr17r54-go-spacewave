@@ -1,0 +1,150 @@
+package unixfs_world_e2e
+
+import (
+	"context"
+	"testing"
+
+	"github.com/aperturerobotics/controllerbus/config"
+	billy_util "github.com/go-git/go-billy/v6/util"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	transform_blockenc "github.com/s4wave/spacewave/db/block/transform/blockenc"
+	transform_gzip "github.com/s4wave/spacewave/db/block/transform/gzip"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/testbed"
+	"github.com/s4wave/spacewave/db/unixfs"
+	unixfs_billy "github.com/s4wave/spacewave/db/unixfs/billy"
+	unixfs_block "github.com/s4wave/spacewave/db/unixfs/block"
+	unixfs_world "github.com/s4wave/spacewave/db/unixfs/world"
+	"github.com/s4wave/spacewave/db/util/blockenc"
+	"github.com/s4wave/spacewave/db/world"
+	world_block_engine "github.com/s4wave/spacewave/db/world/block/engine"
+	"github.com/sirupsen/logrus"
+	"github.com/zeebo/blake3"
+)
+
+// TestInitUnixFSDemo tests the InitUnixFSDemoOp operation.
+func TestInitUnixFSDemo(t *testing.T) {
+	// Prepare the UnixFS demo test context and logger.
+	ctx := context.Background()
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	le := logrus.NewEntry(log)
+
+	// Start the storage testbed with the World engine factory.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	tb.StaticResolver.AddFactory(world_block_engine.NewFactory(tb.Bus))
+
+	// Select the volume, bucket, and World engine identities.
+	vol := tb.Volume
+	volumeID := vol.GetID()
+	engineID := "test-world-engine"
+	objectStoreID := "test-world-engine-store"
+	bucketID := tb.BucketId
+
+	// Derive the encryption key for the demo World store.
+	encKey := make([]byte, 32)
+	blake3.DeriveKey("hydra/test/unixfs: init_unixfs_demo_test.go", []byte(objectStoreID), encKey)
+
+	// Configure compression and encryption for the demo World.
+	xfrmConf, err := block_transform.NewConfig([]config.Config{
+		&transform_gzip.Config{},
+		&transform_blockenc.Config{
+			BlockEnc: blockenc.BlockEnc_BlockEnc_XCHACHA20_POLY1305,
+			Key:      encKey,
+		},
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// initWorldRef is only used if the world has not been previously inited.
+	initWorldRef := &bucket.ObjectRef{
+		BucketId:      bucketID,
+		TransformConf: xfrmConf,
+	}
+
+	// initialize world engine
+	busEngine, worldCtrlRef, err := world.StartEngine(
+		ctx,
+		tb.Bus,
+		world_block_engine.NewConfig(
+			engineID,
+			volumeID, bucketID,
+			objectStoreID,
+			initWorldRef,
+			xfrmConf,
+			false,
+		),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer worldCtrlRef.Release()
+
+	// provide op handlers to bus
+	opc := world.NewLookupOpController("test-unixfs-demo-ops", engineID, world.NewSchema(InitUnixfsDemoTypes).LookupOp)
+	_, err = tb.Bus.AddController(ctx, opc, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// uses short-lived engine txs to implement world state
+	ws := world.NewEngineWorldState(busEngine, true)
+
+	// Select the sender, object key, and timestamp for demo initialization.
+	sender := tb.Volume.GetPeerID()
+	objKey := "test-unixfs-demo"
+	ts := unixfs_block.FillPlaceholderTimestamp(nil).AsTime()
+
+	// apply the InitUnixFSDemoOp operation
+	_, sysErr, err := InitUnixFSDemo(ctx, ws, sender, objKey, ts)
+	if err != nil {
+		if sysErr {
+			t.Fatalf("system error: %v", err)
+		}
+		t.Fatal(err.Error())
+	}
+
+	// verify the filesystem was created with expected structure
+	rootFSCursor, err := unixfs_world.FollowUnixfsRef(ctx, le, ws, &unixfs_world.UnixfsRef{ObjectKey: objKey}, sender, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	fsh, err := unixfs.NewFSHandle(rootFSCursor)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer fsh.Release()
+
+	// wrap in billy filesystem for testing
+	fs := unixfs_billy.NewBillyFilesystem(ctx, fsh, "", ts)
+
+	// verify hello.txt exists and has correct content
+	helloContent, err := billy_util.ReadFile(fs, "hello.txt")
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	expectedContent := "Hello world from Go!\n"
+	if string(helloContent) != expectedContent {
+		t.Errorf("hello.txt content mismatch: got %q, want %q", string(helloContent), expectedContent)
+	}
+
+	// verify world.md exists
+	_, err = fs.Stat("world.md")
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// verify /test/dir directory structure exists
+	_, err = fs.Stat("test/dir")
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Report the verified UnixFS demo structure.
+	le.Info("verified UnixFS demo filesystem structure")
+}

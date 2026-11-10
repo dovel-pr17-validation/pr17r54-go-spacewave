@@ -1,0 +1,147 @@
+package blob
+
+import (
+	"context"
+	"math"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/block/byteslice"
+)
+
+// NewChunk constructs a new chunk.
+func NewChunk(dataRef *block.BlockRef, size, start uint64) *Chunk {
+	return &Chunk{DataRef: dataRef, Size: size, Start: start}
+}
+
+// IsNil returns if the object is nil.
+func (r *Chunk) IsNil() bool {
+	return r == nil
+}
+
+// Validate checks the reference.
+func (r *Chunk) Validate() error {
+	// note: empty data ref -> zeros
+	if r.GetSize() == 0 {
+		return ErrEmptyChunk
+	}
+	if err := r.GetDataRef().Validate(false); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// FetchData fetches the data reference.
+// bcs should be located at chunk
+func (r *Chunk) FetchData(ctx context.Context, bcs *block.Cursor, copyBuf bool) ([]byte, error) {
+	return r.fetchData(ctx, bcs, copyBuf, true)
+}
+
+// FetchDataNoCache fetches the data reference without retaining the chunk bytes
+// in the cursor. Use this for sequential read paths that only need the current
+// chunk as scratch data.
+func (r *Chunk) FetchDataNoCache(ctx context.Context, bcs *block.Cursor, copyBuf bool) ([]byte, error) {
+	return r.fetchData(ctx, bcs, copyBuf, false)
+}
+
+func (r *Chunk) fetchData(ctx context.Context, bcs *block.Cursor, copyBuf bool, cacheData bool) ([]byte, error) {
+	// Read any chunk bytes already retained on the data cursor.
+	var data []byte
+	var dataOk bool
+	var err error
+	currChunkDataCs := r.FollowDataRef(bcs)
+	currChunkBlki, _ := currChunkDataCs.GetBlock()
+	if currChunkBlki != nil {
+		currChunkBlk, ok := currChunkBlki.(*byteslice.ByteSlice)
+		if ok {
+			data = currChunkBlk.GetBytes()
+			dataOk = len(data) != 0
+		}
+	}
+
+	// Fetch chunk bytes when the cursor has no populated byte block.
+	if !dataOk {
+		data, dataOk, err = currChunkDataCs.FetchLeaf(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !dataOk {
+		return nil, errors.Errorf(
+			"chunk data block not found: <%q>",
+			currChunkDataCs.GetRef().MarshalString(),
+		)
+	}
+
+	// Require the stored byte length to match the declared chunk size.
+	currChunkSize := r.GetSize()
+	if currChunkSize > math.MaxInt {
+		return nil, errors.New("chunk size exceeds maximum")
+	}
+	if len(data) != int(currChunkSize) {
+		return nil, errors.Errorf(
+			"expected chunk %s data len %d but got %d",
+			currChunkDataCs.GetRef().MarshalString(),
+			int(currChunkSize),
+			len(data),
+		)
+	}
+
+	// Retain chunk bytes on the cursor when caching is requested.
+	if cacheData && len(data) != 0 {
+		// cache the data in the cursor
+		currChunkDataCs.SetBlock(byteslice.NewByteSlice(&data), false)
+	}
+
+	// Copy chunk bytes when the caller requires an independent buffer.
+	if copyBuf {
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		data = buf
+	}
+	return data, nil
+}
+
+// FollowDataRef follows the data reference.
+func (r *Chunk) FollowDataRef(bcs *block.Cursor) *block.Cursor {
+	return bcs.FollowRef(1, r.GetDataRef())
+}
+
+// ApplyBlockRef applies a ref change with a field id.
+// The reference may be nil if the child block is nil.
+func (r *Chunk) ApplyBlockRef(id uint32, ptr *block.BlockRef) error {
+	switch id {
+	case 1:
+		r.DataRef = ptr
+	}
+	return nil
+}
+
+// GetBlockRefs returns all block references by ID.
+// May return nil, and values may also be nil.
+// Note: this does not include pending references (in a cursor)
+func (r *Chunk) GetBlockRefs() (map[uint32]*block.BlockRef, error) {
+	if r == nil {
+		return nil, nil
+	}
+	m := make(map[uint32]*block.BlockRef)
+	m[1] = r.GetDataRef()
+	return m, nil
+}
+
+// GetBlockRefCtor returns the constructor for the block at the ref id.
+// Return nil to indicate invalid ref ID or unknown.
+func (r *Chunk) GetBlockRefCtor(id uint32) block.Ctor {
+	switch id {
+	case 1:
+		return byteslice.NewByteSliceBlock
+	}
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ block.Block         = (*Chunk)(nil)
+	_ block.BlockWithRefs = (*Chunk)(nil)
+)

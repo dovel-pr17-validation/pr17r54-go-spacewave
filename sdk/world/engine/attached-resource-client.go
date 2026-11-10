@@ -1,0 +1,93 @@
+package sdk_world_engine
+
+import (
+	"context"
+	"sync/atomic"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/s4wave/spacewave/bldr/resource"
+	resource_client "github.com/s4wave/spacewave/bldr/resource/client"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+)
+
+// AttachedResourceClient creates resource refs for resources attached to the current resource request.
+type AttachedResourceClient struct {
+	resourceCtx resource_server.ResourceClientContext
+}
+
+// NewAttachedResourceClient constructs an AttachedResourceClient.
+func NewAttachedResourceClient(resourceCtx resource_server.ResourceClientContext) *AttachedResourceClient {
+	return &AttachedResourceClient{resourceCtx: resourceCtx}
+}
+
+// NewAttachedEngine constructs an SDKEngine from an attached world engine resource id.
+func NewAttachedEngine(ctx context.Context, resourceID uint32) (*SDKEngine, error) {
+	// Require the resource request context for the attached World engine.
+	resourceCtx, err := resource_server.MustGetResourceClientContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wrap the attached engine resource and release it if construction fails.
+	client := NewAttachedResourceClient(resourceCtx)
+	ref := client.CreateResourceReference(resourceID)
+	engine, err := NewSDKEngine(client, ref)
+	if err != nil {
+		ref.Release()
+		return nil, err
+	}
+	return engine, nil
+}
+
+// CreateResourceReference creates a reference to an attached resource.
+func (c *AttachedResourceClient) CreateResourceReference(resourceID uint32) resource_client.ResourceRef {
+	return &attachedResourceRef{resourceCtx: c.resourceCtx, resourceID: resourceID, done: make(chan struct{})}
+}
+
+type attachedResourceRef struct {
+	resourceCtx resource_server.ResourceClientContext
+	resourceID  uint32
+	released    atomic.Bool
+	// done closes on Release. The attached resource context reports no
+	// release by the other side.
+	done chan struct{}
+}
+
+func (r *attachedResourceRef) GetResourceID() uint32 {
+	return r.resourceID
+}
+
+func (r *attachedResourceRef) GetClient() (srpc.Client, error) {
+	if r.released.Load() {
+		return nil, resource.ErrResourceOrClientReleased
+	}
+	if r.resourceCtx == nil {
+		return nil, resource.ErrNoResourceClientContext
+	}
+	return r.resourceCtx.GetAttachedResource(r.resourceID)
+}
+
+func (r *attachedResourceRef) Release() {
+	if r.released.Swap(true) {
+		return
+	}
+	close(r.done)
+	if r.resourceCtx == nil {
+		return
+	}
+	r.resourceCtx.ReleaseResource(r.resourceID)
+}
+
+func (r *attachedResourceRef) Done() <-chan struct{} {
+	return r.done
+}
+
+// ReleasedByServer reports false: the attached resource context reports no
+// release by the other side.
+func (r *attachedResourceRef) ReleasedByServer() bool {
+	return false
+}
+
+var _ ResourceClient = (*AttachedResourceClient)(nil)
+
+var _ resource_client.ResourceRef = (*attachedResourceRef)(nil)

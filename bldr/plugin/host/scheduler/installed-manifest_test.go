@@ -1,0 +1,198 @@
+package plugin_host_scheduler
+
+import (
+	"testing"
+
+	"github.com/aperturerobotics/util/ccontainer"
+	manifest "github.com/s4wave/spacewave/bldr/manifest"
+	plugin_host "github.com/s4wave/spacewave/bldr/plugin/host"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/net/hash"
+	"github.com/sirupsen/logrus"
+)
+
+// TestInstalledManifestSelection proves explicit installation beats catalog
+// order and keeps independent bindings when one installation changes.
+func TestInstalledManifestSelection(t *testing.T) {
+	// Build a controller with one JavaScript plugin host.
+	le := logrus.NewEntry(logrus.New())
+	hosts := &pluginHostSet{pluginHosts: []plugin_host.PluginHost{&testPluginHost{id: "js"}}}
+	c := NewController(le, nil, &Config{})
+	c.pluginHostsCtr = ccontainer.NewCContainer(hosts)
+	_, first := c.newPluginInstance(pluginReference{pluginID: "colors", instanceKey: "first"})
+	_, second := c.newPluginInstance(pluginReference{pluginID: "colors", instanceKey: "second"})
+	old := newTestManifestRef("colors", "js", 1, "old")
+	newer := newTestManifestRef("colors", "js", 99, "newer")
+
+	// Give each manifest ref a resolvable root hash.
+	for _, ref := range []*manifest.ManifestRef{old, newer} {
+		digest, err := hash.Sum(hash.RecommendedHashType, []byte(ref.GetManifestRef().GetBucketId()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.ManifestRef.RootRef = block.NewBlockRef(digest)
+	}
+
+	// Install the old artifact on the first binding and the newer on the second.
+	firstRelease := first.addManifestSelection(old)
+	defer firstRelease()
+	secondRelease := second.addManifestSelection(newer)
+	defer secondRelease()
+
+	// assertSelection fails when the instance's execution state differs.
+	assertSelection := func(instance *pluginInstance, expected *manifest.ManifestRef) {
+		t.Helper()
+		state := instance.executePluginRoutine.GetState()
+		if state == nil || !state.manifestSnapshot.GetManifestRef().EqualVT(expected.GetManifestRef()) {
+			t.Fatal("installation selected a different artifact")
+		}
+	}
+	assertSelection(first, old)
+	assertSelection(second, newer)
+
+	// A later catalog result cannot advance the selected installation.
+	if first.setExecutePluginState(&executePluginArgs{
+		pluginHost: hosts.pluginHosts[0], manifestSnapshot: &manifest.ManifestSnapshot{ManifestRef: newer.GetManifestRef()},
+	}) || first.setExecutePluginState(nil) {
+		t.Fatal("catalog update replaced an explicit installation")
+	}
+	assertSelection(first, old)
+
+	// A new retained demand may deliberately select an older numeric revision.
+	releaseReplacement := second.addManifestSelection(old)
+	assertSelection(second, old)
+	assertSelection(first, old)
+	if second.acceptsManifest(&executePluginArgs{manifestSnapshot: &manifest.ManifestSnapshot{ManifestRef: newer.GetManifestRef()}}) {
+		t.Fatal("superseded preparation remained admissible")
+	}
+	releaseReplacement()
+	releaseReplacement()
+	assertSelection(second, newer)
+}
+
+// TestInstalledManifestSkipsForeignPlatforms proves one installation spanning
+// platforms gives each peer the newest artifact its own host can run, and that
+// only the artifact of the same platform is a fallback.
+func TestInstalledManifestSkipsForeignPlatforms(t *testing.T) {
+	// Build the installation: a newer linux artifact, its predecessor, and darwin.
+	linuxNew := newTestManifestRef("core", "desktop/linux/amd64", 3, "linux-new")
+	darwin := newTestManifestRef("core", "desktop/darwin/arm64", 2, "darwin")
+	linuxOld := newTestManifestRef("core", "desktop/linux/amd64", 1, "linux-old")
+	installation := []*manifest.ManifestRef{linuxNew, darwin, linuxOld}
+	for _, ref := range installation {
+		digest, err := hash.Sum(hash.RecommendedHashType, []byte(ref.GetManifestRef().GetBucketId()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.ManifestRef.RootRef = block.NewBlockRef(digest)
+	}
+
+	// Each peer selects the newest artifact for its own platform.
+	for _, test := range []struct {
+		platform  string
+		selected  *manifest.ManifestRef
+		fallbacks []*manifest.ManifestRef
+	}{
+		{"desktop/linux/amd64", linuxNew, []*manifest.ManifestRef{linuxOld}},
+		{"desktop/darwin/arm64", darwin, nil},
+	} {
+		// Run a scheduler whose only host is on the peer's platform.
+		hosts := &pluginHostSet{pluginHosts: []plugin_host.PluginHost{&testPluginHost{id: test.platform}}}
+		c := NewController(logrus.NewEntry(logrus.New()), nil, &Config{})
+		c.pluginHostsCtr = ccontainer.NewCContainer(hosts)
+		_, instance := c.newPluginInstance(pluginReference{pluginID: "core", instanceKey: "space"})
+		release := instance.addManifestSelection(installation...)
+
+		// Check the selected artifact and its fallbacks.
+		state := instance.executePluginRoutine.GetState()
+		if state == nil || !state.manifestSnapshot.GetManifestRef().EqualVT(test.selected.GetManifestRef()) {
+			t.Fatalf("%s peer selected an artifact it cannot run", test.platform)
+		}
+		if len(state.fallbacks) != len(test.fallbacks) {
+			t.Fatalf("%s peer has %d fallbacks, expected %d", test.platform, len(state.fallbacks), len(test.fallbacks))
+		}
+		for i, fallback := range state.fallbacks {
+			if !fallback.manifestSnapshot.GetManifestRef().EqualVT(test.fallbacks[i].GetManifestRef()) {
+				t.Fatalf("%s peer fell back to the wrong artifact", test.platform)
+			}
+		}
+		release()
+	}
+}
+
+// TestInstalledManifestServesAssets proves a browser artifact without a host
+// is served only while a reference demands its files.
+func TestInstalledManifestServesAssets(t *testing.T) {
+	// Build a controller whose only host cannot run the browser artifact.
+	le := logrus.NewEntry(logrus.New())
+	hosts := &pluginHostSet{pluginHosts: []plugin_host.PluginHost{&testPluginHost{id: "desktop/darwin/arm64"}}}
+	c := NewController(le, nil, &Config{})
+	c.pluginHostsCtr = ccontainer.NewCContainer(hosts)
+	_, instance := c.newPluginInstance(pluginReference{pluginID: "app"})
+	release := instance.addManifestSelection(newTestManifestRef("app", "js", 1, "app"))
+	defer release()
+
+	// serving reports whether the selection serves the artifact's files.
+	serving := func() bool {
+		state := instance.executePluginRoutine.GetState()
+		if state == nil || state.pluginHost != nil {
+			t.Fatal("browser artifact selected a host")
+		}
+		return state.serveAssets
+	}
+	if serving() {
+		t.Fatal("served files without demand")
+	}
+
+	// Demand serves the files until its last release.
+	releaseAssets := instance.addAssetsDemand()
+	if !serving() {
+		t.Fatal("demand did not serve files")
+	}
+	releaseAssets()
+	releaseAssets()
+	if serving() {
+		t.Fatal("served files after release")
+	}
+}
+
+// TestInstalledManifestPrefersNative proves a peer with native and JavaScript
+// hosts runs the native artifact of an installation whose last deploy repinned
+// the JavaScript build in front of it, and never falls back to JavaScript.
+func TestInstalledManifestPrefersNative(t *testing.T) {
+	// Build the installation in deploy repin order: linux, js, darwin, then
+	// the rollback pins of the previous deploy.
+	linux := newTestManifestRef("core", "desktop/linux/amd64", 146, "linux")
+	js := newTestManifestRef("core", "js", 181, "js")
+	darwin := newTestManifestRef("core", "desktop/darwin/arm64", 181, "darwin")
+	jsOld := newTestManifestRef("core", "js", 180, "js-old")
+	darwinOld := newTestManifestRef("core", "desktop/darwin/arm64", 180, "darwin-old")
+	installation := []*manifest.ManifestRef{linux, js, darwin, jsOld, darwinOld}
+	for _, ref := range installation {
+		digest, err := hash.Sum(hash.RecommendedHashType, []byte(ref.GetManifestRef().GetBucketId()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.ManifestRef.RootRef = block.NewBlockRef(digest)
+	}
+
+	// Run a darwin peer that also hosts JavaScript plugins.
+	hosts := &pluginHostSet{pluginHosts: []plugin_host.PluginHost{
+		&testPluginHost{id: "js"},
+		&testPluginHost{id: "desktop/darwin/arm64"},
+	}}
+	c := NewController(logrus.NewEntry(logrus.New()), nil, &Config{})
+	c.pluginHostsCtr = ccontainer.NewCContainer(hosts)
+	_, instance := c.newPluginInstance(pluginReference{pluginID: "core", instanceKey: "space"})
+	release := instance.addManifestSelection(installation...)
+	defer release()
+
+	// The native artifact runs, with only the older native artifact behind it.
+	state := instance.executePluginRoutine.GetState()
+	if state == nil || !state.manifestSnapshot.GetManifestRef().EqualVT(darwin.GetManifestRef()) {
+		t.Fatal("installation did not select the native artifact")
+	}
+	if len(state.fallbacks) != 1 || !state.fallbacks[0].manifestSnapshot.GetManifestRef().EqualVT(darwinOld.GetManifestRef()) {
+		t.Fatal("native artifact fell back to another platform")
+	}
+}

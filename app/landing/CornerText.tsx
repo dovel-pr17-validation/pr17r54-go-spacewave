@@ -1,0 +1,78 @@
+import { createPortal } from 'react-dom'
+import { cn } from '@s4wave/web/style/utils.js'
+import { isDesktop, isMac } from '@aptre/bldr'
+import {
+  useIsStaticMode,
+  useStaticHref,
+} from '@s4wave/app/prerender/StaticContext.js'
+import { useAppBuildInfo } from '@s4wave/app/build-info.js'
+import { ExternalLink } from './ExternalLink.js'
+
+interface CornerTextProps {
+  show: boolean
+}
+
+// CornerText renders corner text for the landing page. A touch screen hides it:
+// the page footer carries the same links at touch size.
+// Desktop: uses fixed positioning via portal (for window chrome integration)
+// Browser: uses fixed positioning to stay in viewport corners
+export function CornerText({ show }: CornerTextProps) {
+  const isStatic = useIsStaticMode()
+  const dmcaHref = useStaticHref('/dmca')
+  const buildInfo = useAppBuildInfo()
+  const showTabHint = isStatic || isDesktop
+  const baseClasses =
+    'text-foreground-alt pointer-events-none z-50 micro-ten transition-opacity duration-300 select-none narrow:hidden [@media(pointer:coarse)]:hidden'
+  const opacityClass = show ? 'opacity-30' : 'opacity-0'
+
+  // Desktop offsets account for window chrome: left hint clears the macOS
+  // traffic lights (cluster ends ~66px in), right hint mirrors its top edge so
+  // both corners share one baseline. left-[63px] overlapped the zoom button.
+  const topLeftPos = isDesktop && isMac ? 'top-1.75 left-18.25' : 'top-2 left-4'
+  const topRightPos = isDesktop && isMac ? 'top-1.75' : 'top-2'
+
+  const content = (
+    <>
+      {showTabHint && (
+        <span className={cn(baseClasses, 'fixed', topLeftPos, opacityClass)}>
+          press tab to navigate
+        </span>
+      )}
+
+      <div
+        className={cn(baseClasses, 'fixed right-4', topRightPos, opacityClass)}
+      >
+        {buildInfo.cornerLabel}
+      </div>
+
+      <ExternalLink
+        href="https://aperture.us"
+        className={cn(
+          baseClasses,
+          'hover:text-foreground pointer-events-auto fixed bottom-2 left-4',
+          opacityClass,
+        )}
+      >
+        {/* The cake is a lie! */}
+        <strong>Aperture Robotics</strong>
+      </ExternalLink>
+
+      <a
+        href={dmcaHref}
+        className={cn(
+          baseClasses,
+          'hover:text-foreground pointer-events-auto fixed right-4 bottom-2',
+          opacityClass,
+        )}
+      >
+        DMCA and legal
+      </a>
+    </>
+  )
+
+  // Desktop: portal to body for window chrome integration
+  if (isDesktop) {
+    return createPortal(content, document.body)
+  }
+  return content
+}

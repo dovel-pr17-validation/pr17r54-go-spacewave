@@ -1,0 +1,135 @@
+//go:build !js
+
+package bldr_project_starlark
+
+import (
+	configset_proto "github.com/aperturerobotics/controllerbus/controller/configset/proto"
+	"github.com/pkg/errors"
+	manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_project "github.com/s4wave/spacewave/bldr/project"
+	"go.starlark.net/starlark"
+)
+
+// manifestBuiltin implements the manifest() built-in function.
+// manifest(id, builder, rev=0, config=None, description="", background=False, platformIds=[], nodeTypeIds=[], opTypeIds=[])
+func (e *evaluator) manifestBuiltin(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	// Declare the manifest arguments.
+	var (
+		id          string
+		builder     string
+		rev         int
+		config      starlark.Value
+		description string
+		background  bool
+		platformIDs []string
+		nodeTypeIDs []string
+		opTypeIDs   []string
+	)
+
+	// Read the positional manifest ID.
+	id, kwargs, err := popPositionalID("manifest", args, kwargs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read each keyword argument into its declared variable.
+	for _, kv := range kwargs {
+		key := string(kv[0].(starlark.String))
+		val := kv[1]
+		switch key {
+		case "builder":
+			s, ok := val.(starlark.String)
+			if !ok {
+				return nil, errExpectedString("manifest", "builder")
+			}
+			builder = string(s)
+		case "rev":
+			i, ok := val.(starlark.Int)
+			if !ok {
+				return nil, errExpectedInt("manifest", "rev")
+			}
+			v, ok := i.Int64()
+			if !ok || v < 0 {
+				return nil, errors.New("manifest(): rev value out of range")
+			}
+			rev = int(v)
+		case "config":
+			config = val
+		case "description":
+			s, ok := val.(starlark.String)
+			if !ok {
+				return nil, errExpectedString("manifest", "description")
+			}
+			description = string(s)
+		case "platformIds", "platform_ids":
+			list, err := toStringList(val)
+			if err != nil {
+				return nil, errors.Wrap(err, "manifest(): platformIds")
+			}
+			platformIDs = list
+		case "nodeTypeIds", "node_type_ids":
+			list, err := toStringList(val)
+			if err != nil {
+				return nil, errors.Wrap(err, "manifest(): nodeTypeIds")
+			}
+			nodeTypeIDs = list
+		case "opTypeIds", "op_type_ids":
+			list, err := toStringList(val)
+			if err != nil {
+				return nil, errors.Wrap(err, "manifest(): opTypeIds")
+			}
+			opTypeIDs = list
+		case "background":
+			b, ok := val.(starlark.Bool)
+			if !ok {
+				return nil, errExpectedBool("manifest", "background")
+			}
+			background = bool(b)
+		default:
+			return nil, errUnknownKwarg("manifest", key)
+		}
+	}
+
+	// Require a valid manifest ID and a builder name.
+	if id == "" {
+		return nil, errors.New("manifest(): id is required")
+	}
+	if err := manifest.ValidateManifestID(id, false); err != nil {
+		return nil, errors.Wrap(err, "manifest()")
+	}
+	if builder == "" {
+		return nil, errors.New("manifest(): builder is required")
+	}
+
+	// Build the ControllerConfig for the builder. The rev seeds both the
+	// builder config revision and the minimum manifest revision, so a fresh
+	// build World still builds at or above the declared revision.
+	ctrlConf := &configset_proto.ControllerConfig{
+		Id:  builder,
+		Rev: uint64(rev),
+	}
+	if config != nil && config != starlark.None {
+		configJSON, err := valueToJSON(config)
+		if err != nil {
+			return nil, errors.Wrap(err, "manifest(): config")
+		}
+		ctrlConf.Config = configJSON
+	}
+
+	// Build the manifest config and register it in the project configuration.
+	mc := &bldr_project.ManifestConfig{
+		Builder:     ctrlConf,
+		Rev:         uint64(rev),
+		Description: description,
+		Background:  background,
+		PlatformIds: platformIDs,
+		NodeTypeIds: nodeTypeIDs,
+		OpTypeIds:   opTypeIDs,
+	}
+	if e.config.Manifests == nil {
+		e.config.Manifests = make(map[string]*bldr_project.ManifestConfig)
+	}
+	e.config.Manifests[id] = mc
+
+	return starlark.None, nil
+}

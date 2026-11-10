@@ -1,0 +1,139 @@
+// Package download serves projected space file content via HTTP.
+// URL: /p/spacewave-core/fs/u/{idx}/so/{soId}/...
+// The /p/spacewave-core/ prefix is stripped by the web runtime.
+// This handler receives: /fs/u/{idx}/so/{soId}/...
+package space_http_download
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+	"runtime/trace"
+	"strings"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/directive"
+	space_http_downloadurl "github.com/s4wave/spacewave/core/space/http/download/downloadurl"
+	space_http_header "github.com/s4wave/spacewave/core/space/http/header"
+	space_resolve "github.com/s4wave/spacewave/core/space/resolve"
+	space_unixfs "github.com/s4wave/spacewave/core/space/unixfs"
+	unixfs_access_http "github.com/s4wave/spacewave/db/unixfs/access/http"
+	"github.com/s4wave/spacewave/db/world"
+	bifrost_http "github.com/s4wave/spacewave/net/http"
+)
+
+// ControllerID is the controller identifier.
+const ControllerID = "space/http/download"
+
+// Version is the controller version.
+var Version = controller.MustParseVersion("0.0.1")
+
+// controllerDescrip is the controller description.
+var controllerDescrip = "serves unixfs file downloads via http"
+
+// fsPathPrefix is the URL path prefix this controller handles.
+const fsPathPrefix = "/fs/"
+
+// Controller serves UnixFS file content for download via LookupHTTPHandler.
+type Controller struct {
+	*bus.BusController[*Config]
+}
+
+// NewFactory constructs the controller factory.
+func NewFactory(b bus.Bus) controller.Factory {
+	return bus.NewBusControllerFactory(
+		b,
+		ConfigID,
+		ControllerID,
+		Version,
+		controllerDescrip,
+		func() *Config {
+			return &Config{}
+		},
+		func(base *bus.BusController[*Config]) (*Controller, error) {
+			return &Controller{BusController: base}, nil
+		},
+	)
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+func (c *Controller) HandleDirective(ctx context.Context, di directive.Instance) ([]directive.Resolver, error) {
+	switch d := di.GetDirective().(type) {
+	case bifrost_http.LookupHTTPHandler:
+		u := d.LookupHTTPHandlerURL()
+		if u != nil && strings.HasPrefix(u.Path, fsPathPrefix) {
+			return directive.R(bifrost_http.NewLookupHTTPHandlerResolver(c), nil)
+		}
+	}
+	return nil, nil
+}
+
+// ServeHTTP handles file download requests.
+// /fs/u/{idx}/so/{soId}/...
+func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Bind the download request to the controller and its trace context.
+	le := c.GetLogger()
+	b := c.GetBus()
+	ctx := r.Context()
+	if trace.IsEnabled() {
+		var task *trace.Task
+		ctx, task = trace.NewTask(ctx, "core/space-http-download/serve")
+		defer task.End()
+	}
+
+	// Parse the session, shared object, and projected file path from the URL.
+	req, err := space_http_downloadurl.Parse(r.URL.Path)
+	if err != nil {
+		http.Error(w, "invalid download URL: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Resolve the requested space for the lifetime of the download.
+	resolved, cleanup, err := space_resolve.ResolveSpace(ctx, b, req.SessionIdx, req.SharedObjectID)
+	if err != nil {
+		le.WithError(err).Warn("failed to resolve space for download")
+		http.Error(w, "space resolution failed", http.StatusServiceUnavailable)
+		return
+	}
+	defer cleanup()
+
+	// Open the projected filesystem through the resolved space engine.
+	ws := world.NewEngineWorldState(resolved.Engine, false)
+	fsh, err := space_unixfs.BuildFSHandle(le, ws, req.SessionIdx, req.SharedObjectID)
+	if err != nil {
+		le.WithError(err).Warn("failed to create fs handle")
+		http.Error(w, "failed to open filesystem", http.StatusInternalServerError)
+		return
+	}
+	defer fsh.Release()
+
+	// Carry the file-server trace context into the Billy filesystem.
+	fileCtx := ctx
+	if trace.IsEnabled() {
+		var fileTask *trace.Task
+		fileCtx, fileTask = trace.NewTask(ctx, "core/space-http-download/serve/file-server")
+		defer fileTask.End()
+	}
+
+	// Build an http.FileSystem from the FSHandle.
+	hfs := unixfs_access_http.NewFileSystem(fileCtx, fsh, "", "")
+
+	// Set Content-Disposition unless inline mode is requested.
+	if r.URL.Query().Get("inline") == "" {
+		fileName := req.ProjectedPath
+		if idx := strings.LastIndex(req.ProjectedPath, "/"); idx >= 0 {
+			fileName = req.ProjectedPath[idx+1:]
+		}
+		space_http_header.SetAttachmentHeader(w, fileName)
+	}
+
+	// Serve the file using the standard http.FileServer.
+	nr := r.Clone(fileCtx)
+	nr.URL = &url.URL{Path: "/" + req.ProjectedPath}
+	handler := unixfs_access_http.NewFileServer(hfs)
+	handler.ServeHTTP(w, nr)
+}
+
+// _ is a type assertion
+var _ controller.Controller = (*Controller)(nil)

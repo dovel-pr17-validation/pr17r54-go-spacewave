@@ -1,0 +1,249 @@
+package kvtx_vlogger
+
+import (
+	"context"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/sirupsen/logrus"
+)
+
+// Tx implements a verbose logger tx.
+type Tx struct {
+	iter atomic.Uint32
+	kvtx.Tx
+	le *logrus.Entry
+
+	discardOnce atomic.Bool
+}
+
+// NewTx constructs a new verbose logger Tx wrapping tx.
+func NewTx(le *logrus.Entry, tx kvtx.Tx) *Tx {
+	return &Tx{
+		Tx: tx,
+		le: le,
+	}
+}
+
+// keyForLogging formats a key summary without exposing key material.
+func keyForLogging(key []byte) string {
+	return "len=" + strconv.Itoa(len(key))
+}
+
+// Get returns values for a key.
+func (t *Tx) Get(ctx context.Context, key []byte) (data []byte, found bool, err error) {
+	t.le.Debugf("Get(%s) start", keyForLogging(key))
+	defer func() {
+		t.le.Debugf(
+			"Get(%s) => data(%d) found(%v) err(%v)",
+			keyForLogging(key),
+			len(data),
+			found,
+			err,
+		)
+	}()
+	return t.Tx.Get(ctx, key)
+}
+
+// GetBatch returns values for multiple keys.
+func (t *Tx) GetBatch(ctx context.Context, keys [][]byte) (values [][]byte, found []bool, err error) {
+	t.le.Debugf("GetBatch(keys=%d) start", len(keys))
+	defer func() {
+		var foundCount int
+		for _, ok := range found {
+			if ok {
+				foundCount++
+			}
+		}
+		t.le.Debugf(
+			"GetBatch(keys=%d) => found(%d) err(%v)",
+			len(keys),
+			foundCount,
+			err,
+		)
+	}()
+	return kvtx.GetBatch(ctx, t.Tx, keys)
+}
+
+// Prefetch prefetches keys.
+func (t *Tx) Prefetch(ctx context.Context, keys [][]byte) (err error) {
+	t.le.Debugf("Prefetch(keys=%d) start", len(keys))
+	defer func() {
+		t.le.Debugf("Prefetch(keys=%d) => err(%v)", len(keys), err)
+	}()
+	return kvtx.Prefetch(ctx, t.Tx, keys)
+}
+
+// Size returns number of keys in the store.
+func (t *Tx) Size(ctx context.Context) (count uint64, err error) {
+	t.le.Debug("Size() start")
+	defer func() {
+		t.le.Debugf(
+			"Size() => count(%d) err(%v)",
+			count,
+			err,
+		)
+	}()
+	return t.Tx.Size(ctx)
+}
+
+// ScanPrefix iterates over keys with a prefix.
+func (t *Tx) ScanPrefix(ctx context.Context, prefix []byte, cb func(key, value []byte) error) (err error) {
+	t.le.Debugf("ScanPrefix(%s) start", keyForLogging(prefix))
+	ta := time.Now()
+	defer func() {
+		tb := time.Now()
+		dur := tb.Sub(ta).String()
+		t.le.Debugf(
+			"ScanPrefix(%s) => err(%v) dur(%v)",
+			keyForLogging(prefix),
+			err,
+			dur,
+		)
+	}()
+	return t.Tx.ScanPrefix(ctx, prefix, func(key, value []byte) error {
+		// Measure the key-value callback and log its result without key material.
+		ta := time.Now()
+		err := cb(key, value)
+		tb := time.Now()
+		dur := tb.Sub(ta).String()
+		t.le.Debugf(
+			"ScanPrefix(%s) => callback(%v, len(%v)) => err(%v) cb-dur(%v)",
+			keyForLogging(prefix),
+			keyForLogging(key), len(value),
+			err,
+			dur,
+		)
+		return err
+	})
+}
+
+// ScanPrefixKeys iterates over keys with a prefix.
+func (t *Tx) ScanPrefixKeys(ctx context.Context, prefix []byte, cb func(key []byte) error) (err error) {
+	t.le.Debugf("ScanPrefixKeys(%s) start", keyForLogging(prefix))
+	ta := time.Now()
+	defer func() {
+		tb := time.Now()
+		dur := tb.Sub(ta).String()
+		t.le.Debugf(
+			"ScanPrefixKeys(%s) => err(%v) dur(%v)",
+			keyForLogging(prefix),
+			err,
+			dur,
+		)
+	}()
+	return t.Tx.ScanPrefixKeys(ctx, prefix, func(key []byte) error {
+		// Measure the key callback and log its result without key material.
+		ta := time.Now()
+		err := cb(key)
+		tb := time.Now()
+		dur := tb.Sub(ta).String()
+		t.le.Debugf(
+			"ScanPrefixKeys(%s) => callback(%v) => err(%v) cb-dur(%v)",
+			keyForLogging(prefix),
+			keyForLogging(key),
+			err,
+			dur,
+		)
+		return err
+	})
+}
+
+// Iterate returns an iterator with a given key prefix.
+func (t *Tx) Iterate(ctx context.Context, prefix []byte, sort, reverse bool) kvtx.Iterator {
+	// Open a transaction iterator and attach its identifier to verbose logs.
+	ii := t.iter.Add(1) - 1
+	it := t.Tx.Iterate(ctx, prefix, sort, reverse)
+	t.le.Debugf(
+		"Iterate(%s, %v, %v) => it(%d)",
+		keyForLogging(prefix),
+		sort, reverse,
+		ii,
+	)
+	le := t.le.WithField("kvtx-vlogger-iter-id", ii)
+	return NewIterator(le, ii, it)
+}
+
+// Set sets the value of a key.
+// This will not be committed until Commit is called.
+func (t *Tx) Set(ctx context.Context, key, value []byte) (err error) {
+	t.le.Debugf("Set(%s) start", keyForLogging(key))
+	defer func() {
+		t.le.Debugf(
+			"Set(%s) => value(%d) err(%v)",
+			keyForLogging(key),
+			len(value),
+			err,
+		)
+	}()
+	return t.Tx.Set(ctx, key, value)
+}
+
+// Delete deletes a key.
+// This will not be committed until Commit is called.
+// Not found should not return an error.
+func (t *Tx) Delete(ctx context.Context, key []byte) (err error) {
+	t.le.Debugf("Delete(%s) start", keyForLogging(key))
+	defer func() {
+		t.le.Debugf(
+			"Delete(%s) => err(%v)",
+			keyForLogging(key),
+			err,
+		)
+	}()
+	return t.Tx.Delete(ctx, key)
+}
+
+// Exists checks if a key exists.
+func (t *Tx) Exists(ctx context.Context, key []byte) (found bool, err error) {
+	t.le.Debugf("Exists(%s) start", keyForLogging(key))
+	defer func() {
+		t.le.Debugf(
+			"Exists(%s) => found(%v) err(%v)",
+			keyForLogging(key),
+			found,
+			err,
+		)
+	}()
+	return t.Tx.Exists(ctx, key)
+}
+
+// Commit commits the transaction to storage. It returns an error when the
+// transaction fails or was discarded.
+func (t *Tx) Commit(ctx context.Context) (err error) {
+	// only log the first Commit or Discard call
+	var logFn func()
+	if t.discardOnce.CompareAndSwap(false, true) {
+		t1 := time.Now()
+		logFn = func() {
+			t.le.Debugf(
+				"Commit() => err(%v) dur(%v)",
+				err,
+				time.Since(t1).String(),
+			)
+		}
+	}
+	if logFn != nil {
+		defer logFn()
+	}
+	return t.Tx.Commit(ctx)
+}
+
+// Discard cancels the transaction.
+// If called after Commit, does nothing.
+// Cannot return an error.
+// Can be called unlimited times.
+func (t *Tx) Discard() {
+	t.Tx.Discard()
+	if t.discardOnce.CompareAndSwap(false, true) {
+		t.le.Debug("Discard()")
+	}
+}
+
+// _ is a type assertion
+var (
+	_ kvtx.Tx            = (*Tx)(nil)
+	_ kvtx.PrefetchTxOps = (*Tx)(nil)
+)

@@ -1,0 +1,98 @@
+package space_world_ops
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_canvas "github.com/s4wave/spacewave/sdk/canvas"
+	"github.com/sirupsen/logrus"
+)
+
+// NewCanvasRemoveEdgeOp constructs a new CanvasRemoveEdgeOp block.
+func NewCanvasRemoveEdgeOp(objKey string, edgeIDs []string) *CanvasRemoveEdgeOp {
+	return &CanvasRemoveEdgeOp{
+		ObjectKey: objKey,
+		EdgeIds:   edgeIDs,
+	}
+}
+
+// Validate performs cursory checks on the op.
+func (o *CanvasRemoveEdgeOp) Validate() error {
+	if len(o.GetObjectKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	if len(o.GetEdgeIds()) == 0 {
+		return ErrNoEdgeIds
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *CanvasRemoveEdgeOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Validate the canvas edge removal before accessing its object.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+
+	// Select the canvas object and edge IDs to remove.
+	objKey := o.GetObjectKey()
+	edgeIDs := o.GetEdgeIds()
+
+	// Open the canvas object state and require that it exists.
+	objState, found, err := worldHandle.GetObject(ctx, objKey)
+	defer world.ReleaseObjectState(objState)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, world.ErrObjectNotFound
+	}
+
+	// Build a set of IDs to remove.
+	removeSet := make(map[string]struct{}, len(edgeIDs))
+	for _, id := range edgeIDs {
+		removeSet[id] = struct{}{}
+	}
+
+	// Update the canvas object with the selected edges removed.
+	_, _, err = world.AccessObjectState(ctx, objState, true, func(bcs *block.Cursor) error {
+		// Load the canvas state or prepare an empty state.
+		state, uerr := s4wave_canvas.UnmarshalCanvasState(ctx, bcs)
+		if uerr != nil {
+			return uerr
+		}
+		if state == nil {
+			state = &s4wave_canvas.CanvasState{}
+		}
+
+		// Preserve the canvas state before filtering its edges.
+		previous := state.CloneVT()
+
+		// Filter edges to exclude removed IDs.
+		edges := state.GetEdges()
+		filtered := make([]*s4wave_canvas.CanvasEdge, 0, len(edges))
+		for _, e := range edges {
+			if _, remove := removeSet[e.GetId()]; !remove {
+				filtered = append(filtered, e)
+			}
+		}
+		state.Edges = filtered
+
+		return s4wave_canvas.WriteCanvasState(ctx, bcs, previous, state)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+// _ is a type assertion
+var _ world.Operation = (*CanvasRemoveEdgeOp)(nil)

@@ -1,0 +1,277 @@
+syntax = "proto3";
+package space.world;
+import "github.com/s4wave/spacewave/sdk/command/command.proto";
+import "github.com/aperturerobotics/common/typeid/typeid.proto";
+import "github.com/s4wave/spacewave/core/sobject/sobject.proto";
+import "github.com/s4wave/spacewave/db/block/block.proto";
+import "github.com/s4wave/spacewave/db/block/transform/transform.proto";
+import "github.com/s4wave/spacewave/db/bucket/bucket.proto";
+import "github.com/s4wave/spacewave/db/world/block/tx/tx.proto";
+import "github.com/s4wave/spacewave/db/world/block/world.proto";
+
+// WorldContents contains a list of world objects and types.
+message WorldContents {
+  // Objects contains the list of world objects.
+  repeated WorldContentsObject objects = 1;
+  // ObjectTypes contains the list of world object types.
+  repeated WorldContentsObjectType object_types = 2;
+}
+
+// WorldContentsObject is an entry in the WorldContents.
+message WorldContentsObject {
+  // ObjectKey is the key of the object in the world.
+  string object_key = 1;
+  // ParentObjectKey is the key of the parent of the object.
+  // Can be empty.
+  string parent_object_key = 2;
+  // ObjectType is the type of the object.
+  string object_type = 3;
+}
+
+// WorldContentsObjectType is an entry in the WorldContents.
+message WorldContentsObjectType {
+  // ObjectType is the type id.
+  string object_type = 1;
+}
+
+// SpaceSettings is an object containing the settings for a Space.
+//
+// Note: the space name and other "public" details are in the SpaceSoMeta.
+message SpaceSettings {
+  option (typeid.id) = "space/settings";
+
+  // IndexPath is the default URL path to display at /.
+  string index_path = 1;
+  // PluginIds lists manifest IDs of plugins this Space uses.
+  // Shared with all Space participants.
+  repeated string plugin_ids = 2;
+  // KeybindingOverrides stores Space-scope keybinding overrides.
+  .s4wave.command.KeybindingOverrideSet keybinding_overrides = 3;
+  // PluginInstallations pins plugins to immutable World artifacts.
+  // Plugins without an installation follow their configured application catalog.
+  map<string, SpacePluginInstallation> plugin_installations = 4;
+  // ChangelogEnabled keeps a changelog of World changes for this Space.
+  // Writing the settings applies it to the World in the same transaction.
+  // Enabling starts history after that write; disabling drops it.
+  bool changelog_enabled = 5;
+}
+
+// SpacePluginInstallation retains explicit installation choices across reopen.
+message SpacePluginInstallation {
+  // ManifestKeys lists immutable artifacts, newest installation first.
+  // Earlier choices recover a working plugin when the requested version fails.
+  repeated string manifest_keys = 1;
+}
+
+// Config configures the World engine of a Space: a SharedObject whose body is
+// a World, served by the one World engine over the Space's agreed order.
+message Config {
+  // EngineId identifies the World on the bus. LookupWorldEngine directives
+  // naming it resolve to the engine. Empty serves no lookup.
+  string engine_id = 1;
+  // Ref is the Space's SharedObject.
+  .sobject.SharedObjectRef ref = 2;
+  // InitWorldOp overrides the operation an owner queues to initialize an
+  // empty World.
+  InitWorldOp init_world_op = 3;
+  // DisableLookup resolves World operations with the built-in types alone,
+  // without the bus.
+  bool disable_lookup = 4;
+  // Verbose logs every operation's outcome.
+  bool verbose = 7;
+  // ReaderPinDelay is how long a replaced World head a reader still holds
+  // waits before the engine pins it, as a duration string. It must stay
+  // below the Volume collector's grace. Empty uses the engine's default.
+  string reader_pin_delay = 8;
+  // MaxPendingBytes bounds the World pages the adapter keeps in memory
+  // before it stores them. Zero uses the adapter's default.
+  uint64 max_pending_bytes = 9;
+}
+
+// InnerState is the World state a Space checkpoint carries and replay
+// computes. A checkpoint's state data has a small size limit.
+message InnerState {
+  // HeadRef is the World root, with its transform config. Its bucket ID is
+  // empty: each member reads it from its own copy of the Space.
+  .bucket.ObjectRef head_ref = 1;
+  // RetainedRoots are past World roots the Space keeps restorable, sorted by
+  // name.
+  repeated RetainedRoot retained_roots = 3;
+}
+
+// WorldOp is one operation of a Space's agreed order against its World.
+message WorldOp {
+  // Body is the operation.
+  oneof body {
+    // InitWorld initializes an empty World.
+    InitWorldOp init_world = 1;
+    // ApplyTxOp applies a World transaction.
+    ApplyTxOp apply_tx_op = 2;
+    // SetRetainedRoot retains or releases a past World root.
+    SetRetainedRootOp set_retained_root = 4;
+    // SetTransformConf changes the transform later World blocks are written
+    // with.
+    SetTransformConfOp set_transform_conf = 5;
+    // GraphSettingsStep moves the World's graph store one bounded step toward
+    // new graph settings.
+    GraphSettingsStepOp graph_settings_step = 6;
+    // Fence asks every writer device for the roots it holds, before a
+    // storage reclaim pass judges which blocks of the shared backend are live.
+    FenceOp fence = 7;
+    // RootSet answers a fence with the roots its author holds.
+    RootSetOp root_set = 8;
+  }
+}
+
+// FenceOp asks every writer device of the Space for the roots it holds. It
+// changes nothing in the World. A device answers after every operation it
+// started before it saw the fence, so the answer covers what it may still
+// reference.
+message FenceOp {
+  // Pass identifies the reclaim pass.
+  string pass = 1;
+}
+
+// RootSetOp answers a fence with every root its author's device holds for the
+// Space. It changes nothing in the World.
+message RootSetOp {
+  // Fence is the hash of the FenceOp it answers.
+  bytes fence = 1;
+  // Roots are the blocks the device holds under its named roots.
+  repeated .block.BlockRef roots = 2;
+}
+
+// InitWorldOp initializes an empty World.
+message InitWorldOp {
+  // LastChangeDisable starts the World without a changelog.
+  bool last_change_disable = 1;
+  // TransformConf is the transform the World's blocks are written with. The
+  // author sets it so every member replays the same World; replay rejects an
+  // operation without it.
+  .block.transform.Config transform_conf = 2;
+  // GraphSettings are the settings the World's graph store starts with.
+  // Empty means the default settings.
+  .world.block.GraphSettings graph_settings = 3;
+}
+
+// ApplyTxOp applies a World transaction.
+message ApplyTxOp {
+  // Tx is the transaction or transaction batch to apply.
+  .world.block.tx.Tx tx = 1;
+}
+
+// SetRetainedRootOp retains a past World root under a name, replacing a root
+// with the same name, or releases the name when root_ref is empty.
+message SetRetainedRootOp {
+  // Name identifies the root within the Space.
+  string name = 1;
+  // RootRef is the World root block to retain, or empty to release.
+  .block.BlockRef root_ref = 2;
+}
+
+// SetTransformConfOp changes the transform the World writes blocks with.
+// Replay accepts only a transform that also reads every block the current
+// one wrote.
+message SetTransformConfOp {
+  // TransformConf is the new World transform.
+  .block.transform.Config transform_conf = 1;
+}
+
+// GraphSettingsStepOp moves the World's graph store one bounded step toward
+// new graph settings, such as building or dropping an index. A step on a World
+// that already has the target settings changes nothing.
+message GraphSettingsStepOp {
+  // Target are the graph settings to move to. Empty means the default
+  // settings.
+  .world.block.GraphSettings target = 1;
+  // Max bounds the links the step indexes or the postings it deletes.
+  uint32 max = 2;
+}
+
+// RetainedRoot is a past World root kept restorable under a name.
+message RetainedRoot {
+  // Name identifies the root within the Space.
+  string name = 1;
+  // RootRef is the World root block. It uses the head's transform config.
+  .block.BlockRef root_ref = 2;
+}
+
+// RetainedRootSet is the block the retained root holds: every retained World
+// root of the installed head. Its outgoing refs are the retained roots.
+message RetainedRootSet {
+  // Roots are the retained roots, sorted by name.
+  repeated RetainedRoot roots = 1;
+}
+
+// HeldRoots is a block that holds several roots under one named root, such
+// as the payloads above the checkpoint, a backfill copy or a fence's live
+// roots. Its outgoing refs are the roots.
+message HeldRoots {
+  // Roots are the held roots, in the order the holder gave them.
+  repeated .block.BlockRef roots = 1;
+  // Prev is an earlier HeldRoots block whose roots, and its own earlier
+  // blocks' roots, are held before these, or empty. An append names the
+  // block it extends instead of naming every root again.
+  .block.BlockRef prev = 2;
+}
+
+// ReplaySpan is the block a Space engine before the adapter held under its
+// replay-span root: the Worlds after the replayed operations above the
+// checkpoint and their payloads, in a chain. The adapter writes none; the
+// child list repair of a Volume written before it reads them.
+message ReplaySpan {
+  // Worlds are the World root blocks in replay order.
+  repeated .block.BlockRef worlds = 1;
+  // Payloads are the operation payload roots in replay order.
+  repeated .block.BlockRef payloads = 2;
+  // Prev is the span block holding the earlier operations, or empty.
+  .block.BlockRef prev = 3;
+}
+
+// ReplayCursor is the replay a Space engine last saved on this device, so a
+// remount resumes after it instead of replaying from the checkpoint. It names
+// a head World only once the replay cursor root holds that World.
+message ReplayCursor {
+  // Base is the World of the checkpoint the replay started from.
+  InnerState base = 1;
+  // Outcomes are the replayed operations in order.
+  repeated ReplayCursorOutcome outcomes = 2;
+  // Head is the World after the last outcome.
+  InnerState head = 3;
+  // Height is the height of the checkpoint whose World is Base.
+  uint64 height = 7;
+  // Fields 4 to 6 held the deadlist ledger.
+  reserved 4, 5, 6;
+}
+
+// ReplayCursorOutcome is the outcome of one replayed operation.
+message ReplayCursorOutcome {
+  // Hash identifies the operation.
+  bytes hash = 1;
+  // Reason is empty when the operation applied, and otherwise says why not.
+  string reason = 2;
+  // Fields 3 and 4 held the conflict and revoked flags.
+  reserved 3, 4;
+  // World is the root block of the World after the operation.
+  .block.BlockRef world = 5;
+  // Payloads are the roots of the operation's payload.
+  repeated .block.BlockRef payloads = 6;
+  // RetainedRoots are the retained roots after the operation when they
+  // differ from those before it, and unset when the operation kept them.
+  RetainedRootSet retained_roots = 7;
+  // Seqno is the World seqno after the operation.
+  uint64 seqno = 8;
+}
+
+// BackfillState is the outcome of the last finished backfill copy on this
+// device.
+message BackfillState {
+  // Root is the World root of the installed checkpoint the copy covered.
+  // The copy also covered the retained roots of the installed head.
+  .block.BlockRef root = 1;
+  // Holes counts the blocks of those roots that no reachable store held.
+  // Zero means the local store holds every block of them.
+  uint32 holes = 2;
+  // Seqno is the World seqno of Root. A later copy never covers a lower one.
+  uint64 seqno = 3;
+}

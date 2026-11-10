@@ -1,0 +1,95 @@
+package space_world_ops
+
+import (
+	"context"
+	"slices"
+
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_canvas "github.com/s4wave/spacewave/sdk/canvas"
+	"github.com/sirupsen/logrus"
+)
+
+// NewCanvasRemoveNodeOp constructs a new CanvasRemoveNodeOp block.
+func NewCanvasRemoveNodeOp(objKey string, nodeIDs []string) *CanvasRemoveNodeOp {
+	return &CanvasRemoveNodeOp{
+		ObjectKey: objKey,
+		NodeIds:   nodeIDs,
+	}
+}
+
+// Validate performs cursory checks on the op.
+func (o *CanvasRemoveNodeOp) Validate() error {
+	if len(o.GetObjectKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	if len(o.GetNodeIds()) == 0 {
+		return ErrNodeIdsRequired
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *CanvasRemoveNodeOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Validate the canvas node removal before accessing its object.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+
+	// Select the canvas object and node IDs to remove.
+	objKey := o.GetObjectKey()
+	nodeIDs := o.GetNodeIds()
+
+	// Build a set of node IDs to remove.
+	removedSet := make(map[string]struct{}, len(nodeIDs))
+	for _, id := range nodeIDs {
+		removedSet[id] = struct{}{}
+	}
+
+	// Update the canvas object with nodes and their incident edges removed.
+	_, _, err = world.AccessWorldObject(ctx, worldHandle, objKey, true, func(bcs *block.Cursor) error {
+		// Load the canvas state or prepare an empty state.
+		state, uerr := s4wave_canvas.UnmarshalCanvasState(ctx, bcs)
+		if uerr != nil {
+			return uerr
+		}
+		if state == nil {
+			state = &s4wave_canvas.CanvasState{}
+		}
+
+		// Preserve the canvas state before removing nodes and edges.
+		previous := state.CloneVT()
+
+		// Remove nodes.
+		for id := range removedSet {
+			delete(state.Nodes, id)
+		}
+
+		// Remove edges referencing deleted nodes.
+		for i, edge := range slices.Backward(state.Edges) {
+			if _, removed := removedSet[edge.GetSourceNodeId()]; removed {
+				state.Edges = append(state.Edges[:i], state.Edges[i+1:]...)
+				continue
+			}
+			if _, removed := removedSet[edge.GetTargetNodeId()]; removed {
+				state.Edges = append(state.Edges[:i], state.Edges[i+1:]...)
+			}
+		}
+
+		return s4wave_canvas.WriteCanvasState(ctx, bcs, previous, state)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+// _ is a type assertion
+var _ world.Operation = (*CanvasRemoveNodeOp)(nil)

@@ -1,0 +1,81 @@
+package provider_local
+
+import (
+	"context"
+	"time"
+
+	account_settings "github.com/s4wave/spacewave/core/account/settings"
+	block_store_s3 "github.com/s4wave/spacewave/db/block/store/s3"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/sirupsen/logrus"
+)
+
+// CheckS3Location writes, reads back, and deletes a probe object in the
+// bucket, and classifies the first failure.
+func CheckS3Location(
+	ctx context.Context,
+	location *account_settings.S3Location,
+	creds *block_store_s3.Credentials,
+) *block_store_s3.CheckResult {
+	client, err := buildS3Client(location, creds)
+	if err != nil {
+		return &block_store_s3.CheckResult{
+			Outcome: block_store_s3.CheckOutcome_CHECK_OUTCOME_FAILED,
+			Detail:  err.Error(),
+		}
+	}
+	return block_store_s3.CheckBucket(ctx, client, location.GetBucket(), location.GetObjectPrefix())
+}
+
+// buildS3BlockStore opens the block store's packfile store on the location's
+// bucket.
+func buildS3BlockStore(
+	le *logrus.Entry,
+	location *account_settings.S3Location,
+	blockStoreID string,
+	creds *block_store_s3.Credentials,
+	index kvtx.Store,
+) (backendStore, error) {
+	client, err := buildS3Client(location, creds)
+	if err != nil {
+		return nil, err
+	}
+	return block_store_s3.NewPackStore(le, client, location.GetBucket(), location.BlockStorePrefix(blockStoreID), &block_store_s3.PackStoreOptions{
+		Pricing:   location.GetPricing(),
+		KeepPacks: location.GetKeepPacks(),
+		Index:     index,
+		IndexOnly: location.GetIndexOnly(),
+		// A value past int64 wraps negative, which the store reads as the default.
+		MaxPackBytes:  int64(location.GetMaxPackBytes()), //nolint:gosec // see above.
+		Linger:        time.Duration(location.GetLingerSeconds()) * time.Second,
+		ReadOnlyIndex: serveOnly.Load(),
+	}), nil
+}
+
+// deleteS3BlockStore deletes the block store's objects from the location's
+// bucket.
+func deleteS3BlockStore(
+	ctx context.Context,
+	location *account_settings.S3Location,
+	blockStoreID string,
+	creds *block_store_s3.Credentials,
+) error {
+	client, err := buildS3Client(location, creds)
+	if err != nil {
+		return err
+	}
+	return block_store_s3.DeletePackStore(ctx, client, location.GetBucket(), location.BlockStorePrefix(blockStoreID))
+}
+
+// buildS3Client builds a signing client for the location's endpoint.
+func buildS3Client(
+	location *account_settings.S3Location,
+	creds *block_store_s3.Credentials,
+) (*block_store_s3.Client, error) {
+	return block_store_s3.BuildClient(&block_store_s3.ClientConfig{
+		Endpoint:    location.GetEndpoint(),
+		Credentials: creds,
+		DisableSsl:  location.GetDisableSsl(),
+		Region:      location.GetRegion(),
+	})
+}

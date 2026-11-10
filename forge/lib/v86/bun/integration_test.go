@@ -1,0 +1,408 @@
+package forge_lib_v86_bun
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	timestamp "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	billy_util "github.com/go-git/go-billy/v6/util"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	"github.com/s4wave/spacewave/db/unixfs"
+	unixfs_billy "github.com/s4wave/spacewave/db/unixfs/billy"
+	unixfs_block "github.com/s4wave/spacewave/db/unixfs/block"
+	unixfs_block_fs "github.com/s4wave/spacewave/db/unixfs/block/fs"
+	unixfs_sync "github.com/s4wave/spacewave/db/unixfs/sync"
+	unixfs_tar "github.com/s4wave/spacewave/db/unixfs/tar"
+	unixfs_world "github.com/s4wave/spacewave/db/unixfs/world"
+	"github.com/s4wave/spacewave/db/world"
+	forge_target "github.com/s4wave/spacewave/forge/target"
+	target_json "github.com/s4wave/spacewave/forge/target/json"
+	"github.com/s4wave/spacewave/forge/testbed"
+	forge_value "github.com/s4wave/spacewave/forge/value"
+)
+
+// skipIfNoV86 checks that V86_DIR and V86FS_DIR are set and point to
+// valid directories. Skips the test if artifacts are not available.
+func skipIfNoV86(t *testing.T) (v86Dir, v86fsDir string) {
+	// Require configured v86 and rootfs directories before running the guest.
+	t.Helper()
+	v86Dir = os.Getenv("V86_DIR")
+	v86fsDir = os.Getenv("V86FS_DIR")
+	if v86Dir == "" {
+		t.Skip("V86_DIR not set (path to v86 repo with build/, bios/, src/)")
+	}
+	if v86fsDir == "" {
+		t.Skip("V86FS_DIR not set (path to rootfs with bzImage, fs.json, flat/)")
+	}
+
+	// Require the guest runtime, BIOS, kernel, and rootfs artifacts to exist.
+	for _, p := range []string{
+		filepath.Join(v86Dir, "build", "v86-debug.wasm"),
+		filepath.Join(v86Dir, "bios", "seabios.bin"),
+		filepath.Join(v86Dir, "src", "main.ts"),
+		filepath.Join(v86fsDir, "bzImage"),
+		filepath.Join(v86fsDir, "rootfs.tar"),
+	} {
+		if _, err := os.Stat(p); err != nil { //nolint:gosec
+			t.Skipf("required artifact missing: %s", p)
+		}
+	}
+	return v86Dir, v86fsDir
+}
+
+// scriptDir returns the absolute path to this package directory.
+// boot.ts and v86fs-bridge.ts live here.
+func scriptDir(t *testing.T) string {
+	// Locate the package boot script and require it to exist.
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Require the package directory to contain the Bun boot script.
+	if _, err := os.Stat(dir + "/boot.ts"); err != nil {
+		t.Fatalf("boot.ts not found in %s", dir)
+	}
+	return dir
+}
+
+// TestV86Execution boots a v86 VM through the full forge execution pipeline,
+// runs a command that writes to /output, and verifies the output BlockRef
+// contains the expected file.
+func TestV86Execution(t *testing.T) {
+	// Require a full test run and locate the v86 guest artifacts.
+	if testing.Short() {
+		t.Skip("skipping v86 integration test in short mode")
+	}
+	v86Dir, v86fsDir := skipIfNoV86(t)
+	sdir := scriptDir(t)
+
+	// Provide the guest artifact paths to the Bun boot script.
+	t.Setenv("V86_DIR", v86Dir)
+	t.Setenv("V86FS_DIR", v86fsDir)
+
+	// Bound the guest execution lifetime and release its context afterward.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	// Start a Forge testbed with the v86 Bun controller factory.
+	tb, err := testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	tb.StaticResolver.AddFactory(NewFactory(tb.Bus))
+
+	// Import the rootfs into a World object for the guest input.
+	rootfsTar := v86fsDir + "/rootfs.tar"
+	t.Setenv("V86FS_DIR", "")
+	rootfsObj := importV86RootfsTarForTest(t, ctx, tb, rootfsTar, "v86-test/rootfs")
+	defer world.ReleaseObjectState(rootfsObj)
+
+	// Resolve a Forge target that writes a file using the imported rootfs.
+	yaml := `
+inputs:
+  - name: rootfs
+    inputType: InputType_WORLD_OBJECT
+    worldObject:
+      objectKey: "v86-test/rootfs"
+outputs:
+  - name: output
+    outputType: OutputType_EXEC
+    execOutput: "output"
+exec:
+  controller:
+    id: forge/lib/v86/bun
+    config:
+      commands:
+        - "echo hello-from-v86 > /tmp/output/test.txt"
+      output_dir: "/tmp/output"
+      script_dir: "` + sdir + `"
+      memory_mb: 256
+`
+	tgt, err := target_json.ResolveYAML(ctx, tb.Bus, []byte(yaml))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Snapshot the imported rootfs for the Forge execution inputs.
+	ts := timestamp.Now()
+	rootfsSnapshot, err := forge_value.NewWorldObjectSnapshot(ctx, rootfsObj, tb.WorldState)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	valueSet := &forge_target.ValueSet{
+		Inputs: forge_value.ValueSlice{
+			forge_value.NewValueWithWorldObjectSnapshot("rootfs", rootfsSnapshot),
+		},
+	}
+
+	// Run the target until Forge produces its final execution state.
+	finalState, err := tb.RunExecutionWithTarget(tgt, valueSet, ts)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Extract output and verify file content.
+	outputs := forge_value.ValueSlice(finalState.GetValueSet().GetOutputs())
+	valMap, err := outputs.BuildValueMap(true, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Require the completed guest execution to publish an output value.
+	outVal := valMap["output"]
+	if outVal == nil || outVal.IsEmpty() {
+		t.Fatal("expected output value to be set")
+	}
+
+	// Verify the guest command wrote the expected output file.
+	verifyUnixFSOutput(t, ctx, tb, outVal, "test.txt", []byte("hello-from-v86\n"))
+}
+
+func importV86RootfsTarForTest(
+	t *testing.T,
+	ctx context.Context,
+	tb *testbed.Testbed,
+	tarPath string,
+	objKey string,
+) world.ObjectState {
+	// Open the rootfs tar and attribute import failures to the calling test.
+	t.Helper()
+	file, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer file.Close()
+
+	// Open a UnixFS cursor and handle over the rootfs tar.
+	cursor, err := unixfs_tar.NewTarFSCursorFromReader(file)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer cursor.Release()
+
+	// Wrap the tar cursor for copying its filesystem into the World.
+	handle, err := unixfs.NewFSHandle(cursor)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer handle.Release()
+
+	// Initialize the World filesystem and copy the rootfs into it.
+	fsType := unixfs_world.FSType_FSType_FS_NODE
+	if _, _, err := unixfs_world.FsInit(ctx, tb.WorldState, tb.Volume.GetPeerID(), objKey, fsType, nil, true, time.Now()); err != nil {
+		t.Fatal(err.Error())
+	}
+	b := unixfs_world.NewBatchFSWriter(tb.WorldState, objKey, fsType, tb.Volume.GetPeerID())
+	defer b.Release()
+
+	// Copy the tar filesystem into the initialized World object.
+	if err := unixfs_sync.SyncToUnixfsBatch(ctx, b, handle, nil); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Retrieve the imported rootfs object for the Forge input snapshot.
+	obj, found, err := tb.WorldState.GetObject(ctx, objKey)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !found {
+		t.Fatalf("imported rootfs object %q not found", objKey)
+	}
+	return obj
+}
+
+// TestV86ExecutionChain runs two v86 executions in sequence. The first
+// writes a file to /output. The second mounts the first's output as an
+// input, reads the file, and writes a derived file to its own /output.
+func TestV86ExecutionChain(t *testing.T) {
+	// Require a full test run and locate the v86 guest artifacts.
+	if testing.Short() {
+		t.Skip("skipping v86 integration test in short mode")
+	}
+	v86Dir, v86fsDir := skipIfNoV86(t)
+	sdir := scriptDir(t)
+
+	// Provide the guest artifact paths to both Bun executions.
+	t.Setenv("V86_DIR", v86Dir)
+	t.Setenv("V86FS_DIR", v86fsDir)
+
+	// Bound the two-stage guest lifetime and release its context afterward.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Start a Forge testbed with storage shared by both guest stages.
+	tb, err := testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	ws := tb.WorldState
+	tb.StaticResolver.AddFactory(NewFactory(tb.Bus))
+
+	// --- Stage A: write a file to /output ---
+	rootfsTar := v86fsDir + "/rootfs.tar"
+	yamlA := `
+outputs:
+  - name: output
+    outputType: OutputType_EXEC
+    execOutput: "output"
+exec:
+  controller:
+    id: forge/lib/v86/bun
+    config:
+      commands:
+        - "echo stage-a-data > /tmp/output/result.txt"
+      output_dir: "/tmp/output"
+      script_dir: "` + sdir + `"
+      rootfs_tar_path: "` + rootfsTar + `"
+      memory_mb: 256
+`
+	tgtA, err := target_json.ResolveYAML(ctx, tb.Bus, []byte(yamlA))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Run stage A to create the first guest output tree.
+	ts := timestamp.Now()
+	stateA, err := tb.RunExecutionWithTarget(tgtA, &forge_target.ValueSet{}, ts)
+	if err != nil {
+		t.Fatalf("stage A: %v", err)
+	}
+
+	// Require stage A to publish the output tree used by stage B.
+	outputsA := forge_value.ValueSlice(stateA.GetValueSet().GetOutputs())
+	valMapA, err := outputsA.BuildValueMap(true, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	outValA := valMapA["output"]
+	if outValA == nil || outValA.IsEmpty() {
+		t.Fatal("stage A produced no output")
+	}
+	t.Log("stage A complete, output captured")
+
+	// Store stage A output as a world object so stage B can reference it.
+	stageARef := outValA.GetBucketRef()
+	stageAObj, err := ws.CreateObject(ctx, "stage-a-output", stageARef)
+	defer world.ReleaseObjectState(stageAObj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	_ = stageAObj
+
+	// --- Stage B: mount stage A output, read + derive ---
+	yamlB := `
+inputs:
+  - name: prev
+    inputType: InputType_WORLD_OBJECT
+    worldObject:
+      objectKey: "stage-a-output"
+outputs:
+  - name: output
+    outputType: OutputType_EXEC
+    execOutput: "output"
+exec:
+  controller:
+    id: forge/lib/v86/bun
+    config:
+      commands:
+        - "cat /tmp/input/prev/result.txt > /tmp/output/derived.txt"
+        - "echo processed-by-stage-b >> /tmp/output/derived.txt"
+      mounts:
+        /tmp/input/prev: prev
+      output_dir: "/tmp/output"
+      script_dir: "` + sdir + `"
+      rootfs_tar_path: "` + rootfsTar + `"
+      memory_mb: 256
+`
+	tgtB, err := target_json.ResolveYAML(ctx, tb.Bus, []byte(yamlB))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Build ValueSet with stage A output as input.
+	inpSnapshot, err := forge_value.NewWorldObjectSnapshot(ctx, stageAObj, ws)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	inpValue := forge_value.NewValueWithWorldObjectSnapshot("prev", inpSnapshot)
+	valueSetB := &forge_target.ValueSet{
+		Inputs: forge_value.ValueSlice{inpValue},
+	}
+
+	// Run stage B with the snapshot of the stage A output.
+	stateB, err := tb.RunExecutionWithTarget(tgtB, valueSetB, ts)
+	if err != nil {
+		t.Fatalf("stage B: %v", err)
+	}
+
+	// Require stage B to publish its derived output tree.
+	outputsB := forge_value.ValueSlice(stateB.GetValueSet().GetOutputs())
+	valMapB, err := outputsB.BuildValueMap(true, false)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	outValB := valMapB["output"]
+	if outValB == nil || outValB.IsEmpty() {
+		t.Fatal("stage B produced no output")
+	}
+	t.Log("stage B complete, output captured")
+
+	// Verify stage B output contains the derived file.
+	verifyUnixFSOutput(t, ctx, tb, outValB, "derived.txt", []byte("stage-a-data\nprocessed-by-stage-b\n"))
+}
+
+// verifyUnixFSOutput reads a file from a forge output value containing a
+// UnixFS tree and checks its content matches expected.
+func verifyUnixFSOutput(
+	t *testing.T,
+	ctx context.Context,
+	tb *testbed.Testbed,
+	val *forge_value.Value,
+	filename string,
+	expected []byte,
+) {
+	// Attribute output verification failures to the calling test.
+	t.Helper()
+
+	// Require the Forge output to contain a stored UnixFS root.
+	bref := val.GetBucketRef()
+	if bref == nil || bref.GetRootRef().GetEmpty() {
+		t.Fatal("output value has no bucket ref")
+	}
+
+	// Read the Forge output through a World storage scope.
+	objRef := &bucket.ObjectRef{RootRef: bref.GetRootRef()}
+	err := tb.WorldState.AccessWorldState(ctx, objRef, func(cs *bucket_lookup.Cursor) error {
+		// Open a read-only UnixFS handle on the output root.
+		fs := unixfs_block_fs.NewFS(ctx, unixfs_block.NodeType_NodeType_DIRECTORY, cs, nil)
+		defer fs.Release()
+		fh, err := unixfs.NewFSHandle(fs)
+		if err != nil {
+			return err
+		}
+		defer fh.Release()
+
+		// Read the output file through BillyFS and compare its contents.
+		bfs := unixfs_billy.NewBillyFS(ctx, fh, "", time.Now())
+		data, err := billy_util.ReadFile(bfs, filename)
+		if err != nil {
+			return err
+		}
+
+		// Verify the guest output file contains the expected command result.
+		if !bytes.Equal(data, expected) {
+			t.Errorf("%s: expected %q, got %q", filename, string(expected), string(data))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}

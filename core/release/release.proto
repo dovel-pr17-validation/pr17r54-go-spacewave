@@ -1,0 +1,83 @@
+syntax = "proto3";
+package release;
+
+import "github.com/s4wave/spacewave/bldr/manifest/manifest.proto";
+import "github.com/s4wave/spacewave/db/block/block.proto";
+
+// ChannelDirectory lists the public release channels in a release Space.
+message ChannelDirectory {
+  // Channels is the list of named release channels.
+  repeated ChannelEntry channels = 1;
+}
+
+// ChannelEntry points one channel key at release metadata.
+message ChannelEntry {
+  // ChannelKey is the stable channel identifier, such as stable or canary.
+  string channel_key = 1;
+  // ReleaseMetadataRef references the ReleaseMetadata for this channel.
+  .block.BlockRef release_metadata_ref = 2;
+}
+
+// ReleaseMetadata describes release-only metadata around bldr manifests.
+message ReleaseMetadata {
+  // ProjectId is the project identifier this release belongs to.
+  string project_id = 1;
+  // Rev is the monotonic release revision.
+  uint64 rev = 2;
+  // Version is the human-readable application version.
+  string version = 3;
+  // ChannelKey is the release channel this metadata belongs to.
+  string channel_key = 4;
+  // ManifestRefs are existing bldr app/plugin manifests resolved by clients.
+  repeated .bldr.manifest.ManifestRef manifest_refs = 5;
+  // BrowserShell is the browser shell/cache metadata.
+  BrowserShellMetadata browser_shell = 6;
+  // MinimumLauncherVersion is the minimum launcher version that can read this
+  // release.
+  string minimum_launcher_version = 7;
+}
+
+// BrowserShellMetadata describes the browser entrypoint shell for a release.
+message BrowserShellMetadata {
+  // Version is the browser shell version.
+  string version = 1;
+  // GenerationId is the browser generation identifier.
+  string generation_id = 2;
+  // EntrypointPath is the app-facing entrypoint script path.
+  string entrypoint_path = 3;
+  // ServiceWorkerPath is the service worker path.
+  string service_worker_path = 4;
+  // SharedWorkerPath is the shared worker path.
+  string shared_worker_path = 5;
+  // WasmPath is the optional native Go runtime WASM path.
+  string wasm_path = 6;
+  // Assets is the set of shell assets.
+  repeated BrowserAsset assets = 7;
+}
+
+// BrowserAsset describes one browser shell asset.
+message BrowserAsset {
+  // Path is the app-facing asset path.
+  string path = 1;
+  // ContentRef references the asset bytes in the release world.
+  .block.BlockRef content_ref = 2;
+  // Size is the asset size in bytes.
+  uint64 size = 3;
+  // Sha256 is the SHA-256 digest of the asset bytes.
+  bytes sha256 = 4;
+  // ContentType is the HTTP content type to serve.
+  string content_type = 5;
+  // CacheControl is the HTTP Cache-Control value to serve.
+  string cache_control = 6;
+}
+
+// UpdateNotification describes a newly available release root.
+message UpdateNotification {
+  // ChannelKey is the release channel that changed.
+  string channel_key = 1;
+  // CheckpointHeight is the height of the observed public checkpoint.
+  uint64 checkpoint_height = 2;
+  // RootPointerUrl is the URL of the root.packedmsg that produced this
+  // notification.
+  string root_pointer_url = 3;
+}

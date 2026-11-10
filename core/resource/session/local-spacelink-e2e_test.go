@@ -1,0 +1,624 @@
+package resource_session_test
+
+import (
+	"context"
+	"crypto/rand"
+	"strings"
+	"testing"
+	"time"
+
+	provider_local "github.com/s4wave/spacewave/core/provider/local"
+	resource_provider "github.com/s4wave/spacewave/core/resource/provider"
+	resource_session "github.com/s4wave/spacewave/core/resource/session"
+	core_session "github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/core/sobject"
+	"github.com/s4wave/spacewave/core/transport"
+	"github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/keypem"
+	"github.com/s4wave/spacewave/net/link"
+	"github.com/s4wave/spacewave/net/peer"
+	transport_dialer "github.com/s4wave/spacewave/net/transport/common/dialer"
+	transport_inproc "github.com/s4wave/spacewave/net/transport/inproc"
+	s4wave_provider_local "github.com/s4wave/spacewave/sdk/provider/local"
+	s4wave_provider_spacewave "github.com/s4wave/spacewave/sdk/provider/spacewave"
+	s4wave_session "github.com/s4wave/spacewave/sdk/session"
+	"github.com/sirupsen/logrus"
+)
+
+const localEnrollmentTestTimeout = 2 * time.Minute
+
+// buildDeviceTicket builds a signed SpaceLink DEVICE ticket for the test.
+func buildDeviceTicket(t *testing.T, priv crypto.PrivKey, agentPeerID peer.ID) (ticketBytes, nonce []byte) {
+	// Mark the helper and generate the ticket's one-use nonce.
+	t.Helper()
+	nonce = make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build the ticket payload for a DEVICE enrollment.
+	payload := &s4wave_provider_spacewave.SpaceLinkAuthRequest{
+		Version:        1,
+		SessionType:    core_session.SessionType_SESSION_TYPE_DEVICE,
+		AgentPeerId:    []byte(agentPeerID),
+		Label:          "e2e device",
+		RequestedRole:  sobject.SOParticipantRole_SOParticipantRole_WRITER,
+		Nonce:          nonce,
+		ExpiresAt:      time.Now().Add(15 * time.Minute).Unix(),
+		CompletionMode: s4wave_provider_spacewave.SpaceLinkCompletionMode_SpaceLinkCompletionMode_CLI,
+	}
+
+	// Marshal the payload, sign it, and wrap it in the ticket.
+	payloadBytes, err := payload.MarshalVT()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := priv.Sign(payloadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticketBytes, err = (&s4wave_provider_spacewave.SpaceLinkAuthTicket{
+		Payload:        payloadBytes,
+		AgentSignature: sig,
+	}).MarshalVT()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ticketBytes, nonce
+}
+
+// connectSessionTransportsForTest connects two session transports via inproc
+// and waits for one established link. Dual-dial from both sides is unstable.
+func connectSessionTransportsForTest(ctx context.Context, t *testing.T, stA, stB *transport.SessionTransport) {
+	// Capture both transports' peer ids and child buses.
+	t.Helper()
+	peerIDA := stA.GetPeerID()
+	peerIDB := stB.GetPeerID()
+	childBusA := stA.GetChildBus()
+	childBusB := stB.GetChildBus()
+
+	// Build a logger for the inproc controllers.
+	le := logrus.NewEntry(logrus.New())
+
+	// Build an inproc transport controller per child bus, each dialing the other.
+	inprocCtrlA := transport_inproc.BuildInprocController(le, childBusA, "", &transport_inproc.Config{
+		Dialers: map[string]*transport_dialer.DialerOpts{
+			peerIDB.String(): {Address: transport_inproc.NewAddr(peerIDB).String()},
+		},
+	})
+	inprocCtrlB := transport_inproc.BuildInprocController(le, childBusB, "", &transport_inproc.Config{
+		Dialers: map[string]*transport_dialer.DialerOpts{
+			peerIDA.String(): {Address: transport_inproc.NewAddr(peerIDA).String()},
+		},
+	})
+
+	// Add both controllers to their child buses.
+	if _, err := childBusA.AddController(ctx, inprocCtrlA, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := childBusB.AddController(ctx, inprocCtrlB, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Connect the two inproc transports in both directions.
+	tptA, err := inprocCtrlA.GetTransport(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tptB, err := inprocCtrlB.GetTransport(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ipA := tptA.(*transport_inproc.Inproc)
+	ipB := tptB.(*transport_inproc.Inproc)
+	ipA.ConnectToInproc(ctx, ipB)
+	ipB.ConnectToInproc(ctx, ipA)
+
+	// Establish a link between the peers and release it at test end.
+	_, rel, err := link.EstablishLinkWithPeerEx(ctx, childBusA, peerIDA, peerIDB, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rel)
+}
+
+// TestLocalSpaceLinkDeviceEnrollmentEndToEnd covers the full local Device
+// enrollment slice in memory: ticket approval by the OWNER, non-owner
+// rejection before mutation, nonce replay rejection, one-use targeted invite
+// completion from the Device's own key, and restart remount identity.
+func TestLocalSpaceLinkDeviceEnrollmentEndToEnd(t *testing.T) {
+	// Skip the in-memory enrollment e2e in short mode.
+	if testing.Short() {
+		t.Skip("skipping in-memory enrollment e2e in short mode")
+	}
+
+	// Bound the test's lifetime.
+	ctx, cancel := context.WithTimeout(t.Context(), localEnrollmentTestTimeout)
+	defer cancel()
+
+	// Set up the owner and device test environments.
+	ownerEnv := setupTestEnv(ctx, t)
+	deviceEnv := setupTestEnv(ctx, t)
+
+	// Owner account with one Space.
+	ownerSessRef, _ := ownerEnv.createSession(ctx, t)
+	ownerAcc := ownerEnv.accessAccount(ctx, t, ownerSessRef)
+	ownerEnv.createSpaceOnAccount(ctx, t, ownerAcc, "EnrollSpace")
+	spaceID := "enrollspace-id"
+
+	// Keep the owner Space mounted so the invite handshake reaches the
+	// SOHost for the duration of the enrollment.
+	ownerSORef := sobject.NewSharedObjectRef(
+		"local",
+		ownerSessRef.GetProviderResourceRef().GetProviderAccountId(),
+		spaceID,
+		provider_local.SobjectBlockStoreID(spaceID),
+	)
+	ownerSOIface, relOwnerSO, err := ownerAcc.MountSharedObject(ctx, ownerSORef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relOwnerSO()
+	ownerMountedSO, ok := ownerSOIface.(*provider_local.SharedObject)
+	if !ok {
+		t.Fatal("unexpected owner shared object type")
+	}
+
+	// Mount the owner session for the approval.
+	ownerSess, relOwnerSess, err := ownerAcc.MountSession(ctx, ownerSessRef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relOwnerSess()
+
+	// A second, non-owner local session cannot approve the ticket. The
+	// failed attempt must not consume the ticket nonce.
+	otherSessRef, _ := ownerEnv.createSession(ctx, t)
+	otherAcc := ownerEnv.accessAccount(ctx, t, otherSessRef)
+	otherSess, relOtherSess, err := otherAcc.MountSession(ctx, otherSessRef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relOtherSess()
+
+	// Generate the Device and non-owner keypairs and PEM encodings.
+	devicePriv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devicePeerID, err := peer.IDFromPrivateKey(devicePriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devicePEM, err := keypem.MarshalPrivKeyPem(devicePriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Generate the non-owner's keypair and PEM encoding.
+	otherPriv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPEM, err := keypem.MarshalPrivKeyPem(otherPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build the signed Device ticket for the OWNER to approve.
+	ticketBytes, nonce := buildDeviceTicket(t, devicePriv, devicePeerID)
+
+	// Non-owner approval is rejected before any mutation.
+	nonOwnerRes := resource_session.NewLocalSessionResource(ownerEnv.tb.Bus, otherSess)
+	_, err = nonOwnerRes.ApproveSpaceLink(ctx, &s4wave_session.ApproveLocalSpaceLinkRequest{
+		Ticket:     ticketBytes,
+		ResourceId: spaceID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected non-owner rejection, got %v", err)
+	}
+
+	// The OWNER approves the ticket.
+	ownerRes := resource_session.NewLocalSessionResource(ownerEnv.tb.Bus, ownerSess)
+	approvalCtx, cancelApproval := context.WithCancel(ctx)
+	resp, err := ownerRes.ApproveSpaceLink(approvalCtx, &s4wave_session.ApproveLocalSpaceLinkRequest{
+		Ticket:     ticketBytes,
+		ResourceId: spaceID,
+	})
+	cancelApproval()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert the completion names the local provider, Space, and Device.
+	completion := resp.GetCompletion()
+	if completion == nil {
+		t.Fatal("approval returned no completion")
+	}
+	if completion.GetProviderId() != "local" {
+		t.Fatalf("unexpected provider id %q", completion.GetProviderId())
+	}
+	if completion.GetResourceId() != spaceID {
+		t.Fatalf("unexpected resource id %q", completion.GetResourceId())
+	}
+	if string(completion.GetSessionPeerId()) != string(devicePeerID) {
+		t.Fatal("completion peer does not match device identity")
+	}
+	if string(completion.GetNonce()) != string(nonce) {
+		t.Fatal("completion nonce does not match ticket nonce")
+	}
+
+	// Assert the invite is one-use, targeted, and matches the requested role.
+	invite := completion.GetInvite()
+	if invite == nil {
+		t.Fatal("completion carries no invite")
+	}
+	if invite.GetTargetPeerId() != devicePeerID.String() {
+		t.Fatal("invite is not targeted at the device peer")
+	}
+	if invite.GetMaxUses() != 1 {
+		t.Fatalf("invite is not one-use: %d", invite.GetMaxUses())
+	}
+	if invite.GetRole() != sobject.SOParticipantRole_SOParticipantRole_WRITER {
+		t.Fatal("invite role does not match requested role")
+	}
+
+	// Replaying the same ticket is rejected.
+	_, err = ownerRes.ApproveSpaceLink(ctx, &s4wave_session.ApproveLocalSpaceLinkRequest{
+		Ticket:     ticketBytes,
+		ResourceId: spaceID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "already consumed") {
+		t.Fatalf("expected nonce replay rejection, got %v", err)
+	}
+
+	// The enrollment RPC rejects a key that does not match the expected
+	// session peer id before creating any local state.
+	le := logrus.NewEntry(logrus.New())
+	deviceProvRes := resource_provider.NewLocalProviderResource(
+		resource_provider.NewProviderResource(le, deviceEnv.tb.Bus, deviceEnv.prov),
+		le,
+		deviceEnv.tb.Bus,
+		deviceEnv.prov,
+	)
+	_, err = deviceProvRes.CompleteSpaceLinkEnrollment(ctx, &s4wave_provider_local.CompleteSpaceLinkEnrollmentRequest{
+		SessionPemPrivateKey: otherPEM,
+		SessionPeerId:        devicePeerID.String(),
+		Invite:               invite,
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match expected session peer id") {
+		t.Fatalf("expected peer id mismatch rejection, got %v", err)
+	}
+
+	// The Device daemon creates its own local session from its durable key
+	// and joins the Space through the one-use targeted invite.
+	deviceSessRef, err := deviceEnv.prov.CreateLocalAccountAndSessionWithKey(ctx, "", devicePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deviceSessRef.GetProviderResourceRef().GetProviderId() != "local" {
+		t.Fatal("device session is not a local session")
+	}
+	if _, err := deviceEnv.sessCtrl.RegisterSession(ctx, deviceSessRef, &core_session.SessionMetadata{
+		ProviderDisplayName: "Local",
+		ProviderId:          "local",
+		ProviderAccountId:   deviceSessRef.GetProviderResourceRef().GetProviderAccountId(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deviceAccIface, relDeviceAcc, err := deviceEnv.prov.AccessProviderAccount(
+		ctx,
+		deviceSessRef.GetProviderResourceRef().GetProviderAccountId(),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relDeviceAcc()
+	deviceAcc := deviceAccIface.(*provider_local.ProviderAccount)
+
+	// Mount the Device session and assert it reopened its durable identity.
+	deviceSess, relDeviceSess, err := deviceAcc.MountSession(ctx, deviceSessRef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deviceSess.GetPeerId().String() != devicePeerID.String() {
+		t.Fatalf("device session reopened as %s, want %s", deviceSess.GetPeerId(), devicePeerID)
+	}
+
+	// Approval starts the owner's invite service on its mounted session
+	// transport. Connect the Device transport, then exercise the same invite
+	// RPC that the cross-host CLI uses.
+	ownerTransport := ownerAcc.GetSessionTransport()
+	if ownerTransport == nil {
+		t.Fatal("approval did not retain the owner session transport")
+	}
+
+	// Assert the owner never dials the Device's link itself.
+	for _, di := range ownerTransport.GetChildBus().GetDirectives() {
+		establish, ok := di.GetDirective().(link.EstablishLinkWithPeer)
+		if ok && establish.EstablishLinkSourcePeerId() == ownerTransport.GetPeerID() &&
+			establish.EstablishLinkTargetPeerId() == devicePeerID {
+			t.Fatal("approval made the owner compete with the Device to establish the same WebRTC link")
+		}
+	}
+
+	// Configure the Device transport and connect both transports.
+	defer ownerAcc.StopSessionTransport()
+	defer ownerAcc.StopP2PSync()
+	if err := deviceAcc.EnsureConfiguredSessionTransport(ctx, devicePriv); err != nil {
+		t.Fatal(err)
+	}
+	defer deviceAcc.StopSessionTransport()
+	connectSessionTransportsForTest(ctx, t, deviceAcc.GetSessionTransport(), ownerTransport)
+
+	// Join the Space through the one-use targeted invite.
+	joinCtx, cancelJoin := context.WithCancel(ctx)
+	joinResult, err := deviceAcc.JoinViaInvite(joinCtx, devicePriv, invite, "")
+	cancelJoin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert the join returned the grant and shared object state.
+	if joinResult == nil || joinResult.Grant == nil {
+		t.Fatal("invite join returned no grant")
+	}
+	if joinResult.SharedObjectState == nil {
+		t.Fatal("invite join returned no owner shared object state")
+	}
+
+	// The joined snapshot must include the owner's post-acceptance invite use
+	// count so native and projected views observe the same authoritative state.
+	foundInvite := false
+	for _, returnedInvite := range joinResult.SharedObjectState.GetInvites() {
+		if returnedInvite.GetInviteId() != invite.GetInviteId() {
+			continue
+		}
+		foundInvite = true
+		if returnedInvite.GetUses() != 1 {
+			t.Fatalf("joined invite uses = %d, want 1", returnedInvite.GetUses())
+		}
+		break
+	}
+	if !foundInvite {
+		t.Fatalf("joined state omitted invite %q", invite.GetInviteId())
+	}
+
+	// The originating owner retains decryption authority over the joined copy.
+	ownerPeerID := ownerMountedSO.GetPeerID().String()
+	var ownerGrant *sobject.SOGrant
+	for _, grant := range joinResult.SharedObjectState.CurrentKeyEpoch().GetGrants() {
+		if grant.GetPeerId() == ownerPeerID {
+			ownerGrant = grant
+		}
+	}
+	if _, err := ownerGrant.DecryptInnerData(ownerMountedSO.GetPrivKey(), spaceID); err != nil {
+		t.Fatalf("originating owner cannot decrypt joined state: %v", err)
+	}
+
+	// Wait past the join request's lifetime and retain the owner peer.
+	joinRelease := time.NewTimer(250 * time.Millisecond)
+	defer joinRelease.Stop()
+	select {
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	case <-joinRelease.C:
+	}
+	if err := deviceAcc.RetainP2PPeer(ctx, ownerTransport.GetPeerID()); err != nil {
+		t.Fatalf("enrollment request released P2P sync: %v", err)
+	}
+
+	// Reopening an already-joined enrollment follows a separate path. Its
+	// request lifetime must not become the P2P lifetime either.
+	deviceAcc.StopP2PSync()
+	reopenCtx, cancelReopen := context.WithCancel(ctx)
+	_, err = deviceProvRes.CompleteSpaceLinkEnrollment(reopenCtx, &s4wave_provider_local.CompleteSpaceLinkEnrollmentRequest{
+		SessionPemPrivateKey: devicePEM,
+		SessionPeerId:        devicePeerID.String(),
+		Invite:               invite,
+	})
+	cancelReopen()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait past the reopen request's lifetime and retain the owner peer again.
+	reopenRelease := time.NewTimer(250 * time.Millisecond)
+	defer reopenRelease.Stop()
+	select {
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	case <-reopenRelease.C:
+	}
+	if err := deviceAcc.RetainP2PPeer(ctx, ownerTransport.GetPeerID()); err != nil {
+		t.Fatalf("reopened enrollment request released P2P sync: %v", err)
+	}
+
+	// A fresh approval for the enrolled Device is redeemed again, so the
+	// Device's copy records the new invite and takes the owner's configuration.
+	freshTicket, _ := buildDeviceTicket(t, devicePriv, devicePeerID)
+	freshResp, err := ownerRes.ApproveSpaceLink(ctx, &s4wave_session.ApproveLocalSpaceLinkRequest{
+		Ticket:     freshTicket,
+		ResourceId: spaceID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshInvite := freshResp.GetCompletion().GetInvite()
+	if freshInvite.GetInviteId() == invite.GetInviteId() {
+		t.Fatal("fresh approval reused the redeemed invite")
+	}
+	if _, err := deviceProvRes.CompleteSpaceLinkEnrollment(ctx, &s4wave_provider_local.CompleteSpaceLinkEnrollmentRequest{
+		SessionPemPrivateKey: devicePEM,
+		SessionPeerId:        devicePeerID.String(),
+		Invite:               freshInvite,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The Device's copy of the Space records the fresh invite.
+	enrolledSORef := sobject.NewSharedObjectRef("local", deviceSessRef.GetProviderResourceRef().GetProviderAccountId(), spaceID, provider_local.SobjectBlockStoreID(spaceID))
+	enrolledSO, relEnrolledSO, err := deviceAcc.MountSharedObject(ctx, enrolledSORef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relEnrolledSO()
+	enrolledState, err := enrolledSO.(*provider_local.SharedObject).GetSOHostState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sobject.FindInvite(enrolledState, freshInvite.GetInviteId()) == nil {
+		t.Fatal("enrolled Device did not redeem the fresh invite")
+	}
+
+	// Assert the join targeted the Space and the Device peer.
+	if joinResult.SharedObjectID != spaceID {
+		t.Fatalf("unexpected joined shared object %q", joinResult.SharedObjectID)
+	}
+	if joinResult.Grant.GetPeerId() != devicePeerID.String() {
+		t.Fatal("grant does not target the device peer")
+	}
+
+	// The grant and Space membership persist for the device account.
+	deviceAccountID := deviceSessRef.GetProviderResourceRef().GetProviderAccountId()
+	deviceSORef := sobject.NewSharedObjectRef("local", deviceAccountID, spaceID, provider_local.SobjectBlockStoreID(spaceID))
+	deviceSO, relDeviceSO, err := deviceAcc.MountSharedObject(ctx, deviceSORef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relDeviceSO()
+
+	// Read the joined Space's host state from the device copy.
+	localDeviceSO, ok := deviceSO.(*provider_local.SharedObject)
+	if !ok {
+		t.Fatal("unexpected shared object type")
+	}
+	deviceSOState, err := localDeviceSO.GetSOHostState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert the Device and storage grants exist and the storage grant decrypts.
+	foundGrant := false
+	foundStorageGrant := false
+	storagePeerID := localDeviceSO.GetPeerID().String()
+	for _, grant := range deviceSOState.CurrentKeyEpoch().GetGrants() {
+		switch grant.GetPeerId() {
+		case devicePeerID.String():
+			foundGrant = true
+		case storagePeerID:
+			foundStorageGrant = true
+			if _, err := grant.DecryptInnerData(localDeviceSO.GetPrivKey(), spaceID); err != nil {
+				t.Fatalf("storage identity cannot decrypt joined state: %v", err)
+			}
+		}
+	}
+	if !foundGrant {
+		t.Fatal("device SO state is missing the device grant")
+	}
+	if !foundStorageGrant {
+		t.Fatal("device SO state is missing the storage grant")
+	}
+
+	// Assert the storage signer joined as a WRITER participant.
+	foundStorageParticipant := false
+	for _, participant := range deviceSOState.GetConfig().GetParticipants() {
+		if participant.GetPeerId() == storagePeerID &&
+			participant.GetRole() == sobject.SOParticipantRole_SOParticipantRole_WRITER {
+			foundStorageParticipant = true
+		}
+	}
+	if !foundStorageParticipant {
+		t.Fatal("device SO state is missing the storage participant")
+	}
+
+	// Assert the joined Space appears as a shared entry on the device account.
+	foundEntry := false
+	for _, soEntry := range deviceAcc.GetSOListCtr().GetValue().GetSharedObjects() {
+		if soEntry.GetRef().GetProviderResourceRef().GetId() == spaceID && soEntry.GetSource() == "shared" {
+			foundEntry = true
+		}
+	}
+	if !foundEntry {
+		t.Fatal("device SO list is missing the joined Space")
+	}
+
+	// Assert the owner's Space lists the enrolled Device as a WRITER.
+	ownerState, err := ownerMountedSO.GetSOHostState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundParticipant := false
+	for _, participant := range ownerState.GetConfig().GetParticipants() {
+		if participant.GetPeerId() == devicePeerID.String() &&
+			participant.GetRole() == sobject.SOParticipantRole_SOParticipantRole_WRITER {
+			foundParticipant = true
+		}
+	}
+	if !foundParticipant {
+		t.Fatal("owner space is missing the enrolled Device participant")
+	}
+
+	// The joined Device copy contains a local storage signer marked OWNER,
+	// but it did not originate the Space and cannot enroll another Device.
+	childPriv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPeerID, err := peer.IDFromPrivateKey(childPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childTicket, _ := buildDeviceTicket(t, childPriv, childPeerID)
+	deviceRes := resource_session.NewLocalSessionResource(deviceEnv.tb.Bus, deviceSess)
+	_, err = deviceRes.ApproveSpaceLink(ctx, &s4wave_session.ApproveLocalSpaceLinkRequest{
+		Ticket:     childTicket,
+		ResourceId: spaceID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "originating local account") {
+		t.Fatalf("expected joined Device approval rejection, got %v", err)
+	}
+
+	// Restart remount: release the device session, then re-mount it. The
+	// session tracker reloads its stored key and identity, and the grant
+	// remains on the persisted Space.
+	relDeviceSO()
+	relDeviceSess()
+
+	// Remount the session and assert it keeps the Device identity.
+	restartedSess, relRestartedSess, err := deviceAcc.MountSession(ctx, deviceSessRef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relRestartedSess()
+	if restartedSess.GetPeerId().String() != devicePeerID.String() {
+		t.Fatal("remounted session lost its device identity")
+	}
+
+	// Remount the Space and assert the device grant persisted.
+	restartedSO, relRestartedSO, err := deviceAcc.MountSharedObject(ctx, deviceSORef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relRestartedSO()
+	localRestartedSO, ok := restartedSO.(*provider_local.SharedObject)
+	if !ok {
+		t.Fatal("unexpected shared object type after remount")
+	}
+
+	// Read the remounted Space's state and assert the device grant survived.
+	restartedState, err := localRestartedSO.GetSOHostState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundGrant = false
+	for _, grant := range restartedState.CurrentKeyEpoch().GetGrants() {
+		if grant.GetPeerId() == devicePeerID.String() {
+			foundGrant = true
+		}
+	}
+	if !foundGrant {
+		t.Fatal("remounted device SO state is missing the device grant")
+	}
+}

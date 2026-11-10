@@ -1,0 +1,253 @@
+//go:build !js
+
+package spacewave_cli
+
+import (
+	"archive/tar"
+	"bytes"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/aperturerobotics/cli"
+
+	s4wave_vm "github.com/s4wave/spacewave/sdk/vm"
+)
+
+func TestVmCommandShape(t *testing.T) {
+	// Require the top-level vm command and its subcommands in order.
+	cmd := newVmCommand(nil)
+	if cmd.Name != "vm" {
+		t.Fatalf("name = %q, want vm", cmd.Name)
+	}
+	if !hasAlias(cmd.Aliases, "vms") {
+		t.Fatal("vms alias missing")
+	}
+	var names []string
+	for _, sub := range cmd.Subcommands {
+		names = append(names, sub.Name)
+	}
+	want := []string{"list", "info", "create", "start", "stop", "watch", "console", "image", "run"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("subcommands = %v, want %v", names, want)
+	}
+
+	// Require the image group, its alias, and its v86 subcommand.
+	image := cmd.Subcommands[7]
+	if !hasAlias(image.Aliases, "images") {
+		t.Fatal("images alias missing")
+	}
+	if len(image.Subcommands) != 1 {
+		t.Fatalf("image subcommand count = %d, want 1", len(image.Subcommands))
+	}
+	if image.Subcommands[0].Name != "v86" {
+		t.Fatalf("image subcommand[0] = %q, want v86", image.Subcommands[0].Name)
+	}
+
+	// Require the v86 image subcommands.
+	if len(image.Subcommands[0].Subcommands) != 4 {
+		t.Fatalf("v86 subcommand count = %d, want 4", len(image.Subcommands[0].Subcommands))
+	}
+	if image.Subcommands[0].Subcommands[0].Name != "list" {
+		t.Fatalf("v86 subcommand[0] = %q, want list", image.Subcommands[0].Subcommands[0].Name)
+	}
+	if image.Subcommands[0].Subcommands[1].Name != "info" {
+		t.Fatalf("v86 subcommand[1] = %q, want info", image.Subcommands[0].Subcommands[1].Name)
+	}
+	if image.Subcommands[0].Subcommands[2].Name != "copy-from-cdn" {
+		t.Fatalf("v86 subcommand[2] = %q, want copy-from-cdn", image.Subcommands[0].Subcommands[2].Name)
+	}
+	if image.Subcommands[0].Subcommands[3].Name != "import" {
+		t.Fatalf("v86 subcommand[3] = %q, want import", image.Subcommands[0].Subcommands[3].Name)
+	}
+}
+
+func TestVmRunCommandRootModeFlag(t *testing.T) {
+	// Require the root-mode flag and its values.
+	cmd := newVmRunCommand()
+	var rootMode *cli.StringFlag
+	for _, flag := range cmd.Flags {
+		sf, ok := flag.(*cli.StringFlag)
+		if ok && sf.Name == "root-mode" {
+			rootMode = sf
+			break
+		}
+	}
+	if rootMode == nil {
+		t.Fatal("root-mode flag missing")
+	}
+	if rootMode.Value != "ram" {
+		t.Fatalf("root-mode default = %q, want ram", rootMode.Value)
+	}
+	if rootMode.Destination == nil || *rootMode.Destination != "ram" {
+		t.Fatalf("root-mode destination default = %v, want ram", rootMode.Destination)
+	}
+	for _, want := range []string{"readonly", "ram", "disk=<path>", "volume=<file>", "daemon=<space>"} {
+		if !strings.Contains(rootMode.Usage, want) {
+			t.Fatalf("root-mode usage %q missing %q", rootMode.Usage, want)
+		}
+	}
+}
+
+func TestParseV86MountFlags(t *testing.T) {
+	// Parse mount flags and reject an unknown mode.
+	mounts, err := parseV86MountFlags([]string{"/workspace=obj1:rw", "/home=obj2:ro", "/data=obj3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts) != 3 {
+		t.Fatalf("mount count = %d, want 3", len(mounts))
+	}
+	if !mounts[0].Writable || mounts[0].Path != "/workspace" || mounts[0].ObjectKey != "obj1" {
+		t.Fatalf("bad rw mount: %+v", mounts[0])
+	}
+	if mounts[1].Writable || mounts[1].ObjectKey != "obj2" {
+		t.Fatalf("bad ro mount: %+v", mounts[1])
+	}
+	if mounts[2].Writable || mounts[2].ObjectKey != "obj3" {
+		t.Fatalf("bad default mount: %+v", mounts[2])
+	}
+	if _, err := parseV86MountFlags([]string{"/bad=obj:bad"}); err == nil {
+		t.Fatal("expected invalid mode error")
+	}
+}
+
+func TestValidateV86ImageImportTarArgs(t *testing.T) {
+	// Accept a valid import tar fixture.
+	dir := t.TempDir()
+	args := &v86ImageImportTarArgs{
+		wasmPath:      writeTestFile(t, dir, "v86.wasm", "wasm"),
+		seabiosPath:   writeTestFile(t, dir, "seabios.bin", "seabios"),
+		vgabiosPath:   writeTestFile(t, dir, "vgabios.bin", "vgabios"),
+		kernelPath:    writeTestFile(t, dir, "bzImage", "kernel"),
+		rootfsTarPath: writeTestTar(t, dir, "rootfs.tar"),
+	}
+	if err := validateV86ImageImportTarArgs(args); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reject a missing kernel path.
+	args.kernelPath = filepath.Join(dir, "missing-bzImage")
+	if err := validateV86ImageImportTarArgs(args); err == nil {
+		t.Fatal("expected missing kernel error")
+	}
+
+	// Reject a rootfs path that is not a tar.
+	args.kernelPath = writeTestFile(t, dir, "bzImage2", "kernel")
+	args.rootfsTarPath = writeTestFile(t, dir, "not-rootfs.tar", "not a tar")
+	if err := validateV86ImageImportTarArgs(args); err == nil {
+		t.Fatal("expected malformed tar error")
+	}
+}
+
+func TestV86ImageImportAssetObjectKey(t *testing.T) {
+	cases := []struct {
+		pred string
+		want string
+	}{
+		{"v86image/wasm", "gizmo/codex-rootfs/c5-image/wasm"},
+		{"v86image/bios/seabios", "gizmo/codex-rootfs/c5-image/bios/seabios"},
+		{"v86image/bios/vgabios", "gizmo/codex-rootfs/c5-image/bios/vgabios"},
+		{"v86image/kernel", "gizmo/codex-rootfs/c5-image/kernel"},
+		{"v86image/rootfs", "gizmo/codex-rootfs/c5-image/rootfs"},
+	}
+	for _, c := range cases {
+		got, err := v86ImageImportAssetObjectKey("gizmo/codex-rootfs/c5-image", c.pred)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Fatalf("asset key for %s = %q, want %q", c.pred, got, c.want)
+		}
+	}
+	if _, err := v86ImageImportAssetObjectKey("", "v86image/rootfs"); err == nil {
+		t.Fatal("expected empty image key error")
+	}
+	if _, err := v86ImageImportAssetObjectKey("image", "v86image/other"); err == nil {
+		t.Fatal("expected unsupported predicate error")
+	}
+}
+
+func writeTestFile(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeTestTar(t *testing.T, dir, name string) string {
+	// Create the tar file and its writer.
+	t.Helper()
+	path := filepath.Join(dir, name)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(f)
+	body := []byte("hello\n")
+
+	// Write the issue file and close the tar.
+	if err := tw.WriteHeader(&tar.Header{Name: "etc/issue", Mode: 0o644, Size: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestWriteV86ImageInfoJSON(t *testing.T) {
+	// Build an image entry and capture stdout.
+	entry := &v86ImageCLIEntry{
+		objectKey: "v86image-test",
+		image: &s4wave_vm.V86Image{
+			Name:          "Debian",
+			Version:       "1",
+			Platform:      "v86",
+			Distro:        "debian",
+			KernelVersion: "6.1",
+			Tags:          []string{"default"},
+		},
+		assets: map[string]string{
+			"wasm":    "asset-wasm",
+			"seabios": "asset-seabios",
+			"vgabios": "asset-vgabios",
+			"kernel":  "asset-kernel",
+			"rootfs":  "asset-rootfs",
+		},
+	}
+	var buf bytes.Buffer
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write the image info and require its JSON fields.
+	os.Stdout = w
+	err = writeV86ImageInfo(entry, "json")
+	w.Close()
+	os.Stdout = old
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"\"objectKey\":\"v86image-test\"", "\"platform\":\"v86\"", "\"rootfs\":\"asset-rootfs\""} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %s: %s", want, out)
+		}
+	}
+}

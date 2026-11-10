@@ -1,0 +1,624 @@
+package world_control_test
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	resource_testbed "github.com/s4wave/spacewave/core/resource/testbed"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	world_control "github.com/s4wave/spacewave/db/world/control"
+	world_testbed "github.com/s4wave/spacewave/db/world/testbed"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_testbed "github.com/s4wave/spacewave/sdk/testbed"
+	sdk_world_engine "github.com/s4wave/spacewave/sdk/world/engine"
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
+)
+
+// TestWatchLoop tests the control loop and WaitForObjectRev.
+func TestWatchLoop(t *testing.T) {
+	// Open the World testbed for revision waits and explicit wakes.
+	ctx := context.Background()
+	tb, err := world_testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Select the World object whose revisions the loop will observe.
+	le := tb.Logger
+	ws := tb.WorldState
+	objKey := "test-object"
+
+	// Wait asynchronously for the object to reach revision two.
+	objCh := make(chan world.ObjectState, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		objs, err := world_control.WaitForObjectRev(ctx, le, ws, objKey, 2)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		objCh <- objs
+	}()
+
+	// perform a couple revisions
+	obj1, err := ws.CreateObject(ctx, objKey, nil)
+	defer world.ReleaseObjectState(obj1)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	_, err = obj1.IncrementRev(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// expect result
+	var outRev uint64
+	select {
+	case err := <-errCh:
+		t.Fatal(err.Error())
+	case res := <-objCh:
+		_, outRev, err = res.GetRootRef(ctx)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		if outRev != 2 {
+			t.Fatalf("expected rev: %v but got %v", 2, outRev)
+		}
+		world.ReleaseObjectState(res)
+	}
+
+	// Start a watch loop that reports each observed object revision.
+	revCh := make(chan uint64, 10)
+	loop := world_control.NewWatchLoop(
+		le,
+		objKey,
+		world_control.NewWaitForStateHandler(func(
+			_ context.Context,
+			_ world.WorldState,
+			obj world.ObjectState,
+			rootCs *block.Cursor,
+			rev uint64,
+		) (bool, error) {
+			revCh <- rev
+			return true, nil
+		}),
+	)
+	go func() {
+		_ = loop.Execute(ctx, ws)
+	}()
+
+	// expect initial revision
+	<-revCh
+
+	// expect nothing
+	select {
+	case <-revCh:
+		t.Fatal("expected loop to sleep after initial rev")
+	case <-time.After(time.Millisecond * 50):
+	}
+
+	// trigger wake
+	loop.Wake()
+
+	// expect value
+	nrev := <-revCh
+	if nrev != outRev {
+		t.Fatalf("expected new rev %d to be equal to old %d", nrev, outRev)
+	}
+}
+
+func TestWatchLoopWakeBeforeWaitIsSticky(t *testing.T) {
+	// Keep the sticky-wake test within the test context lifetime.
+	ctx := t.Context()
+
+	// Open the World testbed for the wake-before-wait check.
+	tb, err := world_testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Wake the loop before execution and capture both handler iterations.
+	revCh := make(chan uint64, 2)
+	loop := world_control.NewWatchLoop(
+		tb.Logger,
+		"",
+		world_control.NewWaitForStateHandler(func(
+			_ context.Context,
+			_ world.WorldState,
+			_ world.ObjectState,
+			_ *block.Cursor,
+			rev uint64,
+		) (bool, error) {
+			revCh <- rev
+			return true, nil
+		}),
+	)
+	loop.Wake()
+	go func() {
+		_ = loop.Execute(ctx, tb.WorldState)
+	}()
+
+	// Verify the pending wake causes a second handler iteration.
+	for i := range 2 {
+		select {
+		case <-revCh:
+		case <-time.After(time.Second):
+			t.Fatalf("expected sticky wake iteration %d", i+1)
+		}
+	}
+}
+
+func TestWatchLoopWakeAfterWaitClearIsSticky(t *testing.T) {
+	// Bound the watch loop lifetime and cancel it on test exit.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Open the World testbed for a wake during handler execution.
+	tb, err := world_testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Start a handler that reads the object the test creates and pauses each
+	// iteration until released.
+	events := make(chan struct{}, 4)
+	release := make(chan struct{})
+	loop := world_control.NewWatchLoop(
+		tb.Logger,
+		"",
+		world_control.NewWaitForStateHandler(func(
+			ctx context.Context,
+			ws world.WorldState,
+			_ world.ObjectState,
+			_ *block.Cursor,
+			_ uint64,
+		) (bool, error) {
+			// Read the object the test changes, then hold until released.
+			obj, _, err := ws.GetObject(ctx, "wake-after-clear")
+			world.ReleaseObjectState(obj)
+			if err != nil {
+				return false, err
+			}
+			events <- struct{}{}
+			select {
+			case <-release:
+				return true, nil
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		}),
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- loop.Execute(ctx, tb.WorldState)
+	}()
+
+	// Release the initial handler so the loop can wait for World changes.
+	recvWatchLoopEvent(t, events, "initial handler")
+	release <- struct{}{}
+
+	// Create a World object to trigger the next handler iteration.
+	{
+		createdObject, err := tb.WorldState.CreateObject(ctx, "wake-after-clear", nil)
+		world.ReleaseObjectState(createdObject)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+	}
+	recvWatchLoopEvent(t, events, "world-change handler")
+
+	// Wake the active handler and verify the wake survives its return.
+	loop.Wake()
+	release <- struct{}{}
+	recvWatchLoopEvent(t, events, "sticky wake handler")
+
+	// Cancel the watch loop and verify its goroutine exits.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("watch loop did not exit")
+	}
+}
+
+func TestWatchLoopReportsObjectDeletion(t *testing.T) {
+	// Bound the object-deletion watch lifetime and cancel it on test exit.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Open the World testbed for deletion notifications.
+	tb, err := world_testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the object whose deletion the handler will observe.
+	objKey := "delete-object"
+	{
+		createdObject, err := tb.WorldState.CreateObject(ctx, objKey, nil)
+		world.ReleaseObjectState(createdObject)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+	}
+
+	// Start a watch loop that reports whether the object still exists.
+	foundCh := make(chan bool, 4)
+	loop := world_control.NewWatchLoop(
+		tb.Logger,
+		objKey,
+		world_control.NewWaitForStateHandler(func(
+			_ context.Context,
+			_ world.WorldState,
+			obj world.ObjectState,
+			_ *block.Cursor,
+			_ uint64,
+		) (bool, error) {
+			foundCh <- obj != nil
+			return true, nil
+		}),
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- loop.Execute(ctx, tb.WorldState)
+	}()
+
+	// Delete the watched object and verify the handler reports its absence.
+	if found := recvWatchLoopValue(t, foundCh, "initial object state"); !found {
+		t.Fatal("expected initial object state")
+	}
+	deleted, err := tb.WorldState.DeleteObject(ctx, objKey)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !deleted {
+		t.Fatal("object was not deleted")
+	}
+	if found := recvWatchLoopValue(t, foundCh, "deleted object state"); found {
+		t.Fatal("expected deleted object state")
+	}
+
+	// Cancel the deletion watch and verify its goroutine exits.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("watch loop did not exit")
+	}
+}
+
+func TestWatchLoopCancellationDuringWait(t *testing.T) {
+	// Create a cancelable lifetime for the World wait.
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Open the World testbed for cancellation during a wait.
+	tb, err := world_testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Start a watch loop that signals its initial handler call.
+	events := make(chan struct{}, 1)
+	loop := world_control.NewWatchLoop(
+		tb.Logger,
+		"",
+		world_control.NewWaitForStateHandler(func(
+			_ context.Context,
+			_ world.WorldState,
+			_ world.ObjectState,
+			_ *block.Cursor,
+			_ uint64,
+		) (bool, error) {
+			events <- struct{}{}
+			return true, nil
+		}),
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- loop.Execute(ctx, tb.WorldState)
+	}()
+
+	// Cancel the waiting loop and verify it returns context cancellation.
+	recvWatchLoopEvent(t, events, "initial handler")
+	cancel()
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("Execute err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watch loop did not exit")
+	}
+}
+
+func TestWatchLoopSkipsCanceledShutdownWarning(t *testing.T) {
+	// Open the World testbed for cancellation warning checks.
+	ctx, cancel := context.WithCancel(t.Context())
+	tb, err := world_testbed.Default(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	t.Cleanup(tb.Release)
+
+	// Capture warnings while a handler returns wrapped cancellation.
+	logger, hook := test.NewNullLogger()
+	logger.SetLevel(logrus.WarnLevel)
+	loop := world_control.NewWatchLoop(
+		logrus.NewEntry(logger),
+		"",
+		world_control.NewWaitForStateHandler(func(
+			_ context.Context,
+			_ world.WorldState,
+			_ world.ObjectState,
+			_ *block.Cursor,
+			_ uint64,
+		) (bool, error) {
+			cancel()
+			return false, errors.Join(context.Canceled, errors.New("handler exit"))
+		}),
+	)
+
+	// Verify shutdown preserves cancellation without emitting warnings.
+	if err := loop.Execute(ctx, tb.WorldState); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Execute err = %v, want context.Canceled", err)
+	}
+	if entries := hook.AllEntries(); len(entries) != 0 {
+		t.Fatalf("warning count = %d, want 0", len(entries))
+	}
+}
+
+func TestWatchLoopSkipsUnhandledOperation(t *testing.T) {
+	// Open a remote World for unhandled operation responses.
+	ctx := t.Context()
+	ws := setupRemoteWorldState(ctx, t)
+
+	// Start a handler that encounters an unhandled remote World operation.
+	calls := make(chan int, 2)
+	count := 0
+	loop := world_control.NewWatchLoop(
+		logrus.NewEntry(logrus.New()),
+		"",
+		world_control.NewWaitForStateHandler(func(
+			ctx context.Context,
+			state world.WorldState,
+			_ world.ObjectState,
+			_ *block.Cursor,
+			_ uint64,
+		) (bool, error) {
+			count++
+			calls <- count
+			if count == 1 {
+				_, _, err := state.ApplyWorldOp(ctx, &unhandledWorldOp{}, peer.ID(""))
+				if !errors.Is(err, world.ErrUnhandledOp) {
+					t.Errorf("remote ApplyWorldOp error = %v, want world.ErrUnhandledOp", err)
+				}
+				return false, err
+			}
+			return false, nil
+		}),
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- loop.Execute(ctx, ws)
+	}()
+
+	// Wake the waiting loop and verify it continues after the unhandled operation.
+	recvWatchLoopValue(t, calls, "initial handler")
+	loop.Wake()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Execute err = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watch loop did not continue after unhandled operation")
+	}
+}
+
+func setupRemoteWorldState(ctx context.Context, t *testing.T) world.WorldState {
+	// Mark remote World setup failures at the calling test.
+	t.Helper()
+
+	// Connect a resource testbed client and register its cleanup.
+	_, resClient, cleanup := resource_testbed.SetupTestbedWithClient(ctx, t)
+	t.Cleanup(cleanup)
+
+	// Create a remote World through the root resource RPC client.
+	rootRef := resClient.AccessRootResource()
+	t.Cleanup(rootRef.Release)
+	srpcClient, err := rootRef.GetClient()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	testbedClient := s4wave_testbed.NewSRPCTestbedResourceServiceClient(srpcClient)
+	createResp, err := testbedClient.CreateWorld(ctx, &s4wave_testbed.CreateWorldRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Acquire the remote World engine and register its cleanup.
+	engineRef := resClient.CreateResourceReference(createResp.ResourceId)
+	t.Cleanup(engineRef.Release)
+	engine, err := sdk_world_engine.NewSDKEngine(resClient, engineRef)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	t.Cleanup(engine.Release)
+
+	// Open a writable World transaction and retain it through the test.
+	tx, err := engine.NewTransaction(ctx, true)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	t.Cleanup(tx.Discard)
+	return tx
+}
+
+type unhandledWorldOp struct{}
+
+func (*unhandledWorldOp) MarshalVT() ([]byte, error) {
+	return nil, nil
+}
+
+func (*unhandledWorldOp) UnmarshalVT([]byte) error {
+	return nil
+}
+
+func (*unhandledWorldOp) Validate() error {
+	return nil
+}
+
+func (*unhandledWorldOp) TypeID() string {
+	return "test/unhandled-world-op"
+}
+
+func (*unhandledWorldOp) ApplyWorldOp(
+	context.Context,
+	*logrus.Entry,
+	world.WorldState,
+	peer.ID,
+) (bool, error) {
+	return false, world.ErrUnhandledOp
+}
+
+func (*unhandledWorldOp) ApplyWorldObjectOp(
+	context.Context,
+	*logrus.Entry,
+	world.ObjectState,
+	peer.ID,
+) (bool, error) {
+	return false, world.ErrUnhandledOp
+}
+
+func recvWatchLoopEvent(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func recvWatchLoopValue[T any](t *testing.T, ch <-chan T, name string) T {
+	t.Helper()
+	select {
+	case val := <-ch:
+		return val
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+	var zero T
+	return zero
+}
+
+// TestWatchLoopReleasesObjectStatePerIteration proves the loop hands back every
+// object handle it takes. A remote world state allocates a server-side resource
+// per GetObject, so a loop that watched a busy object for minutes used to leave
+// one tracked handle behind per revision.
+func TestWatchLoopReleasesObjectStatePerIteration(t *testing.T) {
+	// Bound the object-release watch lifetime and cancel it on test exit.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Create the remote object whose handles the watch loop acquires.
+	remote := setupRemoteWorldState(ctx, t)
+	objKey := "release-object"
+	obj, err := remote.CreateObject(ctx, objKey, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer world.ReleaseObjectState(obj)
+
+	// Start a watch loop over a World that counts outstanding object handles.
+	ws := &countingWorldState{WorldState: remote}
+	revs := make(chan uint64, 8)
+	loop := world_control.NewWatchLoop(
+		logrus.NewEntry(logrus.New()),
+		objKey,
+		world_control.NewWaitForStateHandler(func(
+			_ context.Context,
+			_ world.WorldState,
+			_ world.ObjectState,
+			_ *block.Cursor,
+			rev uint64,
+		) (bool, error) {
+			revs <- rev
+			return true, nil
+		}),
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- loop.Execute(ctx, ws)
+	}()
+
+	// Advance object revisions and verify each iteration releases its previous handle.
+	const revisions = 3
+	for i := 0; i <= revisions; i++ {
+		recvWatchLoopValue(t, revs, "handler call")
+		if outstanding := ws.outstanding.Load(); outstanding > 1 {
+			t.Fatalf("outstanding object handles = %d, want at most 1", outstanding)
+		}
+		if i == revisions {
+			break
+		}
+		if _, err := obj.IncrementRev(ctx); err != nil {
+			t.Fatal(err.Error())
+		}
+	}
+
+	// Cancel the watch loop and verify its goroutine exits.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("watch loop did not exit")
+	}
+
+	// Verify the loop acquired object handles and released them all on exit.
+	if acquired := ws.acquired.Load(); acquired < revisions {
+		t.Fatalf("acquired object handles = %d, want at least %d", acquired, revisions)
+	}
+	if outstanding := ws.outstanding.Load(); outstanding != 0 {
+		t.Fatalf("outstanding object handles after exit = %d, want 0", outstanding)
+	}
+}
+
+// countingWorldState counts the object handles taken from a real world state
+// and the ones handed back.
+type countingWorldState struct {
+	world.WorldState
+
+	acquired    atomic.Int64
+	outstanding atomic.Int64
+}
+
+func (c *countingWorldState) GetObject(ctx context.Context, objKey string) (world.ObjectState, bool, error) {
+	// Acquire the object and count its outstanding handle when present.
+	obj, found, err := c.WorldState.GetObject(ctx, objKey)
+	if obj == nil {
+		return obj, found, err
+	}
+	c.acquired.Add(1)
+	c.outstanding.Add(1)
+	return &countingObjectState{ObjectState: obj, ws: c}, found, err
+}
+
+// countingObjectState reports its release to the owning countingWorldState.
+type countingObjectState struct {
+	world.ObjectState
+
+	ws       *countingWorldState
+	released atomic.Bool
+}
+
+func (c *countingObjectState) Release() {
+	if !c.released.Swap(true) {
+		c.ws.outstanding.Add(-1)
+	}
+	world.ReleaseObjectState(c.ObjectState)
+}

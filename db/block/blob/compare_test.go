@@ -1,0 +1,68 @@
+package blob
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/aperturerobotics/util/prng"
+	"github.com/s4wave/spacewave/db/testbed"
+	"github.com/sirupsen/logrus"
+)
+
+// TestCompareBlobs tests comparing two large blobs.
+func TestCompareBlobs(t *testing.T) {
+	// Prepare the context and logger for comparing stored blobs.
+	ctx := context.Background()
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	le := logrus.NewEntry(log)
+
+	// Start the storage testbed for the comparison fixture.
+	tb, err := testbed.NewTestbed(ctx, le)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Open and release the object cursor used by both blob transactions.
+	cs, err := tb.BuildEmptyCursor(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer cs.Release()
+
+	// test not equal
+	r1 := prng.BuildSeededReader([]byte("test-1"))
+	r2 := prng.BuildSeededReader([]byte("test-2"))
+
+	// Build and persist the first blob from its seeded byte stream.
+	btx, bcs := cs.BuildTransactionAtRef(nil, nil)
+	_, err = BuildBlob(ctx, int64(2048), r1, bcs, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	_, bcs, err = btx.Write(ctx, true)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Build and persist the second blob from a different seeded byte stream.
+	btx2, bcs2 := cs.BuildTransactionAtRef(nil, nil)
+	_, err = BuildBlob(ctx, int64(2048), r2, bcs2, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	_, bcs2, err = btx2.Write(ctx, true)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Compare the stored blobs and verify their contents differ.
+	same, err := CompareBlobs(ctx, bcs, bcs2)
+	if err == nil && same {
+		err = errors.New("expected blobs to not be the same")
+	}
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}

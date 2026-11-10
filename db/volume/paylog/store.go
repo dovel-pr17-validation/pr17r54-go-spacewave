@@ -1,0 +1,304 @@
+// Package paylog is a volume engine shell over a storage Device: block
+// payloads append to a log of segment files, and one ordered index holds the
+// key-value store and the block locations.
+//
+// Every durable index commit also publishes the locations of the blocks
+// written since the previous one. The commit's flush covers the earlier segment
+// writes, so a published block is durable, and a key-value commit that follows
+// a block write publishes that block with it. An ordered commit publishes no
+// blocks, since a crash could keep its record and lose their payloads.
+//
+// A write transaction holds the store's writer from open to end and owns the
+// blocks put and removed through it: its durable commit publishes them with
+// its records, and its discard drops them. Blocks put and removed outside a
+// transaction wait in the store's pending blocks for the next durable commit.
+package paylog
+
+import (
+	"context"
+	"encoding/binary"
+	"maps"
+	"math"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/aperturerobotics/util/csync"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/kvtx"
+	"github.com/s4wave/spacewave/db/volume/device"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+// segmentPrefix starts the device file name of every payload segment.
+const segmentPrefix = "seg-"
+
+// segmentSize is the length at which a segment stops taking payloads.
+const segmentSize = 64 << 20
+
+// Index key prefixes.
+const (
+	// kvPrefix holds the key-value store.
+	kvPrefix = "k/"
+	// blockPrefix maps a block reference key to its payload location.
+	blockPrefix = "b/"
+	// segmentStatsPrefix maps a segment number to the count and bytes of
+	// its published blocks.
+	segmentStatsPrefix = "s/"
+)
+
+// Index is the ordered key-value index a Store keeps on its device. Read
+// transactions see a snapshot and may stay open across commits. A write
+// transaction excludes other writers, and its Commit applies atomically and
+// makes every earlier write on the device durable no later than the commit
+// itself, so a crash never keeps a commit without them. A write transaction
+// may also implement kvtx.OrderedCommitTx, whose commits Sync makes durable.
+// The index keeps its own files on the device, none named with segmentPrefix.
+type Index interface {
+	kvtx.Store
+
+	// Sync makes every completed ordered commit durable. An index may hold an
+	// ordered commit's writes in memory, so a device flush alone may not.
+	Sync(ctx context.Context) error
+
+	// Close releases the index. Uncommitted writes are lost.
+	Close() error
+}
+
+// Store is a volume engine on a Device with an ordered index.
+type Store struct {
+	// Store serves the key-value store under kvPrefix.
+	kvtx.Store
+	// blockStore serves block operations outside any transaction.
+	blockStore
+
+	// dev holds the index and the segments.
+	dev device.Device
+	// index holds the key-value store and the block locations.
+	index Index
+	// hashType is the hash type of new block references; zero selects the
+	// default.
+	hashType hash.HashType
+
+	// writer is held by each write transaction from open to end, so no
+	// commit falls between an ordered commit and the hand-off of its blocks
+	// to pending.
+	writer csync.Mutex
+	// waiting counts the write transactions waiting for writer.
+	waiting atomic.Int32
+
+	// mtx guards the fields below. It is held across segment writes so a
+	// pending location is never published before its payload write is issued.
+	mtx sync.Mutex
+	// segment is the number of the segment taking payloads.
+	segment uint64
+	// offset is the end of the payloads in the segment.
+	offset int64
+	// pending holds the unpublished block writes and removes made outside a
+	// write transaction, by block key.
+	pending map[string]*pendingBlock
+}
+
+// pendingBlock is one unpublished block write or remove.
+type pendingBlock struct {
+	// loc is the payload location; nil for a remove.
+	loc *location
+}
+
+// Open opens the store on dev with index, an index opened on the same device.
+// New block references use hashType, or the default when it is zero. The store
+// owns the index and closes it on Close or on failure.
+func Open(ctx context.Context, dev device.Device, index Index, hashType hash.HashType) (*Store, error) {
+	// Construct the store and its prefixed index view.
+	s := &Store{
+		dev:      dev,
+		index:    index,
+		hashType: hashType,
+		pending:  make(map[string]*pendingBlock),
+	}
+	s.Store = s.Domain(nil)
+	s.blockStore = blockStore{s: s}
+
+	// Start a new segment after every existing one, since an unpublished tail
+	// of the last one may be torn.
+	files, err := dev.List(ctx)
+	if err != nil {
+		_ = index.Close()
+		return nil, err
+	}
+	for _, f := range files {
+		if n, ok := parseSegment(f.Name); ok {
+			s.segment = max(s.segment, n)
+		}
+	}
+	s.segment++
+	return s, nil
+}
+
+// Close closes the index. Unpublished block writes are lost.
+func (s *Store) Close() error {
+	return s.index.Close()
+}
+
+// view runs fn in an index read transaction.
+func (s *Store) view(ctx context.Context, fn func(tx kvtx.Tx) error) error {
+	tx, err := s.index.NewTransaction(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer tx.Discard()
+	return fn(tx)
+}
+
+// update runs fn in a write transaction's index transaction and commits it,
+// durably with the pending blocks unless ordered is set.
+func (s *Store) update(ctx context.Context, ordered bool, fn func(tx kvtx.Tx) error) error {
+	// Apply fn and commit the write transaction.
+	t, err := s.begin(ctx, true, nil)
+	if err != nil {
+		return err
+	}
+	defer t.Discard()
+	if fn != nil {
+		if err := fn(t.itx); err != nil {
+			return err
+		}
+	}
+	return t.commit(ctx, ordered)
+}
+
+// commitIndex commits the index transaction tx, with write ordering only if
+// ordered is set.
+func (s *Store) commitIndex(ctx context.Context, tx kvtx.Tx, ordered bool) error {
+	if ordered {
+		return kvtx.CommitOrdered(ctx, tx)
+	}
+	return tx.Commit(ctx)
+}
+
+// publish writes the pending block locations, overlaid by own, and the
+// segment statistics they change into tx, commits it, and drops the published
+// entries from pending. Entries replaced during the commit stay. own holds a
+// write transaction's unpublished blocks, which are newer than any pending
+// change to the same block.
+//
+// The commit is ordered only if ordered is set and every published entry is a
+// remove. A device flush, such as an index checkpoint, makes an ordered commit
+// durable, so leaving a put pending could keep the commit without its block,
+// and a crash before the flush could keep a published put without its payload.
+func (s *Store) publish(ctx context.Context, tx kvtx.Tx, own map[string]*pendingBlock, ordered bool) error {
+	// Snapshot pending after the payload writes it names were issued.
+	s.mtx.Lock()
+	pending := maps.Clone(s.pending)
+	published := maps.Clone(pending)
+	maps.Copy(published, own)
+	s.mtx.Unlock()
+	for _, p := range published {
+		ordered = ordered && p.loc == nil
+	}
+
+	// Write the locations in key order, tracking the change to each
+	// segment's statistics. A B+tree index splits nodes only at commit, so
+	// unordered puts would shift a growing leaf on every insert.
+	stats := make(map[uint64]segmentStats)
+	for _, key := range slices.Sorted(maps.Keys(published)) {
+		p := published[key]
+		prev, err := getLocation(ctx, tx, []byte(key))
+		if err != nil {
+			return err
+		}
+		if prev != nil {
+			stats[prev.segment] = stats[prev.segment].add(-1, -prev.length)
+		}
+		if p.loc == nil {
+			err = tx.Delete(ctx, []byte(key))
+		} else {
+			stats[p.loc.segment] = stats[p.loc.segment].add(1, p.loc.length)
+			err = tx.Set(ctx, []byte(key), p.loc.marshal())
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	// Apply the statistics changes and commit; the commit's flush covers the
+	// payloads.
+	for segment, delta := range stats {
+		if err := addSegmentStats(ctx, tx, segment, delta); err != nil {
+			return err
+		}
+	}
+	if err := s.commitIndex(ctx, tx, ordered); err != nil {
+		return err
+	}
+
+	// Drop the pending entries the commit published or own replaced.
+	s.mtx.Lock()
+	for key, p := range pending {
+		if s.pending[key] == p {
+			delete(s.pending, key)
+		}
+	}
+	s.mtx.Unlock()
+	return nil
+}
+
+// location is where a block payload lives.
+type location struct {
+	// segment is the segment number.
+	segment uint64
+	// offset is the payload's byte offset in the segment.
+	offset int64
+	// length is the payload length.
+	length int64
+}
+
+// marshal encodes the location as three unsigned varints. Offsets and
+// lengths are never negative.
+func (l *location) marshal() []byte {
+	b := binary.AppendUvarint(nil, l.segment)
+	b = binary.AppendUvarint(b, uint64(l.offset))    //nolint:gosec
+	return binary.AppendUvarint(b, uint64(l.length)) //nolint:gosec
+}
+
+// getLocation reads the location stored at key in tx, nil when absent.
+func getLocation(ctx context.Context, tx kvtx.Tx, key []byte) (*location, error) {
+	v, found, err := tx.Get(ctx, key)
+	if err != nil || !found {
+		return nil, err
+	}
+	return unmarshalLocation(v)
+}
+
+// unmarshalLocation decodes a location.
+func unmarshalLocation(b []byte) (*location, error) {
+	var v [3]uint64
+	for i := range v {
+		n, size := binary.Uvarint(b)
+		if size <= 0 {
+			return nil, errors.New("invalid block location")
+		}
+		v[i], b = n, b[size:]
+	}
+	if v[1] > math.MaxInt64-v[2] {
+		return nil, errors.New("invalid block location")
+	}
+	return &location{segment: v[0], offset: int64(v[1]), length: int64(v[2])}, nil //nolint:gosec
+}
+
+// segmentName returns the device file name of segment n.
+func segmentName(n uint64) string {
+	return segmentPrefix + strconv.FormatUint(n, 10)
+}
+
+// parseSegment returns the number of a segment file name.
+func parseSegment(name string) (uint64, bool) {
+	rest, ok := strings.CutPrefix(name, segmentPrefix)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(rest, 10, 64)
+	return n, err == nil
+}

@@ -1,0 +1,235 @@
+package provider_spacewave
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"slices"
+	"time"
+
+	"github.com/aperturerobotics/go-kvfile"
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/core/provider/spacewave/clouderror"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/packfile"
+	"github.com/s4wave/spacewave/db/packfile/identity"
+	packfile_store "github.com/s4wave/spacewave/db/packfile/store"
+	"github.com/s4wave/spacewave/db/packfile/writer"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+const (
+	// compactMinPacks is the number of small packs that starts a merge.
+	compactMinPacks = 16
+	// compactMaxPacks is the server's limit on packs replaced by one push.
+	compactMaxPacks = 32
+	// compactSmallPackBytes marks a pack as small. Any compactMinPacks small
+	// packs fit one merged pack under the sync pack target.
+	compactSmallPackBytes = syncFlushMaxPackBytes / compactMinPacks
+)
+
+// CompactNow merges the oldest small committed packs into one replacement pack
+// when at least compactMinPacks have accumulated. It holds the flush lock, so a
+// merge never races a flush. A concurrent pull that replaces an input makes the
+// merge push fail with a replacement conflict.
+//
+// A failed merge holds further merges until the next pull refreshes the
+// manifest. A replacement conflict pulls immediately.
+func (s *syncController) CompactNow(ctx context.Context) error {
+	// Hold the flush lock and skip when a pull must refresh the manifest first.
+	s.flushMtx.Lock()
+	defer s.flushMtx.Unlock()
+	if s.compactWaitPull.Load() {
+		return nil
+	}
+
+	// Plan the compaction inputs and merge them.
+	inputs := planCompaction(s.mfst.GetEntries())
+	if len(inputs) == 0 {
+		return nil
+	}
+
+	// Park further merges until the next pull on failure.
+	err := s.mergePacks(ctx, inputs)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	s.compactWaitPull.Store(true)
+	if clouderror.IsPackReplacementConflict(err) {
+		s.le.WithError(err).Debug("small pack merge lost a replacement race, pulling")
+		return s.PullNow(ctx)
+	}
+	return err
+}
+
+// planCompaction picks the oldest small committed packs for one merge, up to
+// compactMaxPacks and the sync pack target. It returns nil when fewer than
+// compactMinPacks qualify. Packs without a sequence have not been pulled back
+// from the server and cannot be replaced yet. Trash packs wait for a reclaim
+// pass to retire them.
+func planCompaction(entries []*packfile.PackfileEntry) []*packfile.PackfileEntry {
+	// Collect committed small packs in sequence order.
+	var small []*packfile.PackfileEntry
+	for _, entry := range entries {
+		if entry.GetSequence() == 0 || entry.IsSuperseded() || entry.IsTrash() {
+			continue
+		}
+		if int64(entry.GetSizeBytes()) >= compactSmallPackBytes { //nolint:gosec // pack sizes are bounded by writer.DefaultMaxPackBytes.
+			continue
+		}
+		small = append(small, entry)
+	}
+	if len(small) < compactMinPacks {
+		return nil
+	}
+
+	// Sort the small packs by sequence.
+	slices.SortFunc(small, func(a, b *packfile.PackfileEntry) int {
+		return cmp.Compare(a.GetSequence(), b.GetSequence())
+	})
+
+	// Take the oldest packs that fit the sync pack target.
+	var total int64
+	n := 0
+	for n < len(small) && n < compactMaxPacks {
+		size := int64(small[n].GetSizeBytes()) //nolint:gosec // bounded by compactSmallPackBytes above.
+		if total+size > syncFlushMaxPackBytes {
+			break
+		}
+		total += size
+		n++
+	}
+	return small[:n]
+}
+
+// mergePacks reads every input pack, writes their blocks into one pack, pushes
+// it as a replacement for the inputs, and commits the replacement locally.
+func (s *syncController) mergePacks(ctx context.Context, inputs []*packfile.PackfileEntry) error {
+	// Prepare the merged pack and push it as a replacement.
+	started := time.Now()
+	chunk, err := s.prepareMergedPack(ctx, inputs)
+	if err != nil {
+		return err
+	}
+	if err := s.pushPreparedChunk(ctx, chunk); err != nil {
+		return err
+	}
+
+	// Apply the manifest delta and record merge telemetry.
+	event := &packfile.PackReplacementEvent{ReplacedPackIds: chunk.replaces}
+	if err := s.applyManifestDelta(ctx, []*packfile.PackfileEntry{chunk.entry}, []*packfile.PackReplacementEvent{event}, 0); err != nil {
+		return errors.Wrap(err, "applying merge delta")
+	}
+	s.telemetrySafeCall(func(t *ProviderAccount, id string) {
+		t.addSyncTelemetryMerge(id, len(chunk.replaces))
+	})
+
+	// Log the completed merge.
+	s.le.WithField("pack-id", chunk.entry.GetId()).
+		WithField("replaced", len(chunk.replaces)).
+		WithField("blocks", chunk.entry.GetBlockCount()).
+		WithField("bytes", len(chunk.packData)).
+		WithField("duration", time.Since(started)).
+		Debug("merged small packs")
+	return nil
+}
+
+// prepareMergedPack builds one pack holding every block of the inputs. Blocks
+// keep their stored value order, inputs oldest first. The merged key set is
+// checked against the union of the input key sets before the pack is returned,
+// so a replacement can never drop a block.
+func (s *syncController) prepareMergedPack(ctx context.Context, inputs []*packfile.PackfileEntry) (*preparedSyncChunk, error) {
+	// Read every input pack and collect unique blocks.
+	replaces := make([]string, len(inputs))
+	seen := make(map[string]struct{})
+	var blocks []packfile_store.PackBlock
+	for i, input := range inputs {
+		replaces[i] = input.GetId()
+		read, err := s.lower.ReadPackBlocks(ctx, input.GetId(), int64(input.GetSizeBytes())) //nolint:gosec // pack sizes are bounded by writer.DefaultMaxPackBytes.
+		if err != nil {
+			return nil, errors.Wrapf(err, "reading pack %s", input.GetId())
+		}
+		for _, b := range read {
+			key := string(packfile.BlockKey(b.Hash))
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			blocks = append(blocks, b)
+		}
+	}
+
+	// Pack the merged blocks.
+	return s.preparePackBlocks(blocks, replaces)
+}
+
+// preparePackBlocks packs blocks in order into one pack that supersedes
+// replaces. The pack's key set is checked against the blocks before it is
+// returned, so a replacement can never drop a block.
+func (s *syncController) preparePackBlocks(blocks []packfile_store.PackBlock, replaces []string) (*preparedSyncChunk, error) {
+	// Pack the blocks and verify the key set.
+	keys := make(map[string]struct{}, len(blocks))
+	for _, b := range blocks {
+		keys[string(packfile.BlockKey(b.Hash))] = struct{}{}
+	}
+	var buf bytes.Buffer
+	idx := 0
+	result, err := writer.PackBlocks(&buf, func() (*hash.Hash, *block.StoredBlock, error) {
+		if idx >= len(blocks) {
+			return nil, nil, nil
+		}
+		b := blocks[idx]
+		idx++
+		return b.Hash, b.Block, nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "packing blocks")
+	}
+	if err := checkPackKeys(buf.Bytes(), keys); err != nil {
+		return nil, err
+	}
+
+	// Build the pack entry.
+	packID, err := identity.BuildPackID(s.resourceID, result)
+	if err != nil {
+		return nil, errors.Wrap(err, "build pack id")
+	}
+	return &preparedSyncChunk{
+		replaces: replaces,
+		entry: &packfile.PackfileEntry{
+			Id:                 packID,
+			BloomFilter:        result.BloomFilter,
+			BloomFormatVersion: packfile.BloomFormatVersionV1,
+			BlockCount:         result.BlockCount,
+			SizeBytes:          result.BytesWritten,
+			CreatedAt:          timestamppb.New(time.Now().UTC()),
+		},
+		packData: buf.Bytes(),
+		bodyHash: result.PackBytesDigest,
+	}, nil
+}
+
+// checkPackKeys verifies the written pack indexes exactly the want key set.
+func checkPackKeys(packData []byte, want map[string]struct{}) error {
+	// Scan the pack index and compare it to the wanted keys.
+	rd, err := kvfile.BuildReader(bytes.NewReader(packData), uint64(len(packData)))
+	if err != nil {
+		return errors.Wrap(err, "read pack index")
+	}
+	var count int
+	err = rd.ScanPrefixKeys(nil, func(key []byte) error {
+		if _, ok := want[string(key)]; !ok {
+			return errors.Errorf("pack holds unexpected key %x", key)
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if count != len(want) {
+		return errors.Errorf("pack holds %d of %d input blocks", count, len(want))
+	}
+	return nil
+}

@@ -1,0 +1,90 @@
+package volume_sqlite
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/s4wave/spacewave/db/volume"
+	vc "github.com/s4wave/spacewave/db/volume/controller"
+	"github.com/sirupsen/logrus"
+)
+
+// Factory constructs a sqlite volume.
+type Factory struct {
+	// bus is the controller bus.
+	bus bus.Bus
+	// open creates a volume with the storage selected by this factory.
+	open OpenFunc
+}
+
+// OpenFunc opens an owned SQLite volume for a controller lifetime.
+type OpenFunc func(context.Context, *logrus.Entry, *Config) (volume.Volume, error)
+
+// NewFactory builds a sqlite volume factory.
+func NewFactory(b bus.Bus) *Factory {
+	return NewFactoryWithOpener(b, func(ctx context.Context, le *logrus.Entry, conf *Config) (volume.Volume, error) {
+		return NewSqlite(ctx, le, conf)
+	})
+}
+
+// NewFactoryWithOpener binds storage creation to this factory instead of a global driver.
+func NewFactoryWithOpener(b bus.Bus, open OpenFunc) *Factory {
+	return &Factory{bus: b, open: open}
+}
+
+// GetConfigID returns the unique ID for the config.
+func (t *Factory) GetConfigID() string {
+	return ConfigID
+}
+
+// GetControllerID returns the unique ID for the controller.
+func (t *Factory) GetControllerID() string {
+	return ControllerID
+}
+
+// ConstructConfig constructs an instance of the controller configuration.
+func (t *Factory) ConstructConfig() config.Config {
+	return &Config{}
+}
+
+// Construct constructs the associated controller given configuration.
+func (t *Factory) Construct(
+	ctx context.Context,
+	conf config.Config,
+	opts controller.ConstructOpts,
+) (controller.Controller, error) {
+	le := opts.GetLogger()
+	cc := conf.(*Config)
+
+	// Construct the volume controller.
+	return vc.NewController(
+		le,
+		cc.GetVolumeConfig(),
+		t.bus,
+		controller.NewInfo(
+			ControllerID,
+			Version,
+			"sqlite@"+cc.GetPath(),
+		),
+		func(
+			ctx context.Context,
+			le *logrus.Entry,
+		) (volume.Volume, error) {
+			return t.open(
+				ctx,
+				le,
+				cc,
+			)
+		},
+	), nil
+}
+
+// GetVersion returns the version of this controller.
+func (t *Factory) GetVersion() controller.Version {
+	return Version
+}
+
+// _ is a type assertion
+var _ controller.Factory = (*Factory)(nil)

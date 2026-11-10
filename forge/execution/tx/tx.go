@@ -1,0 +1,178 @@
+package execution_tx
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/block/byteslice"
+	"github.com/s4wave/spacewave/db/world"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// Transaction is an instance of a transaction object.
+type Transaction interface {
+	// MarshalVT marshals to binary.
+	MarshalVT() ([]byte, error)
+	// UnmarshalVT unmarshals from binary.
+	UnmarshalVT(data []byte) error
+
+	// GetTxType returns the type of transaction this is.
+	GetTxType() TxType
+	// Validate performs a cursory check of the transaction.
+	// Note: this should not fetch network data.
+	Validate() error
+	// ExecuteTx executes the transaction against the execution instance.
+	// exCursor should be located at the execution state root.
+	// The result is written into exCursor.
+	ExecuteTx(
+		ctx context.Context,
+		sender peer.ID,
+		exCursor *block.Cursor,
+		root *forge_execution.Execution,
+	) error
+}
+
+// Validate checks the tx.
+func (t *Tx) Validate() error {
+	ttx, err := t.LocateTx()
+	if err != nil {
+		return err
+	}
+	if err := ttx.Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Validate checks the execution tx type is in range.
+func (t TxType) Validate() error {
+	switch t {
+	case TxType_TxType_START:
+		return nil
+	case TxType_TxType_SET_OUTPUTS:
+		return nil
+	case TxType_TxType_COMPLETE:
+		return nil
+	case TxType_TxType_APPEND_LOG:
+		return nil
+	case TxType_TxType_CANCEL:
+		return nil
+	case TxType_TxType_RECLAIM:
+		return nil
+	case TxType_TxType_SET_WAITING_PLUGIN:
+		return nil
+	case TxType_TxType_RENEW_CLAIM:
+		return nil
+	default:
+		return errors.Wrap(world.ErrUnhandledOp, t.String())
+	}
+}
+
+// LocateTx returns the sub-block for the transaction.
+func (t *Tx) LocateTx() (Transaction, error) {
+	switch t.GetTxType() {
+	case TxType_TxType_START:
+		return t.GetTxStart(), nil
+	case TxType_TxType_SET_OUTPUTS:
+		return t.GetTxSetOutputs(), nil
+	case TxType_TxType_COMPLETE:
+		return t.GetTxComplete(), nil
+	case TxType_TxType_APPEND_LOG:
+		return t.GetTxAppendLog(), nil
+	case TxType_TxType_CANCEL:
+		return t.GetTxCancel(), nil
+	case TxType_TxType_RECLAIM:
+		return t.GetTxReclaim(), nil
+	case TxType_TxType_SET_WAITING_PLUGIN:
+		return t.GetTxSetWaitingPlugin(), nil
+	case TxType_TxType_RENEW_CLAIM:
+		return t.GetTxRenewClaim(), nil
+	default:
+		return nil, errors.Wrap(world.ErrUnhandledOp, t.String())
+	}
+}
+
+// ByteSliceToTx converts a byte slice block a Tx.
+// If blk is nil, returns nil, nil
+// If the blk is already parsed to a Tx, returns the Tx.
+func ByteSliceToTx(blk block.Block) (*Tx, error) {
+	// Decode a serialized execution transaction or accept a parsed transaction.
+	if blk == nil {
+		return nil, nil
+	}
+	var out *Tx
+	nr, ok := blk.(*byteslice.ByteSlice)
+	if ok && nr != nil {
+		out = &Tx{}
+		if err := out.UnmarshalVT(nr.GetBytes()); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+	out, ok = blk.(*Tx)
+	if !ok {
+		return out, block.ErrUnexpectedType
+	}
+	return out, nil
+}
+
+// ApplyWorldOp reclaims an Execution and its placement in one World operation.
+// Other transitions remain object operations.
+func (t *Tx) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	worldHandle world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	if t.GetTxType() == TxType_TxType_RECLAIM {
+		return false, t.GetTxReclaim().applyWorldOp(ctx, worldHandle, sender)
+	}
+	return false, world.ErrUnhandledOp
+}
+
+// ApplyWorldObjectOp applies the operation to a world object handle.
+func (t *Tx) ApplyWorldObjectOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	objectHandle world.ObjectState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Reclaim needs World scope to update placement and its graph atomically.
+	if t.GetTxType() == TxType_TxType_RECLAIM {
+		return false, world.ErrUnhandledOp
+	}
+
+	// Validate the execution transaction operation type.
+	if err := t.GetTxType().Validate(); err != nil {
+		return false, err
+	}
+
+	// Locate the concrete execution transaction implementation.
+	tx, err := t.LocateTx()
+	if err != nil {
+		return false, err
+	}
+
+	// access & update the execution object
+	_, _, err = world.AccessObjectState(ctx, objectHandle, true, func(bcs *block.Cursor) error {
+		// Decode the execution object for its transaction.
+		ex, err := forge_execution.UnmarshalExecution(ctx, bcs)
+		if err != nil {
+			return err
+		}
+
+		// Apply the transaction and validate the resulting execution.
+		err = tx.ExecuteTx(ctx, sender, bcs, ex)
+		if err == nil {
+			err = ex.Validate()
+		}
+		return err
+	})
+	return false, err
+}
+
+// _ is a type assertion
+var _ world.Operation = (*Tx)(nil)

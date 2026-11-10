@@ -1,0 +1,1134 @@
+# bldr.star - Spacewave project configuration
+#
+# Higher-order config using Starlark. Evaluated at runtime alongside bldr.yaml.
+# Star config merges on top of YAML via MergeProjectConfigs().
+
+# The release library downstream projects load from the vendored module.
+load(
+    "core/release/publisher/release.star",
+    "release_deployment",
+    "release_launcher_controller_config",
+    "release_world_config_set",
+    "release_world_reader_config_set",
+    "release_world_serve_config_set",
+)
+
+# Shared Go packages for the core runtime
+CORE_GO_PKGS = [
+    "./db/volume/world",
+    "./core/resource/root/controller",
+    "./core/resource/listener",
+    "./core/session/controller",
+    "./core/provider/local",
+    "./core/provider/spacewave",
+    "./core/space/sobject",
+    "./core/space/world/optypes",
+    "./core/plugin/space",
+    "./core/space/http/download",
+    "./core/space/http/export",
+    "./core/space/world/blocktype",
+    "./core/alarm/watch",
+    "github.com/s4wave/spacewave/db/object/peer",
+]
+
+# COMPOSED_GO_PKGS are host controllers that ./cmd/spacewave/compose constructs
+# with the process-shared listener brokers and Session child factories.
+COMPOSED_GO_PKGS = [
+    "./core/resource/root/controller",
+    "./core/resource/listener",
+    "./core/provider/local",
+    "./core/provider/spacewave",
+]
+
+# core_go_pkgs lists the spacewave-core plugin's Go packages: CORE_GO_PKGS and
+# the proxy for its host's exported plugin hosts.
+def core_go_pkgs(include_export=True):
+    pkgs = ["github.com/s4wave/spacewave/bldr/plugin/host/export"]
+    for pkg in CORE_GO_PKGS:
+        if include_export or pkg != "./core/space/http/export":
+            pkgs.append(pkg)
+    return pkgs
+
+LAUNCHER_GO_PKGS = [
+    "./core/provider/spacewave/launcher/controller",
+    "github.com/s4wave/spacewave/bldr/manifest/fetch/world",
+    "github.com/s4wave/spacewave/core/cdn/world/controller",
+    "github.com/s4wave/spacewave/db/block/store/bucket",
+    "github.com/s4wave/spacewave/db/block/store/rpc",
+    "github.com/s4wave/spacewave/core/space/world/optypes",
+    "github.com/s4wave/spacewave/db/block/store/overlay",
+    "github.com/s4wave/spacewave/db/block/store/rpc/server",
+    "github.com/s4wave/spacewave/db/object/peer",
+]
+
+LAUNCHER_BROWSER_GO_PKGS = [
+    "./core/provider/spacewave/launcher/controller",
+    "github.com/s4wave/spacewave/db/block/store/overlay",
+    "github.com/s4wave/spacewave/db/block/store/rpc/server",
+    "github.com/s4wave/spacewave/db/object/peer",
+]
+
+PRODUCTION_DIST_PEER_ID = "12D3KooWL2DEcvqSXXrrCmUxMdPbqFcqzhHBvqseZWHwjAt7aXfW"
+PRODUCTION_CLOUD_API_ENDPOINT = "https://spacewave.app"
+PRODUCTION_ACCOUNT_ENDPOINT = "https://account.spacewave.app"
+PRODUCTION_RELEASE_CONFIG_URL = "https://spacewave.app/api/release/config"
+BROWSER_RELEASE_CLOUD_API_ENDPOINT = "/"
+
+# Signed by a checked-in test-only peer ID. The private key is not needed at
+# runtime; this packed DistConfig only seeds the release-WASM e2e fixture.
+E2E_RELEASE_WASM_INIT_DIST_CONFIG = "QnF9fgszS28jFAQYB2t0Nx0lOx8KM1VoPCAjKShHamY9cXwMfVVQbjskPBo7R3FIMg0pPws1EkRcQlQImHAm4evJX816W1ZueiWpxzExZyZWv1gerVT0-gbD34GuNied4VzXsHGfTa6sG61t8q9C0PgfEylbZYCUALSnTFVsClHn7sqR2OZPikT405ESAbYmf7rjOJ8kw5554IZXVFPXU83lSBXRaZI9DgLim3kd90GNr2qcznKz-FKKOxfcHf-kjy-pUnR7qBQ0ZF4sCZ2zJUqe6BJL-EZIGczDuXKnli5WfY8V32P9jF2D--5UwB2ZNPU"
+E2E_RELEASE_WASM_DIST_PEER_ID = "12D3KooWJPNip1SbsUG7SjteoegGjfq22D4WThuctPvCwJzHesD5"
+
+# APP_PLUGIN_IDS declares plugins supplied by the Spacewave application.
+APP_PLUGIN_IDS = ["spacewave-core", "spacewave-web", "spacewave-app", "web"]
+
+# Core configSet shared between Go plugin and CLI manifests.
+# Native listeners derive their socket from the project storage root so data,
+# logs, and the runtime socket honor SPACEWAVE_DATA_DIR as one owner.
+def core_config_set(
+        include_export=True,
+        cloud_api_endpoint=PRODUCTION_CLOUD_API_ENDPOINT,
+        account_endpoint=PRODUCTION_ACCOUNT_ENDPOINT,
+        signing_env_prefix="spacewave"):
+    configs = {
+        "store-peer": config_entry("object/peer", 1, {
+            "objectStoreId": "s4wave-peer",
+            "volumeId": "plugin-host",
+        }),
+        "root-resource": config_entry("resource/root", 1, {"appPluginIds": APP_PLUGIN_IDS}),
+        "session-list": config_entry("session", 1),
+        "provider-local": config_entry("provider/local", 2, {
+            "signalingUrl": cloud_api_endpoint,
+            "signalingEnvPrefix": signing_env_prefix,
+        }),
+        "provider-spacewave": config_entry("provider/spacewave", 2, {
+            "endpoint": cloud_api_endpoint,
+            "accountEndpoint": account_endpoint,
+            "signingEnvPrefix": signing_env_prefix,
+        }),
+        "space-sobject": config_entry("space/sobject", 1, {"verbose": False}),
+        "space-world-ops": config_entry("space/world/ops", 1),
+        "blocktype": config_entry("db/blocktype", 1),
+        "download": config_entry("space/http/download", 1),
+        "resource-listener": config_entry("resource/listener", 1, {
+            "storageProjectId": "spacewave",
+        }),
+    }
+    if include_export:
+        configs["export"] = config_entry("space/http/export", 1)
+    return configs
+
+# spacewave_core_config_set extends core_config_set for the spacewave-core
+# plugin, which runs Space plugins on its host's exported plugin hosts.
+def spacewave_core_config_set(**kwargs):
+    configs = core_config_set(**kwargs)
+    configs["plugin-host-export"] = config_entry("bldr/plugin/host/export", 1)
+    return configs
+
+def desktop_status_projector_config_set():
+    return {
+        "desktop-status-projector": config_entry("resource/desktop/status-projector", 1),
+    }
+
+def browser_go_compiler_platform(go_compiler):
+    if go_compiler == "GO_COMPILER_GOSCRIPT":
+        return "js"
+    return "web"
+
+
+def spacewave_core_config(
+        web_go_compiler=None,
+        cloud_api_endpoint=PRODUCTION_CLOUD_API_ENDPOINT):
+    platform_types = {
+        "desktop": {
+            "goPkgs": ["./core/resource/desktop/statusprojector"],
+            "configSet": desktop_status_projector_config_set(),
+        },
+    }
+    if web_go_compiler:
+        platform_types[browser_go_compiler_platform(web_go_compiler)] = {
+            "goCompiler": web_go_compiler,
+        }
+    return {
+        "goPkgs": core_go_pkgs(),
+        "goscriptDeferredFunctions": [
+            "github.com/s4wave/spacewave/core/git.NewCreateGitRepoWizardOp",
+            "github.com/s4wave/spacewave/core/cdn/v86copy.CopyV86ImageFromCdnWithProgress",
+            "github.com/s4wave/spacewave/sdk/world/wizard/resource.LookupWizardObjectType",
+        ],
+        "configSet": spacewave_core_config_set(cloud_api_endpoint=cloud_api_endpoint),
+        "buildTypes": {
+            "dev": {
+                "goPkgs": ["./core/debug/trace"],
+                "configSet": {
+                    "debug-trace": config_entry("debug/trace", 1),
+                },
+            },
+        },
+        "platformTypes": platform_types,
+        "hostConfigSet": {
+            "fetch-manifest-via-spacewave-core": config_entry(
+                "bldr/manifest/fetch/plugin", 1,
+                {"pluginId": "spacewave-core"},
+            ),
+        },
+    }
+
+def browser_spacewave_core_config(web_go_compiler=None):
+    return spacewave_core_config(
+        web_go_compiler=web_go_compiler,
+        cloud_api_endpoint=BROWSER_RELEASE_CLOUD_API_ENDPOINT,
+    )
+
+# The local release server has no cloud signaling service. Local sessions still
+# exercise their full storage and RPC paths without a remote transport retry loop.
+def e2e_browser_spacewave_core_config(web_go_compiler=None):
+    conf = browser_spacewave_core_config(web_go_compiler)
+    conf["configSet"]["provider-local"] = config_entry("provider/local", 1)
+    return conf
+
+# SPACEWAVE_RELEASE_SPACE_ID is the production release World's CDN Space.
+SPACEWAVE_RELEASE_SPACE_ID = "01kqjmfxd44r7ggrq78efad3d2"
+
+# spacewave_release_deployment names a Spacewave release Deployment; the
+# defaults are production. One process per composition owns the release World
+# CDN transport, pack readers, index cache, decoded cache, and the durable dist
+# writeback; every other bus reads the same blocks through it over the block
+# store RPC.
+def spacewave_release_deployment(
+        space_id=SPACEWAVE_RELEASE_SPACE_ID,
+        signer_peer_id=PRODUCTION_DIST_PEER_ID,
+        selector_url=PRODUCTION_RELEASE_CONFIG_URL,
+        cdn_base_url="https://cdn.spacewave.app",
+        channel_key=""):
+    return release_deployment(
+        project_id="spacewave",
+        space_id=space_id,
+        signer_peer_id=signer_peer_id,
+        selector_url=selector_url,
+        cdn_base_url=cdn_base_url,
+        channel_key=channel_key,
+        # Cached refs from older releases name this store.
+        block_store_id="spacewave-release-cdn",
+        cache_block_store_id="dist",
+        release_authority_plugin_id="spacewave-launcher",
+    )
+
+SPACEWAVE_RELEASE = spacewave_release_deployment()
+
+def spacewave_launcher_controller_config(
+        dist_peer_ids=[PRODUCTION_DIST_PEER_ID],
+        refetch_dur="1h",
+        init_dist_config="",
+        disable_endpoint_fetch=False):
+    # Public defaults are production-only. Release-owned overlays replace the
+    # deployment for other release environments.
+    conf = release_launcher_controller_config(
+        SPACEWAVE_RELEASE,
+        refetch_dur=refetch_dur,
+        init_dist_config=init_dist_config,
+        disable_endpoint_fetch=disable_endpoint_fetch,
+    )
+    conf["distPeerIds"] = dist_peer_ids
+    return conf
+
+def spacewave_launcher_config(
+        launcher_controller_config=spacewave_launcher_controller_config(),
+        web_go_compiler=None,
+        include_release_world=True,
+        release=SPACEWAVE_RELEASE):
+    config_set = {
+        "spacewave-launcher": config_entry(
+            "spacewave/launcher/controller", 1,
+            launcher_controller_config,
+        ),
+        "store-peer": config_entry("object/peer", 1, {
+            "objectStoreId": "s4wave-peer",
+            "volumeId": "plugin-host",
+        }),
+    }
+    if include_release_world:
+        # The native launcher resolves release metadata and stages updates from
+        # the Release World, so it mounts a world engine, but reads every block
+        # through the plugin host's authority instead of a second CDN transport.
+        config_set.update(release_world_reader_config_set(release))
+    conf = {
+        "goPkgs": LAUNCHER_GO_PKGS if include_release_world else LAUNCHER_BROWSER_GO_PKGS,
+        "configSet": config_set,
+    }
+    if include_release_world:
+        # Release World providers must be applied to the plugin-host bus as
+        # host configuration so they mount before plugin startup begins.
+        conf["hostConfigSet"] = release_world_config_set(release)
+        conf["hostConfigSet"].update(release_world_serve_config_set(release))
+    if web_go_compiler:
+        conf["platformTypes"] = {
+            browser_go_compiler_platform(web_go_compiler): {
+                "goCompiler": web_go_compiler,
+            },
+        }
+    return conf
+
+def browser_release_launcher_config(web_go_compiler=None):
+    # The browser launcher worker never reads the Release World: js and goscript
+    # builds skip native release staging entirely. The browser distribution
+    # mounts the sole authority and needs no block store rpc server for the
+    # worker.
+    return spacewave_launcher_config(
+        web_go_compiler=web_go_compiler,
+        include_release_world=False,
+    )
+
+def e2e_release_wasm_launcher_config(web_go_compiler=None):
+    return spacewave_launcher_config(
+        spacewave_launcher_controller_config(
+            dist_peer_ids=[E2E_RELEASE_WASM_DIST_PEER_ID],
+            refetch_dur="",
+            init_dist_config=E2E_RELEASE_WASM_INIT_DIST_CONFIG,
+            disable_endpoint_fetch=True,
+        ),
+        web_go_compiler=web_go_compiler,
+        include_release_world=False,
+    )
+
+# Web packages excluded by JS plugins that consume spacewave-web packages.
+EXCLUDED_WEB_PKGS = [
+    web_pkg("@s4wave/web", exclude=True),
+    web_pkg("sonner", exclude=True),
+]
+
+WEB_STARTUP = "app/prerender/startup.tsx"
+
+# -- Manifests --
+
+manifest("web",
+    builder="bldr/web/plugin/compiler",
+    rev=6,
+    config={
+        "nativeApp": {
+            "appName": "Spacewave",
+            "windowTitle": "Spacewave",
+            "themeSource": "dark",
+            "iconPath": "web/images/spacewave-icon.png",
+            "desktopPresencePolicy": "DESKTOP_PRESENCE_POLICY_TRAY_BACKGROUND",
+            "trayIconPath": "web/images/spacewave-icon.png",
+            "macosTemplateTrayIconPath": "web/images/spacewave-tray-template.png",
+        },
+    },
+)
+
+# spacewave-launcher is the minimal launcher plugin. It carries just enough to
+# fetch a DistConfig; browser release still embeds the full startup app closure
+# below so first startup does not depend on that fetch plane. This development
+# manifest mounts no Release World: its host config set needs the product CDN
+# factories, which only the dist host composes, so the development bus cannot
+# apply it. Release builds redeclare the launcher with the Release World.
+manifest("spacewave-launcher",
+    builder="bldr/plugin/compiler/go",
+    rev=1,
+    config=spacewave_launcher_config(include_release_world=False),
+)
+
+# spacewave-loader spawns the cross-platform loading-UI helper during plugin
+# bootstrap and terminates it when the controller context ends. Embedded
+# alongside spacewave-launcher so the loading window appears immediately on
+# cold start, covering the remote-world fetch phase. The controller watches
+# LoadPlugin directive state for the listed plugin ids and forwards progress
+# to the helper over pipesock.
+manifest("spacewave-loader",
+    builder="bldr/plugin/compiler/go",
+    rev=2,
+    config={
+        "goPkgs": [
+            "./core/provider/spacewave/loader/controller",
+        ],
+        "configSet": {
+            "spacewave-loader": config_entry(
+                "spacewave/loader/controller", 1,
+                {
+                    "projectId": "spacewave",
+                    "watchPluginIds": [
+                        "spacewave-core",
+                        "spacewave-web",
+                        "spacewave-app",
+                        "web",
+                    ],
+                },
+            ),
+        },
+    },
+)
+
+SPACEWAVE_CORE_MANIFEST_REV = 13
+
+manifest("spacewave-core",
+    builder="bldr/plugin/compiler/go",
+    rev=SPACEWAVE_CORE_MANIFEST_REV,
+    config=spacewave_core_config(),
+)
+
+manifest("spacewave-debug",
+    builder="bldr/plugin/compiler/go",
+    rev=2,
+    config={
+        "webPluginId": "web",
+        "goPkgs": ["./core/debug/bridge"],
+        "configSet": {
+            "debug-bridge": config_entry("debug/bridge", 1),
+        },
+    },
+)
+
+manifest("spacewave-cli-plugin",
+    builder="bldr/plugin/compiler/go",
+    rev=1,
+    config={
+        "goPkgs": ["./plugin/cli"],
+        "configSet": {
+            "spacewave-cli-plugin": config_entry("plugin/cli", 1),
+        },
+        "platformTypes": {
+            "js": {
+                "goCompiler": "GO_COMPILER_GOSCRIPT",
+            },
+        },
+    },
+)
+
+manifest("spacewave-flowgraph",
+    builder="bldr/plugin/compiler/go",
+    rev=1,
+    nodeTypeIds=["flowgraph/stream-echo"],
+    config={
+        "goPkgs": ["./plugin/flowgraph"],
+        "configSet": {
+            "spacewave-flowgraph": config_entry("plugin/flowgraph", 1),
+        },
+        "webPkgs": EXCLUDED_WEB_PKGS,
+        "platformTypes": {
+            "js": {"goCompiler": "GO_COMPILER_GOSCRIPT"},
+        },
+    },
+)
+
+manifest("spacewave-sql",
+    builder="bldr/plugin/compiler/go",
+    rev=2,
+    config={
+        "goPkgs": ["./plugin/sql"],
+        "configSet": {
+            "spacewave-sql": config_entry("plugin/sql", 1),
+        },
+        "platformTypes": {
+            "js": {
+                "goCompiler": "GO_COMPILER_GOSCRIPT",
+            },
+        },
+    },
+)
+
+# spacewave-prom scrapes Prometheus exporters into prom/target objects from
+# approved Devices and answers PromQL over them. It runs only as a native
+# Device process. No release includes it yet; a Space adds it as a Space
+# plugin.
+manifest("spacewave-prom",
+    builder="bldr/plugin/compiler/go",
+    rev=5,
+    platformIds=["desktop"],
+    config={
+        "goPkgs": ["./plugin/prom"],
+        "configSet": {
+            "spacewave-prom": config_entry("plugin/prom", 1),
+        },
+        "webPkgs": EXCLUDED_WEB_PKGS,
+    },
+)
+
+# spacewave-wasivm runs WebAssembly VMs. It is experimental: no release,
+# remote world or deploy includes it; only the -wasivm builds below do.
+manifest("spacewave-wasivm",
+    builder="bldr/plugin/compiler/go",
+    rev=1,
+    config={
+        "goPkgs": ["./plugin/wasivm"],
+        "configSet": {
+            "spacewave-wasivm": config_entry("plugin/wasivm", 1),
+        },
+        "webPkgs": EXCLUDED_WEB_PKGS,
+        "platformTypes": {
+            "js": {"goCompiler": "GO_COMPILER_GOSCRIPT"},
+        },
+    },
+)
+
+# bldr-materializer serves the typed MaterializeManifest streaming service from
+# a bundled plugin worker. The scheduler demands it for background manifest
+# copying; embedding it in browser entrypoints keeps the bootstrap available
+# before the Release World fetch plane resolves ordinary plugins.
+manifest("bldr-materializer",
+    builder="bldr/plugin/compiler/go",
+    rev=1,
+    config={
+        "goPkgs": ["./bldr/manifest/materializer"],
+        "configSet": {
+            "bldr-materializer": config_entry("bldr/manifest/materializer", 1),
+        },
+        "platformTypes": {
+            "js": {
+                "goCompiler": "GO_COMPILER_GOSCRIPT",
+            },
+        },
+    },
+)
+
+manifest("spacewave",
+    builder="bldr/cli/compiler",
+    config={
+        "goPkgs": [pkg for pkg in CORE_GO_PKGS if pkg not in COMPOSED_GO_PKGS],
+        "composePackage": "./cmd/spacewave/compose",
+        "configSet": core_config_set(),
+        "projectId": "spacewave",
+    },
+)
+
+manifest("spacewave-web",
+    builder="bldr/plugin/compiler/js",
+    rev=12,
+    config={
+        "webPluginId": "web",
+        "modules": [
+            js_module("JS_MODULE_KIND_FRONTEND", "./web/entry.ts"),
+        ],
+        "webPkgs": [
+            web_pkg("@s4wave/web", entrypoints=[
+                "./command", "./configtype", "./contexts", "./debug", "./devtools",
+                "./dnd", "./download", "./editors/file-browser", "./forge", "./frame",
+                "./hooks", "./images", "./launcher", "./layout", "./object",
+                "./platform", "./router", "./sdk/app", "./space", "./state",
+                "./style", "./sync", "./title", "./transform", "./ui", "./ui/credential",
+                "./ui/list", "./ui/loading", "./ui/tree",
+            ]),
+            web_pkg("sonner"),
+        ],
+    },
+)
+
+# spacewave-code provides syntax highlighting: Shiki with its grammars and
+# themes, the @pierre/diffs diff view, and the @s4wave/code components. A
+# plugin that excludes these packages depends on spacewave-code.
+manifest("spacewave-code",
+    builder="bldr/plugin/compiler/js",
+    rev=4,
+    config={
+        "webPluginId": "web",
+        "modules": [
+            js_module("JS_MODULE_KIND_FRONTEND", "./plugin/code/entry.ts"),
+        ],
+        "webPkgs": EXCLUDED_WEB_PKGS + [
+            web_pkg("@s4wave/code", entrypoints=["./CodeBlock", "./markdown"]),
+            # The app's git diff viewer imports the React bindings.
+            web_pkg("@pierre/diffs", entrypoints=["./react"]),
+            web_pkg("@shikijs/core"),
+            web_pkg("@shikijs/engine-javascript"),
+            # @lexical/code-shiki imports the grammar and theme registries, and
+            # the @pierre/diffs theme module imports the core highlighter.
+            web_pkg("shiki", entrypoints=["./core", "./langs", "./themes"]),
+        ],
+    },
+)
+
+# Web packages excluded by JS plugins that highlight code.
+CODE_WEB_PKGS = [
+    web_pkg("@s4wave/code", exclude=True),
+    web_pkg("@pierre/diffs", exclude=True),
+    web_pkg("@shikijs/core", exclude=True),
+    web_pkg("@shikijs/engine-javascript", exclude=True),
+    web_pkg("shiki", exclude=True),
+]
+
+# JS plugins sharing the same exclusion pattern.
+def js_plugin(name, rev, modules, extra_web_pkgs=None):
+    manifest(name,
+        builder="bldr/plugin/compiler/js",
+        rev=rev,
+        config={
+            "webPluginId": "web",
+            "modules": modules,
+            "webPkgs": EXCLUDED_WEB_PKGS + (extra_web_pkgs or []),
+        },
+    )
+
+js_plugin("spacewave-app", rev=225, modules=[
+    js_module("JS_MODULE_KIND_FRONTEND", "./app/App.tsx",
+              entrypoint=True,
+              webViewParentId={"empty": True}),
+], extra_web_pkgs=CODE_WEB_PKGS)
+
+js_plugin("spacewave-notes", rev=2, modules=[
+    js_module("JS_MODULE_KIND_BACKEND", "./plugin/notes/backend.ts",
+              entrypoint=True),
+    js_module("JS_MODULE_KIND_FRONTEND", "./plugin/notes/NotebookViewer.tsx"),
+    js_module("JS_MODULE_KIND_FRONTEND", "./plugin/notes/BlogViewer.tsx"),
+    js_module("JS_MODULE_KIND_FRONTEND", "./plugin/notes/DocsViewer.tsx"),
+    js_module("JS_MODULE_KIND_FRONTEND", "./plugin/notes/NotesWizardViewer.tsx"),
+], extra_web_pkgs=CODE_WEB_PKGS)
+
+js_plugin("spacewave-colors", rev=1, modules=[
+    js_module("JS_MODULE_KIND_BACKEND", "./plugin/colors/backend.ts",
+              entrypoint=True),
+    js_module("JS_MODULE_KIND_FRONTEND", "./plugin/colors/ColorViewer.tsx"),
+])
+
+js_plugin("spacewave-v86", rev=1, modules=[
+    js_module("JS_MODULE_KIND_BACKEND", "./plugin/v86/backend.ts",
+              entrypoint=True),
+    js_module("JS_MODULE_KIND_FRONTEND", "./plugin/v86/VmV86Viewer.tsx"),
+])
+
+DESKTOP_RELEASE_LOAD_PLUGINS = [
+    "spacewave-launcher", "spacewave-loader",
+    "spacewave-core", "spacewave-web", "spacewave-app", "web",
+]
+
+CLI_RELEASE_LOAD_PLUGINS = [
+    "spacewave-launcher",
+    "spacewave-core", "spacewave-web", "spacewave-app",
+]
+
+BROWSER_RELEASE_LOAD_PLUGINS = [
+    # spacewave-loader is intentionally omitted in browser release builds. It
+    # exists only to spawn the native spacewave-helper loading window; in WASM
+    # it has no helper binary to launch and just creates a no-op plugin worker.
+    "spacewave-launcher",
+    "spacewave-core", "spacewave-web", "spacewave-app", "web",
+]
+
+BROWSER_RELEASE_E2E_LOAD_PLUGINS = [
+    "spacewave-launcher",
+    "spacewave-core", "spacewave-web", "spacewave-app", "web",
+]
+
+def dist_release_config(
+        embed_manifests,
+        load_plugins,
+        entrypoint_role="desktop",
+        go_compiler=None,
+        channel_key="stable",
+        host_config_set=None):
+    conf = dist_compiler_config(
+        composePackage="./cmd/spacewave/compose",
+        embedManifests=embed_manifests,
+        entrypointRole=entrypoint_role,
+        channelKey=channel_key,
+        loadPlugins=load_plugins,
+        loadWebStartup=WEB_STARTUP,
+    )
+    # Installers and native updates carry a single executable. Its bootstrap
+    # World must survive packaging without an adjacent volume file.
+    if entrypoint_role != "browser":
+        conf["embedNativeVolume"] = "ENABLE"
+    if go_compiler:
+        conf["goCompiler"] = go_compiler
+    if entrypoint_role == "browser":
+        conf["goscriptDeferredFunctions"] = [
+            "github.com/s4wave/spacewave/core/cdn/v86copy.CopyV86ImageFromCdnWithProgress",
+        ]
+    if host_config_set:
+        conf["hostConfigSet"] = host_config_set
+    return conf
+
+# The browser distribution mounts the Release World before its scheduler
+# starts, so the first startup selection sees the announced release instead of
+# booting the cached one and replacing it.
+def browser_dist_release_config(embed_manifests, load_plugins, go_compiler):
+    return dist_release_config(
+        embed_manifests,
+        load_plugins,
+        entrypoint_role="browser",
+        go_compiler=go_compiler,
+        host_config_set=release_world_config_set(SPACEWAVE_RELEASE),
+    )
+
+manifest("spacewave-dist",
+    builder="bldr/dist/compiler",
+    # embedManifests is empty in the static manifest because every release
+    # build supplies its own (manifestId, platformId) tuples via
+    # manifestOverrides (REPLACE semantics). This keeps the static config
+    # host-agnostic and makes the build target the single source of truth for
+    # what ships in each bundle.
+    config=dist_release_config([], DESKTOP_RELEASE_LOAD_PLUGINS),
+)
+manifest("spacewave-browser",
+    builder="bldr/dist/compiler",
+    # Browser entrypoint packaging is a web shell artifact, not the native
+    # desktop DistConfig slot. Keep it on its own manifest id so browser release
+    # builds never wait on or publish native spacewave-dist refs.
+    config=dist_release_config([], BROWSER_RELEASE_LOAD_PLUGINS, entrypoint_role="browser"),
+)
+manifest("spacewave-cli",
+    builder="bldr/dist/compiler",
+    # CLI uses the same dist compiler and native CLI path as spacewave-dist,
+    # but has its own Manifest id so Release World metadata can distinguish
+    # CLI rollout from desktop app rollout without overloading platform ids.
+    config=dist_release_config([], CLI_RELEASE_LOAD_PLUGINS, entrypoint_role="cli"),
+)
+
+# -- Build targets --
+
+DEV_MANIFESTS = [
+    "web", "spacewave-core", "spacewave-web", "spacewave-code",
+    "spacewave-app", "spacewave-notes", "spacewave-v86", "spacewave-sql", "spacewave-cli-plugin", "spacewave-debug",
+    "bldr-materializer",
+]
+BROWSER_RELEASE_MANIFESTS = [
+    "spacewave-launcher", "bldr-materializer",
+    "spacewave-browser",
+]
+BROWSER_RELEASE_E2E_MANIFESTS = [
+    "spacewave-launcher", "bldr-materializer",
+    "spacewave-core", "spacewave-web", "spacewave-code", "spacewave-app", "spacewave-notes", "spacewave-sql", "spacewave-cli-plugin", "web",
+    "spacewave-browser",
+]
+DESKTOP_RELEASE_MANIFESTS = [
+    "spacewave-launcher",
+    "spacewave-dist",
+]
+CLI_RELEASE_MANIFESTS = [
+    "spacewave-launcher",
+    "spacewave-cli",
+]
+# REMOTE_WORLD_MANIFESTS are the manifests that ship in the R2-hosted plugin
+# world. Desktop entrypoints still embed the startup app manifests for a
+# reliable first boot; plugin-promote can replace them after launch by updating
+# the remote plugin world.
+REMOTE_WORLD_MANIFESTS = [
+    "spacewave-loader", "spacewave-core", "spacewave-web", "spacewave-code", "spacewave-app", "spacewave-notes", "spacewave-v86", "spacewave-sql",
+    "spacewave-cli-plugin", "web",
+]
+PLUGIN_RELEASE_BROWSER_MANIFESTS = [
+    "spacewave-core", "spacewave-web", "spacewave-code", "spacewave-app", "spacewave-notes", "spacewave-v86", "spacewave-sql",
+    "spacewave-cli-plugin", "web",
+]
+
+# The launcher mounts and verifies Release World before the scheduler resolves
+# ordinary startup plugins. Entrypoint artifacts therefore embed no desired
+# plugin state besides the launcher and the bldr-materializer bootstrap plugin;
+# the materializer must be available before background traversal can start.
+def browser_release_embed_manifests(go_platform_id):
+    return [
+        {"manifestId": "spacewave-launcher",
+         "platformId": go_platform_id},
+        {"manifestId": "bldr-materializer",
+         "platformId": go_platform_id},
+    ]
+
+
+BROWSER_RELEASE_LAZY_PLUGIN_FIXTURE_EMBEDS = browser_release_embed_manifests("js")
+BROWSER_RELEASE_LAZY_PLUGIN_FIXTURE_LOAD_PLUGINS = BROWSER_RELEASE_LOAD_PLUGINS + [
+    "spacewave-cli-plugin",
+]
+
+# Browser e2e embeds the startup closure, every Notes platform the browser can
+# select, the spacewave-code plugin they depend on, and the spacewave-sql
+# fixture without a populated Release World.
+def browser_e2e_embed_manifests(go_platform_id):
+    return browser_release_embed_manifests(go_platform_id) + [
+        {"manifestId": "spacewave-core",
+         "platformId": go_platform_id},
+        {"manifestId": "spacewave-web",
+         "platformId": "js"},
+        {"manifestId": "spacewave-code",
+         "platformId": "js"},
+        {"manifestId": "spacewave-app",
+         "platformId": "js"},
+        {"manifestId": "web",
+         "platformId": "web/js/wasm"},
+        {"manifestId": "spacewave-notes",
+         "platformId": "js"},
+        {"manifestId": "spacewave-notes",
+         "platformId": "web/js/wasm"},
+        {"manifestId": "spacewave-sql",
+         "platformId": "js"},
+    ]
+
+
+BROWSER_RELEASE_EMBED_MANIFESTS = browser_release_embed_manifests("js")
+BROWSER_RELEASE_WASM_EMBED_MANIFESTS = browser_release_embed_manifests("web/js/wasm")
+BROWSER_RELEASE_E2E_EMBED_MANIFESTS = browser_e2e_embed_manifests("web/js/wasm")
+BROWSER_RELEASE_E2E_GOSCRIPT_EMBED_MANIFESTS = browser_e2e_embed_manifests("js")
+
+build("app",         manifests=DEV_MANIFESTS,     targets=["desktop"])
+build("web",         manifests=DEV_MANIFESTS,     targets=["browser"])
+build("app-wasivm",  manifests=DEV_MANIFESTS + ["spacewave-wasivm"], targets=["desktop"])
+build("web-wasivm",  manifests=DEV_MANIFESTS + ["spacewave-wasivm"], targets=["browser"])
+build("release-web",
+    manifests=BROWSER_RELEASE_MANIFESTS,
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-launcher": browser_release_launcher_config(web_go_compiler="GO_COMPILER_GOSCRIPT"),
+        "spacewave-core": browser_spacewave_core_config("GO_COMPILER_GOSCRIPT"),
+        "spacewave-browser": browser_dist_release_config(
+            BROWSER_RELEASE_EMBED_MANIFESTS,
+            BROWSER_RELEASE_LOAD_PLUGINS,
+            go_compiler="GO_COMPILER_GOSCRIPT",
+        ),
+    },
+)
+build("release-web-lazy-plugin-fixture",
+    manifests=BROWSER_RELEASE_MANIFESTS,
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-launcher": browser_release_launcher_config(web_go_compiler="GO_COMPILER_GOSCRIPT"),
+        "spacewave-core": browser_spacewave_core_config("GO_COMPILER_GOSCRIPT"),
+        "spacewave-browser": browser_dist_release_config(
+            BROWSER_RELEASE_LAZY_PLUGIN_FIXTURE_EMBEDS,
+            BROWSER_RELEASE_LAZY_PLUGIN_FIXTURE_LOAD_PLUGINS,
+            go_compiler="GO_COMPILER_GOSCRIPT",
+        ),
+    },
+)
+build("release-web-e2e",
+    manifests=BROWSER_RELEASE_E2E_MANIFESTS,
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-launcher": e2e_release_wasm_launcher_config(),
+        "spacewave-core": e2e_browser_spacewave_core_config(),
+        "spacewave-browser": dist_release_config(
+            BROWSER_RELEASE_E2E_EMBED_MANIFESTS,
+            BROWSER_RELEASE_E2E_LOAD_PLUGINS,
+            entrypoint_role="browser",
+        ),
+    },
+)
+# CI serves the js dist output. Split the asset and dist phases so GitHub
+# runners do not optimize the unused web/js/wasm dist runtime in parallel.
+build("release-web-e2e-assets",
+    manifests=[
+        "spacewave-launcher", "bldr-materializer",
+        "spacewave-core", "spacewave-web", "spacewave-code", "spacewave-app", "spacewave-notes", "spacewave-sql", "spacewave-cli-plugin", "web",
+    ],
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-launcher": e2e_release_wasm_launcher_config(),
+        "spacewave-core": e2e_browser_spacewave_core_config(),
+    },
+)
+build("release-web-e2e-dist",
+    manifests=["spacewave-browser"],
+    platformIds=["js"],
+    manifestOverrides={
+        "spacewave-browser": dist_release_config(
+            BROWSER_RELEASE_E2E_EMBED_MANIFESTS,
+            BROWSER_RELEASE_E2E_LOAD_PLUGINS,
+            entrypoint_role="browser",
+        ),
+    },
+)
+build("release-web-e2e-tinygo-core",
+    manifests=["spacewave-core"],
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-core": e2e_browser_spacewave_core_config("GO_COMPILER_TINYGO"),
+    },
+)
+build("release-web-e2e-tinygo-assets",
+    manifests=[
+        "spacewave-launcher",
+        "spacewave-core", "spacewave-web", "spacewave-code", "spacewave-app", "spacewave-notes", "spacewave-sql", "spacewave-cli-plugin", "web",
+    ],
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-core": e2e_browser_spacewave_core_config("GO_COMPILER_TINYGO"),
+        "spacewave-launcher": e2e_release_wasm_launcher_config(),
+    },
+)
+build("release-web-tinygo",
+    manifests=BROWSER_RELEASE_MANIFESTS,
+    platformIds=["web/js/wasm"],
+    manifestOverrides={
+        "spacewave-launcher": browser_release_launcher_config(web_go_compiler="GO_COMPILER_TINYGO"),
+        "spacewave-core": browser_spacewave_core_config("GO_COMPILER_TINYGO"),
+        "spacewave-browser": browser_dist_release_config(
+            BROWSER_RELEASE_WASM_EMBED_MANIFESTS,
+            BROWSER_RELEASE_LOAD_PLUGINS,
+            go_compiler="GO_COMPILER_TINYGO",
+        ),
+    },
+)
+build("release-web-e2e-tinygo",
+    manifests=BROWSER_RELEASE_E2E_MANIFESTS,
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-core": e2e_browser_spacewave_core_config("GO_COMPILER_TINYGO"),
+        "spacewave-launcher": e2e_release_wasm_launcher_config(),
+        "spacewave-browser": dist_release_config(
+            BROWSER_RELEASE_E2E_EMBED_MANIFESTS,
+            BROWSER_RELEASE_E2E_LOAD_PLUGINS,
+            entrypoint_role="browser",
+            go_compiler="GO_COMPILER_TINYGO",
+        ),
+    },
+)
+build("release-web-e2e-goscript",
+    manifests=BROWSER_RELEASE_E2E_MANIFESTS,
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-core": e2e_browser_spacewave_core_config("GO_COMPILER_GOSCRIPT"),
+        "spacewave-launcher": e2e_release_wasm_launcher_config(web_go_compiler="GO_COMPILER_GOSCRIPT"),
+        "spacewave-browser": dist_release_config(
+            BROWSER_RELEASE_E2E_GOSCRIPT_EMBED_MANIFESTS,
+            BROWSER_RELEASE_E2E_LOAD_PLUGINS,
+            entrypoint_role="browser",
+            go_compiler="GO_COMPILER_GOSCRIPT",
+        ),
+    },
+)
+build("cli-plugin",  manifests=["spacewave-cli-plugin"], targets=["browser"])
+# The app frontend builds alone for import into a CLI daemon's plugin store,
+# where it serves a Space bound with spacewave web --space.
+build("cli-web",
+    manifests=["spacewave-app", "spacewave-web"],
+    platform_ids=["js"],
+)
+# Targeted build for the materializer plugin: the build CLI selects whole build
+# targets, so a single-manifest target is the only way to compile one plugin.
+build("materializer", manifests=["bldr-materializer"], targets=["browser"])
+build("cli",         manifests=["spacewave"])
+
+# plugin-release-browser records the browser-side plugin channel manifest set.
+# The CI release helper builds each manifest with its release platform because
+# the remote world mixes the GoScript core/js manifest, JS plugin manifests, and
+# web/web/js/wasm manifest in one channel.
+PLUGIN_RELEASE_BROWSER_MANIFEST_OVERRIDES = {
+    "spacewave-core": browser_spacewave_core_config("GO_COMPILER_GOSCRIPT"),
+}
+def plugin_release_browser_manifest_overrides(manifest_id, release_environment="production"):
+    if manifest_id == "spacewave-core":
+        if release_environment == "staging":
+            core = browser_spacewave_core_config("GO_COMPILER_GOSCRIPT")
+            core["configSet"] = spacewave_core_config_set(
+                cloud_api_endpoint=BROWSER_RELEASE_CLOUD_API_ENDPOINT,
+                account_endpoint="https://account-staging.spacewave.app",
+                signing_env_prefix="spacewave-staging",
+            )
+            return {"spacewave-core": core}
+        return PLUGIN_RELEASE_BROWSER_MANIFEST_OVERRIDES
+    return {}
+
+def plugin_release_browser_manifest_platform_ids(manifest_id):
+    if manifest_id == "web":
+        return ["web/js/wasm"]
+    return ["js"]
+
+
+build("plugin-release-browser",
+    manifests=PLUGIN_RELEASE_BROWSER_MANIFESTS,
+    targets=["browser"],
+    manifestOverrides=PLUGIN_RELEASE_BROWSER_MANIFEST_OVERRIDES,
+)
+
+build("plugin-release-browser-tinygo",
+    manifests=PLUGIN_RELEASE_BROWSER_MANIFESTS,
+    targets=["browser"],
+    manifestOverrides={
+        "spacewave-core": browser_spacewave_core_config("GO_COMPILER_TINYGO"),
+    },
+)
+
+# Per-host release builds. Each (host_key, platform_id) pair drives one
+# `release-<host_key>` build target that release.go invokes via
+# `bldr build -b release-<host_key>`. The manifestOverrides entry REPLACES
+# the static spacewave-dist builder config for that slot, embedding only
+# the (manifestId, platformId) tuples that belong in this host's binary.
+RELEASE_HOSTS = [
+    ("desktop-darwin-arm64",  "desktop/darwin/arm64"),
+    ("desktop-darwin-amd64",  "desktop/darwin/amd64"),
+    ("desktop-linux-arm64",   "desktop/linux/arm64"),
+    ("desktop-linux-amd64",   "desktop/linux/amd64"),
+    ("desktop-windows-arm64", "desktop/windows/arm64"),
+    ("desktop-windows-amd64", "desktop/windows/amd64"),
+]
+
+def define_release_build(host_key, platform_id, channel_key="stable", launcher=None):
+    if launcher == None:
+        launcher = spacewave_launcher_config()
+    desktop_embed_manifests = [
+        {"manifestId": "spacewave-launcher",
+         "platformId": platform_id},
+    ]
+    build("release-" + host_key,
+        manifests=DESKTOP_RELEASE_MANIFESTS,
+        platform_ids=[platform_id],
+        manifestOverrides={
+            "spacewave-launcher": launcher,
+            "spacewave-dist": dist_release_config(
+                desktop_embed_manifests,
+                DESKTOP_RELEASE_LOAD_PLUGINS,
+                channel_key=channel_key,
+            ),
+        },
+    )
+
+for host_key, platform_id in RELEASE_HOSTS:
+    define_release_build(host_key, platform_id)
+
+# Per-host managed CLI entrypoint builds. Each (host_key, platform_id) pair
+# drives one `release-cli-<host_key>` build target that produces a
+# `spacewave-cli` dist entrypoint for the matching host. The terminal path
+# loads the same release-world product plugin surface as desktop, but omits the
+# native helper-window loader so CLI startup owns progress and failure output.
+def define_release_cli_build(host_key, platform_id, channel_key="stable", launcher=None):
+    if launcher == None:
+        launcher = spacewave_launcher_config()
+    cli_host_key = host_key.replace("desktop-", "")
+    cli_embed_manifests = [
+        {"manifestId": "spacewave-launcher",
+         "platformId": platform_id},
+    ]
+    build("release-cli-" + cli_host_key,
+        manifests=CLI_RELEASE_MANIFESTS,
+        platform_ids=[platform_id],
+        manifestOverrides={
+            "spacewave-launcher": launcher,
+            "spacewave-cli": dist_release_config(
+                cli_embed_manifests,
+                CLI_RELEASE_LOAD_PLUGINS,
+                entrypoint_role="cli",
+                channel_key=channel_key,
+            ),
+        },
+    )
+
+for host_key, platform_id in RELEASE_HOSTS:
+    define_release_cli_build(host_key, platform_id)
+
+# The release repository supplies public environment values through this one
+# overlay contract. Native and browser producers retain the source-owned
+# controller factories and build shapes while replacing release authority.
+def apply_release_environment(
+        channel_key,
+        signer_peer_id,
+        cloud_api_endpoint,
+        account_endpoint,
+        signing_env_prefix,
+        world_space_id,
+        cdn_base_url,
+        web_go_compiler=None):
+    core = spacewave_core_config(web_go_compiler=web_go_compiler)
+    include_export = web_go_compiler != "GO_COMPILER_GOSCRIPT"
+    core["goPkgs"] = core_go_pkgs(include_export=include_export)
+    core["configSet"] = spacewave_core_config_set(
+        include_export=include_export,
+        cloud_api_endpoint=cloud_api_endpoint,
+        account_endpoint=account_endpoint,
+        signing_env_prefix=signing_env_prefix,
+    )
+    core["configSet"]["provider-spacewave"] = config_entry("provider/spacewave", 2, {
+        "endpoint": cloud_api_endpoint,
+        "accountEndpoint": account_endpoint,
+        "publicBaseUrl": cloud_api_endpoint,
+        "signingEnvPrefix": signing_env_prefix,
+    })
+    manifest("spacewave-core", builder="bldr/plugin/compiler/go",
+        rev=SPACEWAVE_CORE_MANIFEST_REV, config=core)
+
+    native = web_go_compiler == None
+    release = spacewave_release_deployment(
+        space_id=world_space_id,
+        signer_peer_id=signer_peer_id,
+        selector_url=cloud_api_endpoint.rstrip("/") + "/api/release/config",
+        cdn_base_url=cdn_base_url,
+        channel_key=channel_key,
+    )
+    launcher = spacewave_launcher_config(
+        launcher_controller_config=release_launcher_controller_config(release),
+        web_go_compiler=web_go_compiler,
+        include_release_world=native,
+        release=release,
+    )
+    release_world = release_world_config_set(release)
+    manifest("spacewave-launcher", builder="bldr/plugin/compiler/go", rev=1, config=launcher)
+
+    if native:
+        for host_key, platform_id in RELEASE_HOSTS:
+            define_release_build(host_key, platform_id, channel_key=channel_key, launcher=launcher)
+            define_release_cli_build(host_key, platform_id, channel_key=channel_key, launcher=launcher)
+    if not native:
+        build("release-web", manifests=BROWSER_RELEASE_MANIFESTS, targets=["browser"],
+            manifestOverrides={
+                "spacewave-browser": dist_release_config(
+                    BROWSER_RELEASE_EMBED_MANIFESTS, BROWSER_RELEASE_LOAD_PLUGINS,
+                    entrypoint_role="browser", go_compiler=web_go_compiler,
+                    channel_key=channel_key, host_config_set=release_world,
+                ),
+            },
+        )
+
+# Per-host plugin releases include the Electron host needed to load the UI.
+# Shared JavaScript manifests are built once by plugin-release-browser.
+for host_key, platform_id in RELEASE_HOSTS:
+    build("plugin-release-" + host_key,
+        manifests=["spacewave-loader", "spacewave-core", "spacewave-sql", "web"],
+        platform_ids=[platform_id],
+    )
+
+# -- Publish --
+#
+# The spacewave-release remote is the staging area for uploading manifests to
+# the R2-hosted remote world. =bldr publish -p spacewave-release= copies the
+# selected REMOTE_WORLD_MANIFESTS from the devtool world into a local s4db
+# Volume at =.bldr/release-spacewave.s4wave=. Release automation packs that
+# World into a kvfile and uploads it to the plugin channel namespace at
+# =release/plugins/world/<plugin-rev>.kvfile=. The publish timestamp is pinned
+# so identical inputs yield identical World contents across runs; bump
+# =RELEASE_PIN_TIMESTAMP_SECONDS= at each release cut.
+
+# Pinned timestamp used for publish so reproducible builds stay stable
+# across rebuilds but advance with real releases. Bump at each release cut to
+# match the git tag date. RFC3339 UTC ("Z" suffix required).
+RELEASE_PIN_TIMESTAMP = "2026-04-16T00:00:00Z"
+
+remote("spacewave-release",
+    engineId="spacewave-release-world",
+    objectKey="spacewave/release/manifests",
+    hostConfigSet={
+        "release-volume": config_entry("hydra/volume/s4db", 1, {
+            "path": ".bldr/release-spacewave.s4wave",
+            "noWriteKey": True,
+            "volumeConfig": {
+                "volumeIdAlias": ["release-volume"],
+            },
+        }),
+        "release-bucket": config_entry("hydra/bucket/setup", 1, {
+            "applyBucketConfigs": [{
+                "config": {"id": "spacewave-release", "rev": 1},
+                "volumeIdList": ["release-volume"],
+            }],
+        }),
+        "release-engine": config_entry("hydra/world/block/engine", 1, {
+            "engineId": "spacewave-release-world",
+            "volumeId": "release-volume",
+            "bucketId": "spacewave-release",
+            "objectStoreId": "spacewave-release",
+        }),
+    },
+)
+
+publish("spacewave-release",
+    remotes=["spacewave-release"],
+    manifests=REMOTE_WORLD_MANIFESTS,
+    storage={
+        "timestamp": RELEASE_PIN_TIMESTAMP,
+    },
+)
+
+# -- Project --
+
+project(
+    id="spacewave",
+    start=start_config(
+        plugins=["web", "spacewave-web", "spacewave-app",
+                 "spacewave-core", "spacewave-debug"],
+        loadWebStartup=WEB_STARTUP,
+    ),
+)

@@ -1,0 +1,297 @@
+package plugin_space
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	configset_controller "github.com/aperturerobotics/controllerbus/controller/configset/controller"
+	controller_exec "github.com/aperturerobotics/controllerbus/controller/exec"
+	timestamp "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/pkg/errors"
+	bldr_core "github.com/s4wave/spacewave/bldr/core"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	plugin_host_configset "github.com/s4wave/spacewave/bldr/plugin/host/configset"
+	"github.com/s4wave/spacewave/db/block"
+	block_store_inmem "github.com/s4wave/spacewave/db/block/store/inmem"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	node_controller "github.com/s4wave/spacewave/db/node/controller"
+	"github.com/s4wave/spacewave/db/unixfs"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/hash"
+	bifrost_rpc "github.com/s4wave/spacewave/net/rpc"
+	"github.com/sirupsen/logrus"
+)
+
+// testHostPluginID is the plugin id of the fake host used by the forwarding tests.
+const testHostPluginID = "spacewave-core"
+
+func TestRunCloudBlockStoreForwardingExposesHostBucket(t *testing.T) {
+	// Bound the cloud block forwarding test lifetime.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create the plugin bus with the host configuration factory.
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	le := logrus.NewEntry(log)
+	pluginBus, pluginResolver, err := bldr_core.NewCoreBus(ctx, le.WithField("bus", "plugin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginResolver.AddFactory(plugin_host_configset.NewFactory(pluginBus))
+
+	// Create the host bus and attach its configuration controller.
+	hostBus, _, err := bldr_core.NewCoreBus(ctx, le.WithField("bus", "host"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostConfigSetCtrl, err := configset_controller.NewController(le.WithField("bus", "host"), hostBus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relHostConfigSet, err := hostBus.AddController(ctx, hostConfigSetCtrl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relHostConfigSet()
+
+	// Attach the node controller to the host bus.
+	hostNodeCtrl := node_controller.NewController(&node_controller.Config{}, le.WithField("bus", "host"), hostBus)
+	relHostNode, err := hostBus.AddController(ctx, hostNodeCtrl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relHostNode()
+
+	// Connect the plugin and host buses through their RPC clients.
+	if rel := addFakePluginHost(t, ctx, le, pluginBus, hostBus); rel != nil {
+		defer rel()
+	}
+	if rel := addPluginClientOnHost(t, ctx, le, pluginBus, hostBus); rel != nil {
+		defer rel()
+	}
+
+	// Populate the mounted bucket with a block unavailable in the local cache.
+	// Only the mounted capability can read these bytes. A generic bucket lookup
+	// must not replace it with the provider's local-only cache.
+	bucketID := "p/spacewave/acct/blk/space"
+	store, _, err := block_store_inmem.NewBlockStoreBuilder(le, &block_store_inmem.Config{BlockStoreId: bucketID})(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("forwarded block")
+	ref, _, err := store.PutBlock(ctx, body, &block.PutOpts{HashType: hash.HashType_HashType_SHA256})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a plugin distribution containing its entrypoint.
+	const entrypoint = "plugin.js"
+	distFS := memfs.New()
+	entrypointFile, err := distFS.Create(entrypoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entrypointFile.Write([]byte("console.log('plugin ok')\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := entrypointFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write the plugin manifest and mount its bucket cursor.
+	manifestTx, manifestCursor := block.NewTransaction(store, nil, nil, nil)
+	manifestMeta := bldr_manifest.NewManifestMeta("gizmo-web", bldr_manifest.BuildType_DEV, "desktop/darwin/arm64", 1)
+	if err := bldr_manifest.CreateManifestWithBilly(ctx, manifestCursor, bldr_manifest.NewManifest(manifestMeta, entrypoint), distFS, nil, timestamp.Now()); err != nil {
+		t.Fatal(err)
+	}
+	manifestRootRef, _, err := manifestTx.Write(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestObjRef := &bucket.ObjectRef{BucketId: bucketID, RootRef: manifestRootRef}
+	mountedCursor := bucket_lookup.NewCursor(ctx, pluginBus, le, nil, store, nil, nil,
+		&bucket.BucketOpArgs{BucketId: bucketID}, nil)
+	defer mountedCursor.Release()
+
+	// Attach the cloud block store forwarder to the plugin bus.
+	forwarder := NewCloudBlockStoreForwarder(
+		le,
+		pluginBus,
+		"space/spacewave/acct/space",
+		bucketID,
+		testHostPluginID,
+		world.NewAccessWorldStateFunc(mountedCursor),
+	)
+	forwarderRef, err := pluginBus.AddController(ctx, forwarder, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarderRef()
+
+	// Resolve the forwarded bucket on the host bus.
+	hostBucket, _, hostBucketRef, err := bucket.ExBuildBucketAPI(ctx, hostBus, false, bucketID, bucketID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostBucketRef.Release()
+	if hostBucket.GetID() != bucketID {
+		t.Fatalf("expected host bucket id %q, got %q", bucketID, hostBucket.GetID())
+	}
+
+	// Verify the forwarded bucket returns the original block bytes.
+	got, found, err := hostBucket.GetBucket().GetBlock(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected block to be readable through host bucket")
+	}
+	if string(got) != string(body) {
+		t.Fatalf("expected block body %q, got %q", string(body), string(got))
+	}
+
+	// Resolve the forwarded bucket lookup on the host bus.
+	hostLookup, _, hostLookupRef, err := bucket_lookup.ExBuildBucketLookup(ctx, hostBus, false, bucketID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostLookupRef.Release()
+
+	// Verify the bucket lookup returns the original block bytes.
+	got, found, err = bucket_lookup.NewBucketFromHandle(hostLookup).GetBlock(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected block to be readable through host bucket lookup")
+	}
+	if string(got) != string(body) {
+		t.Fatalf("expected lookup block body %q, got %q", string(body), string(got))
+	}
+
+	// Open the plugin manifest through the forwarded host cursor.
+	hostRootCursor := bucket_lookup.NewCursor(
+		ctx,
+		hostBus,
+		le,
+		nil,
+		bucket_lookup.NewBucketFromHandle(hostLookup),
+		nil,
+		&bucket.ObjectRef{BucketId: bucketID},
+		&bucket.BucketOpArgs{BucketId: bucketID},
+		nil,
+	)
+	defer hostRootCursor.Release()
+	err = bldr_manifest_world.AccessManifest(
+		ctx,
+		le,
+		world.NewAccessWorldStateFunc(hostRootCursor),
+		manifestObjRef,
+		func(
+			ctx context.Context,
+			_ *bucket_lookup.Cursor,
+			_ *block.Cursor,
+			manifest *bldr_manifest.Manifest,
+			distFS *unixfs.FSHandle,
+			_ *unixfs.FSHandle,
+		) error {
+			// Verify the forwarded manifest retains its entrypoint.
+			if got := manifest.GetEntrypoint(); got != entrypoint {
+				t.Fatalf("expected manifest entrypoint %q, got %q", entrypoint, got)
+			}
+
+			// Open the entrypoint and verify its file metadata is readable.
+			entrypointHandle, _, err := distFS.LookupPath(ctx, entrypoint)
+			if err != nil {
+				return err
+			}
+			defer entrypointHandle.Release()
+			_, err = entrypointHandle.GetFileInfo(ctx)
+			return err
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func addFakePluginHost(t *testing.T, ctx context.Context, le *logrus.Entry, pluginBus bus.Bus, hostBus bus.Bus) func() {
+	// Expose the fake plugin host through an RPC client controller.
+	t.Helper()
+	mux := srpc.NewMux()
+	if err := bldr_plugin.SRPCRegisterPluginHost(mux, &testPluginHost{hostBus: hostBus}); err != nil {
+		t.Fatal(err)
+	}
+	client := srpc.NewClient(srpc.NewServerPipe(srpc.NewServer(mux)))
+	ctrl := bifrost_rpc.NewClientController(
+		le,
+		pluginBus,
+		controller.NewInfo("test/plugin-host-client", controller.MustParseVersion("0.0.1"), ""),
+		client,
+		[]string{bldr_plugin.HostServiceIDPrefix},
+	)
+	rel, err := pluginBus.AddController(ctx, ctrl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rel
+}
+
+func addPluginClientOnHost(t *testing.T, ctx context.Context, le *logrus.Entry, pluginBus bus.Bus, hostBus bus.Bus) func() {
+	// Attach the plugin RPC client to the host bus.
+	t.Helper()
+	serverID := bldr_plugin.HostServerID("default")
+	client := srpc.NewClient(srpc.NewServerPipe(srpc.NewServer(bifrost_rpc.NewInvoker(pluginBus, serverID, true))))
+	ctrl := bifrost_rpc.NewClientController(
+		le,
+		hostBus,
+		controller.NewInfo("test/spacewave-core-client", controller.MustParseVersion("0.0.1"), ""),
+		client,
+		[]string{bldr_plugin.PluginServiceID(testHostPluginID, "")},
+	)
+	rel, err := hostBus.AddController(ctx, ctrl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rel
+}
+
+type testPluginHost struct {
+	hostBus bus.Bus
+}
+
+func (h *testPluginHost) GetPluginInfo(context.Context, *bldr_plugin.GetPluginInfoRequest) (*bldr_plugin.GetPluginInfoResponse, error) {
+	return &bldr_plugin.GetPluginInfoResponse{PluginId: testHostPluginID}, nil
+}
+
+func (h *testPluginHost) ExecController(req *controller_exec.ExecControllerRequest, strm bldr_plugin.SRPCPluginHost_ExecControllerStream) error {
+	return req.Execute(strm.Context(), h.hostBus, true, strm.Send)
+}
+
+func (h *testPluginHost) LoadPlugin(*bldr_plugin.LoadPluginRequest, bldr_plugin.SRPCPluginHost_LoadPluginStream) error {
+	return errors.New("LoadPlugin is not used by this test")
+}
+
+func (h *testPluginHost) PluginRpc(bldr_plugin.SRPCPluginHost_PluginRpcStream) error {
+	return errors.New("PluginRpc is not used by this test")
+}
+
+func (h *testPluginHost) PluginFsRpc(bldr_plugin.SRPCPluginHost_PluginFsRpcStream) error {
+	return errors.New("PluginFsRpc is not used by this test")
+}
+
+func (h *testPluginHost) WatchPluginStatus(*bldr_plugin.WatchPluginStatusRequest, bldr_plugin.SRPCPluginHost_WatchPluginStatusStream) error {
+	return errors.New("WatchPluginStatus is not used by this test")
+}
+
+// _ is a type assertion
+var _ bldr_plugin.SRPCPluginHostServer = (*testPluginHost)(nil)

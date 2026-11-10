@@ -1,0 +1,342 @@
+package transport
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/directive"
+	ws "github.com/aperturerobotics/go-websocket"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/pkg/errors"
+	bifrost_crypto "github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/signaling"
+	signaling_rpc "github.com/s4wave/spacewave/net/signaling/rpc"
+	signaling_rpc_client "github.com/s4wave/spacewave/net/signaling/rpc/client"
+	signaling_rpc_frame "github.com/s4wave/spacewave/net/signaling/rpc/frame"
+	"github.com/sirupsen/logrus"
+)
+
+// signalingWebSocketPingInterval is the liveness interval for signaling WS.
+const (
+	signalingWebSocketPingInterval  = 15 * time.Second
+	signalingWebSocketRetryDelay    = 250 * time.Millisecond
+	signalingWebSocketMaxRetryDelay = 5 * time.Second
+)
+
+// signalingURLFunc acquires a fresh ticket and builds its WebSocket URL.
+type signalingURLFunc func(context.Context) (string, error)
+
+// dialSignalingClient dials a SignalingDO via WebSocket and returns a
+// signaling client using SRPC frames, one per WebSocket message, so the
+// server can hibernate between messages. The caller runs frames.ReadPump.
+func dialSignalingClient(
+	ctx context.Context,
+	le *logrus.Entry,
+	url string,
+	priv bifrost_crypto.PrivKey,
+) (*signaling_rpc_client.Client, *ws.Conn, *signaling_rpc_frame.Conn, error) {
+	// Dial the signaling WebSocket endpoint.
+	conn, _, err := ws.Dial(ctx, url, nil)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "dial signaling websocket")
+	}
+
+	// Build the signaling client over SRPC frames on the connection.
+	frames := signaling_rpc_frame.NewConn(ctx, conn)
+	sig := signaling_rpc.NewSRPCSignalingClient(srpc.NewClient(frames.OpenStream))
+	sc, err := signaling_rpc_client.NewClient(le, sig, priv, nil)
+	if err != nil {
+		conn.CloseNow()
+		return nil, nil, nil, errors.Wrap(err, "create signaling client")
+	}
+	return sc, conn, frames, nil
+}
+
+// wsSignalingCtrl integrates a direct-WS signaling client with the bus.
+type wsSignalingCtrl struct {
+	le    *logrus.Entry
+	b     bus.Bus
+	url   signalingURLFunc
+	priv  bifrost_crypto.PrivKey
+	sigID string
+	pid   peer.ID
+
+	client *signaling_rpc_client.Client
+	conn   *ws.Conn
+
+	mtx   sync.Mutex
+	ready chan struct{}
+	// done is closed when the current connection generation ends.
+	done       chan struct{}
+	refs       map[string]listenRef
+	retryDelay time.Duration
+}
+
+// listenRef holds references for an incoming signaling session.
+type listenRef struct {
+	peerRef *signaling_rpc_client.ClientPeerRef
+	dirRef  directive.Reference
+}
+
+// newWSSignalingCtrl constructs a new WebSocket signaling bus controller.
+func newWSSignalingCtrl(
+	le *logrus.Entry,
+	b bus.Bus,
+	url signalingURLFunc,
+	priv bifrost_crypto.PrivKey,
+	sigID string,
+	pid peer.ID,
+) *wsSignalingCtrl {
+	return &wsSignalingCtrl{
+		le:    le,
+		b:     b,
+		url:   url,
+		priv:  priv,
+		sigID: sigID,
+		pid:   pid,
+		ready: make(chan struct{}),
+		refs:  make(map[string]listenRef),
+	}
+}
+
+// GetControllerInfo returns information about the controller.
+func (c *wsSignalingCtrl) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(
+		"aperture/transport/ws-signaling",
+		controller.MustParseVersion("0.0.1"),
+		"WebSocket signaling client",
+	)
+}
+
+// Execute keeps signaling attached for the session transport lifetime. A
+// failed dial or broken WebSocket starts a fresh generation after backoff.
+func (c *wsSignalingCtrl) Execute(ctx context.Context) error {
+	delay := c.retryDelay
+	if delay <= 0 {
+		delay = signalingWebSocketRetryDelay
+	}
+	for {
+		err := c.executeGeneration(ctx)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		c.le.WithError(err).Warn("signaling websocket generation failed; reconnecting")
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < signalingWebSocketMaxRetryDelay {
+			delay = min(delay*2, signalingWebSocketMaxRetryDelay)
+		}
+	}
+}
+
+// executeGeneration acquires fresh authorization and owns one connection lifetime.
+func (c *wsSignalingCtrl) executeGeneration(ctx context.Context) error {
+	// Acquire authorization immediately before opening this generation.
+	url, err := c.url(ctx)
+	if err != nil {
+		return err
+	}
+	client, conn, frames, err := dialSignalingClient(ctx, c.le, url, c.priv)
+	if err != nil {
+		return err
+	}
+	defer conn.CloseNow()
+	defer client.ClearContext()
+
+	// Publish readiness until this generation releases its signaling references.
+	c.mtx.Lock()
+	c.client = client
+	c.conn = conn
+	c.done = make(chan struct{})
+	close(c.ready)
+	c.mtx.Unlock()
+	defer func() {
+		// Release the generation's references and reset its state.
+		c.mtx.Lock()
+		c.releaseAllRefsLocked()
+		c.client = nil
+		c.conn = nil
+		close(c.done)
+		c.done = nil
+		c.ready = make(chan struct{})
+		c.mtx.Unlock()
+	}()
+
+	// Attach incoming peers through the existing signaling directives.
+	client.SetListenHandler(func(lctx context.Context, reset, added bool, pid string) {
+		// Serialize listen callbacks against the controller state.
+		c.mtx.Lock()
+		defer c.mtx.Unlock()
+
+		// Drop all references when the peer list resets.
+		if reset {
+			c.releaseAllRefsLocked()
+		}
+		if pid == "" {
+			return
+		}
+		if !added {
+			if lr, ok := c.refs[pid]; ok {
+				lr.dirRef.Release()
+				lr.peerRef.Release()
+				delete(c.refs, pid)
+			}
+			return
+		}
+
+		// Attach the new peer with a session directive.
+		peerRef := client.AddPeerRef(pid)
+		sess := signaling_rpc_client.NewSessionWithRef(peerRef)
+		di := signaling.NewHandleSignalPeer(c.sigID, sess)
+		_, ref, addErr := c.b.AddDirective(ctx, di, nil)
+		if addErr != nil {
+			peerRef.Release()
+			c.le.WithError(addErr).Warn("failed to add HandleSignalPeer directive")
+			return
+		}
+		c.refs[pid] = listenRef{peerRef: peerRef, dirRef: ref}
+	})
+	client.SetContext(ctx)
+
+	// Detect a broken socket and return it to the controller retry loop.
+	// Protocol pings do not wake a hibernated server.
+	connErr := make(chan error, 2)
+	go func() {
+		connErr <- frames.ReadPump(nil)
+	}()
+	go func() {
+		connErr <- runWebSocketPing(ctx, conn, signalingWebSocketPingInterval)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-connErr:
+		if err == nil {
+			err = errors.New("signaling websocket stopped")
+		}
+		return err
+	}
+}
+
+// releaseAllRefsLocked releases every listen reference and empties the map.
+// The caller must hold c.mtx.
+func (c *wsSignalingCtrl) releaseAllRefsLocked() {
+	for k, lr := range c.refs {
+		lr.dirRef.Release()
+		lr.peerRef.Release()
+		delete(c.refs, k)
+	}
+}
+
+// runWebSocketPing pings the websocket until the context is canceled.
+func runWebSocketPing(ctx context.Context, conn *ws.Conn, interval time.Duration) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+
+		if err := conn.Ping(ctx); err != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return errors.Wrap(err, "ping websocket")
+		}
+	}
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+func (c *wsSignalingCtrl) HandleDirective(ctx context.Context, di directive.Instance) ([]directive.Resolver, error) {
+	switch dir := di.GetDirective().(type) {
+	case signaling.SignalPeer:
+		return c.resolveSignalPeer(ctx, di, dir)
+	}
+	return nil, nil
+}
+
+// resolveSignalPeer checks directive filters and returns a resolver.
+func (c *wsSignalingCtrl) resolveSignalPeer(_ context.Context, _ directive.Instance, dir signaling.SignalPeer) ([]directive.Resolver, error) {
+	if sid := dir.SignalingID(); sid != "" && sid != c.sigID {
+		return nil, nil
+	}
+	if lpid := dir.SignalLocalPeerID(); len(lpid) > 0 && lpid != c.pid {
+		return nil, nil
+	}
+	if len(dir.SignalRemotePeerID()) == 0 {
+		return nil, nil
+	}
+	return directive.Resolvers(&wsSignalPeerResolver{c: c, dir: dir}), nil
+}
+
+// Close releases any resources used by the controller.
+func (c *wsSignalingCtrl) Close() error {
+	return nil
+}
+
+// wsSignalPeerResolver resolves a SignalPeer directive via the WS client.
+type wsSignalPeerResolver struct {
+	c   *wsSignalingCtrl
+	dir signaling.SignalPeer
+}
+
+// Resolve resolves the values, emitting them to the handler.
+func (r *wsSignalPeerResolver) Resolve(ctx context.Context, handler directive.ResolverHandler) error {
+	remotePeerIDStr := r.dir.SignalRemotePeerID().String()
+	for {
+		// Wait for a connection generation and reference the remote peer on it.
+		var peerRef *signaling_rpc_client.ClientPeerRef
+		var genDone <-chan struct{}
+		for peerRef == nil {
+			r.c.mtx.Lock()
+			client := r.c.client
+			ready := r.c.ready
+			if client != nil {
+				peerRef = client.AddPeerRef(remotePeerIDStr)
+				genDone = r.c.done
+			}
+			r.c.mtx.Unlock()
+			if peerRef != nil {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ready:
+			}
+		}
+
+		var val signaling.SignalPeerValue = signaling_rpc_client.NewSessionWithRef(peerRef)
+		vid, accepted := handler.AddValue(val)
+		if !accepted {
+			peerRef.Release()
+			return nil
+		}
+		handler.AddValueRemovedCallback(vid, peerRef.Release)
+
+		// Replace the value when this connection generation ends.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-genDone:
+			_, _ = handler.RemoveValue(vid)
+		}
+	}
+}
+
+// _ is a type assertion
+var _ controller.Controller = (*wsSignalingCtrl)(nil)
+
+// _ is a type assertion
+var _ directive.Resolver = (*wsSignalPeerResolver)(nil)

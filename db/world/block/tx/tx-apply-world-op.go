@@ -1,0 +1,163 @@
+package world_block_tx
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// NewTxApplyWorldOp constructs a new APPLY_WORLD_OP transaction.
+func NewTxApplyWorldOp(op world.Operation, opSender peer.ID) (*Tx, error) {
+	// Require an operation type before recording the World operation.
+	opTypeID := op.TypeID()
+	if opTypeID == "" {
+		return nil, world.ErrEmptyOp
+	}
+
+	// Encode the World operation body for transaction replay.
+	opBody, err := op.MarshalVT()
+	if err != nil {
+		return nil, err
+	}
+
+	// Let authenticated operations determine their sender during replay.
+	if _, authenticated := op.(world.AuthenticatedOperation); authenticated {
+		opSender = ""
+	}
+	return &Tx{
+		TxType: TxType_TxType_APPLY_WORLD_OP,
+		TxApplyWorldOp: &TxApplyWorldOp{
+			OperationTypeId: opTypeID,
+			OperationBody:   opBody,
+			OpSender:        opSender.String(),
+		},
+	}, nil
+}
+
+// NewTxApplyWorldOpTxn constructs a new APPLY_WORLD_OP transaction.
+func NewTxApplyWorldOpTxn() Transaction {
+	return &TxApplyWorldOp{}
+}
+
+// IsNil returns if the object is nil.
+func (t *TxApplyWorldOp) IsNil() bool {
+	return t == nil
+}
+
+// GetTxType returns the type of transaction this is.
+func (t *TxApplyWorldOp) GetTxType() TxType {
+	return TxType_TxType_APPLY_WORLD_OP
+}
+
+// GetEmpty checks if the tx is empty.
+func (t *TxApplyWorldOp) GetEmpty() bool {
+	return t.GetOperationTypeId() == "" || len(t.GetOperationBody()) == 0
+}
+
+// Clone clones the tx object.
+func (t *TxApplyWorldOp) Clone() *TxApplyWorldOp {
+	if t == nil {
+		return nil
+	}
+	body := make([]byte, len(t.GetOperationBody()))
+	copy(body, t.GetOperationBody())
+	return &TxApplyWorldOp{
+		OperationTypeId: t.GetOperationTypeId(),
+		OperationBody:   body,
+		OpSender:        t.GetOpSender(),
+	}
+}
+
+// Validate performs a cursory check of the transaction.
+// Note: this should not fetch network data.
+func (t *TxApplyWorldOp) Validate() error {
+	if len(t.GetOperationTypeId()) == 0 {
+		return world.ErrEmptyOp
+	}
+	if opSender := t.GetOpSender(); opSender != "" {
+		if _, err := confparse.ParsePeerID(opSender); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ExecuteTx executes the transaction against a world instance.
+func (t *TxApplyWorldOp) ExecuteTx(
+	ctx context.Context,
+	sender peer.ID,
+	lookupOp world.LookupOp,
+	worldInstance world.WorldState,
+) (sysErr bool, rerr error) {
+	// Translate operation panics into transaction errors.
+	defer func() {
+		if err := recover(); err != nil {
+			if v, ok := err.(error); ok {
+				rerr = v
+			} else {
+				rerr = errors.New("apply operation paniced")
+			}
+		}
+	}()
+
+	// Decode the operation and resolve its sender.
+	op, err := t.decodeOp(ctx, lookupOp)
+	if err != nil {
+		return false, err
+	}
+	if _, authenticated := op.(world.AuthenticatedOperation); !authenticated {
+		if opSender := t.GetOpSender(); opSender != "" {
+			sender, err = confparse.ParsePeerID(opSender)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+
+	// Apply the operation.
+	_, sysErr, err = worldInstance.ApplyWorldOp(ctx, op, sender)
+	return sysErr, nameMissingBlock(err, t.GetOperationTypeId(), op)
+}
+
+// decodeOp validates the transaction and decodes its operation, resolving the
+// operation type with lookupOp.
+func (t *TxApplyWorldOp) decodeOp(ctx context.Context, lookupOp world.LookupOp) (world.Operation, error) {
+	if err := t.Validate(); err != nil {
+		return nil, err
+	}
+	return decodeOperation(ctx, lookupOp, t.GetOperationTypeId(), t.GetOperationBody())
+}
+
+// decodeOperation constructs the operation type opTypeID with lookupOp and
+// decodes body into it.
+func decodeOperation(ctx context.Context, lookupOp world.LookupOp, opTypeID string, body []byte) (op world.Operation, rerr error) {
+	// Translate decoding panics into errors.
+	defer func() {
+		if err := recover(); err != nil {
+			if v, ok := err.(error); ok {
+				rerr = v
+			} else {
+				rerr = errors.New("unmarshal operation paniced")
+			}
+		}
+	}()
+
+	// Construct the operation type and decode the body.
+	op, err := lookupOp(ctx, opTypeID)
+	if err == nil && op == nil {
+		err = errors.Wrap(world.ErrUnhandledOp, opTypeID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := op.UnmarshalVT(body); err != nil {
+		return nil, err
+	}
+	return op, nil
+}
+
+// _ is a type assertion
+var _ Transaction = (*TxApplyWorldOp)(nil)

@@ -1,0 +1,928 @@
+package resource_space
+
+import (
+	"cmp"
+	"context"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/directive"
+	timestamppb "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/broadcast"
+	"github.com/pkg/errors"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	process_binding "github.com/s4wave/spacewave/core/plugin/process"
+	"github.com/s4wave/spacewave/core/plugin/space/pluginids"
+	plugin_space_runtime "github.com/s4wave/spacewave/core/plugin/space/runtime"
+	space_world "github.com/s4wave/spacewave/core/space/world"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/volume"
+	"github.com/s4wave/spacewave/db/world"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	s4wave_process "github.com/s4wave/spacewave/sdk/process"
+	s4wave_space "github.com/s4wave/spacewave/sdk/space"
+	"github.com/sirupsen/logrus"
+)
+
+// errSpaceContentsReleased reports a call on a released contents mount.
+var errSpaceContentsReleased = errors.New("space contents resource is released")
+
+// SpaceContentsResource provides streaming plugin status for one contents
+// mount of a Space. Every mount of the Space shares one plugin runtime, and
+// each mount keeps every plugin the Space lists running.
+type SpaceContentsResource struct {
+	le       *logrus.Entry
+	b        bus.Bus
+	mux      srpc.Invoker
+	engine   world.Engine
+	spaceID  string
+	engineID string
+	volumeID string
+	storeID  string
+	// runtime is the shared plugin runtime of the Space.
+	runtime *plugin_space_runtime.Controller
+	// runtimeRef holds this mount's reference to runtime.
+	runtimeRef directive.Reference
+	// demand keeps every listed plugin of runtime running.
+	demand *plugin_space_runtime.PluginDemand
+	// ctx is canceled when the mount is released.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+	// mu guards the cached plugin descriptions and manifest catalog below.
+	mu sync.Mutex
+	// descriptionPluginIDs is the plugin ID set for the cached descriptions.
+	descriptionPluginIDs []string
+	// descriptions caches plugin descriptions for the current plugin set.
+	descriptions map[string]string
+	// availablePluginManifestRefs fingerprints the manifest object content set for
+	// the cached catalog.
+	availablePluginManifestRefs []string
+	// availablePlugins caches the installable plugin catalog for the current
+	// manifest object content set.
+	availablePlugins []*s4wave_space.AvailablePlugin
+	// buildDescriptions overrides description lookup in tests.
+	buildDescriptions func(context.Context, world.WorldState, []string) (map[string]string, error)
+	// buildAvailablePlugins overrides catalog enumeration in tests.
+	buildAvailablePlugins func(context.Context, world.WorldState) ([]*s4wave_space.AvailablePlugin, error)
+	// lookupManifest overrides manifest lookup in tests.
+	lookupManifest func(context.Context, world.WorldState, string) (*bldr_manifest.Manifest, *bucket.ObjectRef, error)
+	// afterAttachedRpcServiceReady blocks the bind continuation in focused lifecycle tests.
+	afterAttachedRpcServiceReady func()
+}
+
+// NewSpaceContentsResource creates a contents mount of the Space runtime that
+// demands every plugin the Space lists. The mount owns runtimeRef and releases
+// it in Release.
+func NewSpaceContentsResource(
+	le *logrus.Entry,
+	b bus.Bus,
+	engine world.Engine,
+	spaceID string,
+	engineID string,
+	runtime *plugin_space_runtime.Controller,
+	runtimeRef directive.Reference,
+) *SpaceContentsResource {
+	// Build the mount, demanding every listed plugin until Release.
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // SpaceContentsResource.Release owns the stored cancellation function.
+	r := &SpaceContentsResource{
+		le:         le,
+		b:          b,
+		engine:     engine,
+		spaceID:    spaceID,
+		engineID:   engineID,
+		runtime:    runtime,
+		runtimeRef: runtimeRef,
+		demand:     runtime.DemandAllPlugins(),
+		ctx:        ctx,
+		ctxCancel:  cancel,
+	}
+
+	// Serve the contents service.
+	mux := srpc.NewMux()
+	_ = s4wave_space.SRPCRegisterSpaceContentsResourceService(mux, r)
+	r.mux = mux
+	return r
+}
+
+// Release ends the calls of the mount and drops its demand and runtime
+// reference. The runtime stops after its last holder is released.
+func (r *SpaceContentsResource) Release() {
+	r.ctxCancel()
+	r.demand.Release()
+	r.runtimeRef.Release()
+}
+
+// getStoreLocation returns the volume and object store IDs that hold the
+// process bindings, falling back to the plugin volume defaults.
+func (r *SpaceContentsResource) getStoreLocation() (string, string) {
+	// Resolve the volume that holds the Space process bindings.
+	volumeID := r.volumeID
+	if volumeID == "" {
+		volumeID = bldr_plugin.PluginVolumeID
+	}
+
+	// Resolve the object store that holds the Space process bindings.
+	storeID := r.storeID
+	if storeID == "" {
+		storeID = process_binding.DefaultObjectStoreID
+	}
+	return volumeID, storeID
+}
+
+// GetMux returns the rpc mux.
+func (r *SpaceContentsResource) GetMux() srpc.Invoker {
+	return r.mux
+}
+
+// BindAttachedRpcService publishes a caller-attached Resource under one private
+// service ID prefix for the caller attachment lifetime. The route follows the
+// running generation of the shared Space runtime, and the prefix is reserved
+// across every mount of the Space.
+func (r *SpaceContentsResource) BindAttachedRpcService(
+	req *s4wave_space.BindAttachedRpcServiceRequest,
+	strm s4wave_space.SRPCSpaceContentsResourceService_BindAttachedRpcServiceStream,
+) error {
+	// Validate the attached Resource identity and private service prefix.
+	if req.GetAttachedResourceId() == 0 {
+		return errors.New("attached resource ID must be nonzero")
+	}
+	prefix := req.GetServiceIdPrefix()
+	if !isSafeAttachedRpcServicePrefix(prefix) {
+		return errors.New("service ID prefix must be nonempty and safe")
+	}
+
+	// Resolve the attached Resource client and its lifetime notification.
+	resourceCtx, err := resource_server.MustGetResourceClientContext(strm.Context())
+	if err != nil {
+		return err
+	}
+	client, err := resourceCtx.GetAttachedResource(req.GetAttachedResourceId())
+	if err != nil {
+		return err
+	}
+	var clientDone <-chan struct{}
+	if doneClient, ok := client.(interface{ Done() <-chan struct{} }); ok {
+		clientDone = doneClient.Done()
+	}
+
+	// Refuse a route when the caller, attachment, request, or mount has already
+	// ended.
+	if err := r.attachedRpcServiceLifetimeError(strm.Context(), resourceCtx.Context(), clientDone); err != nil {
+		return err
+	}
+	releasePrefix, err := r.runtime.ReserveServicePrefix(prefix)
+	if err != nil {
+		return err
+	}
+	defer releasePrefix()
+
+	// Keep the attached service route bound to the current Space generation.
+	invoker := srpc.NewClientInvoker(client)
+	var installed *plugin_space_runtime.Generation
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	ready := false
+	for {
+		gen, waitCh, err := r.runtime.GetGeneration()
+		if err != nil {
+			return err
+		}
+		if gen == nil {
+			select {
+			case <-strm.Context().Done():
+				return strm.Context().Err()
+			case <-resourceCtx.Context().Done():
+				return resourceCtx.Context().Err()
+			case <-r.ctx.Done():
+				return errSpaceContentsReleased
+			case <-clientDone:
+				return nil
+			case <-waitCh:
+				continue
+			}
+		}
+		if gen == installed {
+			select {
+			case <-strm.Context().Done():
+				return strm.Context().Err()
+			case <-resourceCtx.Context().Done():
+				return resourceCtx.Context().Err()
+			case <-r.ctx.Done():
+				return errSpaceContentsReleased
+			case <-clientDone:
+				return nil
+			case <-gen.Done():
+				installed = nil
+				release()
+				release = nil
+				continue
+			}
+		}
+
+		// Stop the previous generation's route before installing it on the
+		// replacement.
+		if release != nil {
+			release()
+			release = nil
+		}
+		ctrl := NewAttachedRpcServiceController(prefix, invoker)
+		release, err = gen.GetBus().AddController(strm.Context(), ctrl, nil)
+		if err != nil {
+			select {
+			case <-gen.Done():
+				continue
+			default:
+			}
+			return err
+		}
+		installed = gen
+
+		// Wait until the route can answer before the first readiness response.
+		select {
+		case <-ctrl.Ready():
+		case <-strm.Context().Done():
+			return strm.Context().Err()
+		case <-resourceCtx.Context().Done():
+			return resourceCtx.Context().Err()
+		case <-r.ctx.Done():
+			return errSpaceContentsReleased
+		case <-clientDone:
+			return errors.New("attached resource ended before attached service was ready")
+		case <-gen.Done():
+			installed = nil
+			release()
+			release = nil
+			continue
+		}
+		// Let focused lifecycle tests replace the Space runtime after its route is ready.
+		if r.afterAttachedRpcServiceReady != nil {
+			r.afterAttachedRpcServiceReady()
+		}
+
+		// Publish this route only while its generation is still running.
+		current, _, err := r.runtime.GetGeneration()
+		if err != nil {
+			return err
+		}
+		if current != gen {
+			installed = nil
+			release()
+			release = nil
+			continue
+		}
+		if !ready {
+			// Check the caller lifetimes again before reporting the first route.
+			if err := r.attachedRpcServiceLifetimeError(strm.Context(), resourceCtx.Context(), clientDone); err != nil {
+				return err
+			}
+			if err := strm.Send(&s4wave_space.BindAttachedRpcServiceResponse{}); err != nil {
+				return err
+			}
+			ready = true
+		}
+	}
+}
+
+// attachedRpcServiceLifetimeError reports an ended binding lifetime without waiting.
+func (r *SpaceContentsResource) attachedRpcServiceLifetimeError(
+	streamCtx context.Context,
+	resourceCtx context.Context,
+	clientDone <-chan struct{},
+) error {
+	// Check the stream, Resource, and Space mount lifetimes before publishing a route.
+	if err := streamCtx.Err(); err != nil {
+		return err
+	}
+	if err := resourceCtx.Err(); err != nil {
+		return err
+	}
+	if r.ctx.Err() != nil {
+		return errSpaceContentsReleased
+	}
+	select {
+	case <-clientDone:
+		return errors.New("attached resource ended before attached service was ready")
+	default:
+	}
+	return nil
+}
+
+// isSafeAttachedRpcServicePrefix reports whether prefix is a bounded, relative
+// service ID prefix ending in a slash with no whitespace or control characters.
+func isSafeAttachedRpcServicePrefix(prefix string) bool {
+	if prefix == "" || len(prefix) > 256 || !utf8.ValidString(prefix) ||
+		prefix[0] == '/' || prefix[len(prefix)-1] != '/' {
+		return false
+	}
+	for _, char := range prefix {
+		if unicode.IsSpace(char) || unicode.IsControl(char) {
+			return false
+		}
+	}
+	return true
+}
+
+// WatchState streams the current plugin and process state for the space.
+func (r *SpaceContentsResource) WatchState(
+	req *s4wave_space.WatchSpaceContentsStateRequest,
+	strm s4wave_space.SRPCSpaceContentsResourceService_WatchStateStream,
+) error {
+	ctx := strm.Context()
+	var prevSeqno uint64
+	var prev *s4wave_space.SpaceContentsState
+	for {
+		// Read SpaceSettings, manifest descriptions, and the installable plugin
+		// catalog from the world, recording the reads.
+		reads := world.NewReadSet()
+		var pluginIDs []string
+		var descriptions map[string]string
+		var availablePlugins []*s4wave_space.AvailablePlugin
+		if err := func() error {
+			// Open a World snapshot for the Space contents readback.
+			tx, err := r.engine.NewTransaction(ctx, false)
+			if err != nil {
+				return err
+			}
+			defer tx.Discard()
+
+			// Capture the World revision for the next contents change.
+			prevSeqno, err = tx.GetSeqno(ctx)
+			if err != nil {
+				return err
+			}
+			wtx := reads.Track(tx)
+
+			// Read the configured plugins from SpaceSettings.
+			settings, err := space_world.LookupSpaceSettingsBody(ctx, wtx)
+			if err != nil {
+				return err
+			}
+			if settings != nil {
+				pluginIDs = settings.GetPluginIds()
+			}
+
+			// Resolve descriptions for the configured Space plugins.
+			descriptions, err = r.getPluginDescriptions(ctx, wtx, pluginIDs)
+			if err != nil {
+				r.le.WithError(err).Warn("failed to resolve plugin descriptions")
+				descriptions = nil
+			}
+
+			// Read the installable plugin catalog from the World snapshot.
+			availablePlugins, err = r.getAvailablePlugins(ctx, wtx)
+			if err != nil {
+				r.le.WithError(err).Warn("failed to resolve plugin catalog")
+				availablePlugins = nil
+			}
+
+			return nil
+		}(); err != nil {
+			return err
+		}
+
+		// Build plugin statuses from the running runtime generation.
+		gen, runtimeCh, runtimeErr := r.runtime.GetGeneration()
+		accountIDs := pluginids.Missing(pluginIDs, r.runtime.GetAccountPluginIDs())
+		loadedIDs := map[string]struct{}{}
+		var loadedCh, requestedCh <-chan struct{}
+		var requestedIDs []string
+		schedulerStatuses := map[string]*bldr_plugin.PluginStatus{}
+		var waitStatusChange, waitHostChange func(context.Context) error
+		if gen != nil {
+			_, hostChanged, hostErr := gen.GetScheduler().GetHostState()
+			waitHostChange = hostChanged
+			if hostErr != nil {
+				runtimeErr = errors.Wrap(hostErr, "watch daemon plugin hosts")
+			}
+			var ids []string
+			ids, loadedCh = gen.GetSpaceController().GetLoadedPluginIDsAndWaitCh()
+			for _, pid := range ids {
+				loadedIDs[pid] = struct{}{}
+			}
+			var requested []string
+			requested, requestedCh = gen.GetSpaceController().GetRequestedPluginIDsAndWaitCh()
+			requestedIDs = pluginids.Missing(slices.Concat(pluginIDs, accountIDs), requested)
+
+			statusCtr := gen.GetScheduler().GetPluginStatusCtr()
+			statusSnapshot := statusCtr.GetValue()
+			schedulerStatuses = spacePluginStatusesByID(statusSnapshot, r.spaceID)
+			waitStatusChange = func(waitCtx context.Context) error {
+				_, err := statusCtr.WaitValueChange(waitCtx, statusSnapshot, nil)
+				return err
+			}
+		}
+		plugins := make([]*s4wave_space.SpacePluginStatus, 0, len(pluginIDs)+len(accountIDs))
+		for i, pid := range slices.Concat(pluginIDs, accountIDs) {
+			_, loaded := loadedIDs[pid]
+			status := buildSpacePluginStatus(
+				pid,
+				descriptions[pid],
+				loaded,
+				gen != nil,
+				schedulerStatuses[pid],
+			)
+			status.Account = i >= len(pluginIDs)
+			if runtimeErr != nil {
+				status.State = s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_FAILED
+				status.Detail = runtimeErr.Error()
+			}
+			plugins = append(plugins, status)
+		}
+
+		// Read the process decisions from the account store.
+		processBindings, err := r.listProcessBindingInfos(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Send the state when it changed.
+		state := &s4wave_space.SpaceContentsState{
+			Ready:              true,
+			Plugins:            plugins,
+			ProcessBindings:    processBindings,
+			AvailablePlugins:   availablePlugins,
+			RequestedPluginIds: requestedIDs,
+		}
+		if !state.EqualVT(prev) {
+			if err := strm.Send(state); err != nil {
+				return err
+			}
+			prev = state
+		}
+
+		// Wait for a change to what the World reads saw, or a runtime,
+		// process binding, loaded, or requested state change.
+		err = waitSpaceContentsSources(ctx, func(waitCtx context.Context) error {
+			_, err := reads.WaitChange(waitCtx, r.engine, prevSeqno)
+			return err
+		}, []<-chan struct{}{runtimeCh, loadedCh, requestedCh}, waitStatusChange, waitHostChange)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// waitSpaceContentsSources blocks until waitWorld returns, any channel in
+// waitChs closes, or any waitFn returns nil. It returns ctx.Err when ctx ends
+// first and nil after any wake.
+func waitSpaceContentsSources(
+	ctx context.Context,
+	waitWorld func(context.Context) error,
+	waitChs []<-chan struct{},
+	waitFns ...func(context.Context) error,
+) error {
+	// Scope the Space contents waits so any completed source can stop the others.
+	waitCtx, waitCancel := context.WithCancel(ctx)
+	defer waitCancel()
+
+	// Watch the runtime channels and each available contents change source.
+	waitCount := 1
+	for _, waitFn := range waitFns {
+		if waitFn != nil {
+			waitCount++
+		}
+	}
+	waitAnyDone := make(chan struct{}, waitCount)
+	go func() {
+		if err := broadcast.WaitAny(waitCtx, waitChs...); err == nil {
+			waitCancel()
+		}
+		waitAnyDone <- struct{}{}
+	}()
+	for _, waitFn := range waitFns {
+		if waitFn == nil {
+			continue
+		}
+		go func() {
+			if err := waitFn(waitCtx); err == nil {
+				waitCancel()
+			}
+			waitAnyDone <- struct{}{}
+		}()
+	}
+
+	// Join the contents watchers after the World change wait ends.
+	err := waitWorld(waitCtx)
+	waitCancel()
+	for range waitCount {
+		<-waitAnyDone
+	}
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// spacePluginStatusesByID indexes the scheduler statuses of instanceKey by
+// plugin ID.
+func spacePluginStatusesByID(
+	snapshot *bldr_plugin.PluginStatusSnapshot,
+	instanceKey string,
+) map[string]*bldr_plugin.PluginStatus {
+	statuses := map[string]*bldr_plugin.PluginStatus{}
+	if snapshot == nil {
+		return statuses
+	}
+	for _, plugin := range snapshot.Plugins {
+		if plugin == nil || plugin.GetInstanceKey() != instanceKey {
+			continue
+		}
+		statuses[plugin.GetPluginId()] = plugin
+	}
+	return statuses
+}
+
+// buildSpacePluginStatus projects the loaded state and scheduler status of one
+// configured plugin into its Space lifecycle status.
+func buildSpacePluginStatus(
+	pluginID string,
+	description string,
+	loaded bool,
+	controllerStarted bool,
+	schedulerStatus *bldr_plugin.PluginStatus,
+) *s4wave_space.SpacePluginStatus {
+	// Project the configured plugin through runtime, scheduler, and loaded states.
+	state := s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_CONFIGURED
+	detail := ""
+	if controllerStarted {
+		state = s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_LOADING
+		detail = "Plugin runtime requested"
+	}
+	if schedulerStatus != nil {
+		state, detail = projectSpacePluginLifecycle(schedulerStatus)
+	}
+	if loaded || (schedulerStatus != nil && schedulerStatus.GetRunning()) {
+		loaded = true
+		state = s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_LOADED
+		detail = ""
+	}
+	return &s4wave_space.SpacePluginStatus{
+		PluginId:    pluginID,
+		Loaded:      loaded,
+		Description: description,
+		State:       state,
+		Detail:      detail,
+	}
+}
+
+// projectSpacePluginLifecycle maps a scheduler plugin status to a Space
+// lifecycle state and detail message.
+func projectSpacePluginLifecycle(
+	status *bldr_plugin.PluginStatus,
+) (s4wave_space.SpacePluginLifecycleState, string) {
+	if msg := status.GetLastErrorMessage(); msg != "" {
+		if status.GetState() == bldr_plugin.PluginState_PluginState_REQUESTED {
+			return s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_RETRYING, msg
+		}
+		return s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_FAILED, msg
+	}
+	switch status.GetState() {
+	case bldr_plugin.PluginState_PluginState_RUNNING:
+		return s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_LOADED, ""
+	case bldr_plugin.PluginState_PluginState_REQUESTED:
+		return s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_LOADING, "Plugin runtime requested"
+	default:
+		return s4wave_space.SpacePluginLifecycleState_SpacePluginLifecycleState_CONFIGURED, ""
+	}
+}
+
+// getPluginDescriptions returns cached plugin descriptions for the current plugin set.
+func (r *SpaceContentsResource) getPluginDescriptions(
+	ctx context.Context,
+	ws world.WorldState,
+	pluginIDs []string,
+) (map[string]string, error) {
+	// Retain a stable plugin set for the description cache lookup.
+	pluginIDs = slices.Clone(pluginIDs)
+
+	// Return cached descriptions when the configured plugin set matches.
+	var cached map[string]string
+	r.mu.Lock()
+	if slices.Equal(r.descriptionPluginIDs, pluginIDs) {
+		cached = maps.Clone(r.descriptions)
+	}
+	r.mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+
+	// Build descriptions for the changed Space plugin set.
+	buildDescriptions := r.buildDescriptions
+	if buildDescriptions == nil {
+		buildDescriptions = r.collectPluginDescriptions
+	}
+	descriptions, err := buildDescriptions(ctx, ws, pluginIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Retain an independent description cache for subsequent contents reads.
+	r.mu.Lock()
+	r.descriptionPluginIDs = slices.Clone(pluginIDs)
+	r.descriptions = maps.Clone(descriptions)
+	r.mu.Unlock()
+	return maps.Clone(descriptions), nil
+}
+
+// collectPluginDescriptions builds a description summary for the current plugin set.
+func (r *SpaceContentsResource) collectPluginDescriptions(
+	ctx context.Context,
+	ws world.WorldState,
+	pluginIDs []string,
+) (map[string]string, error) {
+	// Prepare the description result for the configured Space plugins.
+	descriptions := make(map[string]string, len(pluginIDs))
+	if len(pluginIDs) == 0 {
+		return descriptions, nil
+	}
+
+	// Collect the nonempty plugin IDs whose descriptions are needed.
+	needed := make(map[string]struct{}, len(pluginIDs))
+	for _, pid := range pluginIDs {
+		if pid != "" {
+			needed[pid] = struct{}{}
+		}
+	}
+	if len(needed) == 0 {
+		return descriptions, nil
+	}
+
+	// Read manifest descriptions until every requested plugin has one.
+	manifestKeys, err := world_types.ListObjectsWithType(ctx, ws, bldr_manifest_world.ManifestTypeID)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range manifestKeys {
+		m, _, err := bldr_manifest_world.LookupManifest(ctx, ws, key)
+		if err != nil {
+			continue
+		}
+		meta := m.GetMeta()
+		mid := meta.GetManifestId()
+		if _, ok := needed[mid]; !ok {
+			continue
+		}
+		if _, ok := descriptions[mid]; ok {
+			continue
+		}
+		if desc := meta.GetDescription(); desc != "" {
+			descriptions[mid] = desc
+		}
+		if len(descriptions) == len(needed) {
+			break
+		}
+	}
+
+	return descriptions, nil
+}
+
+// getAvailablePlugins returns the cached installable plugin catalog for the
+// current manifest object content set, using the test override when set.
+func (r *SpaceContentsResource) getAvailablePlugins(
+	ctx context.Context,
+	ws world.WorldState,
+) ([]*s4wave_space.AvailablePlugin, error) {
+	// Use the test override when set.
+	if r.buildAvailablePlugins != nil {
+		return r.buildAvailablePlugins(ctx, ws)
+	}
+
+	// Return the cached catalog while the manifest refs are unchanged.
+	manifestRefs, err := collectAvailablePluginManifestRefs(ctx, ws)
+	if err != nil {
+		return nil, err
+	}
+	var cached []*s4wave_space.AvailablePlugin
+	r.mu.Lock()
+	if slices.Equal(r.availablePluginManifestRefs, manifestRefs) {
+		cached = cloneAvailablePlugins(r.availablePlugins)
+	}
+	r.mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+
+	// Rebuild the catalog and cache it.
+	lookupManifest := r.lookupManifest
+	if lookupManifest == nil {
+		lookupManifest = bldr_manifest_world.LookupManifest
+	}
+	availablePlugins, err := collectAvailablePlugins(ctx, ws, manifestRefs, lookupManifest)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	r.availablePluginManifestRefs = slices.Clone(manifestRefs)
+	r.availablePlugins = cloneAvailablePlugins(availablePlugins)
+	r.mu.Unlock()
+	return cloneAvailablePlugins(availablePlugins), nil
+}
+
+// collectAvailablePluginManifestRefs returns the root refs of every manifest
+// object in key order, fingerprinting the installable plugin catalog.
+func collectAvailablePluginManifestRefs(
+	ctx context.Context,
+	ws world.WorldState,
+) ([]string, error) {
+	// Order manifest object keys for a stable catalog fingerprint.
+	manifestKeys, err := world_types.ListObjectsWithType(ctx, ws, bldr_manifest_world.ManifestTypeID)
+	if err != nil {
+		return nil, err
+	}
+	manifestKeys = slices.Clone(manifestKeys)
+	slices.Sort(manifestKeys)
+
+	// Collect manifest root references without retaining World object handles.
+	manifestRefs := make([]string, 0, len(manifestKeys))
+	for _, key := range manifestKeys {
+		obj, err := world.MustGetObject(ctx, ws, key)
+		if err != nil {
+			return nil, err
+		}
+		ref, _, err := obj.GetRootRef(ctx)
+		world.ReleaseObjectState(obj)
+		if err != nil {
+			return nil, err
+		}
+		manifestRefs = append(manifestRefs, key+"\x00"+ref.MarshalString())
+	}
+	return manifestRefs, nil
+}
+
+// LookupAvailablePlugin returns the highest revision catalog entry for pluginID
+// in the Space World, or nil if the World offers no such plugin.
+func (r *SpaceResource) LookupAvailablePlugin(ctx context.Context, pluginID string) (*s4wave_space.AvailablePlugin, error) {
+	// Read the catalog from one World snapshot, again on the next engine when
+	// a retired one ends the snapshot.
+	var plugins []*s4wave_space.AvailablePlugin
+	err := world.ExecTransaction(ctx, r.space.GetWorldEngine(), false, func(ctx context.Context, ws world.WorldState) error {
+		manifestRefs, err := collectAvailablePluginManifestRefs(ctx, ws)
+		if err != nil {
+			return err
+		}
+		plugins, err = collectAvailablePlugins(ctx, ws, manifestRefs, bldr_manifest_world.LookupManifest)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Select the plugin.
+	idx := slices.IndexFunc(plugins, func(plugin *s4wave_space.AvailablePlugin) bool {
+		return plugin.GetPluginId() == pluginID
+	})
+	if idx == -1 {
+		return nil, nil
+	}
+	return plugins[idx], nil
+}
+
+// collectAvailablePlugins enumerates the manifest object content set and returns
+// the installable plugin catalog, keeping the highest revision for each manifest
+// ID. Manifests that fail to load are skipped, but a superseded read, such as
+// one a retired engine ended, returns its error: the snapshot is gone, and the
+// catalog it would build is partial.
+func collectAvailablePlugins(
+	ctx context.Context,
+	ws world.WorldState,
+	manifestRefs []string,
+	lookupManifest func(context.Context, world.WorldState, string) (*bldr_manifest.Manifest, *bucket.ObjectRef, error),
+) ([]*s4wave_space.AvailablePlugin, error) {
+	catalog := make(map[string]*bldr_manifest.ManifestMeta, len(manifestRefs))
+	for _, ref := range manifestRefs {
+		key, _, _ := strings.Cut(ref, "\x00")
+		m, _, err := lookupManifest(ctx, ws, key)
+		if world.IsSuperseded(err) {
+			return nil, err
+		}
+		if err != nil || m == nil {
+			continue
+		}
+		addManifestToCatalog(catalog, m.GetMeta())
+	}
+
+	return availablePluginsFromCatalog(catalog), nil
+}
+
+// addManifestToCatalog records the manifest meta under its manifest ID, keeping
+// the highest revision when the same plugin has multiple platform/revision
+// builds.
+func addManifestToCatalog(catalog map[string]*bldr_manifest.ManifestMeta, meta *bldr_manifest.ManifestMeta) {
+	manifestID := meta.GetManifestId()
+	if manifestID == "" {
+		return
+	}
+	if prev, ok := catalog[manifestID]; !ok || meta.GetRev() > prev.GetRev() {
+		catalog[manifestID] = meta
+	}
+}
+
+// availablePluginsFromCatalog projects the collected catalog into the sorted
+// app-facing available plugin list.
+func availablePluginsFromCatalog(catalog map[string]*bldr_manifest.ManifestMeta) []*s4wave_space.AvailablePlugin {
+	out := make([]*s4wave_space.AvailablePlugin, 0, len(catalog))
+	for manifestID, meta := range catalog {
+		out = append(out, &s4wave_space.AvailablePlugin{
+			PluginId:    manifestID,
+			Description: meta.GetDescription(),
+			Revision:    strconv.FormatUint(meta.GetRev(), 10),
+			Background:  meta.GetBackground(),
+			NodeTypeIds: meta.GetNodeTypeIds(),
+		})
+	}
+	slices.SortFunc(out, func(a, b *s4wave_space.AvailablePlugin) int {
+		return cmp.Compare(a.GetPluginId(), b.GetPluginId())
+	})
+	return out
+}
+
+// cloneAvailablePlugins deep-copies the plugin catalog so callers cannot
+// mutate the cache.
+func cloneAvailablePlugins(in []*s4wave_space.AvailablePlugin) []*s4wave_space.AvailablePlugin {
+	if in == nil {
+		return nil
+	}
+	out := make([]*s4wave_space.AvailablePlugin, 0, len(in))
+	for _, plugin := range in {
+		out = append(out, plugin.CloneVT())
+	}
+	return out
+}
+
+// SetProcessBinding sets the state for a process binding.
+func (r *SpaceContentsResource) SetProcessBinding(
+	ctx context.Context,
+	req *s4wave_space.SetProcessBindingRequest,
+) (*s4wave_space.SetProcessBindingResponse, error) {
+	// Validate the process binding object identity and type.
+	objKey := req.GetObjectKey()
+	if objKey == "" {
+		return nil, errors.New("object_key is required")
+	}
+	typeID := req.GetTypeId()
+	if typeID == "" {
+		return nil, errors.New("type_id is required")
+	}
+
+	// Open the local object store that holds Space process decisions.
+	volumeID, storeID := r.getStoreLocation()
+	handle, _, ref, err := volume.ExBuildObjectStoreAPI(
+		ctx,
+		r.b,
+		true,
+		storeID,
+		volumeID,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer ref.Release()
+
+	// Translate the requested approval into the process binding state.
+	state := s4wave_process.ProcessBindingState_ProcessBindingState_UNAPPROVED
+	if req.GetApproved() {
+		state = s4wave_process.ProcessBindingState_ProcessBindingState_APPROVED
+	}
+
+	// Persist the process binding decision with its decision time.
+	binding := &s4wave_process.ProcessBinding{
+		State:     state,
+		ObjectKey: objKey,
+		TypeId:    typeID,
+		DecidedAt: timestamppb.Now(),
+	}
+	if err := process_binding.SetProcessBinding(ctx, handle.GetObjectStore(), r.spaceID, objKey, binding); err != nil {
+		return nil, err
+	}
+
+	// Wake the Space runtime to apply the changed process decision.
+	r.runtime.NotifyProcessBindingsChanged()
+	return &s4wave_space.SetProcessBindingResponse{}, nil
+}
+
+// listProcessBindingInfos returns the process bindings of the Space from the
+// peer-local object store.
+func (r *SpaceContentsResource) listProcessBindingInfos(
+	ctx context.Context,
+) ([]*s4wave_space.ProcessBindingInfo, error) {
+	volumeID, storeID := r.getStoreLocation()
+	return listProcessBindingInfos(ctx, r.b, volumeID, storeID, r.spaceID)
+}
+
+// _ is a type assertion
+var _ s4wave_space.SRPCSpaceContentsResourceServiceServer = (*SpaceContentsResource)(nil)

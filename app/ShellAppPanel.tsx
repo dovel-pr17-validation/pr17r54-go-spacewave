@@ -1,0 +1,178 @@
+import { useCallback, useMemo, useRef } from 'react'
+import { useLatestRef } from '@aptre/bldr-react'
+
+import { BottomBarRoot } from '@s4wave/web/frame/bottom-bar-root.js'
+import { useAppNavigation } from '@s4wave/web/sdk/app/environment.js'
+import { HistoryRouter } from '@s4wave/web/router/HistoryRouter.js'
+import { resolvePath, type To } from '@s4wave/web/router/router.js'
+import {
+  StateNamespaceProvider,
+  useStateAtom,
+} from '@s4wave/web/state/index.js'
+import {
+  TabContextProvider,
+  type TabContextValue,
+} from '@s4wave/web/object/TabContext.js'
+import { ObjectLayoutTab } from '@s4wave/sdk/layout/world/world.pb.js'
+import type { AddTabRequest } from '@s4wave/sdk/layout/layout.pb.js'
+
+import { AppRoutes } from './routes/AppRoutes.js'
+import {
+  ShellTabStateProvider,
+  useShellTabs,
+  useTabId,
+} from './ShellTabContext.js'
+import { buildPathTab } from './shell-layout-tab-utils.js'
+import { getTabObjectKey } from './shell-tab.js'
+
+// ShellAppPanelProps are the props for ShellAppPanel.
+export interface ShellAppPanelProps {
+  tabId: string
+  initialPath: string
+  namespace: string[]
+  syncAppPath?: boolean
+}
+
+// ShellAppPanel renders the shared app surface for a shell tab or grid panel.
+export function ShellAppPanel({
+  tabId,
+  initialPath,
+  namespace,
+  syncAppPath = false,
+}: ShellAppPanelProps) {
+  return (
+    <ShellTabStateProvider tabId={tabId}>
+      <StateNamespaceProvider namespace={namespace}>
+        <ShellAppPanelInner
+          initialPath={initialPath}
+          syncAppPath={syncAppPath}
+        />
+      </StateNamespaceProvider>
+    </ShellTabStateProvider>
+  )
+}
+
+// ShellAppPanelInner provides tab context, bottom bar, and routing for a shell panel.
+function ShellAppPanelInner({
+  initialPath,
+  syncAppPath,
+}: {
+  initialPath: string
+  syncAppPath: boolean
+}) {
+  const { getAppNavigationGeneration, setAppPath } = useAppNavigation()
+  const [openMenu, setOpenMenu] = useStateAtom<string>(null, 'openMenu', '')
+  const tabId = useTabId()
+  const { tabs, activeTabId, addShellTab, updateTabPath, updateTabAutoName } =
+    useShellTabs()
+
+  // The path commit can be delayed behind the store's Web Lock. Decide at
+  // commit time, not at initiation: a panel that lost active status, a
+  // navigation a later one superseded, and a document the user moved
+  // elsewhere in the meantime each forfeit the hash.
+  const activeTabIdRef = useLatestRef(activeTabId)
+  const syncAppPathRef = useLatestRef(syncAppPath)
+  const navGenerationRef = useRef(0)
+  const beginAppPathCommit = useCallback(
+    (path: string) => {
+      const generation = ++navGenerationRef.current
+      const documentGeneration = getAppNavigationGeneration()
+      return () => {
+        if (generation !== navGenerationRef.current) return
+        if (!syncAppPathRef.current || tabId !== activeTabIdRef.current) return
+        if (getAppNavigationGeneration() !== documentGeneration) return
+        setAppPath(path)
+      }
+    },
+    [
+      tabId,
+      getAppNavigationGeneration,
+      setAppPath,
+      activeTabIdRef,
+      syncAppPathRef,
+    ],
+  )
+
+  const addTab = useCallback(
+    (request: AddTabRequest) => {
+      const tab = request.tab
+      if (!tab) return Promise.resolve({ tabId: '' })
+
+      let path = '/'
+      if (tab.data && tab.data.length > 0) {
+        const layoutTab = ObjectLayoutTab.fromBinary(tab.data)
+        path = layoutTab.path || '/'
+      }
+
+      const newTab = buildPathTab(path)
+      addShellTab(newTab, {
+        afterTabId: tabId ?? undefined,
+        select: request.select,
+      })
+      return Promise.resolve({ tabId: newTab.id })
+    },
+    [tabId, addShellTab],
+  )
+
+  const navigateTab = useCallback(
+    (path: string) => {
+      if (tabId) {
+        void updateTabPath(
+          tabId,
+          path,
+          syncAppPath ? beginAppPathCommit(path) : undefined,
+        )
+      }
+      return Promise.resolve({})
+    },
+    [tabId, updateTabPath, syncAppPath, beginAppPathCommit],
+  )
+
+  const path = useMemo(() => {
+    if (!tabId) return initialPath
+    const tab = tabs.find((t) => t.id === tabId)
+    return tab?.path ?? initialPath
+  }, [tabs, tabId, initialPath])
+
+  // A navigation resets the tab name from the path; nameTab changes with the
+  // path, so the shown object's viewer names the tab again.
+  const nameTab = useCallback(
+    (objectKey: string, name: string) => {
+      if (tabId && getTabObjectKey(path) === objectKey) {
+        updateTabAutoName(tabId, name)
+      }
+    },
+    [tabId, path, updateTabAutoName],
+  )
+
+  const tabContext = useMemo<TabContextValue>(
+    () => ({ tabId: tabId ?? '', addTab, navigateTab, nameTab }),
+    [tabId, addTab, navigateTab, nameTab],
+  )
+
+  const handleNavigate = useCallback(
+    (to: To) => {
+      if (!tabId) return
+      if (syncAppPath && tabId !== activeTabId) return
+      const newPath = resolvePath(path, to)
+      void updateTabPath(
+        tabId,
+        newPath,
+        syncAppPath ? beginAppPathCommit(newPath) : undefined,
+      )
+    },
+    [tabId, activeTabId, path, updateTabPath, syncAppPath, beginAppPathCommit],
+  )
+
+  return (
+    <TabContextProvider value={tabContext}>
+      <BottomBarRoot openMenu={openMenu} setOpenMenu={setOpenMenu}>
+        <div className="flex h-full flex-1 flex-col overflow-hidden">
+          <HistoryRouter path={path} onNavigate={handleNavigate}>
+            <AppRoutes />
+          </HistoryRouter>
+        </div>
+      </BottomBarRoot>
+    </TabContextProvider>
+  )
+}

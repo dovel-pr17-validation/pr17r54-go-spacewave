@@ -1,0 +1,630 @@
+package resource_objecttype_registry
+
+import (
+	"context"
+	"sync"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/pkg/errors"
+	resource "github.com/s4wave/spacewave/bldr/resource"
+	resource_client "github.com/s4wave/spacewave/bldr/resource/client"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	resource_world "github.com/s4wave/spacewave/core/resource/world"
+	"github.com/s4wave/spacewave/core/sobject"
+	space_world_optypes "github.com/s4wave/spacewave/core/space/world/optypes"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_objecttype_registry "github.com/s4wave/spacewave/sdk/objecttype/registry"
+	s4wave_plugin "github.com/s4wave/spacewave/sdk/plugin"
+	sdk_world "github.com/s4wave/spacewave/sdk/world"
+	"github.com/s4wave/spacewave/sdk/world/objecttype"
+	"github.com/sirupsen/logrus"
+)
+
+// BridgeController resolves LookupObjectType directives for registry-registered
+// types by proxying to the source TS plugin.
+type BridgeController struct {
+	// le logs Resource and controller lifecycle failures.
+	le *logrus.Entry
+	// b resolves World and typed handler directives.
+	b bus.Bus
+	// registry owns admitted object type registrations and their revisions.
+	registry *ObjectTypeRegistryResource
+}
+
+// NewBridgeController creates a new BridgeController.
+func NewBridgeController(
+	le *logrus.Entry,
+	b bus.Bus,
+	registry *ObjectTypeRegistryResource,
+) *BridgeController {
+	return &BridgeController{
+		le:       le,
+		b:        b,
+		registry: registry,
+	}
+}
+
+// GetControllerInfo returns information about the controller.
+func (c *BridgeController) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(
+		"resource/objecttype-registry-bridge",
+		controller.MustParseVersion("0.0.1"),
+		"resolves LookupObjectType for plugin-registered types",
+	)
+}
+
+// Execute executes the controller.
+func (c *BridgeController) Execute(ctx context.Context) error {
+	return nil
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+func (c *BridgeController) HandleDirective(ctx context.Context, di directive.Instance) ([]directive.Resolver, error) {
+	// Resolve metadata lookups from the registry's retained registrations.
+	if metaDir, ok := di.GetDirective().(s4wave_objecttype_registry.LookupObjectTypeMetadata); ok {
+		return c.resolveMetadata(metaDir)
+	}
+
+	// Match the object type directive independently of registration visibility.
+	dir, ok := di.GetDirective().(objecttype.LookupObjectType)
+	if !ok {
+		return nil, nil
+	}
+	typeID := dir.LookupObjectTypeID()
+	if typeID == "" {
+		return nil, nil
+	}
+
+	// Keep unresolved and already-resolved lookups attached to registry changes.
+	return directive.R(directive.NewFuncResolver(func(ctx context.Context, handler directive.ResolverHandler) error {
+		var current *objectTypeRegistration
+		var valueID uint32
+		for {
+			// Read visibility and the wakeup position under the same admission lock.
+			var next *objectTypeRegistration
+			var instanceKey string
+			var wait <-chan struct{}
+			c.registry.bcast.HoldLock(func(_ func(), getWait func() <-chan struct{}) {
+				next = c.registry.lookupRegistrationLocked(typeID, dir.LookupObjectTypeEngineID())
+				instanceKey = c.registry.generations.InstanceKeyLocked(next)
+				wait = getWait()
+			})
+
+			// Replace only this resolver's value; existing Resources keep their own
+			// handler lifetime and new lookups receive the admitted generation.
+			if next != current {
+				if valueID != 0 {
+					handler.RemoveValue(valueID)
+					valueID = 0
+				}
+				current = next
+				if next != nil {
+					factory := &registrationFactory{le: c.le, b: c.b, reg: next, instanceKey: instanceKey}
+					valueID, _ = handler.AddValue(factory.objectType())
+				}
+			}
+			handler.MarkIdle(true)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-wait:
+			}
+			handler.MarkIdle(false)
+		}
+	}), nil)
+}
+
+// resolveMetadata resolves LookupObjectTypeMetadata from the registry. The value
+// is a copy of the visible registration's metadata, replaced when the
+// registration changes and removed when it is released.
+func (c *BridgeController) resolveMetadata(dir s4wave_objecttype_registry.LookupObjectTypeMetadata) ([]directive.Resolver, error) {
+	typeID := dir.LookupObjectTypeMetadataTypeID()
+	if typeID == "" {
+		return nil, nil
+	}
+	return directive.R(directive.NewFuncResolver(func(ctx context.Context, handler directive.ResolverHandler) error {
+		var current *objectTypeRegistration
+		var valueID uint32
+		for {
+			// Read visibility and the wakeup position under the same admission lock.
+			var next *objectTypeRegistration
+			var wait <-chan struct{}
+			c.registry.bcast.HoldLock(func(_ func(), getWait func() <-chan struct{}) {
+				next = c.registry.lookupRegistrationLocked(typeID, dir.LookupObjectTypeMetadataEngineID())
+				wait = getWait()
+			})
+
+			// Replace the value only when a different registration is visible.
+			if next != current {
+				if valueID != 0 {
+					handler.RemoveValue(valueID)
+					valueID = 0
+				}
+				current = next
+				if next != nil {
+					metadata := next.registration.GetMetadata().CloneVT()
+					if metadata == nil {
+						metadata = &s4wave_objecttype_registry.ObjectTypeMetadata{}
+					}
+					valueID, _ = handler.AddValue(metadata)
+				}
+			}
+			handler.MarkIdle(true)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-wait:
+			}
+			handler.MarkIdle(false)
+		}
+	}), nil)
+}
+
+// Close releases any resources held by the controller.
+func (c *BridgeController) Close() error {
+	return nil
+}
+
+// registrationFactory binds ObjectType construction to one admitted capability.
+type registrationFactory struct {
+	// le logs Resource and controller lifecycle failures.
+	le *logrus.Entry
+	// b resolves World and typed handler directives.
+	b bus.Bus
+	// reg retains the admitted registration for this invoker generation.
+	reg *objectTypeRegistration
+	// instanceKey is the plugin instance serving reg, empty for a global one.
+	instanceKey string
+}
+
+// objectType binds factories to this exact registration capability.
+func (r *registrationFactory) objectType() objecttype.ObjectType {
+	factory := func(
+		ctx context.Context,
+		le *logrus.Entry,
+		b bus.Bus,
+		engine world.Engine,
+		ws world.WorldState,
+		objectKey string,
+	) (srpc.Invoker, func(), error) {
+		if r.reg.attached != nil {
+			return r.invokeAttached(ctx, objectKey, engine)
+		}
+		return r.invokePlugin(ctx, objectKey, engine)
+	}
+	return &bridgeObjectType{
+		ObjectType: objecttype.NewObjectType(r.reg.registration.GetTypeId(), factory),
+		r:          r,
+	}
+}
+
+// openResources opens a Resource client generation to the handler serving
+// the registration: the caller-attached handler, or the plugin instance under
+// ctx.
+func (r *registrationFactory) openResources(ctx context.Context) (*resource_client.Client, func(), func() bool, error) {
+	if r.reg.attached != nil {
+		return openAttachedResources(r.reg.attached)
+	}
+	return openPluginResources(ctx, r.b, r.reg.registration.GetPluginId(), r.instanceKey)
+}
+
+// bridgeObjectType is a registered ObjectType whose handler renders its
+// bodies through ObjectTypeBodyService.
+type bridgeObjectType struct {
+	objecttype.ObjectType
+	// r is the admitted registration the type was built from.
+	r *registrationFactory
+}
+
+// MarshalBodiesJSON asks the handler's ObjectTypeBodyService to render
+// bodies. A handler that does not serve it leaves every body without JSON.
+// Each call opens and releases one Resource client generation.
+func (t *bridgeObjectType) MarshalBodiesJSON(ctx context.Context, bodies [][]byte) ([]string, error) {
+	// Reach the handler root on a fresh Resource client generation.
+	client, release, _, err := t.r.openResources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	rootRef := client.AccessRootResource()
+	defer rootRef.Release()
+	rootClient, err := rootRef.GetClient()
+	if err != nil {
+		return nil, err
+	}
+
+	// Render the bodies, treating a handler without the service as no JSON.
+	resp, err := s4wave_objecttype_registry.NewSRPCObjectTypeBodyServiceClient(rootClient).MarshalBodiesJSON(ctx, &s4wave_objecttype_registry.MarshalBodiesJSONRequest{
+		TypeId: t.GetObjectTypeID(),
+		Bodies: bodies,
+	})
+	if err != nil {
+		if err.Error() == srpc.ErrUnimplemented.Error() {
+			return make([]string, len(bodies)), nil
+		}
+		return nil, err
+	}
+	if len(resp.GetBodiesJson()) != len(bodies) {
+		return nil, errors.Errorf("object type %s rendered %d of %d bodies", t.GetObjectTypeID(), len(resp.GetBodiesJson()), len(bodies))
+	}
+	return resp.GetBodiesJson(), nil
+}
+
+// openAttachedResources opens a Resource client generation on a
+// caller-attached handler. The generation lives until released or until the
+// caller generation that supplied the handler ends.
+func openAttachedResources(handler *attachedObjectTypeHandler) (*resource_client.Client, func(), func() bool, error) {
+	client, err := resource_client.NewClient(
+		handler.ctx,
+		resource.NewSRPCResourceServiceClient(handler.client),
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return client, client.Release, nil, nil
+}
+
+// openPluginResources opens a Resource client generation on the plugin
+// instance. The alive callback reports whether the plugin runtime still holds
+// the generation.
+func openPluginResources(ctx context.Context, b bus.Bus, pluginID, instanceKey string) (*resource_client.Client, func(), func() bool, error) {
+	resources, err := s4wave_plugin.ConnectPluginInstanceResources(ctx, b, pluginID, instanceKey)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	alive := func() bool {
+		select {
+		case <-resources.Client.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	return resources.Client, resources.Release, alive, nil
+}
+
+// invokeAttached creates an ObjectType proxy through a caller-attached handler.
+func (r *registrationFactory) invokeAttached(
+	ctx context.Context,
+	objectKey string,
+	engine world.Engine,
+) (srpc.Invoker, func(), error) {
+	invoker := newAttachedObjectTypeInvoker(r.reg.attached, r.reg.registration, objectKey, engine, objecttype.EngineIDFromContext(ctx), objecttype.CallerFromContext(ctx), r.b, r.le)
+	if err := invoker.connect(ctx); err != nil {
+		return nil, nil, err
+	}
+	return invoker, invoker.Close, nil
+}
+
+// invokePlugin connects to the source plugin and creates a proxy invoker.
+// If engine is non-nil, it is attached as a resource so the TS handler
+// can access the world via getAttachedRef(attachedEngineResourceId).
+func (r *registrationFactory) invokePlugin(
+	ctx context.Context,
+	objectKey string,
+	engine world.Engine,
+) (srpc.Invoker, func(), error) {
+	// Retain the client generation that owns the plugin invocation.
+	resourceCtx := resource_server.GetResourceClientContext(ctx)
+	resourceClientCtx := ctx
+	if resourceCtx != nil {
+		resourceClientCtx = resourceCtx.Context()
+	}
+	invoker := newPluginObjectTypeInvoker(resourceClientCtx, r.reg.registration, r.instanceKey, objectKey, engine, objecttype.EngineIDFromContext(ctx), objecttype.CallerFromContext(ctx), r.b, r.le)
+	if err := invoker.connect(ctx); err != nil {
+		return nil, nil, err
+	}
+	return invoker, invoker.Close, nil
+}
+
+// pluginResourceSession drives one nested ResourceClient generation for a
+// proxied ObjectType. It owns the resource client, the optional world-engine
+// attachment, the root and child references, and the child SRPC client.
+type pluginResourceSession struct {
+	// le logs Resource and controller lifecycle failures.
+	le *logrus.Entry
+	// b resolves World and typed handler directives.
+	b bus.Bus
+	// reg retains the admitted registration for this invoker generation.
+	reg *s4wave_objecttype_registry.ObjectTypeRegistration
+	// objectKey identifies the object granted to the handler.
+	objectKey string
+	// engine retains the granted transactional World capability.
+	engine world.Engine
+	// engineID is the registry scope granted with the borrowed engine.
+	engineID string
+	// caller is the authenticated identity retained through bridge reconnection.
+	caller objecttype.Caller
+
+	// openResources opens the ResourceClient generation. The alive callback
+	// reports whether the generation is still usable; nil means always.
+	openResources func(ctx context.Context) (*resource_client.Client, func(), func() bool, error)
+	// detachCtx outlives one request and is used to detach the engine.
+	detachCtx context.Context
+
+	// mtx guards the nested Resource client generation.
+	mtx sync.Mutex
+
+	// resources is the nested Resource client retained under mtx.
+	resources *resource_client.Client
+	// releaseResources releases the nested Resource client generation under mtx.
+	releaseResources func()
+	// alive reports whether the nested client generation remains usable under mtx.
+	alive func() bool
+	// engineResourceID identifies the engine attached to the nested client under mtx.
+	engineResourceID uint32
+	// engineResource owns typed handles created by the nested engine mount under mtx.
+	engineResource *resource_world.EngineResource
+	// rootRef retains the handler root Resource under mtx.
+	rootRef resource_client.ResourceRef
+	// childRef retains the typed child Resource under mtx.
+	childRef resource_client.ResourceRef
+	// childClient invokes the typed child Resource under mtx.
+	childClient srpc.Client
+}
+
+// connectLocked opens a fresh session, replacing any current one.
+func (s *pluginResourceSession) connectLocked(ctx context.Context) error {
+	// Open the nested Resource client generation for the registered handler.
+	s.resetLocked()
+	client, releaseResources, alive, err := s.openResources(ctx)
+	if err != nil {
+		return err
+	}
+	s.resources = client
+	s.releaseResources = releaseResources
+	s.alive = alive
+
+	// Lend the selected engine with its trusted registry scope.
+	if s.engine != nil {
+		var callerPeer peer.ID
+		if s.caller.PeerID != "" {
+			callerPeer, err = peer.IDB58Decode(s.caller.PeerID)
+			if err != nil {
+				s.resetLocked()
+				return err
+			}
+		}
+		lookupOp := space_world_optypes.BuildSpaceLookupOp(s.b, s.le, s.engineID)
+		s.engineResource = resource_world.NewEngineResource(s.le, s.b, s.engine, lookupOp, &sdk_world.EngineInfo{EngineId: s.engineID},
+			resource_world.WithSessionPeerID(callerPeer),
+			resource_world.WithCallerParticipantLookup(func(context.Context, peer.ID) (*sobject.SOParticipantConfig, error) {
+				return s.caller.Participant.CloneVT(), nil
+			}),
+		)
+		s.engineResourceID, err = client.AttachResource(ctx, "world-engine", s.engineResource.GetMux())
+		if err != nil {
+			s.resetLocked()
+			return err
+		}
+	}
+
+	// Acquire the handler root from the nested Resource client.
+	s.rootRef = client.AccessRootResource()
+	rootClient, err := s.rootRef.GetClient()
+	if err != nil {
+		s.resetLocked()
+		return err
+	}
+
+	// Invoke the admitted object type handler through the registry contract.
+	handlerSvc := s4wave_objecttype_registry.NewSRPCObjectTypeHandlerServiceClient(rootClient)
+	resp, err := handlerSvc.InvokeObjectType(ctx, &s4wave_objecttype_registry.InvokeObjectTypeRequest{
+		TypeId:                   s.reg.GetTypeId(),
+		ObjectKey:                s.objectKey,
+		AttachedEngineResourceId: s.engineResourceID,
+	})
+	if err != nil {
+		s.resetLocked()
+		return err
+	}
+
+	// Adopt the typed child returned by the registered handler.
+	s.childRef = client.CreateResourceReference(resp.GetResourceId())
+	s.childClient, err = s.childRef.GetClient()
+	if err != nil {
+		s.resetLocked()
+		return err
+	}
+	return nil
+}
+
+// resetLocked releases the child, root, engine attachment, and client
+// generation.
+func (s *pluginResourceSession) resetLocked() {
+	// Release references and the engine attachment from the nested client generation.
+	if s.childRef != nil {
+		s.childRef.Release()
+	}
+	if s.rootRef != nil {
+		s.rootRef.Release()
+	}
+	if s.engineResource != nil {
+		s.engineResource.Close()
+	}
+	if s.resources != nil {
+		if s.engineResourceID != 0 {
+			_ = s.resources.DetachResource(s.detachCtx, s.engineResourceID)
+		}
+		if s.releaseResources != nil {
+			s.releaseResources()
+		} else {
+			s.resources.Release()
+		}
+	}
+
+	// Clear the session so no later invocation uses a released generation.
+	s.resources = nil
+	s.releaseResources = nil
+	s.alive = nil
+	s.engineResourceID = 0
+	s.engineResource = nil
+	s.rootRef = nil
+	s.childRef = nil
+	s.childClient = nil
+}
+
+// connect replaces the current session with a fresh one.
+func (s *pluginResourceSession) connect(ctx context.Context) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.connectLocked(ctx)
+}
+
+// close releases the current session.
+func (s *pluginResourceSession) close() {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.resetLocked()
+}
+
+// peekChildClient returns the connected child client without reconnecting.
+func (s *pluginResourceSession) peekChildClient() srpc.Client {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.childClient
+}
+
+// currentClient returns a live child client, reconnecting when the session
+// was released or the plugin runtime dropped it.
+func (s *pluginResourceSession) currentClient(ctx context.Context) (srpc.Client, error) {
+	// Check the retained child before forwarding; Done closes after release drains.
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.childRef != nil && (s.alive == nil || s.alive()) {
+		if client, err := s.childRef.GetClient(); err == nil {
+			return client, nil
+		}
+	}
+
+	// Acquire a fresh generation before this new explicit caller operation.
+	if err := s.connectLocked(ctx); err != nil {
+		return nil, err
+	}
+	return s.childClient, nil
+}
+
+// attachedObjectTypeInvoker holds one nested ResourceClient generation. It is
+// invalidated when the caller generation that supplied the handler ends.
+type attachedObjectTypeInvoker struct {
+	// session owns the nested client generation and typed child.
+	session pluginResourceSession
+}
+
+// newAttachedObjectTypeInvoker creates an invoker over a caller-attached
+// handler.
+func newAttachedObjectTypeInvoker(
+	handler *attachedObjectTypeHandler,
+	reg *s4wave_objecttype_registry.ObjectTypeRegistration,
+	objectKey string,
+	engine world.Engine,
+	engineID string,
+	caller objecttype.Caller,
+	b bus.Bus,
+	le *logrus.Entry,
+) *attachedObjectTypeInvoker {
+	i := &attachedObjectTypeInvoker{}
+	i.session = pluginResourceSession{
+		le:        le,
+		b:         b,
+		reg:       reg,
+		objectKey: objectKey,
+		engine:    engine,
+		engineID:  engineID,
+		caller:    caller,
+		detachCtx: handler.ctx,
+		openResources: func(_ context.Context) (*resource_client.Client, func(), func() bool, error) {
+			return openAttachedResources(handler)
+		},
+	}
+	return i
+}
+
+// InvokeMethod invokes a method on the attached handler child resource.
+func (i *attachedObjectTypeInvoker) InvokeMethod(serviceID, methodID string, strm srpc.Stream) (bool, error) {
+	childClient := i.session.peekChildClient()
+	if childClient == nil {
+		return false, resource.ErrResourceOrClientReleased
+	}
+	return srpc.NewClientInvoker(childClient).InvokeMethod(serviceID, methodID, strm)
+}
+
+// connect adopts the child from the caller-attached handler generation.
+func (i *attachedObjectTypeInvoker) connect(ctx context.Context) error {
+	return i.session.connect(ctx)
+}
+
+// Close releases the child, root, engine attachment, and client generation.
+func (i *attachedObjectTypeInvoker) Close() {
+	i.session.close()
+}
+
+// pluginObjectTypeInvoker forwards explicit calls to the source plugin without replay.
+// A later call reconnects before forwarding if its ResourceClient generation ended.
+type pluginObjectTypeInvoker struct {
+	// session owns the nested client generation and typed child.
+	session pluginResourceSession
+}
+
+// newPluginObjectTypeInvoker creates an invoker that connects to the plugin
+// instance named by reg and instanceKey and reconnects on released sessions.
+func newPluginObjectTypeInvoker(
+	resourceClientCtx context.Context,
+	reg *s4wave_objecttype_registry.ObjectTypeRegistration,
+	instanceKey string,
+	objectKey string,
+	engine world.Engine,
+	engineID string,
+	caller objecttype.Caller,
+	b bus.Bus,
+	le *logrus.Entry,
+) *pluginObjectTypeInvoker {
+	i := &pluginObjectTypeInvoker{}
+	i.session = pluginResourceSession{
+		le:        le,
+		b:         b,
+		reg:       reg,
+		objectKey: objectKey,
+		engine:    engine,
+		engineID:  engineID,
+		caller:    caller,
+		detachCtx: resourceClientCtx,
+		openResources: func(_ context.Context) (*resource_client.Client, func(), func() bool, error) {
+			return openPluginResources(resourceClientCtx, b, reg.GetPluginId(), instanceKey)
+		},
+	}
+	return i
+}
+
+// InvokeMethod forwards one explicit method call and returns its original result.
+// Reconnection precedes the call; an invocation failure never replays the method.
+func (i *pluginObjectTypeInvoker) InvokeMethod(serviceID, methodID string, strm srpc.Stream) (bool, error) {
+	// Acquire the current child before starting the caller's explicit operation.
+	childClient, err := i.session.currentClient(strm.Context())
+	if err != nil {
+		return false, err
+	}
+
+	// Forward the method once without inferring replay safety from its error.
+	return srpc.NewClientInvoker(childClient).InvokeMethod(serviceID, methodID, strm)
+}
+
+// connect adopts the child from the current plugin generation.
+func (i *pluginObjectTypeInvoker) connect(ctx context.Context) error {
+	return i.session.connect(ctx)
+}
+
+// Close releases the currently connected plugin ObjectType resource.
+func (i *pluginObjectTypeInvoker) Close() {
+	i.session.close()
+}
+
+// _ is a type assertion
+var (
+	_ controller.Controller    = (*BridgeController)(nil)
+	_ objecttype.BodyMarshaler = (*bridgeObjectType)(nil)
+)

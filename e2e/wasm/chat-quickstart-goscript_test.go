@@ -1,0 +1,135 @@
+//go:build !skip_e2e && !js
+
+package wasm
+
+import (
+	"strconv"
+	"strings"
+	"testing"
+
+	playwright "github.com/mxschmitt/playwright-go"
+)
+
+const chatQuickstartWaitMS = 240000
+
+// chatMessageInputSelector matches the composer textarea rendered by the Chat
+// viewer. The placeholder ends in a single ellipsis character, and a CSS
+// attribute selector compares exactly, so every query for this element shares
+// one owner rather than repeating a string that has already drifted once.
+const chatMessageInputSelector = "textarea[placeholder=\"Type a message…\"]"
+
+func TestGoScriptChatQuickstartMessagingParity(t *testing.T) {
+	// Skip the test unless the compiler is GoScript.
+	compiler, err := ResolveE2EWasmCompiler()
+	if err != nil {
+		t.Fatalf("resolve wasm compiler: %v", err)
+	}
+	if compiler != E2EWasmCompilerGoScript {
+		t.Skipf("requires %s", E2EWasmCompilerGoScript)
+	}
+
+	// Open a clean page and capture its console.
+	sess := harness(t).NewCleanPageSession(t)
+	console, stopConsole := sess.WatchConsole()
+	defer stopConsole()
+	defer func() {
+		report := DrainCrashReport(console)
+		if report.HasCrash() {
+			t.Errorf("unexpected browser/WASM crash report during Chat quickstart gate: %+v", report)
+		}
+		if report.HasExitedGoLoop() {
+			t.Errorf("unexpected exited-Go loop during Chat quickstart gate: %+v", report)
+		}
+	}()
+
+	// Open the chat quickstart.
+	page := sess.Page()
+	WaitForApp(t, page)
+	EnableQuickstartTimingLogs(t, page)
+	NavigateHash(t, harness(t), page, "#/quickstart/chat")
+
+	// Require the general channel route.
+	waitForChatRoute(t, page)
+	route := page.URL()
+	if !strings.Contains(route, "/-/chat/channel/general") {
+		t.Fatalf("Chat quickstart route = %q, want /-/chat/channel/general; debug: %v", route, collectChatQuickstartDebug(page))
+	}
+
+	// Send a message and wait for it.
+	message := "GoScript Chat Proof"
+	sendChatMessage(t, page, message)
+	waitForChatMessage(t, page, message)
+
+	// Reload the page and require the message to remain.
+	if _, err := page.Reload(playwright.PageReloadOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(chatQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("reload Chat route: %v", err)
+	}
+	waitForChatMessage(t, page, message)
+
+	// Leave and return to the channel, and require the message again.
+	NavigateHash(t, harness(t), page, "#/")
+	hashIdx := strings.Index(route, "#")
+	if hashIdx < 0 {
+		t.Fatalf("Chat quickstart route has no hash: %q", route)
+	}
+	NavigateHash(t, harness(t), page, route[hashIdx:])
+	waitForChatMessage(t, page, message)
+}
+
+func waitForChatRoute(t testing.TB, page playwright.Page) {
+	t.Helper()
+
+	locator := page.Locator(chatMessageInputSelector)
+	if err := locator.WaitFor(playwright.LocatorWaitForOptions{
+		Timeout: playwright.Float(chatQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("wait for Chat message input: %v\ndebug: %v", err, collectChatQuickstartDebug(page))
+	}
+	if err := page.Locator("text=Chat").First().WaitFor(playwright.LocatorWaitForOptions{
+		Timeout: playwright.Float(chatQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("wait for Chat viewer header: %v\ndebug: %v", err, collectChatQuickstartDebug(page))
+	}
+}
+
+func sendChatMessage(t testing.TB, page playwright.Page, message string) {
+	t.Helper()
+
+	input := page.Locator(chatMessageInputSelector)
+	if err := input.Fill(message, playwright.LocatorFillOptions{
+		Timeout: playwright.Float(chatQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("fill Chat message: %v\ndebug: %v", err, collectChatQuickstartDebug(page))
+	}
+	if err := input.Press("Enter", playwright.LocatorPressOptions{
+		Timeout: playwright.Float(chatQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("send Chat message: %v\ndebug: %v", err, collectChatQuickstartDebug(page))
+	}
+}
+
+func waitForChatMessage(t testing.TB, page playwright.Page, message string) {
+	t.Helper()
+
+	if err := page.Locator("text=" + message).First().WaitFor(playwright.LocatorWaitForOptions{
+		Timeout: playwright.Float(chatQuickstartWaitMS),
+	}); err != nil {
+		t.Fatalf("wait for Chat message %q: %v\ndebug: %v", message, err, collectChatQuickstartDebug(page))
+	}
+}
+
+func collectChatQuickstartDebug(page playwright.Page) any {
+	raw, err := page.Evaluate(`() => ({
+		hash: window.location.hash,
+		timing: globalThis.__s4waveQuickstartTiming ?? globalThis.__s4wave_debug?.quickstartTiming ?? null,
+		text: document.querySelector('#bldr-root')?.textContent?.replace(/\s+/g, ' ').slice(0, 2200) ?? '',
+		hasInput: !!document.querySelector(` + strconv.Quote(chatMessageInputSelector) + `),
+	})`)
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	return raw
+}

@@ -1,0 +1,61 @@
+package spacewave_chat
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// AuthenticatedOperation selects the verified transaction signer on replay.
+func (o *SendChatMessageOp) AuthenticatedOperation() {}
+
+// Validate requires a stable send identity, a transaction ID or an envelope, and a timestamp.
+func (o *SendChatMessageOp) Validate() error {
+	if o.GetObjectKey() == "" {
+		return world.ErrEmptyObjectKey
+	}
+	if o.GetRequest().GetTransactionId() == "" && o.GetRequest().GetEnvelope() == nil {
+		return errors.New("chat append operation requires a transaction ID or envelope")
+	}
+	return o.GetTimestamp().Validate(false)
+}
+
+// ApplyWorldOp appends against the World history accepted before this operation.
+func (o *SendChatMessageOp) ApplyWorldOp(ctx context.Context, _ *logrus.Entry, ws world.WorldState, sender peer.ID) (bool, error) {
+	// Validate the replayed append intent.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+
+	// Resolve the verified author for the replayed channel append.
+	resource, err := newReplayResource(ctx, o.GetObjectKey(), sender)
+	if err != nil {
+		return false, err
+	}
+
+	// Append the requested message inside the replay transaction.
+	_, err = resource.appendMessage(ctx, ws, o.GetRequest(), o.GetTimestamp())
+	return false, err
+}
+
+// newReplayResource binds a replayed operation to its verified signing device
+// and the person and role the replay authority resolved from the accepted config.
+func newReplayResource(ctx context.Context, objectKey string, sender peer.ID) (*ChatResource, error) {
+	person := world.OperationPersonFromContext(ctx)
+	if sender == "" || person == "" {
+		return nil, ErrChatAuthorIdentityRequired
+	}
+	return &ChatResource{
+		objectKey:   objectKey,
+		localPeerID: sender.String(),
+		device:      sender,
+		personID:    person,
+		owner:       world.OperationOwnerFromContext(ctx),
+	}, nil
+}
+
+// _ is a type assertion
+var _ world.AuthenticatedOperation = (*SendChatMessageOp)(nil)

@@ -1,0 +1,1959 @@
+//go:build !js
+
+package bldr_plugin_compiler_go
+
+import (
+	"context"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/configset"
+	configset_proto "github.com/aperturerobotics/controllerbus/controller/configset/proto"
+	protobuf_go_lite "github.com/aperturerobotics/protobuf-go-lite"
+	"github.com/aperturerobotics/util/fsutil"
+	"github.com/pkg/errors"
+	bldr_manifest "github.com/s4wave/spacewave/bldr/manifest"
+	bldr_manifest_builder "github.com/s4wave/spacewave/bldr/manifest/builder"
+	bldr_platform "github.com/s4wave/spacewave/bldr/platform"
+	bldr_platform_go "github.com/s4wave/spacewave/bldr/platform/go"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	bldr_plugin_compiler "github.com/s4wave/spacewave/bldr/plugin/compiler"
+	plugin_host_configset "github.com/s4wave/spacewave/bldr/plugin/host/configset"
+	bldr_plugin_load "github.com/s4wave/spacewave/bldr/plugin/load"
+	vardef "github.com/s4wave/spacewave/bldr/plugin/vardef"
+	bldr_compress "github.com/s4wave/spacewave/bldr/util/compress"
+	"github.com/s4wave/spacewave/bldr/util/gocompiler"
+	bldr_web_bundler "github.com/s4wave/spacewave/bldr/web/bundler"
+	bldr_web_bundler_esbuild "github.com/s4wave/spacewave/bldr/web/bundler/esbuild"
+	bldr_vite "github.com/s4wave/spacewave/bldr/web/bundler/vite"
+	web_fetch_controller "github.com/s4wave/spacewave/bldr/web/fetch/service"
+	web_pkg "github.com/s4wave/spacewave/bldr/web/pkg"
+	web_pkg_fs_controller "github.com/s4wave/spacewave/bldr/web/pkg/fs/controller"
+	web_pkg_rpc_server "github.com/s4wave/spacewave/bldr/web/pkg/rpc/server"
+	bldr_web_plugin_handle_rpc "github.com/s4wave/spacewave/bldr/web/plugin/handle-rpc"
+	bldr_web_plugin_handle_web_pkg_assets "github.com/s4wave/spacewave/bldr/web/plugin/handle-web-pkg-assets"
+	bldr_web_plugin_handle_web_view_rpc "github.com/s4wave/spacewave/bldr/web/plugin/handle-web-view-rpc"
+	web_runtime_goscript_build "github.com/s4wave/spacewave/bldr/web/runtime/goscript/build"
+	web_runtime_wasm_build "github.com/s4wave/spacewave/bldr/web/runtime/wasm/build"
+	web_view_handler_server "github.com/s4wave/spacewave/bldr/web/view/handler/server"
+	bldr_web_view_observer "github.com/s4wave/spacewave/bldr/web/view/observer"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/sirupsen/logrus"
+)
+
+// ControllerID is the compiler controller ID.
+const ControllerID = ConfigID
+
+// Version is the controller version.
+var Version = controller.MustParseVersion("0.0.1")
+
+// controllerDescrip is the controller description.
+var controllerDescrip = "go plugin compiler controller"
+
+// goScriptSharedWebPkgConfig checks the web pkg list for the GoScript shared
+// web pkg and reports whether this plugin provides or consumes it.
+func goScriptSharedWebPkgConfig(webPkgs []*bldr_web_bundler.WebPkgRefConfig) (string, bool, bool) {
+	// Scan the web pkg list for the GoScript shared pkg entry.
+	webPkgID := web_runtime_goscript_build.GoScriptSharedWebPkgID
+	var provider bool
+	var consumer bool
+	for _, webPkg := range webPkgs {
+		if webPkg.GetId() != web_runtime_goscript_build.GoScriptSharedWebPkgID {
+			continue
+		}
+		webPkgID = webPkg.GetId()
+		if webPkg.GetExclude() {
+			consumer = true
+		} else {
+			provider = true
+		}
+	}
+	return webPkgID, provider, consumer
+}
+
+// filterGoScriptSharedWebPkgs removes the GoScript shared web pkg from the list.
+func filterGoScriptSharedWebPkgs(webPkgs []*bldr_web_bundler.WebPkgRefConfig) []*bldr_web_bundler.WebPkgRefConfig {
+	out := make([]*bldr_web_bundler.WebPkgRefConfig, 0, len(webPkgs))
+	for _, webPkg := range webPkgs {
+		if webPkg.GetId() == web_runtime_goscript_build.GoScriptSharedWebPkgID {
+			continue
+		}
+		out = append(out, webPkg)
+	}
+	return out
+}
+
+// Controller is the compiler controller.
+type Controller struct {
+	*bus.BusController[*Config]
+	preBuildHooks []PreBuildHook
+}
+
+// Factory is the factory for the compiler controller.
+type Factory = bus.BusFactory[*Config, *Controller]
+
+// NewControllerWithBusController constructs a new plugin compiler controller with an existing BusController.
+func NewControllerWithBusController(base *bus.BusController[*Config]) (*Controller, error) {
+	return &Controller{
+		BusController: base,
+	}, nil
+}
+
+// NewController constructs a new plugin compiler controller.
+func NewController(le *logrus.Entry, b bus.Bus, conf *Config) (*Controller, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, err
+	}
+
+	base := bus.NewBusController(
+		le,
+		b,
+		conf,
+		ControllerID,
+		Version,
+		controllerDescrip,
+	)
+
+	return NewControllerWithBusController(base)
+}
+
+// NewFactory constructs a new plugin compiler controller factory.
+func NewFactory(b bus.Bus) controller.Factory {
+	return bus.NewBusControllerFactory(
+		b,
+		ConfigID,
+		ControllerID,
+		Version,
+		controllerDescrip,
+		NewConfig,
+		NewControllerWithBusController,
+	)
+}
+
+// PreBuildHook is a callback called before building the plugin.
+// Returns an optional PreBuildResult.
+type PreBuildHook func(
+	ctx context.Context,
+	builderConf *bldr_manifest_builder.BuilderConfig,
+	worldEng world.Engine,
+) (*PreBuildHookResult, error)
+
+// AddPreBuildHook adds a callback run just after the plugin working
+// directory is constructed, before the Go compiler runs and before the
+// assets or dist fs are bundled.
+func (c *Controller) AddPreBuildHook(hook PreBuildHook) {
+	if hook != nil {
+		c.preBuildHooks = append(c.preBuildHooks, hook)
+	}
+}
+
+// Execute executes the controller goroutine.
+func (c *Controller) Execute(ctx context.Context) error {
+	return nil
+}
+
+// SupportsStartupManifestCache returns true if startup cache reuse is safe.
+func (c *Controller) SupportsStartupManifestCache() bool {
+	return true
+}
+
+// BuildManifest compiles the manifest with the given builder args.
+func (c *Controller) BuildManifest(
+	ctx context.Context,
+	args *bldr_manifest_builder.BuildManifestArgs,
+	buildHost bldr_manifest_builder.BuildManifestHost,
+) (*bldr_manifest_builder.BuilderResult, error) {
+	// Resolve the manifest meta and target build platform from the args.
+	conf := c.GetConfig()
+	builderConf := args.GetBuilderConfig()
+	meta, buildPlatform, err := builderConf.GetManifestMeta().Resolve()
+	if err != nil {
+		return nil, err
+	}
+
+	// Read the identity, source path, and release mode from the meta.
+	platformID := meta.GetPlatformId()
+	pluginID := strings.TrimSpace(meta.GetManifestId())
+	sourcePath := builderConf.GetSourcePath()
+	buildType := bldr_manifest.ToBuildType(meta.GetBuildType())
+	isRelease := buildType.IsRelease()
+
+	// Detect a web build platform by its executable extension.
+	isWebBuildPlatform := buildPlatform.GetExecutableExt() == ".mjs"
+
+	// Compute the working, dist, and assets output paths.
+	workingPath := builderConf.GetWorkingPath()
+	outDistPath := filepath.Join(workingPath, "dist")
+	outAssetsPath := filepath.Join(workingPath, "assets")
+	distSourcePath := builderConf.GetDistSourcePath()
+
+	// outEntrypointName is the .wasm or .mjs entrypoint name.
+	outEntrypointName := pluginID + buildPlatform.GetExecutableExt()
+
+	// outBinName is the name of the Go binary.
+	var outBinName string
+	if isWebBuildPlatform {
+		// build to .wasm and import with the .mjs
+		outBinName = pluginID + ".wasm"
+	} else {
+		// build to .exe or no suffix, no separate entrypoint .mjs
+		outBinName = outEntrypointName
+	}
+
+	// Build the output world engine for this manifest build.
+	buildWorld := world.NewBusEngine(ctx, c.GetBus(), builderConf.GetEngineId())
+
+	// Attach the build identity fields to the controller logger.
+	le := c.GetLogger().
+		WithField("plugin-id", pluginID).
+		WithField("build-type", buildType).
+		WithField("platform-id", platformID)
+
+	// Log the start of the manifest build.
+	le.Debug("building plugin manifest")
+
+	// Select the dev info file for hot reload compatibility in dev mode.
+	var devInfoFile string
+	if !isRelease {
+		devInfoFile = "dev-info.bin"
+	}
+
+	// If no Go files changed, rebuild esbuild assets only (hot reload)
+	prevResult := args.GetPrevBuilderResult()
+	var updatedManifestMeta *bldr_manifest_builder.InputManifest
+	if !prevResult.GetManifestRef().GetEmpty() && !isRelease {
+		// Check out the previous result to disk.
+		prevManifestRef := prevResult.GetManifestRef()
+		_, err = builderConf.CheckoutManifest(
+			ctx,
+			le,
+			buildWorld.AccessWorldState,
+			prevManifestRef.GetManifestRef(),
+			outDistPath,
+			outAssetsPath,
+		)
+		if err != nil {
+			err = errors.Wrap(err, "failed to check out previous manifest")
+		}
+
+		// Run the fast rebuild.
+		if err == nil {
+			updatedManifestMeta, err = c.FastRebuildPlugin(
+				ctx,
+				le,
+				pluginID,
+				sourcePath,
+				distSourcePath,
+				workingPath,
+				outDistPath,
+				outAssetsPath,
+				conf.GetEsbuildFlags(),
+				prevResult.GetInputManifest(),
+				args.GetChangedFiles(),
+				devInfoFile,
+				builderConf,
+				buildHost,
+				buildWorld,
+			)
+		}
+
+		if err != nil {
+			le.WithError(err).Warn("fast rebuild failed: continuing with normal build")
+			updatedManifestMeta = nil
+		} else if updatedManifestMeta != nil {
+			le.Debug("completed fast rebuild")
+		}
+	}
+
+	// if fast-rebuild skipped or failed, use the full rebuild process (slower)
+	if updatedManifestMeta == nil {
+		// clean/create build directories
+		if err := fsutil.CleanCreateDir(outDistPath); err != nil {
+			return nil, err
+		}
+		if err := fsutil.CleanCreateDir(outAssetsPath); err != nil {
+			return nil, err
+		}
+
+		// build base plugin config
+		pluginBuildConf := conf.CloneVT()
+		if pluginBuildConf == nil {
+			pluginBuildConf = &Config{}
+		}
+
+		// apply the per-build-type configs
+		pluginBuildConf.FlattenBuildTypes(buildType)
+
+		// apply the per-platform-type configs
+		pluginBuildConf.FlattenPlatformTypes(buildPlatform)
+
+		goCompiler, err := resolveBuildGoCompiler(buildPlatform, buildType, pluginBuildConf.GetGoCompiler())
+		if err != nil {
+			return nil, err
+		}
+		supported, err := validateGoCompilerPlatform(buildPlatform, goCompiler)
+		if err != nil {
+			return nil, err
+		}
+		if !supported {
+			le.Warnf("skipping build for non-go platform: %v", buildPlatform.GetInputPlatformID())
+			return nil, nil
+		}
+
+		// call any pre-build hooks
+		for _, hook := range c.preBuildHooks {
+			res, err := hook(ctx, builderConf, buildWorld)
+			if err != nil {
+				return nil, err
+			}
+
+			// merge the returned config
+			pluginBuildConf.Merge(res.GetConfig())
+		}
+
+		// determine project id
+		projectID := builderConf.GetProjectId()
+		if cproj := pluginBuildConf.GetProjectId(); cproj != "" {
+			projectID = cproj
+		}
+
+		pluginMeta := bldr_plugin.NewPluginMeta(
+			projectID,
+			pluginID,
+			buildPlatform.GetPlatformID(),
+			buildType.String(),
+		)
+
+		le.Debug("compiling plugin")
+		updatedManifestMeta, err = c.BuildPlugin(
+			ctx,
+			le,
+			pluginMeta,
+			buildWorld,
+			buildHost,
+			buildType,
+			buildPlatform,
+			BuildPluginOpts{
+				JsMinification:                    builderConf.GetBuildPolicy().ResolveJsMinification(buildType),
+				JsSourcemaps:                      builderConf.GetBuildPolicy().ResolveJsSourcemaps(buildType),
+				GoScriptCodeSplitting:             builderConf.GetBuildPolicy().ResolveGoScriptCodeSplitting(buildType),
+				GoScriptDeadCodeElimination:       builderConf.GetBuildPolicy().ResolveGoScriptDeadCodeElimination(buildType),
+				OutBinName:                        outBinName,
+				WorkingPath:                       workingPath,
+				SourcePath:                        sourcePath,
+				DistSourcePath:                    distSourcePath,
+				OutDistPath:                       outDistPath,
+				OutAssetsPath:                     outAssetsPath,
+				GoPkgs:                            pluginBuildConf.GetGoPkgs(),
+				WebPkgs:                           pluginBuildConf.GetWebPkgs(),
+				WebPluginID:                       pluginBuildConf.GetWebPluginId(),
+				DelveAddr:                         pluginBuildConf.GetDelveAddr(),
+				LinkerFlags:                       pluginBuildConf.GetLinkerFlags(),
+				DisableRpcFetch:                   pluginBuildConf.GetDisableRpcFetch(),
+				ConfigSet:                         pluginBuildConf.GetConfigSet(),
+				HostConfigSet:                     pluginBuildConf.GetHostConfigSet(),
+				EnableCgoOpt:                      pluginBuildConf.GetEnableCgo(),
+				GoCompilerOpt:                     pluginBuildConf.GetGoCompiler(),
+				EnableImportedFactoryDiscoveryOpt: pluginBuildConf.GetEnableImportedFactoryDiscovery(),
+				EnableCompressionOpt:              pluginBuildConf.GetEnableCompression(),
+				BaseEsbuildFlags:                  pluginBuildConf.GetEsbuildFlags(),
+				DevInfoFile:                       devInfoFile,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Open a write transaction on the build world engine.
+	tx, err := buildWorld.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Discard()
+
+	// Bundle the dist and assets filesystems into the manifest.
+	le.Debug("bundling plugin files")
+	timeStart := time.Now()
+	committedManifest, committedManifestRef, err := builderConf.CommitManifestWithPaths(
+		ctx,
+		le,
+		tx,
+		meta,
+		outEntrypointName,
+		outDistPath,
+		outAssetsPath,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Assemble the builder result from the committed manifest.
+	le.Debugf(
+		"plugin build complete with %d input files",
+		len(updatedManifestMeta.Files),
+	)
+	result := bldr_manifest_builder.NewBuilderResult(
+		committedManifest,
+		committedManifestRef,
+		updatedManifestMeta,
+	)
+
+	// Commit the transaction and log the build duration.
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	le.
+		WithField("dur", time.Since(timeStart).String()).
+		Info("committed plugin manifest")
+
+	return result, nil
+}
+
+// resolveBuildGoCompiler resolves the Go compiler to use for the platform and
+// build type, falling back to the configured or default compiler.
+func resolveBuildGoCompiler(
+	buildPlatform bldr_platform.Platform,
+	buildType bldr_manifest.BuildType,
+	goCompilerOpt GoCompiler,
+) (gocompiler.GoCompiler, error) {
+	// Resolve the configured compiler option value.
+	resolvedModeOpt, err := goCompilerOpt.GoCompiler()
+	if err != nil {
+		return "", err
+	}
+
+	// Detect the TinyGo default for a native platform building a JS module.
+	defaultTinygoEnabled := false
+	if _, ok := buildPlatform.(*bldr_platform.NativePlatform); ok && buildPlatform.GetExecutableExt() == ".mjs" {
+		defaultTinygoEnabled = gocompiler.DefaultTinyGoEnabled(buildPlatform, buildType.IsRelease())
+	}
+	return gocompiler.ResolveGoCompiler(
+		buildPlatform,
+		resolvedModeOpt,
+		defaultTinygoEnabled,
+	)
+}
+
+// validateGoCompilerPlatform returns true if the compiler can target the
+// given platform and reports an error for invalid compiler/platform pairs.
+func validateGoCompilerPlatform(buildPlatform bldr_platform.Platform, goCompiler gocompiler.GoCompiler) (bool, error) {
+	if goCompiler.IsGoScript() {
+		if buildPlatform.GetExecutableExt() != ".mjs" {
+			return false, errors.New("goscript Go compiler requires a JavaScript module platform")
+		}
+		return true, nil
+	}
+	if _, ok := buildPlatform.(*bldr_platform.NativePlatform); !ok {
+		return false, nil
+	}
+	return true, nil
+}
+
+// goAnalysisEnv returns the GOOS/GOARCH values for the platform, used to make
+// analysis build-tag gating match the target compile.
+func goAnalysisEnv(buildPlatform bldr_platform.Platform) (string, string, error) {
+	// Convert the platform into its Go environment variables.
+	platformEnv, err := bldr_platform_go.PlatformToGoEnv(buildPlatform)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Extract GOOS and GOARCH from the environment list.
+	var goos, goarch string
+	for _, env := range platformEnv {
+		if value, ok := strings.CutPrefix(env, "GOOS="); ok {
+			goos = value
+			continue
+		}
+		if value, ok := strings.CutPrefix(env, "GOARCH="); ok {
+			goarch = value
+		}
+	}
+	return goos, goarch, nil
+}
+
+// BuildPlugin compiles the plugin once, committing it to the target world.
+//
+// It returns the source inputs consumed by the plugin and its web bundles.
+func (c *Controller) BuildPlugin(
+	ctx context.Context,
+	le *logrus.Entry,
+	pluginMeta *bldr_plugin.PluginMeta,
+	buildWorld world.Engine,
+	buildHost bldr_manifest_builder.BuildManifestHost,
+	buildType bldr_manifest.BuildType,
+	buildPlatform bldr_platform.Platform,
+	opts BuildPluginOpts,
+) (*bldr_manifest_builder.InputManifest, error) {
+	// Extract the build options used more than once below.
+	outBinName := opts.OutBinName
+	workingPath := opts.WorkingPath
+	sourcePath := opts.SourcePath
+	distSourcePath := opts.DistSourcePath
+	outDistPath := opts.OutDistPath
+	outAssetsPath := opts.OutAssetsPath
+	devInfoFile := opts.DevInfoFile
+	jsMinification := opts.JsMinification
+
+	// Extract the remaining web, package, and compiler options.
+	jsSourcemaps := opts.JsSourcemaps
+	goPkgs := opts.GoPkgs
+	webPkgs := opts.WebPkgs
+	webPluginID := opts.WebPluginID
+	delveAddr := opts.DelveAddr
+	hostConfigSet := opts.HostConfigSet
+	goCompilerOpt := opts.GoCompilerOpt
+	baseEsbuildFlags := opts.BaseEsbuildFlags
+
+	// Read the plugin identity, release mode, and controller config.
+	pluginID := pluginMeta.GetPluginId()
+	isRelease := buildType.IsRelease()
+	conf := c.GetConfig()
+
+	// Clone the go pkg and web pkg lists and split out the GoScript shared pkg.
+	goPkgs = slices.Clone(goPkgs)
+	webPkgs = protobuf_go_lite.CloneVTSlice(webPkgs)
+	goScriptSharedWebPkgID, buildGoScriptSharedProvider, consumeGoScriptSharedProvider := goScriptSharedWebPkgConfig(webPkgs)
+	bundleWebPkgs := filterGoScriptSharedWebPkgs(webPkgs)
+
+	// Detect a web build platform by its executable extension.
+	isWebBuildPlatform := buildPlatform.GetExecutableExt() == ".mjs"
+
+	// Resolve the cgo and compression options for this build.
+	enableCgo := opts.EnableCgoOpt.IsEnabled(false)
+
+	// enable compression for release mode only on default (isRelease means default value depends on release mode)
+	enableCompression := opts.EnableCompressionOpt.IsEnabled(isRelease)
+
+	// Resolve the Go compiler to use for the platform and build type.
+	goCompiler, err := resolveBuildGoCompiler(buildPlatform, buildType, goCompilerOpt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reject a compiler that cannot target the requested platform.
+	supported, err := validateGoCompilerPlatform(buildPlatform, goCompiler)
+	if err != nil {
+		return nil, err
+	}
+	if !supported {
+		return nil, errors.Errorf("go compiler %s does not support platform %s", goCompiler, buildPlatform.GetInputPlatformID())
+	}
+
+	// Record the resolved compiler mode and remaining feature options.
+	useGoScript := goCompiler == gocompiler.GoCompilerGoScript
+	resolvedGoCompiler, err := GoCompilerFromGoCompiler(goCompiler)
+	if err != nil {
+		return nil, err
+	}
+	enableTinygo := goCompiler.IsTinyGo()
+	enableImportedFactoryDiscovery := opts.EnableImportedFactoryDiscoveryOpt.IsEnabled(false)
+
+	// Start the embedded config set for the plugin startup controllers.
+	embedConfigSet := make(configset_proto.ConfigSetMap)
+
+	// applyToConfigSet applies the config to the target config set if it does not already exist
+	applyToConfigSet := func(id string, conf config.Config) error {
+		// Skip if this config ID already exists in the map
+		if _, ok := embedConfigSet[id]; ok {
+			return nil
+		}
+		configBin, err := conf.MarshalVT()
+		if err != nil {
+			return err
+		}
+		embedConfigSet[id] = &configset_proto.ControllerConfig{
+			Id:     conf.GetConfigID(),
+			Rev:    1,
+			Config: configBin,
+		}
+		return nil
+	}
+
+	// addGoPkg appends a Go package to the analyzed package list once.
+	addGoPkg := func(pkgName string) {
+		if !slices.Contains(goPkgs, pkgName) {
+			goPkgs = append(goPkgs, pkgName)
+		}
+	}
+
+	// Add the RPC fetch controller unless the build disables it.
+	if !opts.DisableRpcFetch {
+		addGoPkg("github.com/s4wave/spacewave/bldr/web/fetch/service")
+		if err := applyToConfigSet(
+			"rpc-fetch",
+			web_fetch_controller.NewConfig(),
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	// apply the config set entries for the web plugin, if applicable.
+	if webPluginID != "" {
+		// - load-web: loads the web plugin on startup
+		if err := applyToConfigSet("load-web", &bldr_plugin_load.Config{
+			PluginId: webPluginID,
+		}); err != nil {
+			return nil, err
+		}
+
+		// - observe-web-view: handle LookupWebView with incoming HandleWebView directives
+		addGoPkg("github.com/s4wave/spacewave/bldr/web/view/observer")
+		if err := applyToConfigSet("observe-web-view", &bldr_web_view_observer.Config{}); err != nil {
+			return nil, err
+		}
+
+		// - handle-rpc: handle incoming RPCs for web-view
+		addGoPkg("github.com/s4wave/spacewave/bldr/web/plugin/handle-rpc")
+		if err := applyToConfigSet("handle-rpc", &bldr_web_plugin_handle_rpc.Config{
+			WebPluginId:    webPluginID,
+			HandlePluginId: pluginID,
+			ServerIdRe:     "web-view/.*",
+		}); err != nil {
+			return nil, err
+		}
+
+		// - handle-web-view-rpc: handle web views via HandleWebView
+		addGoPkg("github.com/s4wave/spacewave/bldr/web/plugin/handle-web-view-rpc")
+		if err := applyToConfigSet("handle-web-view-rpc", &bldr_web_plugin_handle_web_view_rpc.Config{
+			WebPluginId:    webPluginID,
+			HandlePluginId: pluginID,
+		}); err != nil {
+			return nil, err
+		}
+
+		// - handle-web-view-server: handle incoming RPCs for HandleWebView
+		addGoPkg("github.com/s4wave/spacewave/bldr/web/view/handler/server")
+		if err := applyToConfigSet("handle-web-view-server", &web_view_handler_server.Config{}); err != nil {
+			return nil, err
+		}
+
+		// - handle-web-pkgs: handle web pkg lookups for the webPkgIds if there are any webPkgs defined
+		if len(webPkgs) != 0 {
+			// NOTE: add the actual config later after we build the web pkgs
+			addGoPkg("github.com/s4wave/spacewave/bldr/web/plugin/handle-web-pkg-assets")
+		}
+	}
+
+	// Add Go packages for web package serving if any web packages are defined.
+	if len(webPkgs) != 0 {
+		addGoPkg("github.com/s4wave/spacewave/bldr/web/pkg/rpc/server")
+		addGoPkg("github.com/s4wave/spacewave/bldr/web/pkg/fs/controller")
+	}
+
+	// apply host config set
+	if len(hostConfigSet) != 0 {
+		if err := applyToConfigSet("plugin-host-configset", &plugin_host_configset.Config{
+			ConfigSet: hostConfigSet,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	// merge configured config set entries
+	configset_proto.MergeConfigSetMaps(embedConfigSet, opts.ConfigSet)
+
+	// cleanup list of go packages
+	slices.Sort(goPkgs)
+	goPkgs = slices.Compact(goPkgs)
+
+	// Analyze the go packages with target-matched build tags.
+	le.Info("analyzing go packages")
+	buildTagsForAnalyze := newBuildTagsForAnalyze(buildPlatform, buildType, goCompiler)
+
+	// Match analysis GOOS/GOARCH to the target so factories gated on
+	// platform-specific build tags (e.g. volume_s4db with "//go:build !js")
+	// are excluded from the generated factory list when targeting browser
+	// JavaScript, whether the artifact platform is web/js/wasm or js.
+	analyzeGOOS, analyzeGOARCH, err := goAnalysisEnv(buildPlatform)
+	if err != nil {
+		return nil, err
+	}
+	an, err := AnalyzePackages(
+		ctx,
+		le,
+		sourcePath,
+		goPkgs,
+		buildTagsForAnalyze,
+		analyzeGOOS,
+		analyzeGOARCH,
+		enableImportedFactoryDiscovery,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// ensure all go packages were found.
+	for srcPkg, dstPkg := range an.GetPackagePathMappings() {
+		if _, ok := an.GetPackages()[dstPkg]; !ok {
+			return nil, errors.Errorf("go package not found: make sure it is imported in at least one Go file: %v", srcPkg)
+		}
+	}
+
+	// mapping between go.package.path.Variable and value
+	// for the Go compiler linker flags
+	var goVariableDefs []*vardef.PluginVar
+
+	// Read the parsed code files and file set from the analysis.
+	codeFiles := an.GetGoCodeFiles()
+	programCodeFiles := an.GetProgramSourceFiles()
+	fset := an.GetFileSet()
+
+	// Build the source file list from all program packages.
+	var goSrcFiles []string
+	for _, pkgFiles := range programCodeFiles {
+		goSrcFiles = append(goSrcFiles, pkgFiles...)
+	}
+
+	// parse bldr:asset comments
+	assetPkgs, err := an.FindAssetVariables(codeFiles)
+	if err != nil {
+		return nil, err
+	}
+	var assetSrcFiles []string
+	if len(assetPkgs) != 0 {
+		le.Debugf("found %d packages with %s comments", len(assetPkgs), AssetTag)
+		assetVarDefs, assetSrcPaths, err := BuildDefAssets(le, codeFiles, fset, assetPkgs, outAssetsPath, pluginID, isRelease)
+		if err != nil {
+			return nil, err
+		}
+		assetSrcFiles = assetSrcPaths
+		goVariableDefs = append(goVariableDefs, assetVarDefs...)
+	}
+
+	// parse bldr:asset:href comments
+	assetHrefPkgs, err := an.FindAssetHrefVariables(codeFiles)
+	if err != nil {
+		return nil, err
+	}
+	if len(assetHrefPkgs) != 0 {
+		le.Debugf("found %d packages with %s comments", len(assetHrefPkgs), AssetHrefTag)
+		assetHrefDefs, err := BuildDefAssetHrefs(le, codeFiles, fset, assetHrefPkgs, outAssetsPath, pluginID, isRelease)
+		if err != nil {
+			return nil, err
+		}
+		goVariableDefs = append(goVariableDefs, assetHrefDefs...)
+	}
+
+	// track web pkg refs
+	// NOTE: We specify the list of web pkgs in the parameters to BuildPlugin.
+	// NOTE: However: we only actually build the web pkgs that are referenced by the code.
+	// NOTE: This is because we need to tree-shake which imports are referenced.
+	var webPkgRefs web_pkg.WebPkgRefSlice
+
+	// parse bldr:esbuild comments and build import path definition list
+	esbuildPkgs, err := an.FindEsbuildVariables(codeFiles)
+	if err != nil {
+		return nil, err
+	}
+	var esbuildBundleVarMeta []*EsbuildBundleVarMeta
+	var esbuildOutputMeta []*bldr_web_bundler_esbuild.EsbuildOutputMeta
+	var esbuildSrcFiles []string
+	if len(esbuildPkgs) != 0 {
+		le.Debugf("found %d packages with %s comments", len(esbuildPkgs), EsbuildTag)
+
+		// esbuildBundleVarMeta is sorted
+		esbuildBundleVarMeta, err = BuildEsbuildBundleVarMeta(le, sourcePath, codeFiles, fset, esbuildPkgs)
+		if err != nil {
+			return nil, err
+		}
+
+		esbuildBundlerConf, err := BuildEsbuildBundlerConfig(esbuildBundleVarMeta, bundleWebPkgs, baseEsbuildFlags, sourcePath)
+		if err == nil {
+			err = esbuildBundlerConf.Validate()
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build esbuild bundler config")
+		}
+
+		esbuildBuilderProto, err := configset_proto.NewControllerConfig(configset.NewControllerConfig(1, esbuildBundlerConf), true)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal esbuild bundler config")
+		}
+
+		// Build and checkout the esbuild sub-manifest
+		webPkgRefs, esbuildSrcFiles, esbuildOutputMeta, err = bldr_plugin_compiler.BuildAndCheckoutEsbuildSubManifest(
+			ctx,
+			le,
+			buildHost,
+			buildWorld,
+			outAssetsPath,
+			esbuildBuilderProto,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// build the go variable bindings to the js files
+		esbuildGoVarDefs, err := buildEsbuildGoVariableDefs(pluginID, esbuildBundleVarMeta, esbuildOutputMeta)
+		if err != nil {
+			return nil, err
+		}
+		goVariableDefs = append(goVariableDefs, esbuildGoVarDefs...)
+	}
+
+	// parse bldr:vite comments and build import path definition list
+	vitePkgs, err := an.FindViteVariables(codeFiles)
+	if err != nil {
+		return nil, err
+	}
+	var viteBundleVarMeta []*ViteBundleVarMeta
+	var viteOutputMeta []*bldr_vite.ViteOutputMeta
+	var viteWebPkgRefs web_pkg.WebPkgRefSlice
+	var viteSrcFiles []string
+	if len(vitePkgs) != 0 {
+		le.Debugf("found %d packages with %s comments", len(vitePkgs), ViteTag)
+
+		// viteBundleVarMeta is sorted
+		viteBundleVarMeta, err = BuildViteBundleVarMeta(le, sourcePath, codeFiles, fset, vitePkgs)
+		if err != nil {
+			return nil, err
+		}
+
+		// Get base vite config paths from the config
+		viteConfigPaths := conf.GetViteConfigPaths()
+		disableProjectConfig := conf.GetViteDisableProjectConfig()
+
+		// public path for assets
+		publicPath := bldr_plugin.PluginAssetHTTPPath(pluginID, bldr_plugin_compiler.ViteAssetSubdir)
+
+		viteBundlerConf, err := BuildViteBundlerConfig(
+			viteBundleVarMeta,
+			bundleWebPkgs,
+			viteConfigPaths,
+			publicPath,
+			disableProjectConfig,
+		)
+		if err == nil {
+			err = viteBundlerConf.Validate()
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build vite bundler config")
+		}
+
+		viteBuilderProto, err := configset_proto.NewControllerConfig(configset.NewControllerConfig(1, viteBundlerConf), true)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal vite bundler config")
+		}
+
+		// Build and checkout the vite sub-manifest
+		viteWebPkgRefs, viteSrcFiles, viteOutputMeta, err = bldr_plugin_compiler.BuildAndCheckoutViteSubManifest(
+			ctx,
+			le,
+			buildHost,
+			buildWorld,
+			outAssetsPath,
+			viteBuilderProto,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// build the go variable bindings to the output files
+		viteGoVarDefs, err := buildViteGoVariableDefs(pluginID, viteBundleVarMeta, viteOutputMeta)
+		if err != nil {
+			return nil, err
+		}
+		goVariableDefs = append(goVariableDefs, viteGoVarDefs...)
+
+		// Merge web pkg refs from vite with any from esbuild
+		webPkgRefs = append(webPkgRefs, viteWebPkgRefs...)
+	}
+
+	// If there are web packages declared but none were built by esbuild/vite
+	// sub-manifests, build them directly.
+	if len(webPkgRefs) == 0 && len(bundleWebPkgs) != 0 {
+		le.Debug("building web packages directly (no esbuild/vite sub-manifests)")
+		directRefs, directSrcFiles, _, err := bldr_plugin_compiler.BuildDirectWebPkgs(
+			ctx, le, distSourcePath, sourcePath, workingPath, outAssetsPath, isRelease, jsMinification, jsSourcemaps, bundleWebPkgs,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "build direct web packages")
+		}
+		viteSrcFiles = append(viteSrcFiles, directSrcFiles...)
+		webPkgRefs = append(webPkgRefs, directRefs...)
+	}
+
+	// Filter out excluded web package references (another plugin provides these).
+	excludedIDs := bldr_web_bundler.ExcludedWebPkgIDs(bundleWebPkgs)
+	webPkgRefs = webPkgRefs.FilterExcluded(excludedIDs)
+
+	// sort the web pkg refs
+	web_pkg.SortWebPkgRefs(webPkgRefs)
+
+	// sort go variable defs
+	vardef.SortPluginVars(goVariableDefs)
+
+	// NOTE: we add the Go pkgs to the list earlier in this function.
+	webPkgIDs := webPkgRefs.ToWebPkgIDList()
+	if useGoScript && buildGoScriptSharedProvider && !slices.Contains(webPkgIDs, goScriptSharedWebPkgID) {
+		webPkgIDs = append(webPkgIDs, goScriptSharedWebPkgID)
+		slices.Sort(webPkgIDs)
+	}
+	if len(webPkgIDs) != 0 {
+		// add the web packages rpc server to the config set.
+		// resolves AccessRpcService directive
+		if err := applyToConfigSet(
+			"web-pkgs-rpc",
+			web_pkg_rpc_server.NewConfig("", webPkgIDs),
+		); err != nil {
+			return nil, err
+		}
+
+		// add the web packages UnixFS-backed resolver to the config set.
+		// we know the list of included web pkg ids, so provide it explicitly.
+		// resolves LookupWebPkg directive
+		if err := applyToConfigSet(
+			"web-pkgs-fs",
+			web_pkg_fs_controller.NewConfig(
+				bldr_plugin.PluginAssetsFsId(pluginID),
+				bldr_plugin.PluginAssetsWebPkgsDir,
+				true,
+				webPkgIDs,
+			),
+		); err != nil {
+			return nil, err
+		}
+
+		// tell the web plugin to forward web pkgs to our plugin assets fs.
+		if webPluginID != "" {
+			if err := applyToConfigSet("handle-web-pkgs", &bldr_web_plugin_handle_web_pkg_assets.Config{
+				WebPluginId:    webPluginID,
+				HandlePluginId: pluginID,
+				WebPkgsPath:    bldr_plugin.PluginAssetsWebPkgsDir,
+				WebPkgIdList:   webPkgIDs,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// encode config set for embedded config set binary
+	var configSetBin []byte
+	if len(embedConfigSet) != 0 {
+		configSetObj := &configset_proto.ConfigSet{
+			Configs: embedConfigSet,
+		}
+		configSetBin, err = configSetObj.MarshalDeterministicVT()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Generate the plugin module from the analyzed packages.
+	le.Debug("generating go packages")
+	moduleID := strings.Join([]string{pluginMeta.GetProjectId(), pluginMeta.GetPluginId()}, "-")
+	mc, err := NewModuleCompiler(le, workingPath, moduleID)
+	if err != nil {
+		return nil, err
+	}
+	an.AddVariableDefImports(le, goVariableDefs)
+
+	// Generate the plugin source module and its dev info record.
+	pluginDevInfo, err := mc.GenerateModule(an, pluginMeta, configSetBin, goVariableDefs, devInfoFile)
+	if err != nil {
+		return nil, err
+	}
+
+	// Write dev info file if applicable.
+	if err := writeDevInfoFile(le, outDistPath, devInfoFile, pluginDevInfo); err != nil {
+		return nil, errors.Wrap(err, "write dev info file")
+	}
+
+	// List the files to copy from the generated module into the dist directory.
+	var copyFiles []string
+	var webRuntimeSrcFiles []string
+	var goScriptBuildFlags []string
+	var goScriptOverrideDirs []string
+	var goScriptOverrideDirRels []string
+	outDistBinary := filepath.Join(outDistPath, outBinName)
+
+	// Decide whether to compile a plugin binary or a dev wrapper.
+	compilePluginBinary := !useGoScript && (isRelease || delveAddr == "" || isWebBuildPlatform)
+	compileDevWrapper := !useGoScript && !compilePluginBinary
+
+	// Compile the plugin TypeScript package tree with GoScript.
+	if useGoScript {
+		le.Info("compiling plugin TypeScript package tree")
+		goScriptBuildFlags = newGoScriptBuildFlags(buildPlatform, buildType)
+		goScriptOverrideDirs, goScriptOverrideDirRels = existingSourceDirs(sourcePath, "gs")
+		goScriptCacheRoot, err := gocompiler.GoScriptCompilerCacheRootFromEnv(workingPath)
+		if err != nil {
+			return nil, err
+		}
+		// The generated package tree stays outside dist so the manifest stores
+		// only the bundled entrypoint.
+		goScriptOutputRoot := filepath.Join(workingPath, "goscript")
+		if err := fsutil.CleanCreateDir(goScriptOutputRoot); err != nil {
+			return nil, err
+		}
+		mainPackagePath, err := mc.CompilePluginGoScript(
+			ctx,
+			le,
+			goScriptOutputRoot,
+			goScriptCacheRoot,
+			goScriptBuildFlags,
+			goScriptOverrideDirs,
+			conf.GetGoscriptDeferredFunctions(),
+			opts.GoScriptDeadCodeElimination,
+		)
+		if err != nil {
+			return nil, err
+		}
+		outScriptPath := filepath.Join(outDistPath, pluginID+".mjs")
+		timeStart := time.Now()
+		// Raw GoScript browser plugin bundles can be hundreds of megabytes
+		// before Oxc compaction. Keep dev FetchManifest output runnable by
+		// always serving the mangled entrypoint; the generated package tree
+		// remains under the working path for source-level inspection. Dev
+		// builds skip the compress pass, which costs most of the minify time
+		// for a few percent of output size.
+		goScriptJSMinification := web_runtime_goscript_build.GoScriptMinifyMangle
+		if isRelease {
+			goScriptJSMinification = web_runtime_goscript_build.GoScriptMinifyFull
+		}
+		goScriptJSSourcemaps := false
+		sharedOptions := web_runtime_goscript_build.GoScriptSharedBundleOptions{
+			WebPkgID: goScriptSharedWebPkgID,
+			Enabled:  consumeGoScriptSharedProvider,
+		}
+		buildBundleFn := web_runtime_goscript_build.BuildWebGoScriptPluginScriptWithOptions
+		if _, ok := buildPlatform.(*bldr_platform.CloudflarePlatform); ok {
+			buildBundleFn = web_runtime_goscript_build.BuildWebGoScriptCloudflarePluginScript
+		}
+		webRuntimeSrcFiles, err = buildBundleFn(
+			ctx,
+			le,
+			distSourcePath,
+			mc.pluginCodegenPath,
+			goScriptOutputRoot,
+			outScriptPath,
+			mainPackagePath,
+			goScriptJSMinification,
+			goScriptJSSourcemaps,
+			opts.GoScriptCodeSplitting,
+			sharedOptions,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if buildGoScriptSharedProvider {
+			sharedOutPath := filepath.Join(outAssetsPath, bldr_plugin.PluginAssetsWebPkgsDir, goScriptSharedWebPkgID)
+			_, sharedInputs, err := web_runtime_goscript_build.BuildWebGoScriptSharedProviderScript(
+				ctx,
+				le,
+				distSourcePath,
+				filepath.Join(mc.pluginCodegenPath, "goscript-shared-provider"),
+				goScriptOutputRoot,
+				sharedOutPath,
+				goScriptSharedWebPkgID,
+				goScriptJSMinification,
+				goScriptJSSourcemaps,
+			)
+			if err != nil {
+				return nil, err
+			}
+			webRuntimeSrcFiles = append(webRuntimeSrcFiles, sharedInputs...)
+			webPkgRefs = append(webPkgRefs, &web_pkg.WebPkgRef{
+				WebPkgId:   goScriptSharedWebPkgID,
+				WebPkgRoot: filepath.Join(outAssetsPath, bldr_plugin.PluginAssetsWebPkgsDir, goScriptSharedWebPkgID),
+			})
+		}
+		le.
+			WithField("dur", time.Since(timeStart).String()).
+			Info("compiled GoScript web plugin entrypoint")
+	}
+	if compilePluginBinary {
+		le.Info("compiling plugin binary")
+		if err := mc.CompilePlugin(
+			ctx,
+			le,
+			outDistBinary,
+			buildPlatform,
+			buildType,
+			enableCgo,
+			enableTinygo,
+			opts.LinkerFlags,
+		); err != nil {
+			return nil, err
+		}
+
+		// optimization pass: compression
+		if enableCompression && isWebBuildPlatform {
+			le.Info("compressing plugin binary")
+
+			/*
+				brPath, err := bldr_compress.CompressBrotli(le, workingPath, outDistBinary)
+				if err != nil {
+					return nil, err
+				}
+			*/
+
+			brPath, err := bldr_compress.CompressGzip(ctx, le, workingPath, outDistBinary)
+			if err != nil {
+				return nil, err
+			}
+
+			// use this new binary from now on
+			if err := os.Remove(outDistBinary); err != nil {
+				return nil, err
+			}
+
+			outDistBinary = brPath //nolint
+			outBinName = filepath.Base(brPath)
+		}
+	}
+	if compileDevWrapper {
+		le.Info("compiling plugin dev wrapper binary")
+		if err := mc.CompilePluginDevWrapper(ctx, le, outDistBinary, delveAddr, buildPlatform, buildType, enableCgo, opts.LinkerFlags); err != nil {
+			return nil, err
+		}
+		copyFiles = append(copyFiles, "plugin.go", "config-set.bin")
+	}
+
+	// build the WebWorker / SharedWorker js entrypoint if applicable
+	if isWebBuildPlatform && !useGoScript {
+		// override entrypoint path to point to .mjs instead (for web worker)
+		le.Info("compiling web plugin entrypoint")
+		outScriptPath := filepath.Join(
+			outDistPath,
+			pluginID+".mjs",
+		)
+		timeStart := time.Now()
+		webRuntimeSrcFiles, err = web_runtime_wasm_build.BuildWebWasmPluginScript(
+			ctx,
+			le,
+			distSourcePath,
+			outScriptPath,
+			outBinName,
+			enableTinygo,
+			jsMinification,
+			jsSourcemaps,
+		)
+		if err != nil {
+			return nil, err
+		}
+		le.
+			WithField("dur", time.Since(timeStart).String()).
+			Info("compiled web plugin entrypoint")
+	}
+
+	// copyFile copies one generated file into the dist directory.
+	copyFile := func(filename string) error {
+		// Skip empty filenames.
+		if filename == "" {
+			return nil
+		}
+
+		// Skip files that are empty or do not exist in the generated module.
+		srcPath := filepath.Join(mc.pluginCodegenPath, filename)
+		if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+			return nil
+		}
+
+		// Compute log paths relative to the current working directory.
+		relSrcPath, relOutDistPath := srcPath, outDistPath
+		if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+			if rs, err := filepath.Rel(cwd, relSrcPath); err == nil {
+				relSrcPath = rs
+			}
+			if rs, err := filepath.Rel(cwd, relOutDistPath); err == nil {
+				relOutDistPath = rs
+			}
+		}
+		le.Debugf("copy %s to %s", relSrcPath, relOutDistPath)
+
+		return fsutil.CopyFileToDir(outDistPath, srcPath, 0o644)
+	}
+
+	// Copy the files the entrypoint will need into dist.
+	for _, filename := range copyFiles {
+		if err := copyFile(filename); err != nil {
+			return nil, err
+		}
+	}
+
+	// Sort the web pkg references and compact the web pkg configs.
+	web_pkg.SortWebPkgRefs(webPkgRefs)
+	webPkgs = bldr_web_bundler.CompactWebPkgRefConfigs(slices.Clone(webPkgs))
+
+	// Build the input manifest metadata record.
+	inputManifestMeta := &InputManifestMeta{
+		DevInfo: pluginDevInfo,
+
+		WebPkgRefs: webPkgRefs,
+		WebPkgs:    webPkgs,
+
+		EsbuildBundles: esbuildBundleVarMeta,
+		EsbuildFlags:   baseEsbuildFlags,
+		EsbuildOutputs: esbuildOutputMeta,
+
+		ViteBundles:              viteBundleVarMeta,
+		ViteConfigPaths:          conf.GetViteConfigPaths(),
+		ViteOutputs:              viteOutputMeta,
+		ViteDisableProjectConfig: conf.GetViteDisableProjectConfig(),
+		GoCompiler:               resolvedGoCompiler,
+		GoscriptBuildFlags:       goScriptBuildFlags,
+		GoscriptOverrideDirs:     goScriptOverrideDirRels,
+		GoscriptAllDependencies:  useGoScript,
+	}
+	inputManifestMetaBin, err := inputManifestMeta.MarshalVT()
+	if err != nil {
+		return nil, err
+	}
+
+	// Create the input manifest with the module source files.
+	inputManifest := &bldr_manifest_builder.InputManifest{Metadata: inputManifestMetaBin}
+	moduleSrcFiles := existingSourceFiles(sourcePath, "go.mod", "go.sum", "vendor/modules.txt")
+
+	// Record the Go and asset input files in the manifest.
+	if err := appendInputManifestFiles(
+		inputManifest,
+		sourcePath,
+		InputFileKind_InputFileKind_GO,
+		append(goSrcFiles, moduleSrcFiles...),
+		false,
+	); err != nil {
+		return nil, err
+	}
+	if err := appendInputManifestFiles(
+		inputManifest,
+		sourcePath,
+		InputFileKind_InputFileKind_GO,
+		an.localReplaceSourceFiles,
+		true,
+	); err != nil {
+		return nil, err
+	}
+	if err := appendInputManifestFiles(
+		inputManifest,
+		sourcePath,
+		InputFileKind_InputFileKind_ASSET,
+		assetSrcFiles,
+		false,
+	); err != nil {
+		return nil, err
+	}
+
+	// Record the GoScript override source files in the manifest.
+	if useGoScript {
+		goScriptOverrideFiles, err := sourceFilesUnderDirs(sourcePath, goScriptOverrideDirRels)
+		if err != nil {
+			return nil, err
+		}
+		if err := appendInputManifestFiles(
+			inputManifest,
+			sourcePath,
+			InputFileKind_InputFileKind_GOSCRIPT_OVERRIDE,
+			goScriptOverrideFiles,
+			false,
+		); err != nil {
+			return nil, err
+		}
+		replacedGoScriptOverrideFiles, err := localReplaceGoScriptOverrideFiles(an.localReplaceDirs)
+		if err != nil {
+			return nil, err
+		}
+		if err := appendInputManifestFiles(
+			inputManifest,
+			sourcePath,
+			InputFileKind_InputFileKind_GOSCRIPT_OVERRIDE,
+			replacedGoScriptOverrideFiles,
+			true,
+		); err != nil {
+			return nil, err
+		}
+	}
+	webRuntimeSrcFiles = filterPathsUnderBase(sourcePath, webRuntimeSrcFiles, workingPath)
+	if len(webRuntimeSrcFiles) != 0 {
+		err = fsutil.ConvertPathsToRelative(sourcePath, webRuntimeSrcFiles)
+		if err != nil {
+			return nil, err
+		}
+	}
+	seenInputPaths := make(map[string]struct{}, len(inputManifest.Files))
+	for _, inputFile := range inputManifest.Files {
+		seenInputPaths[inputFile.GetPath()] = struct{}{}
+	}
+	for _, srcPath := range append(append(esbuildSrcFiles, viteSrcFiles...), webRuntimeSrcFiles...) {
+		if _, ok := seenInputPaths[srcPath]; ok {
+			continue
+		}
+		seenInputPaths[srcPath] = struct{}{}
+		inputManifest.Files = append(inputManifest.Files, &bldr_manifest_builder.InputManifest_File{
+			Path:        srcPath,
+			StartupOnly: true,
+		})
+	}
+	addCompilerStartupCacheInputs(inputManifest, goCompilerOpt, goCompiler)
+	inputManifest.SortFiles()
+
+	return inputManifest, nil
+}
+
+// newGoScriptBuildFlags builds the GoScript target's build flags.
+func newGoScriptBuildFlags(buildPlatform bldr_platform.Platform, buildType bldr_manifest.BuildType) []string {
+	buildTags := gocompiler.NewBuildTags(buildType)
+	buildTags = append(buildTags, gocompiler.PureGoBuildTag, gocompiler.GoScriptBuildTag, gocompiler.SQLLiteBuildTag)
+	if _, ok := buildPlatform.(*bldr_platform.CloudflarePlatform); ok {
+		buildTags = append(buildTags, gocompiler.CloudflareBuildTag)
+	}
+	return []string{"-tags=" + strings.Join(buildTags, ",")}
+}
+
+// appendInputManifestFiles records paths of the given kind in the input manifest.
+// includeExternalSources permits local replacement paths outside the source root.
+func appendInputManifestFiles(
+	inputManifest *bldr_manifest_builder.InputManifest,
+	sourcePath string,
+	kind InputFileKind,
+	srcPaths []string,
+	includeExternalSources bool,
+) error {
+	// Keep local Go inputs within the project unless they come from a replacement.
+	if kind == InputFileKind_InputFileKind_GO && !includeExternalSources {
+		srcPaths = filterPathsUnderBase(sourcePath, srcPaths)
+	}
+
+	// Encode the input file metadata once for all paths.
+	meta := &InputFileMeta{Kind: kind}
+	metaBin, err := meta.MarshalVT()
+	if err != nil {
+		return err
+	}
+
+	// Convert each path to source-root-relative form.
+	if includeExternalSources {
+		for i, srcPath := range srcPaths {
+			relPath, err := filepath.Rel(sourcePath, srcPath)
+			if err != nil {
+				return err
+			}
+			srcPaths[i] = filepath.ToSlash(relPath)
+		}
+	} else if err := fsutil.ConvertPathsToRelative(sourcePath, srcPaths); err != nil {
+		return err
+	}
+
+	// Append one manifest file entry per source path.
+	for _, srcPath := range srcPaths {
+		inputManifest.Files = append(inputManifest.Files, &bldr_manifest_builder.InputManifest_File{
+			Path:     srcPath,
+			Metadata: metaBin,
+		})
+	}
+	return nil
+}
+
+// filterPathsUnderBase retains source files outside generated build roots.
+// Generated inputs are covered by their source and compiler inputs, and must
+// not make startup validation depend on disposable build output.
+func filterPathsUnderBase(basePath string, paths []string, generatedRoots ...string) []string {
+	// Keep only paths outside the generated build roots.
+	if len(paths) == 0 {
+		return nil
+	}
+	for _, root := range slices.Clone(generatedRoots) {
+		if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
+			generatedRoots = append(generatedRoots, resolved)
+		}
+	}
+	filtered := paths[:0]
+nextInput:
+	for _, filePath := range paths {
+		if filePath == "" {
+			continue
+		}
+		relPath, err := filepath.Rel(basePath, filePath)
+		if err != nil {
+			continue
+		}
+		if relPath == "." || relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+			continue
+		}
+		for _, root := range generatedRoots {
+			rel, err := filepath.Rel(root, filePath)
+			if err == nil && filepath.IsLocal(rel) {
+				continue nextInput
+			}
+		}
+		filtered = append(filtered, filePath)
+	}
+	return filtered
+}
+
+// newBuildTagsForAnalyze assembles the build tags used during analysis for the
+// given build type, cgo setting, and Go compiler.
+func newBuildTagsForAnalyze(
+	buildPlatform bldr_platform.Platform,
+	buildType bldr_manifest.BuildType,
+	goCompiler gocompiler.GoCompiler,
+) []string {
+	// Start from the build type's base tags.
+	buildTags := gocompiler.NewBuildTags(buildType)
+
+	// Select portable Go and the reduced SQL surface for browser and
+	// non-desktop targets, matching gocompiler.ExecBuildEntrypoint.
+	if goCompiler.IsTinyGo() || goCompiler.IsGoScript() || (buildPlatform != nil && buildPlatform.GetBasePlatformID() != bldr_platform.PlatformID_DESKTOP) {
+		buildTags = append(buildTags, gocompiler.PureGoBuildTag, gocompiler.SQLLiteBuildTag)
+	}
+
+	// Add the TinyGo-specific tags.
+	if goCompiler.IsTinyGo() {
+		buildTags = append(buildTags, "tinygo")
+		buildTags = append(buildTags, gocompiler.BldrTinyGoJSImportBuildTag)
+	}
+	if goCompiler.IsGoScript() {
+		buildTags = append(buildTags, gocompiler.GoScriptBuildTag)
+		if _, ok := buildPlatform.(*bldr_platform.CloudflarePlatform); ok {
+			buildTags = append(buildTags, gocompiler.CloudflareBuildTag)
+		}
+	}
+	return buildTags
+}
+
+// FastRebuildPlugin compiles the plugin once skipping running the Go compiler if possible.
+// Assumes we are in dev mode (not release mode).
+// Assumes the previous result is already checked out to outDistPath and outAssetsPath.
+// Returns nil, nil if fast rebuild is not applicable.
+func (c *Controller) FastRebuildPlugin(
+	ctx context.Context,
+	le *logrus.Entry,
+	pluginID,
+	sourcePath,
+	distSourcePath,
+	workingPath,
+	outDistPath,
+	outAssetsPath string,
+	baseEsbuildFlags []string,
+	prevInputManifest *bldr_manifest_builder.InputManifest,
+	changedFiles []*bldr_manifest_builder.InputManifest_File,
+	devInfoFile string,
+	builderConf *bldr_manifest_builder.BuilderConfig,
+	buildHost bldr_manifest_builder.BuildManifestHost,
+	buildWorld world.Engine,
+) (*bldr_manifest_builder.InputManifest, error) {
+	// Skip if there is no previous result.
+	if len(prevInputManifest.GetFiles()) == 0 {
+		return nil, nil
+	}
+
+	// If any Go or Asset files changed, skip fast rebuild.
+	// The manifest builder will be restarted when the sub-manifest changes.
+	// Those changed files won't appear in the changedFiles set.
+	// Therefore if changedFiles has anything in it, we changed an Asset or a Go file.
+	if len(changedFiles) != 0 {
+		// Skip fast rebuild: non-esbuild asset changed.
+		return nil, nil
+	}
+
+	// Skip if there is no valid input manifest metadata.
+	prevMetaBin := prevInputManifest.Metadata
+	if len(prevMetaBin) == 0 {
+		return nil, nil
+	}
+	inputMeta := &InputManifestMeta{}
+	if err := inputMeta.UnmarshalVT(prevMetaBin); err != nil {
+		return nil, errors.Wrap(err, "unmarshal input metadata")
+	}
+
+	// If nothing was rebuilt, return
+	prevEsbuildBundles := inputMeta.GetEsbuildBundles()
+	prevViteBundles := inputMeta.GetViteBundles()
+	if len(prevEsbuildBundles) == 0 && len(prevViteBundles) == 0 {
+		// Nothing to rebuild
+		return nil, nil
+	}
+
+	// Perform fast rebuild by running the bundlers only.
+	le.Info("performing fast rebuild")
+
+	// Recreate the web pkgs assets directory for the rebuilt bundles.
+	outAssetsWebPkgPath := filepath.Join(outAssetsPath, bldr_plugin.PluginAssetsWebPkgsDir)
+	if err := fsutil.CleanCreateDir(outAssetsWebPkgPath); err != nil {
+		return nil, err
+	}
+
+	// Start the rebuilt web pkg refs and bundler output metadata lists.
+	prevWebPkgs := inputMeta.GetWebPkgs()
+	var updatedWebPkgRefs web_pkg.WebPkgRefSlice
+	var esbuildWebPkgRefs web_pkg.WebPkgRefSlice
+	var viteWebPkgRefs web_pkg.WebPkgRefSlice
+	var updatedEsbuildOutputs []*bldr_web_bundler_esbuild.EsbuildOutputMeta
+	var updatedViteOutputs []*bldr_vite.ViteOutputMeta
+
+	// Rebuild the esbuild bundles recorded in the previous metadata.
+	if len(prevEsbuildBundles) > 0 {
+		// Build the esbuild bundler config from the previous metadata.
+		esbuildBundlerConf, err := BuildEsbuildBundlerConfig(prevEsbuildBundles, prevWebPkgs, baseEsbuildFlags, sourcePath)
+		if err == nil {
+			err = esbuildBundlerConf.Validate()
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build esbuild bundler config for fast rebuild")
+		}
+		esbuildBuilderProto, err := configset_proto.NewControllerConfig(configset.NewControllerConfig(1, esbuildBundlerConf), true)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal esbuild bundler config for fast rebuild")
+		}
+
+		// Build and checkout the esbuild sub-manifest, capturing its output metadata.
+		esbuildWebPkgRefs, _, updatedEsbuildOutputs, err = bldr_plugin_compiler.BuildAndCheckoutEsbuildSubManifest(
+			ctx,
+			le,
+			buildHost,
+			buildWorld,
+			outAssetsPath,
+			esbuildBuilderProto,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build and checkout esbuild sub-manifest during fast rebuild")
+		}
+
+		// Add the esbuild web pkg refs to the collected list.
+		updatedWebPkgRefs = append(updatedWebPkgRefs, esbuildWebPkgRefs...)
+	}
+
+	// Read the previous vite config inputs for the rebuild.
+	prevViteConfigPaths := inputMeta.GetViteConfigPaths()
+	prevViteDisableProjectConfig := inputMeta.GetViteDisableProjectConfig()
+
+	// Rebuild the vite bundles recorded in the previous metadata.
+	if len(prevViteBundles) > 0 {
+		// Build the vite config from the previous metadata.
+		publicPath := bldr_plugin.PluginAssetHTTPPath(pluginID, bldr_plugin_compiler.ViteAssetSubdir)
+		viteBundlerConf, err := BuildViteBundlerConfig(
+			prevViteBundles,
+			prevWebPkgs,
+			prevViteConfigPaths,
+			publicPath,
+			prevViteDisableProjectConfig,
+		)
+		if err == nil {
+			err = viteBundlerConf.Validate()
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build vite bundler config for fast rebuild")
+		}
+		viteBuilderProto, err := configset_proto.NewControllerConfig(configset.NewControllerConfig(1, viteBundlerConf), true)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal vite bundler config for fast rebuild")
+		}
+
+		// Build and checkout the vite sub-manifest
+		// Capture the vite output metadata for later use.
+		viteWebPkgRefs, _, updatedViteOutputs, err = bldr_plugin_compiler.BuildAndCheckoutViteSubManifest(
+			ctx,
+			le,
+			buildHost,
+			buildWorld,
+			outAssetsPath,
+			viteBuilderProto,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build and checkout vite sub-manifest during fast rebuild")
+		}
+
+		// Add to collected web pkg refs
+		updatedWebPkgRefs = append(updatedWebPkgRefs, viteWebPkgRefs...)
+	}
+
+	// Sort web pkg refs for comparison
+	web_pkg.SortWebPkgRefs(updatedWebPkgRefs)
+
+	// Compare the web pkg refs to see if they changed.
+	// If so: we must perform a full rebuild to pick up the new refs + rebuild the web pkgs.
+	if !(&InputManifestMeta{WebPkgRefs: inputMeta.WebPkgRefs}).EqualVT(&InputManifestMeta{WebPkgRefs: updatedWebPkgRefs}) {
+		le.Info("references to web pkgs changed: forcing a full re-build")
+		return nil, nil
+	}
+
+	// Build the go variable bindings based on the *new* outputs and *old* bundle definitions
+	var nextGoVariableDefs []*vardef.PluginVar
+
+	// Regenerate the esbuild variable definitions from the new outputs.
+	if len(prevEsbuildBundles) > 0 {
+		esbuildVarDefs, err := buildEsbuildGoVariableDefs(pluginID, prevEsbuildBundles, updatedEsbuildOutputs)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build esbuild go variable definitions during fast rebuild")
+		}
+		nextGoVariableDefs = append(nextGoVariableDefs, esbuildVarDefs...)
+	}
+
+	// Regenerate the vite variable definitions from the new outputs.
+	if len(prevViteBundles) > 0 {
+		viteVarDefs, err := buildViteGoVariableDefs(pluginID, prevViteBundles, updatedViteOutputs)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to build vite go variable definitions during fast rebuild")
+		}
+		nextGoVariableDefs = append(nextGoVariableDefs, viteVarDefs...)
+	}
+
+	// Sort the regenerated variable definitions.
+	vardef.SortPluginVars(nextGoVariableDefs)
+
+	// Clone the previous input manifest and meta for the update.
+	updatedInputManifest := prevInputManifest.CloneVT()
+	updatedInputMeta := inputMeta.CloneVT()
+	if updatedInputMeta.DevInfo == nil {
+		// Ensure DevInfo exists, though it should if we got this far from a previous build
+		updatedInputMeta.DevInfo = &vardef.PluginDevInfo{}
+	}
+
+	// Replace the bundler outputs in the metadata.
+	if len(updatedEsbuildOutputs) > 0 {
+		updatedInputMeta.EsbuildOutputs = updatedEsbuildOutputs
+	}
+	if len(updatedViteOutputs) > 0 {
+		updatedInputMeta.ViteOutputs = updatedViteOutputs
+	}
+
+	// WebPkgRefs are confirmed to be the same, no need to update updatedInputMeta.WebPkgRefs
+
+	// Drop overwritten variable definitions from the DevInfo set before re-adding them.
+	type varDefKey struct {
+		pkgPath string
+		pkgVar  string
+	}
+	overwrittenVarDefs := make(map[varDefKey]struct{})
+	for _, goVarDef := range nextGoVariableDefs {
+		overwrittenVarDefs[varDefKey{pkgPath: goVarDef.PkgImportPath, pkgVar: goVarDef.PkgVar}] = struct{}{}
+	}
+	updatedInputMeta.DevInfo.PluginVars = slices.DeleteFunc(updatedInputMeta.DevInfo.PluginVars, func(goVarDef *vardef.PluginVar) bool {
+		_, overwritten := overwrittenVarDefs[varDefKey{pkgPath: goVarDef.PkgImportPath, pkgVar: goVarDef.PkgVar}]
+		return overwritten
+	})
+
+	// Append the updated variable definitions and sort the set.
+	updatedInputMeta.DevInfo.PluginVars = append(updatedInputMeta.DevInfo.PluginVars, nextGoVariableDefs...)
+	vardef.SortPluginVars(updatedInputMeta.DevInfo.PluginVars)
+
+	// Sort the updated input manifest files.
+	updatedInputManifest.SortFiles()
+
+	// Encode the updated metadata into the manifest.
+	updMetaBin, err := updatedInputMeta.MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to marshal updated input meta for fast rebuild")
+	}
+	updatedInputManifest.Metadata = updMetaBin
+
+	// Write the updated dev info file if applicable.
+	if err := writeDevInfoFile(le, outDistPath, devInfoFile, updatedInputMeta.GetDevInfo()); err != nil {
+		return nil, errors.Wrap(err, "write updated dev info file")
+	}
+
+	// Log the completion of the fast rebuild.
+	le.Debug("fast rebuild complete")
+	return updatedInputManifest, nil
+}
+
+// buildEsbuildGoVariableDefs generates the Go variable definitions based on esbuild outputs.
+func buildEsbuildGoVariableDefs(
+	pluginID string,
+	esbuildBundleVarMeta []*EsbuildBundleVarMeta,
+	esbuildOutputMeta []*bldr_web_bundler_esbuild.EsbuildOutputMeta,
+) ([]*vardef.PluginVar, error) {
+	// Match every bundle variable against the esbuild outputs.
+	var goVariableDefs []*vardef.PluginVar
+	for _, bundleVarDef := range esbuildBundleVarMeta {
+		// match each variable to a output entrypoint
+		for _, entrypointVar := range bundleVarDef.GetEntrypointVars() {
+			entrypointVarEsbuildEntrypointID := entrypointVar.ToEsbuildEntrypointId(bundleVarDef.GetId())
+
+			// locate the esbuild output corresponding to this variable
+			outputEntrypointIdx := slices.IndexFunc(esbuildOutputMeta, func(output *bldr_web_bundler_esbuild.EsbuildOutputMeta) bool {
+				entrypointPath := output.GetPath()
+				// TODO: is there a better way to determine the "actual" entrypoint (not the css bundle)?
+				if !strings.HasSuffix(entrypointPath, ".mjs") && !strings.HasSuffix(entrypointPath, ".js") {
+					return false
+				}
+
+				// match entrypoint id
+				return output.GetEntrypointId() == entrypointVarEsbuildEntrypointID
+			})
+			if outputEntrypointIdx == -1 {
+				return nil, errors.Errorf("could not find esbuild entrypoint corresponding to: %v", entrypointVarEsbuildEntrypointID)
+			}
+			outputEntrypoint := esbuildOutputMeta[outputEntrypointIdx]
+
+			var outpEntrypointPath string
+			if outpPath := outputEntrypoint.GetPath(); outpPath != "" {
+				outpEntrypointPath = filepath.ToSlash(outpPath) // possibly unnecessary
+				outpEntrypointPath = path.Join(bldr_plugin_compiler.EsbuildAssetSubdir, outpEntrypointPath)
+			}
+
+			var outpCssPath string
+			if cssPath := outputEntrypoint.GetCssBundlePath(); cssPath != "" {
+				outpCssPath = filepath.ToSlash(cssPath) // possibly unnecessary
+				outpCssPath = path.Join(bldr_plugin_compiler.EsbuildAssetSubdir, outpCssPath)
+			}
+
+			// varValue is the value for the go variable.
+			varType := entrypointVar.GetPkgVarType()
+			pkgImportPath := entrypointVar.GetPkgImportPath()
+			pkgVar := entrypointVar.GetPkgVar()
+			var varDef *vardef.PluginVar
+			switch varType {
+			case EsbuildVarType_EsbuildVarType_ENTRYPOINT_PATH:
+				var assetHref string
+				if outpEntrypointPath != "" {
+					assetHref = bldr_plugin.PluginAssetHTTPPath(pluginID, outpEntrypointPath)
+				} else {
+					assetHref = bldr_plugin.PluginAssetHTTPPath(pluginID, outpCssPath)
+				}
+				varDef = vardef.NewPluginVar(pkgImportPath, pkgVar, &vardef.PluginVar_StringValue{StringValue: assetHref})
+			case EsbuildVarType_EsbuildVarType_WEB_BUNDLER_OUTPUT:
+				output := &bldr_web_bundler.WebBundlerOutput{}
+				if outpEntrypointPath != "" {
+					output.EntrypointHref = bldr_plugin.PluginAssetHTTPPath(pluginID, outpEntrypointPath)
+				}
+				if outpCssPath != "" {
+					output.CssHref = bldr_plugin.PluginAssetHTTPPath(pluginID, outpCssPath)
+				}
+				varDef = vardef.NewPluginVar(pkgImportPath, pkgVar, &vardef.PluginVar_WebBundlerOutput{
+					WebBundlerOutput: output,
+				})
+			default:
+				return nil, errors.Errorf("unknown target variable type: %s", varType.String())
+			}
+
+			goVariableDefs = append(goVariableDefs, varDef)
+		}
+	}
+	return goVariableDefs, nil
+}
+
+// buildViteGoVariableDefs generates the Go variable definitions based on vite outputs.
+func buildViteGoVariableDefs(
+	pluginID string,
+	viteBundleVarMeta []*ViteBundleVarMeta,
+	viteOutputMeta []*bldr_vite.ViteOutputMeta,
+) ([]*vardef.PluginVar, error) {
+	// Index the vite outputs by entrypoint path.
+	var goVariableDefs []*vardef.PluginVar
+	outputsByEntrypoint := make(map[string][]*bldr_vite.ViteOutputMeta)
+
+	// Group output files by entrypoint
+	for _, output := range viteOutputMeta {
+		entrypointPath := output.GetEntrypointPath()
+		if entrypointPath != "" {
+			outputsByEntrypoint[entrypointPath] = append(outputsByEntrypoint[entrypointPath], output)
+		}
+	}
+
+	// Process each bundle
+	for _, bundleVarDef := range viteBundleVarMeta {
+		// Match each variable to a output entrypoint
+		for _, entrypointVar := range bundleVarDef.GetEntrypointVars() {
+			// Build the full entrypoint path
+			fullEntrypointPath := filepath.Join(entrypointVar.GetPkgCodePath(), entrypointVar.GetEntrypointPath())
+
+			// Find all outputs for this entrypoint
+			outputs, found := outputsByEntrypoint[fullEntrypointPath]
+			if !found || len(outputs) == 0 {
+				return nil, errors.Errorf(
+					"no output found for vite entrypoint: %s.%s -> %s",
+					entrypointVar.GetPkgImportPath(),
+					entrypointVar.GetPkgVar(),
+					fullEntrypointPath,
+				)
+			}
+
+			// Find JS and CSS outputs
+			var jsOutputPath, cssOutputPath string
+			for _, output := range outputs {
+				path := output.GetPath()
+				ext := filepath.Ext(path)
+				switch ext {
+				case ".js", ".mjs":
+					jsOutputPath = path
+				case ".css":
+					cssOutputPath = path
+				}
+			}
+
+			// Create variable based on type
+			switch entrypointVar.GetPkgVarType() {
+			case ViteVarType_ViteVarType_ENTRYPOINT_PATH:
+				if jsOutputPath == "" {
+					return nil, errors.Errorf(
+						"no JS output found for vite entrypoint: %s.%s",
+						entrypointVar.GetPkgImportPath(),
+						entrypointVar.GetPkgVar(),
+					)
+				}
+
+				// Build asset href and create string variable
+				// Prepend ViteAssetSubdir to ensure the path is relative to the plugin assets root.
+				jsAssetPath := path.Join(bldr_plugin_compiler.ViteAssetSubdir, jsOutputPath)
+				assetHref := bldr_plugin.PluginAssetHTTPPath(pluginID, jsAssetPath)
+				goVariableDefs = append(goVariableDefs, vardef.NewPluginVar(
+					entrypointVar.GetPkgImportPath(),
+					entrypointVar.GetPkgVar(),
+					&vardef.PluginVar_StringValue{StringValue: assetHref},
+				))
+
+			case ViteVarType_ViteVarType_WEB_BUNDLER_OUTPUT:
+				// Create WebBundlerOutput with JS and CSS references
+				// Prepend ViteAssetSubdir to ensure the paths are relative to the plugin assets root.
+				output := &bldr_web_bundler.WebBundlerOutput{}
+				if jsOutputPath != "" {
+					jsAssetPath := path.Join(bldr_plugin_compiler.ViteAssetSubdir, jsOutputPath)
+					output.EntrypointHref = bldr_plugin.PluginAssetHTTPPath(pluginID, jsAssetPath)
+				}
+				if cssOutputPath != "" {
+					cssAssetPath := path.Join(bldr_plugin_compiler.ViteAssetSubdir, cssOutputPath)
+					output.CssHref = bldr_plugin.PluginAssetHTTPPath(pluginID, cssAssetPath)
+				}
+
+				goVariableDefs = append(goVariableDefs, vardef.NewPluginVar(
+					entrypointVar.GetPkgImportPath(),
+					entrypointVar.GetPkgVar(),
+					&vardef.PluginVar_WebBundlerOutput{WebBundlerOutput: output},
+				))
+			}
+		}
+	}
+
+	return goVariableDefs, nil
+}
+
+// existingSourceFiles resolves existing source-relative inputs to full paths.
+// The Go input filter requires paths rooted in the builder's source directory.
+func existingSourceFiles(sourcePath string, relPaths ...string) []string {
+	var existing []string
+	for _, relPath := range relPaths {
+		if relPath == "" {
+			continue
+		}
+		absPath := filepath.Join(sourcePath, relPath)
+		fileInfo, err := os.Stat(absPath)
+		if err != nil || fileInfo.IsDir() {
+			continue
+		}
+		existing = append(existing, absPath)
+	}
+	return existing
+}
+
+// existingSourceDirs filters source-relative directory paths to absolute paths that exist.
+func existingSourceDirs(sourcePath string, relPaths ...string) ([]string, []string) {
+	var existingAbs []string
+	var existingRel []string
+	for _, relPath := range relPaths {
+		if relPath == "" {
+			continue
+		}
+		absPath := filepath.Join(sourcePath, relPath)
+		fileInfo, err := os.Stat(absPath)
+		if err != nil || !fileInfo.IsDir() {
+			continue
+		}
+		existingAbs = append(existingAbs, absPath)
+		existingRel = append(existingRel, relPath)
+	}
+	return existingAbs, existingRel
+}
+
+// localReplaceGoScriptOverrideFiles returns override sources under local replacement gs directories.
+func localReplaceGoScriptOverrideFiles(replaceDirs []string) ([]string, error) {
+	// Walk each existing replacement gs directory.
+	var files []string
+	for _, replaceDir := range replaceDirs {
+		overrideDir := filepath.Join(replaceDir, "gs")
+		fileInfo, err := os.Stat(overrideDir)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, errors.Wrapf(err, "stat GoScript overrides at %s", overrideDir)
+		}
+		if !fileInfo.IsDir() {
+			continue
+		}
+
+		// Record every override file using its replacement module's root.
+		relPaths, err := sourceFilesUnderDirs(replaceDir, []string{"gs"})
+		if err != nil {
+			return nil, errors.Wrapf(err, "list GoScript overrides at %s", overrideDir)
+		}
+		for _, relPath := range relPaths {
+			files = append(files, filepath.Join(replaceDir, filepath.FromSlash(relPath)))
+		}
+	}
+
+	// Keep the override source order deterministic and unique.
+	slices.Sort(files)
+	return slices.Compact(files), nil
+}
+
+// sourceFilesUnderDirs walks the given source-relative directories and returns
+// the sorted relative paths of every file found beneath them.
+func sourceFilesUnderDirs(sourcePath string, relDirs []string) ([]string, error) {
+	// Walk each source-relative directory collecting file paths.
+	var files []string
+	for _, relDir := range relDirs {
+		// Walk the directory recording each non-directory entry's path.
+		absDir := filepath.Join(sourcePath, relDir)
+		if err := filepath.WalkDir(absDir, func(path string, entry os.DirEntry, err error) error {
+			// Propagate walk errors and skip directories.
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+
+			// Record the source-relative path of the file.
+			relPath, err := filepath.Rel(sourcePath, path)
+			if err != nil {
+				return err
+			}
+			files = append(files, relPath)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Sort the collected file paths.
+	slices.Sort(files)
+	return files, nil
+}
+
+// writeDevInfoFile writes the plugin development info file if the path is specified.
+func writeDevInfoFile(le *logrus.Entry, outDistPath, devInfoFile string, devInfo *vardef.PluginDevInfo) error {
+	// Skip when no dev info file is configured for this build.
+	if devInfoFile == "" || devInfo == nil {
+		return nil
+	}
+
+	// Marshal the dev info and write it into the dist directory.
+	devInfoBin, err := devInfo.MarshalVT()
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal dev info")
+	}
+	devInfoPath := filepath.Join(outDistPath, devInfoFile)
+	if err := os.WriteFile(devInfoPath, devInfoBin, 0o644); err != nil {
+		return errors.Wrapf(err, "failed to write dev info file %s", devInfoFile)
+	}
+	le.Debugf("wrote dev info file: %s", devInfoFile)
+	return nil
+}
+
+// GetSupportedPlatforms returns the base platform IDs this compiler supports.
+func (c *Controller) GetSupportedPlatforms() []string {
+	return []string{bldr_platform.PlatformID_DESKTOP, bldr_platform.PlatformID_WEB, bldr_platform.PlatformID_JS}
+}
+
+// _ is a type assertion
+var _ bldr_manifest_builder.Controller = (*Controller)(nil)

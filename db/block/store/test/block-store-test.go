@@ -1,0 +1,156 @@
+package block_store_test
+
+import (
+	"bytes"
+	"context"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+// TestAll tests all tests for a block store whose RmBlock deletes the block.
+func TestAll(ctx context.Context, client block.StoreOps, putDelay time.Duration) error {
+	return testAll(ctx, client, putDelay, true)
+}
+
+// TestAllReleasing tests a block store whose RmBlock releases the caller's
+// hold, such as a bucket of a Volume that keeps liveness: the block may stay
+// for other holders until the Volume's collector frees it.
+func TestAllReleasing(ctx context.Context, client block.StoreOps, putDelay time.Duration) error {
+	return testAll(ctx, client, putDelay, false)
+}
+
+// testAll runs the tests, checking that RmBlock deleted the blocks when
+// deletes is set.
+func testAll(ctx context.Context, client block.StoreOps, putDelay time.Duration, deletes bool) error {
+	// Bound propagation waits after mutations to the block store.
+	waitAfterPut := func() {
+		if putDelay != 0 {
+			select {
+			case <-time.After(putDelay):
+			case <-ctx.Done():
+			}
+		}
+	}
+
+	// Build a known BLAKE3 reference for new-block writes and lookups.
+	sampleBlockBody := []byte("How hard are these tests? What exactly was in that phonebook of a contract I signed?")
+	samplePutOpts := &block.PutOpts{HashType: hash.HashType_HashType_BLAKE3, RefsKnown: true}
+	sampleBlockRef, err := block.BuildBlockRef(sampleBlockBody, samplePutOpts)
+	if err != nil {
+		return err
+	}
+
+	// Check if the block exists
+	retBlockExists, err := client.GetBlockExists(ctx, sampleBlockRef)
+	if err != nil {
+		return err
+	}
+	if retBlockExists {
+		return errors.New("block existed before being put")
+	}
+
+	// Put the block
+	wroteRef, existed, err := client.PutBlock(ctx, sampleBlockBody, samplePutOpts)
+	if err != nil {
+		return err
+	}
+	if existed || !wroteRef.EqualsRef(sampleBlockRef) {
+		return errors.Errorf("wrote %s but expected %s", wroteRef.MarshalString(), sampleBlockRef.MarshalString())
+	}
+
+	// Allow the first block write to propagate before testing a missing block.
+	waitAfterPut()
+
+	// Get a not-found block
+	// Returns a 404 error, but this is processed to exists=false.
+	sampleBlockBody2 := []byte("I seem to be getting a distress signal from that aerial faith plate...")
+	sampleBlockRef2, err := block.BuildBlockRef(sampleBlockBody2, samplePutOpts)
+	if err != nil {
+		return err
+	}
+	retBlockData, retBlockExists, err := client.GetBlock(ctx, sampleBlockRef2)
+	if err != nil {
+		return err
+	}
+	if retBlockExists || len(retBlockData) != 0 {
+		return errors.New("expected block to not exist")
+	}
+
+	// Check if the block exists (not expected to)
+	retBlockExists, err = client.GetBlockExists(ctx, sampleBlockRef2)
+	if err != nil {
+		return err
+	}
+	if retBlockExists {
+		return errors.New("expected block to not exist")
+	}
+
+	// Put the block
+	samplePutOpts2 := samplePutOpts.CloneVT()
+	samplePutOpts2.ForceBlockRef = sampleBlockRef2.Clone()
+	ref, existed, err := client.PutBlock(ctx, sampleBlockBody2, samplePutOpts2)
+	if err != nil {
+		return err
+	}
+	if err := ref.Validate(false); err != nil {
+		return err
+	}
+	if !ref.EqualsRef(sampleBlockRef2) {
+		return errors.Errorf("expected ref %s but got %s", sampleBlockRef2.MarshalString(), ref.MarshalString())
+	}
+	if existed {
+		return errors.New("expected block to not have already existed")
+	}
+
+	// Wait for the forced block write to become visible before reading it.
+	waitAfterPut()
+
+	// Get the block back again
+	retBlockData, retBlockExists, err = client.GetBlock(ctx, sampleBlockRef2)
+	if err != nil {
+		return err
+	}
+	if !retBlockExists || !bytes.Equal(retBlockData, sampleBlockBody2) {
+		return errors.New("expected block to exist")
+	}
+
+	// Check if the block exists
+	retBlockExists, err = client.GetBlockExists(ctx, sampleBlockRef2)
+	if err != nil {
+		return err
+	}
+	if !retBlockExists {
+		return errors.New("expected block to exist")
+	}
+
+	// Delete the block(s)
+	err = client.RmBlock(ctx, sampleBlockRef2)
+	if err != nil {
+		return err
+	}
+	err = client.RmBlock(ctx, sampleBlockRef)
+	if err != nil {
+		return err
+	}
+
+	// A store whose RmBlock only releases may keep the blocks.
+	if !deletes {
+		return nil
+	}
+
+	// Allow both deletions to propagate before checking block absence.
+	waitAfterPut()
+
+	// Check if the block exists
+	retBlockExists, err = client.GetBlockExists(ctx, sampleBlockRef2)
+	if err != nil {
+		return err
+	}
+	if retBlockExists {
+		return errors.New("expected block to not exist")
+	}
+	return nil
+}

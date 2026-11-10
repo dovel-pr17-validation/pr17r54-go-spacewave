@@ -1,0 +1,72 @@
+package main
+
+import (
+	"slices"
+	"testing"
+
+	configset_proto "github.com/aperturerobotics/controllerbus/controller/configset/proto"
+	provider_local "github.com/s4wave/spacewave/core/provider/local"
+	root_controller "github.com/s4wave/spacewave/core/resource/root/controller"
+)
+
+// TestConfigSetProviderLocalSignaling decodes the compiled configset.bin and
+// asserts the provider-local entry carries the trusted cloud signaling URL
+// serialized from bldr.star, so the running CLI default matches the build
+// graph.
+func TestConfigSetProviderLocalSignaling(t *testing.T) {
+	// Load the compiled configset and locate its provider-local entry.
+	set := readCompiledConfigSet(t)
+	entry, ok := set.GetConfigs()["provider-local"]
+	if !ok {
+		t.Fatalf("configset.bin has no provider-local entry: %v", set.GetConfigs())
+	}
+	cfg := &provider_local.Config{}
+	if err := cfg.UnmarshalJSON(entry.GetConfig()); err != nil {
+		t.Fatalf("decode provider-local config: %v", err)
+	}
+
+	// Validate the provider-local signaling URL serialized from the cloud endpoint.
+	// PRODUCTION_CLOUD_API_ENDPOINT in bldr.star.
+	if got := cfg.GetSignalingUrl(); got != "https://spacewave.app" {
+		t.Fatalf("provider-local signalingUrl = %q, want https://spacewave.app", got)
+	}
+	if _, err := cfg.ParseSignalingURL(); err != nil {
+		t.Fatalf("provider-local signalingUrl invalid: %v", err)
+	}
+}
+
+// TestConfigSetAppPlugins checks the declaration consumed by the actual CLI.
+func TestConfigSetAppPlugins(t *testing.T) {
+	// Load the compiled configset and decode the root resource configuration.
+	set := readCompiledConfigSet(t)
+	entry, ok := set.GetConfigs()["root-resource"]
+	if !ok {
+		t.Fatal("compiled config has no root resource")
+	}
+	cfg := &root_controller.Config{}
+	if err := cfg.UnmarshalJSON(entry.GetConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.GetAppPluginIds(), []string{"spacewave-core", "spacewave-web", "spacewave-app", "web"}) {
+		t.Fatalf("compiled application plugins = %v", cfg.GetAppPluginIds())
+	}
+}
+
+// readCompiledConfigSet decodes the configuration embedded in the CLI.
+func readCompiledConfigSet(t *testing.T) *configset_proto.ConfigSet {
+	// Attribute embedded config failures to the test that requests the set.
+	t.Helper()
+
+	// Read the compiled configset bytes from the embedded filesystem.
+	data, err := configSetFS.ReadFile("configset.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Decode the compiled bytes into a ConfigSet record.
+	set := &configset_proto.ConfigSet{}
+	if err := set.UnmarshalVT(data); err != nil {
+		t.Fatalf("decode configset.bin: %v", err)
+	}
+	return set
+}

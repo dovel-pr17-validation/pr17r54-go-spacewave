@@ -1,0 +1,443 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { SelfEnrollmentGateState } from '@s4wave/sdk/provider/spacewave/spacewave.pb.js'
+
+const CDN_SPACE_ID = '01kpm6m5mg9ncme4ve3jraxv5n'
+
+const mockNavigate = vi.hoisted(() => vi.fn())
+const mockToastError = vi.hoisted(() => vi.fn())
+const mockUseWatchStateRpc = vi.hoisted(() => vi.fn())
+const mockUseResource = vi.hoisted(() => vi.fn())
+const mockUseResourceValue = vi.hoisted(() => vi.fn())
+const mockSessionUseContext = vi.hoisted(() => vi.fn())
+const mockOrgListUseContextSafe = vi.hoisted(() => vi.fn())
+const mockOnboardingUseContextSafe = vi.hoisted(() => vi.fn())
+const mockUseSessionInfo = vi.hoisted(() => vi.fn())
+const mockUseMountAccount = vi.hoisted(() => vi.fn())
+const mockUseRootResource = vi.hoisted(() => vi.fn())
+const mockUseSessionIndex = vi.hoisted(() => vi.fn<() => number>())
+const mockUseSessionNavigate = vi.hoisted(() => vi.fn())
+const mockUseVisibleQuickstartOptions = vi.hoisted(() => vi.fn())
+const renderedDashboard = vi.hoisted(
+  () =>
+    vi.fn() as unknown as ReturnType<
+      typeof vi.fn<(props: unknown) => React.ReactElement>
+    >,
+)
+
+vi.mock('@aptre/bldr-react', () => ({
+  useWatchStateRpc: mockUseWatchStateRpc,
+}))
+
+vi.mock('@s4wave/web/router/router.js', () => ({
+  useNavigate: () => mockNavigate,
+}))
+
+vi.mock('@s4wave/web/ui/toaster.js', () => ({
+  toast: { error: mockToastError },
+}))
+
+vi.mock('@aptre/bldr-sdk/hooks/useResource.js', () => ({
+  useResource: mockUseResource,
+  useResourceValue: mockUseResourceValue,
+}))
+
+vi.mock('@s4wave/web/contexts/contexts.js', () => ({
+  SessionContext: { useContext: mockSessionUseContext },
+  useSessionIndex: () => mockUseSessionIndex(),
+  useSessionNavigate: () => mockUseSessionNavigate,
+}))
+
+vi.mock('@s4wave/web/contexts/SpacewaveOrgListContext.js', () => ({
+  SpacewaveOrgListContext: { useContextSafe: mockOrgListUseContextSafe },
+}))
+
+vi.mock('@s4wave/web/contexts/SpacewaveOnboardingContext.js', () => ({
+  SpacewaveOnboardingContext: {
+    useContextSafe: mockOnboardingUseContextSafe,
+  },
+}))
+
+vi.mock('@s4wave/web/hooks/useSessionInfo.js', () => ({
+  useSessionInfo: mockUseSessionInfo,
+}))
+
+vi.mock('@s4wave/web/hooks/useMountAccount.js', () => ({
+  useMountAccount: mockUseMountAccount,
+}))
+
+vi.mock('@s4wave/web/hooks/useRootResource.js', () => ({
+  useRootResource: mockUseRootResource,
+}))
+
+vi.mock('@s4wave/app/quickstart/useQuickstartOptions.js', () => ({
+  useVisibleQuickstartOptions: mockUseVisibleQuickstartOptions,
+}))
+
+vi.mock('./SessionFrame.js', () => ({
+  SessionFrame: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="session-frame">{children}</div>
+  ),
+}))
+
+vi.mock('./dashboard/SessionDashboard.js', () => ({
+  SessionDashboard: (props: { onQuickstartClick?: (id: string) => void }) => {
+    renderedDashboard(props)
+    return (
+      <>
+        <button
+          type="button"
+          data-testid="quickstart-drive"
+          onClick={() => props.onQuickstartClick?.('drive')}
+        >
+          Drive
+        </button>
+        <button
+          type="button"
+          data-testid="quickstart-gizmo"
+          onClick={() => props.onQuickstartClick?.('gizmo-workspace')}
+        >
+          Gizmo
+        </button>
+      </>
+    )
+  },
+}))
+
+vi.mock('@s4wave/app/quickstart/create.js', () => ({
+  __esModule: true,
+}))
+
+import { SessionDashboardContainer } from './SessionDashboardContainer.js'
+
+function getRenderedSpaces() {
+  const props = getRenderedDashboardProps()
+  expect(props).toBeDefined()
+  return props?.spaces ?? []
+}
+
+function getRenderedDashboardProps() {
+  return renderedDashboard.mock.calls[0]?.[0] as
+    | {
+        spaces?: Array<{
+          id: string
+          name: string
+          orgId?: string
+          source?: string
+          objectType?: string
+        }>
+        topStatus?: string
+      }
+    | undefined
+}
+
+describe('SessionDashboardContainer', () => {
+  beforeEach(() => {
+    mockNavigate.mockReset()
+    mockToastError.mockReset()
+    renderedDashboard.mockReset()
+
+    mockUseWatchStateRpc.mockReturnValue({ spacesList: [] })
+    mockUseResource.mockReturnValue({
+      value: null,
+      loading: false,
+      error: null,
+      retry: vi.fn(),
+    })
+    mockUseResourceValue.mockReturnValue({
+      createSpace: vi.fn(),
+      deleteSpace: vi.fn(),
+    })
+    mockSessionUseContext.mockReturnValue({ value: {} })
+    mockOrgListUseContextSafe.mockReturnValue({ organizations: [] })
+    mockOnboardingUseContextSafe.mockReturnValue({
+      onboarding: null,
+      isPendingDelete: false,
+      isReadOnlyGrace: false,
+    })
+    mockUseSessionInfo.mockReturnValue({
+      providerId: 'local',
+      accountId: 'acct',
+      isCloud: false,
+    })
+    mockUseMountAccount.mockReturnValue({ value: null })
+    mockUseRootResource.mockReturnValue({ value: null })
+    mockUseSessionIndex.mockReturnValue(1)
+    mockUseSessionNavigate.mockReset()
+    mockUseVisibleQuickstartOptions.mockReset()
+    mockUseVisibleQuickstartOptions.mockReturnValue([
+      {
+        id: 'drive',
+        name: 'Create a Drive',
+        description: 'Drive workspace',
+        category: 'storage',
+        icon: () => null,
+      },
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('navigates to ./new/drive on quickstart click without running a pipeline', () => {
+    render(<SessionDashboardContainer />)
+    const tile = screen.getByTestId('quickstart-drive')
+    fireEvent.click(tile)
+
+    expect(mockUseSessionNavigate).toHaveBeenCalledWith({ path: 'new/drive' })
+    const props = renderedDashboard.mock.calls[0]?.[0] as
+      | { quickstartLoading?: unknown }
+      | undefined
+    expect(props).toBeDefined()
+    expect(props!.quickstartLoading).toBeUndefined()
+  })
+
+  it('navigates dynamic quickstarts from the watched inventory', () => {
+    mockUseVisibleQuickstartOptions.mockReturnValue([
+      {
+        id: 'gizmo-workspace',
+        name: 'Gizmo Workspace',
+        description: 'Operator workspace',
+        category: 'tools',
+        icon: () => null,
+        dynamic: true,
+        pluginId: 'gizmo-web',
+      },
+    ])
+
+    render(<SessionDashboardContainer />)
+    const tile = screen.getByTestId('quickstart-gizmo')
+    fireEvent.click(tile)
+
+    expect(mockUseSessionNavigate).toHaveBeenCalledWith({
+      path: 'new/gizmo-workspace',
+    })
+  })
+
+  it('blocks quickstart navigation for read-only accounts with a toast', () => {
+    mockOnboardingUseContextSafe.mockReturnValue({
+      onboarding: null,
+      isPendingDelete: true,
+      isReadOnlyGrace: false,
+    })
+    render(<SessionDashboardContainer />)
+    const tile = screen.getByTestId('quickstart-drive')
+    fireEvent.click(tile)
+
+    expect(mockToastError).toHaveBeenCalledWith(
+      'This cloud account is read-only',
+    )
+    expect(mockNavigate).not.toHaveBeenCalled()
+    expect(mockUseSessionNavigate).not.toHaveBeenCalled()
+  })
+
+  it('maps each watched space index ObjectType into its dashboard row', () => {
+    mockUseWatchStateRpc.mockReturnValue({
+      spacesList: [
+        {
+          entry: {
+            ref: { providerResourceRef: { id: 'space-canvas' } },
+            source: 'created',
+          },
+          spaceMeta: { name: 'Canvas Space' },
+          indexObjectType: 'canvas',
+        },
+        {
+          entry: {
+            ref: { providerResourceRef: { id: 'space-repo' } },
+            source: 'shared',
+          },
+          spaceMeta: { name: 'Repository Space' },
+          indexObjectType: 'git/repo',
+        },
+        {
+          entry: {
+            ref: { providerResourceRef: { id: 'space-generic' } },
+            source: 'created',
+          },
+          spaceMeta: { name: 'Generic Space' },
+        },
+      ],
+    })
+
+    render(<SessionDashboardContainer />)
+
+    expect(
+      getRenderedSpaces().map(({ id, name, source, objectType }) => ({
+        id,
+        name,
+        source,
+        objectType,
+      })),
+    ).toEqual([
+      {
+        id: 'space-canvas',
+        name: 'Canvas Space',
+        source: 'created',
+        objectType: 'canvas',
+      },
+      {
+        id: 'space-repo',
+        name: 'Repository Space',
+        source: 'shared',
+        objectType: 'git/repo',
+      },
+      {
+        id: 'space-generic',
+        name: 'Generic Space',
+        source: 'created',
+        objectType: undefined,
+      },
+    ])
+  })
+
+  it('injects the CDN space under the owning org group', () => {
+    const cdnResource = {
+      value: CDN_SPACE_ID,
+      loading: false,
+      error: null,
+      retry: vi.fn(),
+    }
+    mockUseResource.mockReturnValue(cdnResource)
+    mockUseResourceValue.mockImplementation((resource) => {
+      if (resource === cdnResource) return CDN_SPACE_ID
+      return {
+        createSpace: vi.fn(),
+        deleteSpace: vi.fn(),
+      }
+    })
+    mockOrgListUseContextSafe.mockReturnValue({
+      organizations: [
+        {
+          id: 'org-1',
+          displayName: 'Aperture Robotics',
+          spaceIds: [CDN_SPACE_ID],
+        },
+      ],
+    })
+
+    render(<SessionDashboardContainer />)
+
+    expect(getRenderedSpaces()).toContainEqual({
+      id: CDN_SPACE_ID,
+      name: 'Spacewave CDN',
+      orgId: 'org-1',
+    })
+  })
+
+  it('does not inject the CDN space when no org claims it', () => {
+    const cdnResource = {
+      value: CDN_SPACE_ID,
+      loading: false,
+      error: null,
+      retry: vi.fn(),
+    }
+    mockUseResource.mockReturnValue(cdnResource)
+    mockUseResourceValue.mockImplementation((resource) => {
+      if (resource === cdnResource) return CDN_SPACE_ID
+      return {
+        createSpace: vi.fn(),
+        deleteSpace: vi.fn(),
+      }
+    })
+
+    render(<SessionDashboardContainer />)
+
+    expect(getRenderedSpaces()).not.toContainEqual(
+      expect.objectContaining({ id: CDN_SPACE_ID }),
+    )
+  })
+
+  it('does not inject the CDN space when the CDN resource is null', () => {
+    const cdnResource = {
+      value: null,
+      loading: false,
+      error: null,
+      retry: vi.fn(),
+    }
+    mockUseResource.mockReturnValue(cdnResource)
+    mockUseResourceValue.mockImplementation((resource) => {
+      if (resource === cdnResource) return null
+      return {
+        createSpace: vi.fn(),
+        deleteSpace: vi.fn(),
+      }
+    })
+    mockOrgListUseContextSafe.mockReturnValue({
+      organizations: [
+        {
+          id: 'org-1',
+          displayName: 'Aperture Robotics',
+          spaceIds: [CDN_SPACE_ID],
+        },
+      ],
+    })
+
+    render(<SessionDashboardContainer />)
+
+    expect(getRenderedSpaces()).not.toContainEqual(
+      expect.objectContaining({ id: CDN_SPACE_ID }),
+    )
+  })
+
+  it('passes self-enrollment checking status to the dashboard', () => {
+    mockOnboardingUseContextSafe.mockReturnValue({
+      onboarding: {
+        selfEnrollmentGateState: SelfEnrollmentGateState.CHECKING,
+      },
+      isPendingDelete: false,
+      isReadOnlyGrace: false,
+    })
+
+    render(<SessionDashboardContainer />)
+
+    expect(getRenderedDashboardProps()?.topStatus).toBe(
+      'Checking connected spaces',
+    )
+  })
+
+  it('clears self-enrollment checking status after the gate becomes ready', () => {
+    mockOnboardingUseContextSafe.mockReturnValue({
+      onboarding: {
+        selfEnrollmentGateState: SelfEnrollmentGateState.CHECKING,
+      },
+      isPendingDelete: false,
+      isReadOnlyGrace: false,
+    })
+
+    const { rerender } = render(<SessionDashboardContainer />)
+
+    expect(getRenderedDashboardProps()?.topStatus).toBe(
+      'Checking connected spaces',
+    )
+
+    mockOnboardingUseContextSafe.mockReturnValue({
+      onboarding: {
+        selfEnrollmentGateState: SelfEnrollmentGateState.READY,
+      },
+      isPendingDelete: false,
+      isReadOnlyGrace: false,
+    })
+
+    renderedDashboard.mockClear()
+    rerender(<SessionDashboardContainer />)
+
+    expect(getRenderedDashboardProps()?.topStatus).toBeUndefined()
+  })
+
+  it('passes self-enrollment auto-connect status to the dashboard', () => {
+    mockOnboardingUseContextSafe.mockReturnValue({
+      onboarding: {
+        selfEnrollmentGateState: SelfEnrollmentGateState.AUTO_CONNECTING,
+      },
+      isPendingDelete: false,
+      isReadOnlyGrace: false,
+    })
+
+    render(<SessionDashboardContainer />)
+
+    expect(getRenderedDashboardProps()?.topStatus).toBe('Connecting spaces')
+  })
+})

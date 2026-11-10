@@ -1,0 +1,259 @@
+package world
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+)
+
+// ExecTransaction runs cb in a transaction and commits it when write is set
+// and cb succeeds. When another writer moves the World head or the storage
+// snapshot becomes invalid, it replays cb in a fresh transaction, up to
+// maxEngineWorldStateTries more times. cb must be safe to replay: it must
+// create or reset its per-attempt state and perform no external effects.
+func ExecTransaction(
+	ctx context.Context,
+	eng Engine,
+	write bool,
+	cb func(ctx context.Context, wtx WorldState) error,
+) error {
+	// Replay the complete attempt while the failure permits a fresh transaction.
+	var err error
+	for range maxEngineWorldStateTries + 1 {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		err = execTransactionOnce(ctx, eng, write, cb)
+		if !retryWorldOp(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// execTransactionOnce runs one ExecTransaction attempt.
+func execTransactionOnce(
+	ctx context.Context,
+	eng Engine,
+	write bool,
+	cb func(ctx context.Context, wtx WorldState) error,
+) error {
+	// Open the attempt's transaction.
+	wtx, err := eng.NewTransaction(ctx, write)
+	if err != nil {
+		return err
+	}
+	defer wtx.Discard()
+
+	// Run the callback, then commit a write.
+	if err := cb(ctx, wtx); err != nil {
+		return err
+	}
+	if !write {
+		return nil
+	}
+	return wtx.Commit(ctx)
+}
+
+// AssertObjectRev asserts that an object is at a given rev.
+func AssertObjectRev(ctx context.Context, obj ObjectState, expected uint64) error {
+	_, rev, err := obj.GetRootRef(ctx)
+	if err == nil && rev != expected {
+		err = errors.Wrapf(ErrUnexpectedRev, "expected %d got %d", expected, rev)
+	}
+	return err
+}
+
+// LookupRootRef gets an object and returns its root reference and rev.
+//
+// If not found, returns nil, 0, nil.
+func LookupRootRef(ctx context.Context, eng Engine, key string) (*bucket.ObjectRef, uint64, error) {
+	// Open a read transaction for the object root lookup.
+	stx, err := eng.NewTransaction(ctx, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer stx.Discard()
+
+	// Acquire the object state and release it after reading its root.
+	obj, found, err := stx.GetObject(ctx, key)
+	defer ReleaseObjectState(obj)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Return an empty root when the object key is absent.
+	if !found {
+		return nil, 0, nil
+	}
+	return obj.GetRootRef(ctx)
+}
+
+// LookupObject looks up & unmarshals an object from the world.
+func LookupObject[T any, PT block.Ptr[T]](
+	ctx context.Context,
+	ws WorldState,
+	objKey string,
+) (out PT, objRef ObjectState, err error) {
+	// Acquire the object state that supplies the requested body.
+	obj, err := MustGetObject(ctx, ws, objKey)
+	if err != nil {
+		ReleaseObjectState(obj)
+		return out, nil, err
+	}
+
+	// Decode the acquired object body and release its state on failure.
+	_, _, err = AccessObjectState(ctx, obj, false, func(bcs *block.Cursor) error {
+		out, err = block.UnmarshalBlock[T, PT](ctx, bcs)
+		return err
+	})
+	if err != nil {
+		ReleaseObjectState(obj)
+		obj = nil
+	}
+	return out, obj, err
+}
+
+// releasableObjectState is an ObjectState that holds resources until released.
+type releasableObjectState interface {
+	// Release releases the object state.
+	Release()
+}
+
+// ReleaseObjectState calls Release on obj when the ObjectState implementation
+// has a Release method.
+func ReleaseObjectState(obj ObjectState) {
+	if obj == nil {
+		return
+	}
+	if releasable, ok := obj.(releasableObjectState); ok {
+		releasable.Release()
+	}
+}
+
+// LookupObjectBody looks up and unmarshals an object without returning the
+// object-state handle.
+func LookupObjectBody[T any, PT block.Ptr[T]](
+	ctx context.Context,
+	ws WorldState,
+	objKey string,
+) (out PT, err error) {
+	// Read bytes directly when the transport can return the body in one response.
+	bodies, err := LookupObjectBodies[T, PT](ctx, ws, []string{objKey})
+	if err != nil {
+		// A batch RPC may reject a valid block larger than its response envelope.
+		// Remote errors need not retain their Go type; the object read remains authoritative.
+		var state ObjectState
+		out, state, err = LookupObject[T, PT](ctx, ws, objKey)
+		ReleaseObjectState(state)
+		return out, err
+	}
+	if !bodies[0].Exists {
+		return out, ErrObjectNotFound
+	}
+	return bodies[0].Body, nil
+}
+
+// LookupObjectBodyBytes looks up the transformed root body for an object.
+// It returns nil, false, nil when the object does not exist.
+func LookupObjectBodyBytes(
+	ctx context.Context,
+	ws WorldState,
+	objKey string,
+) ([]byte, bool, error) {
+	body, err := LookupObjectBodyEntry(ctx, ws, objKey)
+	if err != nil {
+		return nil, false, err
+	}
+	return body.Body, body.Exists, nil
+}
+
+// LookupObjectBodyEntry looks up the transformed root body of an object with
+// its revision and, when the object state reports it, its ModSeqno. A missing
+// object returns a body with Exists unset.
+func LookupObjectBodyEntry(ctx context.Context, ws WorldState, objKey string) (*ObjectBody, error) {
+	// Acquire the requested object state for the body read.
+	out := &ObjectBody{ObjectKey: objKey}
+	obj, found, err := ws.GetObject(ctx, objKey)
+	if err != nil {
+		ReleaseObjectState(obj)
+		return nil, err
+	}
+	if !found {
+		return out, nil
+	}
+	defer ReleaseObjectState(obj)
+
+	// Read the object root, its revision and its ModSeqno.
+	rootRef, rev, err := obj.GetRootRef(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out.Rev, out.Exists = rev, true
+	out.ModSeqno, err = obj.GetModSeqno(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch the root block bytes through the object storage cursor.
+	_, err = AccessObject(ctx, obj.AccessWorldState, rootRef, func(bcs *block.Cursor) error {
+		body, keep, found, err := bcs.FetchWithKeep(ctx)
+		if found {
+			out.Body, out.keep = body, keep
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// LookupObjectRef looks up & unmarshals an object ref from the world.
+func LookupObjectRef[T any, PT block.Ptr[T]](
+	ctx context.Context,
+	access AccessWorldStateFunc,
+	ref *bucket.ObjectRef,
+) (out PT, err error) {
+	_, err = AccessObject(ctx, access, ref, func(bcs *block.Cursor) error {
+		out, err = block.UnmarshalBlock[T, PT](ctx, bcs)
+		return err
+	})
+	return out, err
+}
+
+// CollectObjectBodies looks up and unmarshals the objects with the given keys.
+//
+// Returns two slices of length len(objKeys). If any objects are not found,
+// their entries are nil and ErrObjectNotFound is returned with the rest.
+// Returns nil, nil, err for any other error.
+func CollectObjectBodies[T any, PT block.Ptr[T]](
+	ctx context.Context,
+	ws WorldState,
+	objKeys []string,
+) ([]PT, []ObjectState, error) {
+	// Collect object bodies and states, releasing acquired states on failure.
+	objs := make([]PT, len(objKeys))
+	objStates := make([]ObjectState, len(objKeys))
+	var retErr error
+	for i, objKey := range objKeys {
+		obj, objState, err := LookupObject[T, PT](ctx, ws, objKey)
+		if err != nil {
+			ReleaseObjectState(objState)
+			if err == ErrObjectNotFound {
+				retErr = err
+				continue
+			}
+			for _, objState := range objStates {
+				ReleaseObjectState(objState)
+			}
+			return nil, nil, err
+		}
+		objs[i] = obj
+		objStates[i] = objState
+	}
+
+	return objs, objStates, retErr
+}

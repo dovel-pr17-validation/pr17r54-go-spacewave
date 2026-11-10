@@ -1,0 +1,321 @@
+package http_range_http
+
+import (
+	"io"
+	"net/http"
+	"strconv"
+	"sync/atomic"
+
+	httplog "github.com/aperturerobotics/util/httplog"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+)
+
+// HttpClient can perform http requests.
+type HttpClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// ErrNoContentLength is returned when a response carries no content length.
+var ErrNoContentLength = errors.New("no content length returned")
+
+// HTTPRangeReader reads ranges of data over HTTP using requests with
+// Range headers to implement io.ReadSeeker and io.ReaderAt. It is concurrency
+// safe.
+//
+// While Read() and Seek() are concurrency safe, the behavior while using them
+// concurrently is undefined. Only use ReadAt concurrently.
+//
+// Note that the body of the passed request is ignored.
+// The method of the request is changed to HEAD for Size().
+// Call SetSize to avoid a HEAD request.
+//
+// if le is nil all logging will be disabled
+// verbose logs all http responses even if successful
+type HTTPRangeReader struct {
+	le      *logrus.Entry
+	client  HttpClient
+	request *http.Request
+	verbose bool
+
+	seek      atomic.Pointer[int64]
+	knownSize atomic.Pointer[uint64]
+}
+
+// NewHTTPRangeReader initializes a HTTPRangeReader for the given request.
+func NewHTTPRangeReader(le *logrus.Entry, request *http.Request, client HttpClient, verbose bool) *HTTPRangeReader {
+	return &HTTPRangeReader{le: le, request: request, client: client, verbose: verbose}
+}
+
+// SetSize sets the size of the remote file, avoiding a HEAD request.
+func (r *HTTPRangeReader) SetSize(size uint64) {
+	r.knownSize.Store(&size)
+}
+
+// ReadAt reads len(buf) bytes into buf starting at offset off.
+//
+// A server may answer a range request with fewer bytes than requested, so
+// ReadAt requests the remainder until buf is full. A short read returns a
+// non-nil error, as io.ReaderAt requires.
+func (r *HTTPRangeReader) ReadAt(buf []byte, off int64) (int, error) {
+	var n int
+	for n < len(buf) {
+		// Fetch the remote data that overlaps the unfilled part of buf.
+		pos := off + int64(n)
+		dataOffset, data, err := r.SliceReadAt(pos, int64(len(buf)-n))
+
+		// Copy the returned bytes at pos when the response covers it.
+		var copied int
+		if start := pos - dataOffset; start >= 0 && start < int64(len(data)) {
+			copied = copy(buf[n:], data[start:])
+			n += copied
+		}
+
+		// Stop at an error, or when the response held no bytes at pos.
+		if err != nil {
+			if n == len(buf) {
+				return n, nil
+			}
+			return n, err
+		}
+		if copied == 0 {
+			return n, io.ErrUnexpectedEOF
+		}
+	}
+	return n, nil
+}
+
+// SliceReadAt reads a slice of data from the requested location.
+// NOTE: the returned slice may start before or after the requested location and length.
+// NOTE: this may return a completely different range than what you asked for!
+func (r *HTTPRangeReader) SliceReadAt(offset, length int64) (dataOffset int64, data []byte, err error) {
+	// Reject a range with a negative offset or no buffer space.
+	if offset < 0 {
+		return 0, nil, io.EOF
+	}
+	if length == 0 {
+		return offset, nil, io.ErrShortBuffer
+	}
+
+	// Clip the requested range to the known remote file size.
+	if knownSizePtr := r.knownSize.Load(); knownSizePtr != nil {
+		knownSize := int64(*knownSizePtr) //nolint:gosec
+		if offset >= knownSize {
+			return offset, nil, io.EOF
+		}
+		if offset+length > knownSize {
+			length = knownSize - offset
+			if length < 0 {
+				return offset, nil, io.EOF
+			}
+		}
+	}
+
+	// Prepare the HTTP request for the requested byte range.
+	req := r.request.Clone(r.request.Context())
+	req.Header.Add("Range", fmtRange(offset, length))
+
+	// Open the HTTP response body for the byte range.
+	resp, err := httplog.DoRequestWithClient(r.le, r.client, req, r.verbose)
+	if err != nil {
+		return offset, nil, err
+	}
+	defer resp.Body.Close()
+
+	// Read the returned range or report the HTTP status failure.
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent:
+		// For both OK and Partial Content, read the body.
+		// Note: OK means the server does not support Range and returned the entire content.
+		var bodyBytes []byte
+		var err error
+		if resp.StatusCode == http.StatusOK {
+			// If the entire file is returned, do not limit the read.
+			limitedReader := io.LimitReader(resp.Body, offset+length)
+			bodyBytes, err = io.ReadAll(limitedReader)
+		} else {
+			// For partial content, limit the read to the requested length.
+			limitedReader := io.LimitReader(resp.Body, length)
+			bodyBytes, err = io.ReadAll(limitedReader)
+		}
+		if err != nil {
+			return 0, nil, errors.Wrap(err, "failed to read response body")
+		}
+		if resp.StatusCode == http.StatusOK {
+			// If the response is 200, the server does not support Range.
+			// The entire file was returned, handle that here.
+			if int64(len(bodyBytes)) < offset+1 {
+				return 0, nil, io.EOF
+			}
+			return 0, bodyBytes, io.EOF
+		} else {
+			// Partial content response, as expected.
+			return offset, bodyBytes, nil
+		}
+	case 416:
+		// Requested Range Not Satisfiable
+		return 0, nil, errors.New("requested range not satisfiable")
+	case 403:
+		// Forbidden
+		return 0, nil, errors.New("forbidden")
+	case 404:
+		// Not Found
+		return 0, nil, errors.New("not found")
+	default:
+		return 0, nil, errors.Errorf("unexpected response status: %d", resp.StatusCode)
+	}
+}
+
+// Read implements the io.Reader interface for HTTPRangeReader.
+func (r *HTTPRangeReader) Read(buf []byte) (int, error) {
+	// Read from the current position and advance the reader by the bytes copied.
+	var seek int64
+	seekPtr := r.seek.Load()
+	if seekPtr != nil {
+		seek = *seekPtr
+	}
+	n, err := r.ReadAt(buf, seek)
+	seek += int64(n)
+	r.seek.CompareAndSwap(seekPtr, &seek)
+	return n, err
+}
+
+// Seek sets the offset for the next Read or ReadAt operation.
+func (r *HTTPRangeReader) Seek(offset int64, whence int) (int64, error) {
+	// Resolve the requested position relative to the start, current position, or end.
+	var seek int64
+	switch whence {
+	case io.SeekStart:
+		seek = offset
+	case io.SeekCurrent:
+		if seekPtr := r.seek.Load(); seekPtr != nil {
+			seek = *seekPtr
+		}
+		seek += offset
+	case io.SeekEnd:
+		var length uint64
+		if knownSizePtr := r.knownSize.Load(); knownSizePtr != nil {
+			length = *knownSizePtr
+		} else {
+			var err error
+			length, err = r.Size()
+			if err != nil {
+				return 0, err
+			}
+		}
+
+		seek = int64(length) + offset //nolint:gosec
+	default:
+		return 0, errors.New("invalid whence")
+	}
+
+	// Reject a seek position before the remote file begins.
+	if seek < 0 {
+		return 0, errors.New("negative position")
+	}
+
+	// Retain the resolved position for subsequent reads.
+	r.seek.Store(&seek)
+	return seek, nil
+}
+
+// getSizeFromRequest makes an HTTP request with the specified method and attempts to determine the content length.
+// If the Content-Length header is missing in a GET response, it reads the entire body to calculate the size.
+func (r *HTTPRangeReader) getSizeFromRequest(method string) (uint64, error) {
+	// Prepare the HTTP request used to determine the remote file size.
+	req := r.request.Clone(r.request.Context())
+	req.Method = method
+
+	// Open the HTTP response body used to determine the file size.
+	resp, err := httplog.DoRequestWithClient(r.le, r.client, req, r.verbose)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	// Handle response status codes
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent, http.StatusNoContent, http.StatusNotModified:
+		// Success cases
+	case http.StatusRequestedRangeNotSatisfiable:
+		return 0, errors.New("requested range not satisfiable")
+	case http.StatusForbidden:
+		return 0, errors.New("forbidden")
+	case http.StatusNotFound:
+		return 0, errors.New("not found")
+	default:
+		return 0, errors.Errorf("unexpected response status: %d", resp.StatusCode)
+	}
+
+	// Read the remote file size from the Content-Length header when present.
+	contentLengthStr := resp.Header.Get("Content-Length")
+	if len(contentLengthStr) != 0 {
+		contentLength, err := strconv.ParseInt(contentLengthStr, 10, 64)
+		if err != nil {
+			return 0, errors.Wrap(err, "invalid content length header returned by "+method+" request")
+		}
+		if contentLength < 0 {
+			return 0, errors.Errorf("negative content length returned by "+method+" request: %v", contentLength)
+		}
+		return uint64(contentLength), nil
+	}
+
+	// If Content-Length is missing in a GET response, read the entire body
+	if method == http.MethodGet {
+		var totalSize uint64
+		buffer := make([]byte, 4096) // Buffer for reading in chunks
+		for {
+			n, err := resp.Body.Read(buffer)
+			if n > 0 {
+				totalSize += uint64(n) //nolint:gosec
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return 0, errors.Wrap(err, "failed to read response body")
+			}
+		}
+		return totalSize, nil
+	}
+
+	return 0, errors.Wrap(ErrNoContentLength, method+" request")
+}
+
+// Size uses an HTTP HEAD request to find out the total available bytes.
+// If the HEAD request does not return a Content-Length, it attempts a GET request.
+// If the GET request also lacks a Content-Length, it reads the entire body to determine the size.
+func (r *HTTPRangeReader) Size() (uint64, error) {
+	// Reuse the remote file size when the reader already knows it.
+	if knownSizePtr := r.knownSize.Load(); knownSizePtr != nil {
+		return *knownSizePtr, nil
+	}
+
+	// First, try HEAD request
+	size, err := r.getSizeFromRequest("HEAD")
+	if err != nil {
+		if errors.Is(err, ErrNoContentLength) {
+			// Try GET request
+			size, err = r.getSizeFromRequest("GET")
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			return 0, err
+		}
+	}
+
+	// Cache the discovered remote file size for subsequent range requests.
+	r.knownSize.Store(&size)
+	return size, nil
+}
+
+func fmtRange(from, length int64) string {
+	var to int64
+	if length > 0 {
+		to = from + length - 1
+	} else {
+		to = from
+	}
+	return "bytes=" + strconv.FormatInt(from, 10) + "-" + strconv.FormatInt(to, 10)
+}

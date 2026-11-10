@@ -1,0 +1,52 @@
+package plugin_host_storage
+
+import (
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller/resolver/static"
+	plugin_host_storage_volume "github.com/s4wave/spacewave/bldr/plugin/host/storage/volume"
+	"github.com/s4wave/spacewave/bldr/storage"
+	volume_controller "github.com/s4wave/spacewave/db/volume/controller"
+	volume_rpc_client "github.com/s4wave/spacewave/db/volume/rpc/client"
+)
+
+// PluginHostStorage provides storage via the plugin host.
+type PluginHostStorage struct {
+	// storageID selects the host provider; empty selects its default.
+	storageID string
+}
+
+// NewPluginHostStorage constructs the storage.
+func NewPluginHostStorage(storageID string) *PluginHostStorage {
+	return &PluginHostStorage{storageID: storageID}
+}
+
+// GetStorageInfo returns StorageInfo.
+func (s *PluginHostStorage) GetStorageInfo() *storage.StorageInfo {
+	return &storage.StorageInfo{}
+}
+
+// AddFactories adds the factories to the resolver.
+func (s *PluginHostStorage) AddFactories(b bus.Bus, sr *static.Resolver) {
+	sr.AddFactory(volume_rpc_client.NewFactory(b))
+	sr.AddFactory(plugin_host_storage_volume.NewFactory(b))
+}
+
+// BuildVolumeConfig creates the volume config for the store ID.
+// Returns nil if the storage cannot produce Volume.
+// baseVolCtrlConf can be nil
+func (s *PluginHostStorage) BuildVolumeConfig(id string, baseVolCtrlConf *volume_controller.Config) (config.Config, error) {
+	return &plugin_host_storage_volume.Config{
+		StorageId:       s.storageID,
+		StorageVolumeId: id,
+		VolumeConfig:    baseVolCtrlConf,
+	}, nil
+}
+
+// DeleteVolume is not supported for plugin host storage.
+func (s *PluginHostStorage) DeleteVolume(id string) error {
+	return nil
+}
+
+// _ is a type assertion
+var _ storage.Storage = (*PluginHostStorage)(nil)

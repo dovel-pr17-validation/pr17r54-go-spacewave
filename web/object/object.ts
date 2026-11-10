@@ -1,0 +1,60 @@
+import type { IObjectState } from '@s4wave/sdk/world/object-state.js'
+import type { IWorldState } from '@s4wave/sdk/world/world-state.js'
+import { UnixFSTypeID } from '@s4wave/sdk/unixfs/type.js'
+import type { Resource } from '@aptre/bldr-sdk/hooks/useResource.js'
+import type { ObjectInfo } from './object.pb.js'
+import type { SpaceContents } from '@s4wave/sdk/space/contents.js'
+
+// ObjectViewerComponentProps are the props passed to object viewer components.
+export interface ObjectViewerComponentProps {
+  // objectInfo contains metadata about the object being viewed.
+  objectInfo: ObjectInfo
+  // worldState is the world state resource.
+  worldState: Resource<IWorldState>
+  // objectState is the world object state, undefined for standalone unixfs.
+  objectState?: IObjectState
+  // spaceContents is the mounted Space contents resource when this viewer is
+  // rendered from a Space route. External plugin bundles cannot rely on
+  // app-bundle React contexts being shared, so process-capable viewers receive
+  // the resource through the viewer contract.
+  spaceContents?: Resource<SpaceContents>
+}
+
+// getObjectKey extracts the objectKey from an ObjectInfo.
+export function getObjectKey(info: ObjectInfo): string {
+  if (info?.info?.case === 'worldObjectInfo') {
+    return info.info.value.objectKey ?? ''
+  }
+  if (info?.info?.case === 'unixfsObjectInfo') {
+    return info.info.value.unixfsId ?? ''
+  }
+  return ''
+}
+
+// getTypeID extracts the typeID from an ObjectInfo.
+export function getTypeID(info: ObjectInfo): string {
+  if (info?.info?.case === 'worldObjectInfo') {
+    return info.info.value.objectType ?? ''
+  }
+  return UnixFSTypeID
+}
+
+// ObjectViewerComponent describes a registered viewer component.
+export interface ObjectViewerComponent {
+  // componentID is the stable identifier used for persisted viewer selection.
+  componentID: string
+  // typeID is the type identifier this component handles.
+  typeID: string
+  // name is the display name of the component.
+  name: string
+  // category is the grouping category for the component selector dropdown.
+  category?: string
+  // disablePadding removes the default 5px viewer content padding.
+  disablePadding?: boolean
+  // requiresObjectState indicates whether the component needs the generic
+  // world object handle before it can render. Components that open their typed
+  // resource directly can render from a trusted object type hint.
+  requiresObjectState?: boolean
+  // component is the React component to render.
+  component: React.ComponentType<ObjectViewerComponentProps>
+}

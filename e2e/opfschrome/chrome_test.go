@@ -1,0 +1,3279 @@
+package chrometest
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	playwright "github.com/mxschmitt/playwright-go"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/bldr/util/gocompiler"
+)
+
+// Browser probe settings and watchdog deadlines.
+const (
+	runEnv                          = "RUN_OPFS_CHROME_TEST"
+	profileEnv                      = "RUN_OPFS_CHROME_PROFILE"
+	tinyGoEnv                       = "RUN_OPFS_CHROME_TINYGO"
+	tinyGoProfileEnv                = "RUN_OPFS_CHROME_TINYGO_PROFILE"
+	tinyGoOptEnv                    = "RUN_OPFS_CHROME_TINYGO_OPT"
+	tinyGoGCEnv                     = "RUN_OPFS_CHROME_TINYGO_GC"
+	tinyGoLLVMEnv                   = "RUN_OPFS_CHROME_TINYGO_LLVM_FEATURES"
+	tinyGoPanicEnv                  = "RUN_OPFS_CHROME_TINYGO_PANIC"
+	tinyGoSchedulerEnv              = "RUN_OPFS_CHROME_TINYGO_SCHEDULER"
+	tinyGoStackEnv                  = "RUN_OPFS_CHROME_TINYGO_STACK_SIZE"
+	resourceReadChunkEnv            = "RUN_OPFS_CHROME_RESOURCE_READ_CHUNK"
+	largeSizeEnv                    = "RUN_OPFS_CHROME_LARGE_SIZE"
+	tinyGoProfileCustom             = "custom"
+	tinyGoTargetDefault             = "target-default"
+	tinyGoBldrFeatures              = "bldr-features"
+	chromeSmoke                     = "smoke"
+	chromeStress                    = "stress"
+	runWorkersScriptWatchdogDefault = 30 * time.Second
+	runWorkersScriptWatchdogMargin  = 15 * time.Second
+	runWorkersScriptWatchdogMin     = 100 * time.Millisecond
+)
+
+// sharedHarness owns the browser and generated assets shared by this test process.
+var sharedHarness *chromeHarness
+
+// chromeHarness owns the selected browser, asset server, and disposable build directory.
+type chromeHarness struct {
+	// dir owns the disposable asset and profile directory.
+	dir string
+	// server serves the compiled worker.
+	server *httptest.Server
+	// pw owns the Playwright driver process.
+	pw *playwright.Playwright
+	// browser owns the launched browser.
+	browser playwright.Browser
+	// browserType creates matching persistent profiles when needed.
+	browserType playwright.BrowserType
+}
+
+// chromeSession owns an isolated browser context and its current page.
+type chromeSession struct {
+	// ctx owns this scenario's isolated storage and pages.
+	ctx playwright.BrowserContext
+	// page is the currently active test page.
+	page playwright.Page
+}
+
+// storageSnapshot records origin quota and recursively counted OPFS file bytes.
+type storageSnapshot struct {
+	// usage is the browser's origin usage estimate in bytes.
+	usage int64
+	// quota is the origin quota in bytes.
+	quota int64
+	// opfsBytes is the recursive sum of OPFS file sizes.
+	opfsBytes int64
+	// files counts OPFS files.
+	files int64
+	// persisted reports the origin's persistent-storage grant.
+	persisted bool
+}
+
+// TIER: pr
+func TestMain(m *testing.M) {
+	// Run ordinary tests unless the Chrome harness was explicitly enabled.
+	if os.Getenv(runEnv) != "1" && !strings.EqualFold(os.Getenv(runEnv), "true") {
+		os.Exit(m.Run())
+	}
+
+	// Start the shared Chrome harness and close it after the test run.
+	h, err := startChromeHarness()
+	if err != nil {
+		os.Stderr.WriteString(err.Error() + "\n")
+		os.Exit(1)
+	}
+	sharedHarness = h
+	code := m.Run()
+	h.close()
+	os.Exit(code)
+}
+
+// TestOpfsChromeCopyWalkWrapperConcurrency probes whether the production
+// AccessWorldState -> CopyObjectToBucket -> WalkObjectBlocks wrapper deadlocks
+// at a raised maxConcurrency on real OPFS under native Go-WASM, isolating a
+// wrapper bug from a GoScript-scheduler bug (the GoScript compiler is held out
+// of this path). It runs the copy-walk-wrapper-concurrency scenario, which
+// builds a wide source DAG in a bucket distinct from the dest world root, then
+// copies it via the production nested-access pattern twice over fresh source
+// objects: first at maxConcurrency=1 (control) and then at the suspect
+// concurrency (default 16). A wrapper deadlock at the raised concurrency would
+// hang the copy, which the chrome harness context deadline turns into a test
+// failure. Pass concurrency via OPFS_COPYWALK_CONCURRENCY and source input bytes
+// via OPFS_COPYWALK_BLOCKS.
+func TestOpfsChromeCopyWalkWrapperConcurrency(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeStress)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Read the copy-walk concurrency and input size for the probe.
+	concurrency := envIntDefault(t, "OPFS_COPYWALK_CONCURRENCY", 16)
+	inputBytes := envIntDefault(t, "OPFS_COPYWALK_BLOCKS", 64*1024)
+
+	// Run the copy-walk probe in a fresh OPFS root and report its duration.
+	root := "opfs-chrome-copywalk-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{scenario: "clear", root: root})
+	res := s.runWorker(t, workerArgs{
+		scenario:   "copy-walk-wrapper-concurrency",
+		root:       root,
+		iterations: inputBytes,
+		batch:      concurrency,
+	})
+	t.Logf("copy-walk-wrapper concurrency=%d inputBytes=%d durationMs=%d",
+		concurrency, inputBytes, res.durationMS)
+}
+
+// TestOpfsChromeClassifiesPromiseRejection checks browser NotFound rejection classification.
+func TestOpfsChromeClassifiesPromiseRejection(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newPersistentSession(t, "volume-reset-incompatible")
+	defer s.close(t)
+
+	// Exercise missing-file deletion in a fresh OPFS root.
+	root := "opfs-chrome-reject-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "missing-delete-classify",
+		root:     root,
+	})
+}
+
+// TestOpfsChromeReadFileHelperLoop checks repeated whole-file reads inside a worker.
+func TestOpfsChromeReadFileHelperLoop(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newPersistentSession(t, "volume-reset-unknown")
+	defer s.close(t)
+
+	// Run the file-read helper repeatedly in a fresh OPFS root.
+	root := "opfs-chrome-read-helper-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "read-file-helper-loop",
+		root:       root,
+		iterations: 64,
+	})
+}
+
+// TestOpfsChromeLargeWriteReadList checks large file writes, sampled reads, and listing.
+func TestOpfsChromeLargeWriteReadList(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Run large file writes, sampled reads, and listing in a fresh OPFS root.
+	root := "opfs-chrome-large-write-read-list-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "large-write-read-list",
+		root:       root,
+		iterations: 8 * 1024 * 1024,
+		batch:      4,
+	})
+}
+
+// TestOpfsChromeTinyGoPipeWriteLoop checks TinyGo pipe streaming independently of storage.
+func TestOpfsChromeTinyGoPipeWriteLoop(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo io.Pipe scheduling path", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Run the TinyGo pipe streaming scenario in a fresh OPFS root.
+	root := "opfs-chrome-pipe-write-loop-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario:   "pipe-write-loop",
+		root:       root,
+		iterations: 4 * 1024 * 1024,
+	})
+}
+
+// TestOpfsChromeTinyGoSRPCEchoLoop checks TinyGo calls over a multiplexed connection.
+func TestOpfsChromeTinyGoSRPCEchoLoop(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise TinyGo SRPC unary call liveness", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Run the TinyGo unary RPC scenario in a fresh OPFS root.
+	root := "opfs-chrome-srpc-echo-loop-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario:   "srpc-echo-loop",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 128),
+		batch:      envIntDefault(t, resourceReadChunkEnv, 4096),
+	})
+}
+
+// TestOpfsChromeTinyGoSRPCRpcStreamEchoLoop checks TinyGo calls through nested RPC streams.
+func TestOpfsChromeTinyGoSRPCRpcStreamEchoLoop(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise TinyGo SRPC-over-rpcstream liveness", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Run the TinyGo nested RPC scenario in a fresh OPFS root.
+	root := "opfs-chrome-srpc-rpcstream-echo-loop-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario:   "srpc-rpcstream-echo-loop",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 128),
+		batch:      envIntDefault(t, resourceReadChunkEnv, 4096),
+	})
+}
+
+// TestOpfsChromeTinyGoResourceEchoLoop checks TinyGo resource reference calls.
+func TestOpfsChromeTinyGoResourceEchoLoop(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise TinyGo resource-routed SRPC liveness", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Run TinyGo resource calls in a fresh OPFS root.
+	root := "opfs-chrome-resource-echo-loop-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario:   "resource-echo-loop",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 128),
+		batch:      envIntDefault(t, resourceReadChunkEnv, 4096),
+	})
+}
+
+// TestOpfsChromeTinyGoLargeWriteReadList checks large raw OPFS files under TinyGo.
+func TestOpfsChromeTinyGoLargeWriteReadList(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo OPFS helper ABI", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Run large TinyGo file writes and readback in a fresh OPFS root.
+	root := "opfs-chrome-large-write-read-list-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "large-write-read-list",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 68056093),
+		batch:      1,
+	})
+}
+
+// TestOpfsChromeUnixFSStorageAmplification bounds actual disk growth for a large UnixFS upload.
+func TestOpfsChromeUnixFSStorageAmplification(t *testing.T) {
+	// Require the browser profile selected for the OPFS scenario.
+	requireChromeProfile(t, chromeSmoke)
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Measure OPFS usage before and after uploading the UnixFS workload.
+	const sourceBytes = 68056093
+	root := "opfs-chrome-unixfs-storage-amplification-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	before := s.readStorageSnapshot(t)
+	s.runWorker(t, workerArgs{
+		scenario:   "world-resource-large-unixfs-write",
+		root:       root,
+		iterations: sourceBytes,
+		batch:      262144,
+	})
+	after := s.readStorageSnapshot(t)
+
+	// Verify UnixFS storage growth stays within the amplification and quota limits.
+	opfsGrowth := after.opfsBytes - before.opfsBytes
+	usageGrowth := after.usage - before.usage
+	if opfsGrowth <= 0 {
+		t.Fatalf("OPFS growth = %d, want positive", opfsGrowth)
+	}
+	if opfsGrowth*100 > sourceBytes*120 {
+		t.Fatalf("UnixFS OPFS amplification = %.6f, want at most 1.20", float64(opfsGrowth)/sourceBytes)
+	}
+	if usageGrowth*100 > sourceBytes*120 {
+		t.Fatalf("UnixFS origin usage amplification = %.6f, want at most 1.20", float64(usageGrowth)/sourceBytes)
+	}
+	if after.quota <= after.usage {
+		t.Fatalf("storage estimate quota=%d usage=%d, want positive headroom", after.quota, after.usage)
+	}
+
+	// Report the UnixFS workload and measured storage amplification.
+	t.Logf(
+		"unixfs storage estimate: source=%d quota=%d usage_before=%d usage_after=%d usage_growth=%d opfs_before=%d opfs_after=%d opfs_growth=%d files_before=%d files_after=%d persisted_before=%t persisted_after=%t opfs_amplification=%.6f usage_amplification=%.6f",
+		sourceBytes,
+		after.quota,
+		before.usage,
+		after.usage,
+		usageGrowth,
+		before.opfsBytes,
+		after.opfsBytes,
+		opfsGrowth,
+		before.files,
+		after.files,
+		before.persisted,
+		after.persisted,
+		float64(opfsGrowth)/float64(sourceBytes),
+		float64(usageGrowth)/float64(sourceBytes),
+	)
+}
+
+// TestOpfsChromeReadAtHelperLoop checks worker offset reads and EOF semantics.
+func TestOpfsChromeReadAtHelperLoop(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Run the offset-read helper repeatedly in a fresh OPFS root.
+	root := "opfs-chrome-read-at-helper-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "read-at-helper-loop",
+		root:       root,
+		iterations: 64,
+	})
+}
+
+// TestOpfsChromeRunWorkersScriptWatchdogReportsHangingWorker requires useful progress in timeout failures.
+func TestOpfsChromeRunWorkersScriptWatchdogReportsHangingWorker(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Verify a hanging worker reports its scenario, identity, and last progress.
+	_, err := s.evalWorkersScript(t, `async ({ worker }) => {
+  window.__opfsChromeWorkerWatchdog.record({
+    scenario: worker.scenario,
+    worker: worker.worker,
+    phase: 'test-hang',
+  })
+  await new Promise(() => {})
+}`, map[string]any{
+		"worker": mapSingleWorkerArg(workerArgs{
+			scenario: "watchdog-hang",
+			root:     "watchdog-hang",
+			worker:   7,
+			workers:  1,
+		}),
+	}, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected hanging worker script watchdog error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"opfs worker script timeout",
+		"scenario=watchdog-hang",
+		"worker=7",
+		"phase=test-hang",
+		"browser exception=none",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("watchdog error missing %q: %s", want, msg)
+		}
+	}
+}
+
+// TestOpfsChromeFileLockSerializesWorkers requires file locking to preserve every counter increment.
+func TestOpfsChromeFileLockSerializesWorkers(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeStress)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Initialize a fresh OPFS counter before concurrent increments.
+	root := "opfs-chrome-lock-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "counter-init",
+		root:     root,
+	})
+
+	// Run locked counter writers and verify every increment survives.
+	const (
+		workers    = 6
+		iterations = 12
+	)
+	var args []workerArgs
+	for i := range workers {
+		args = append(args, workerArgs{
+			scenario:   "counter-increment",
+			root:       root,
+			worker:     i,
+			workers:    workers,
+			iterations: iterations,
+			batch:      1,
+		})
+	}
+	s.runWorkers(t, args)
+	s.runWorker(t, workerArgs{
+		scenario:   "counter-verify",
+		root:       root,
+		workers:    workers,
+		iterations: iterations,
+		batch:      1,
+	})
+}
+
+// TestOpfsChromeFileLockQueuedWorkersProgressAfterRelease checks queued writers resume after release.
+func TestOpfsChromeFileLockQueuedWorkersProgressAfterRelease(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Initialize a fresh OPFS counter before queuing writers.
+	root := "opfs-chrome-lock-queued-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "counter-init",
+		root:     root,
+	})
+
+	// Queue counter writers behind a holder and verify their increments after release.
+	const (
+		workers    = 4
+		iterations = 5
+	)
+	holder := workerArgs{
+		scenario: "counter-hold",
+		root:     root,
+	}
+	var args []workerArgs
+	for i := range workers {
+		args = append(args, workerArgs{
+			scenario:   "counter-queued-increment",
+			root:       root,
+			worker:     i,
+			workers:    workers,
+			iterations: iterations,
+			batch:      1,
+		})
+	}
+	s.runBlockedLockWorkers(t, holder, args)
+	s.runWorker(t, workerArgs{
+		scenario:   "counter-verify",
+		root:       root,
+		workers:    workers,
+		iterations: iterations,
+		batch:      1,
+	})
+}
+
+// TestOpfsChromeFileLockQueuedWorkersProgressAfterHolderTermination checks crash-released lock progress.
+func TestOpfsChromeFileLockQueuedWorkersProgressAfterHolderTermination(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeStress)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Initialize a fresh OPFS counter before terminating its lock holder.
+	root := "opfs-chrome-lock-terminated-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "counter-init",
+		root:     root,
+	})
+
+	// Queue counter writers and verify their increments after holder termination.
+	const (
+		workers    = 4
+		iterations = 5
+	)
+	holder := workerArgs{
+		scenario: "counter-hold",
+		root:     root,
+	}
+	var args []workerArgs
+	for i := range workers {
+		args = append(args, workerArgs{
+			scenario:   "counter-queued-increment",
+			root:       root,
+			worker:     i,
+			workers:    workers,
+			iterations: iterations,
+			batch:      1,
+		})
+	}
+	s.runTerminatedLockHolderWorkers(t, holder, args)
+	s.runWorker(t, workerArgs{
+		scenario:   "counter-verify",
+		root:       root,
+		workers:    workers,
+		iterations: iterations,
+		batch:      1,
+	})
+}
+
+// TestOpfsChromeWebLockIfAvailable checks nonblocking lock outcomes while a holder is active.
+func TestOpfsChromeWebLockIfAvailable(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeStress)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Initialize a fresh OPFS counter before probing lock availability.
+	root := "opfs-chrome-lock-if-available-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "counter-init",
+		root:     root,
+	})
+
+	// Verify the Web Lock is unavailable during the hold and available after release.
+	holder := workerArgs{
+		scenario: "counter-hold",
+		root:     root,
+	}
+	heldCheck := workerArgs{
+		scenario: "counter-try-lock-unavailable",
+		root:     root,
+	}
+	s.runHeldLockCheck(t, holder, heldCheck)
+	s.runWorker(t, workerArgs{
+		scenario: "counter-try-lock-available",
+		root:     root,
+	})
+}
+
+// TestOpfsChromeWebLockCancellation checks queued Web Lock cancellation.
+func TestOpfsChromeWebLockCancellation(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Initialize a fresh OPFS counter before cancelling a queued lock request.
+	root := "opfs-chrome-lock-cancel-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "counter-init",
+		root:     root,
+	})
+
+	// Probe queued lock cancellation while the counter holder remains active.
+	s.runHeldLockCheck(t, workerArgs{
+		scenario: "counter-hold",
+		root:     root,
+	}, workerArgs{
+		scenario: "counter-timeout-lock",
+		root:     root,
+	})
+}
+
+// TestOpfsChromeVolumeRuntimeSlice checks interrupted initialization, durable remount, and explicit deletion.
+func TestOpfsChromeVolumeRuntimeSlice(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeStress)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Clear a fresh OPFS root before interrupting its format-marker creation.
+	root := "opfs-chrome-volume-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+
+	// Simulate termination after creating the first format-marker entry.
+	_, err := s.page.Evaluate(`async (name) => {
+	  const root = await navigator.storage.getDirectory()
+	  const test = await root.getDirectoryHandle(name, { create: true })
+	  const volume = await test.getDirectoryHandle('volume', { create: true })
+	  await volume.getFileHandle('.spacewave-opfs-format', { create: true })
+	}`, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify volume writes, remount readback, and explicit deletion after interruption.
+	s.runWorker(t, workerArgs{
+		scenario: "volume-runtime-write",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "volume-runtime-verify",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "volume-runtime-delete-verify",
+		root:     root,
+	})
+}
+
+// TestOpfsChromeWorldInitUnixFS checks world initialization through the product volume.
+func TestOpfsChromeWorldInitUnixFS(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Initialize a World and UnixFS in a fresh OPFS root.
+	root := "opfs-chrome-world-unixfs-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "world-init-unixfs",
+		root:     root,
+	})
+}
+
+// TestOpfsChromeWorldCrashRecovery checks that a World recovers at its last commit.
+func TestOpfsChromeWorldCrashRecovery(t *testing.T) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Verify World recovery at the last commit in a fresh OPFS root.
+	root := "opfs-chrome-world-crash-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario: "world-crash-recovery",
+		root:     root,
+	})
+}
+
+// TestOpfsChromeTinyGoWorldLargeUnixFSUpload checks large world file write and readback under TinyGo.
+func TestOpfsChromeTinyGoWorldLargeUnixFSUpload(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo UnixFS large-upload path", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Upload and read back a large UnixFS file in a fresh OPFS World.
+	root := "opfs-chrome-world-large-unixfs-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "world-large-unixfs-upload",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 68056093),
+	})
+}
+
+// TestOpfsChromeTinyGoWorldResourceLargeUnixFSUpload checks large resource uploads under TinyGo.
+func TestOpfsChromeTinyGoWorldResourceLargeUnixFSUpload(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo UnixFS resource large-upload path", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Upload a large UnixFS file through the World resource in a fresh OPFS root.
+	root := "opfs-chrome-world-resource-large-unixfs-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "world-resource-large-unixfs-upload",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 68056093),
+		batch:      envInt(t, resourceReadChunkEnv),
+	})
+}
+
+// TestOpfsChromeTinyGoWorldResourceDirectUploadTreeLargeUnixFSUpload isolates direct UploadTree from RPC.
+func TestOpfsChromeTinyGoWorldResourceDirectUploadTreeLargeUnixFSUpload(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo direct UploadTree path", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Exercise direct UploadTree with a large UnixFS file in a fresh OPFS root.
+	root := "opfs-chrome-world-resource-direct-upload-tree-large-unixfs-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "world-resource-direct-upload-tree-large-unixfs-upload",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 68056093),
+		batch:      envInt(t, resourceReadChunkEnv),
+	})
+}
+
+// TestOpfsChromeTinyGoWorldControllerResourceLargeUnixFSUpload checks controller-backed resource uploads.
+func TestOpfsChromeTinyGoWorldControllerResourceLargeUnixFSUpload(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo controller bucket large-upload path", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Upload a large UnixFS file through the controller-backed resource.
+	root := "opfs-chrome-world-controller-resource-large-unixfs-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "world-controller-resource-large-unixfs-upload",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 68056093),
+		batch:      envInt(t, resourceReadChunkEnv),
+	})
+}
+
+// TestOpfsChromeTinyGoWorldCloudOverlayResourceLargeUnixFSUpload checks the dirty-tracking overlay upload path.
+func TestOpfsChromeTinyGoWorldCloudOverlayResourceLargeUnixFSUpload(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo cloud-overlay large-upload path", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Upload a large UnixFS file through the dirty-tracking overlay.
+	root := "opfs-chrome-world-cloud-overlay-resource-large-unixfs-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "world-cloud-overlay-resource-large-unixfs-upload",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 68056093),
+		batch:      envInt(t, resourceReadChunkEnv),
+	})
+}
+
+// TestOpfsChromeTinyGoWorldCloudSyncResourceLargeUnixFSUpload checks packing concurrent with an upload.
+func TestOpfsChromeTinyGoWorldCloudSyncResourceLargeUnixFSUpload(t *testing.T) {
+	// Require the selected browser profile and TinyGo compiler for the worker scenario.
+	requireChromeProfile(t, chromeSmoke)
+	if os.Getenv(tinyGoEnv) != "1" && !strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		t.Skipf("set %s=1 to exercise the TinyGo cloud-sync large-upload path", tinyGoEnv)
+	}
+
+	// Open a browser session for the selected OPFS worker scenario.
+	h := newChromeHarness(t)
+	s := h.newSession(t)
+	defer s.close(t)
+
+	// Upload a large UnixFS file while the World sync path packs blocks.
+	root := "opfs-chrome-world-cloud-sync-resource-large-unixfs-" + time.Now().Format("150405.000000000")
+	s.runWorker(t, workerArgs{
+		scenario: "clear",
+		root:     root,
+	})
+	s.runWorker(t, workerArgs{
+		scenario:   "world-cloud-sync-resource-large-unixfs-upload",
+		root:       root,
+		iterations: envIntDefault(t, largeSizeEnv, 68056093),
+		batch:      envInt(t, resourceReadChunkEnv),
+	})
+}
+
+// newChromeHarness returns the initialized harness or skips when browser tests are disabled.
+func newChromeHarness(t testing.TB) *chromeHarness {
+	t.Helper()
+	if os.Getenv(runEnv) != "1" && !strings.EqualFold(os.Getenv(runEnv), "true") {
+		t.Skipf("set %s=1 to run Chrome OPFS stress tests", runEnv)
+	}
+	if sharedHarness == nil {
+		t.Fatal("Chrome OPFS stress harness was not initialized")
+	}
+	return sharedHarness
+}
+
+// requireChromeProfile skips scenarios outside the selected test profile.
+func requireChromeProfile(t testing.TB, profiles ...string) {
+	// Apply the selected browser profile to the requested scenario.
+	t.Helper()
+	profile := os.Getenv(profileEnv)
+	if profile == "" {
+		return
+	}
+	if slices.Contains(profiles, profile) {
+		return
+	}
+	t.Skipf("set %s=%s to run this Chrome OPFS test", profileEnv, strings.Join(profiles, " or "))
+}
+
+// envInt reads a nonnegative workload setting, returning zero when unset.
+func envInt(t testing.TB, key string) int {
+	// Read and validate the nonnegative workload setting.
+	t.Helper()
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		t.Fatalf("invalid %s=%q: %v", key, val, err)
+	}
+	if n < 0 {
+		t.Fatalf("invalid %s=%d: must be non-negative", key, n)
+	}
+	return n
+}
+
+// envIntDefault reads a workload setting or uses the supplied positive default.
+func envIntDefault(t testing.TB, key string, def int) int {
+	t.Helper()
+	val := envInt(t, key)
+	if val == 0 {
+		return def
+	}
+	return val
+}
+
+// BenchmarkOpfsChromeProductVolumeKVWrite commits one key per write
+// transaction on the product OPFS volume inside real Chromium workers. The
+// worker reports total elapsed nanos and ops; ns/op is derived here.
+func BenchmarkOpfsChromeProductVolumeKVWrite(b *testing.B) {
+	benchmarkOpfsChromeProductVolumeKVWrite(b, "volume-kv-write-per-op")
+}
+
+// BenchmarkOpfsChromeProductVolumeKVWriteSingleTx puts all values into one
+// write transaction and commits once. The delta from
+// BenchmarkOpfsChromeProductVolumeKVWrite isolates per-transaction commit
+// overhead on the product immutable-engine path.
+func BenchmarkOpfsChromeProductVolumeKVWriteSingleTx(b *testing.B) {
+	benchmarkOpfsChromeProductVolumeKVWrite(b, "volume-kv-write-single-tx")
+}
+
+// benchmarkOpfsChromeProductVolumeKVWrite measures product metadata writes in isolated worker roots.
+func benchmarkOpfsChromeProductVolumeKVWrite(b *testing.B, scenario string) {
+	// Open a browser session for the selected OPFS worker scenario.
+	requireChromeProfile(b, chromeStress)
+	h := newChromeHarness(b)
+	s := h.newSession(b)
+	defer s.close(b)
+
+	// Measure each metadata value size in an independent OPFS root.
+	for _, size := range []int{4 << 10, 64 << 10} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			// Unique root per size and session so no run reuses another
+			// run's tree state.
+			root := "opfs-chrome-kv-" + scenario + "-" + strconv.Itoa(size) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+			// Pre-delete of any stale root and the final delete below both
+			// fail loudly on non-NotFound errors (clearRoot), so a live
+			// stale handle aborts instead of measuring contamination.
+			clearRes := s.runWorker(b, workerArgs{scenario: "clear", root: root})
+			if !clearRes.ok {
+				b.Fatal(clearRes.err)
+			}
+
+			// Run the metadata write workload and require its successful result.
+			res := s.runWorker(b, workerArgs{
+				scenario:   scenario,
+				root:       root,
+				iterations: b.N,
+				batch:      size,
+			})
+			if !res.ok {
+				b.Fatal(res.err)
+			}
+
+			// Delete the benchmark root and require usable worker timing.
+			delRes := s.runWorker(b, workerArgs{scenario: "clear", root: root})
+			if !delRes.ok {
+				b.Fatalf("final volume root delete: %s", delRes.err)
+			}
+			if res.ops == 0 || res.opNanos == 0 {
+				b.Fatal("worker reported no benchmark timing")
+			}
+
+			// Distinct unit name: the default ns/op column would report
+			// harness wall time per op, not storage cost.
+			b.ReportMetric(float64(res.opNanos)/float64(res.ops), "storage-ns/op")
+		})
+	}
+}
+
+// startChromeHarness builds and serves the assets, then launches the selected browser.
+// The caller owns the returned harness and closes it after all sessions finish.
+func startChromeHarness() (*chromeHarness, error) {
+	// Build browser assets in a disposable harness directory.
+	dir, err := os.MkdirTemp("", "opfs-chrometest-*")
+	if err != nil {
+		return nil, err
+	}
+	if err := buildAssets(dir); err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
+
+	// Serve the assets and validate the requested browser type.
+	server := newServer(dir)
+	browserName := os.Getenv("RUN_OPFS_BROWSER")
+	if browserName == "" {
+		browserName = "chromium"
+	}
+	if browserName != "chromium" && browserName != "webkit" {
+		server.Close()
+		os.RemoveAll(dir)
+		return nil, errors.New("RUN_OPFS_BROWSER must be chromium or webkit")
+	}
+
+	// Install the selected browser through Playwright.
+	if err := playwright.Install(&playwright.RunOptions{
+		Browsers: []string{browserName},
+		Stdout:   os.Stdout,
+		Stderr:   os.Stderr,
+	}); err != nil {
+		server.Close()
+		os.RemoveAll(dir)
+		return nil, errors.Wrap(err, "install playwright "+browserName)
+	}
+
+	// Start the Playwright driver for the selected browser.
+	pw, err := playwright.Run()
+	if err != nil {
+		server.Close()
+		os.RemoveAll(dir)
+		return nil, errors.Wrap(err, "start playwright")
+	}
+
+	// Select browser launch settings, including the requested Chromium GPU mode.
+	browserType := pw.Chromium
+	if browserName == "webkit" {
+		browserType = pw.WebKit
+	}
+	headless := true
+	launchOpts := playwright.BrowserTypeLaunchOptions{
+		Headless: &headless,
+	}
+	if browserName == "chromium" && chrometestGPUEnabled() {
+		channel := "chromium"
+		launchOpts.Channel = &channel
+		headless = false
+		launchOpts.Args = []string{
+			"--headless=new",
+			"--ignore-gpu-blocklist",
+			"--use-angle=vulkan",
+			"--enable-gpu-rasterization",
+			"--enable-zero-copy",
+			"--enable-features=Vulkan",
+		}
+	}
+
+	// Launch the browser and release harness resources if launch fails.
+	browser, err := browserType.Launch(launchOpts)
+	if err != nil {
+		pw.Stop()
+		server.Close()
+		os.RemoveAll(dir)
+		return nil, errors.Wrap(err, "launch "+browserName)
+	}
+	return &chromeHarness{
+		dir:         dir,
+		server:      server,
+		pw:          pw,
+		browser:     browser,
+		browserType: browserType,
+	}, nil
+}
+
+// close releases browser resources before the server and generated assets.
+func (h *chromeHarness) close() {
+	if h.browser != nil {
+		if err := h.browser.Close(); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+		}
+	}
+	if h.pw != nil {
+		if err := h.pw.Stop(); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+		}
+	}
+	if h.server != nil {
+		h.server.Close()
+	}
+	if h.dir != "" {
+		os.RemoveAll(h.dir)
+	}
+}
+
+// newSession opens an isolated browser context and its initial page.
+// WebKit uses a persistent context because its ephemeral context lacks OPFS.
+func (h *chromeHarness) newSession(t testing.TB) *chromeSession {
+	// Attribute browser session failures to the calling test.
+	t.Helper()
+
+	// Use a persistent profile when WebKit needs one for OPFS support.
+	if h.browserType.Name() == "webkit" {
+		return h.newPersistentSession(t, "webkit-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	}
+
+	// Open an isolated browser context and its initial page.
+	ctx, err := h.browser.NewContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &chromeSession{ctx: ctx}
+	s.openPage(t, h.server.URL)
+	return s
+}
+
+// newPersistentSession opens one named browser profile and its initial page.
+func (h *chromeHarness) newPersistentSession(t testing.TB, name string) *chromeSession {
+	// Attribute persistent browser session failures to the calling test.
+	t.Helper()
+
+	// Select persistent browser launch settings for the requested GPU mode.
+	headless := true
+	persistOpts := playwright.BrowserTypeLaunchPersistentContextOptions{
+		Headless: &headless,
+	}
+	if h.browserType.Name() == "chromium" && chrometestGPUEnabled() {
+		channel := "chromium"
+		persistOpts.Channel = &channel
+		headless = false
+		persistOpts.Args = []string{
+			"--headless=new",
+			"--ignore-gpu-blocklist",
+			"--use-angle=vulkan",
+			"--enable-gpu-rasterization",
+			"--enable-zero-copy",
+			"--enable-features=Vulkan",
+		}
+	}
+
+	// Open the named browser profile and its initial page.
+	ctx, err := h.browserType.LaunchPersistentContext(filepath.Join(h.dir, name), persistOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &chromeSession{ctx: ctx}
+	s.openPage(t, h.server.URL+"/")
+	return s
+}
+
+// close releases this session's page and profile resources through its context.
+func (s *chromeSession) close(t testing.TB) {
+	t.Helper()
+
+	if err := s.ctx.Close(); err != nil {
+		t.Error(err)
+	}
+}
+
+// openPage creates the session page and waits for its initial document.
+func (s *chromeSession) openPage(t testing.TB, url string) {
+	// Attribute browser page failures to the calling test.
+	t.Helper()
+
+	// Create a browser page and attach console and error reporting.
+	page, err := s.ctx.NewPage()
+	if err != nil {
+		if closeErr := s.ctx.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+		t.Fatal(err)
+	}
+	page.On("console", func(msg playwright.ConsoleMessage) {
+		t.Logf("browser console %s: %s", msg.Type(), msg.Text())
+	})
+	page.On("pageerror", func(err error) {
+		t.Errorf("page error: %v", err)
+	})
+
+	// Load the initial document and require a successful HTTP response.
+	resp, err := page.Goto(url, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		Timeout:   playwright.Float(30000),
+	})
+	if err != nil {
+		if closeErr := page.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+		t.Fatal(err)
+	}
+	if resp != nil && resp.Status() >= 400 {
+		if closeErr := page.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+		t.Fatalf("GET / returned HTTP %d", resp.Status())
+	}
+	s.page = page
+}
+
+// readStorageSnapshot measures origin quota and all OPFS files in the isolated context.
+func (s *chromeSession) readStorageSnapshot(t testing.TB) storageSnapshot {
+	// Measure browser origin quota and OPFS file sizes.
+	t.Helper()
+	raw, err := s.page.Evaluate(`async () => {
+	  const estimate = await navigator.storage.estimate()
+	  const root = await navigator.storage.getDirectory()
+	  let opfsBytes = 0
+	  let files = 0
+	  const walk = async (dir) => {
+	    for await (const [, handle] of dir.entries()) {
+	      if (handle.kind === 'directory') {
+	        await walk(handle)
+	        continue
+	      }
+	      const file = await handle.getFile()
+	      opfsBytes += file.size
+	      files++
+	    }
+	  }
+	  await walk(root)
+	  return {
+	    usage: estimate.usage ?? 0,
+	    quota: estimate.quota ?? 0,
+	    opfsBytes,
+	    files,
+	    persisted: await navigator.storage.persisted(),
+	  }
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Decode the browser storage snapshot and require numeric size fields.
+	values, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("storage snapshot returned %T", raw)
+	}
+	number := func(name string) int64 {
+		switch value := values[name].(type) {
+		case int:
+			return int64(value)
+		case int64:
+			return value
+		case float64:
+			return int64(value)
+		default:
+			t.Fatalf("storage snapshot %s returned %T", name, values[name])
+			return 0
+		}
+	}
+	persisted, ok := values["persisted"].(bool)
+	if !ok {
+		t.Fatalf("storage snapshot persisted returned %T", values["persisted"])
+	}
+
+	return storageSnapshot{
+		usage:     number("usage"),
+		quota:     number("quota"),
+		opfsBytes: number("opfsBytes"),
+		files:     number("files"),
+		persisted: persisted,
+	}
+}
+
+// runWorker runs one worker to a successful terminal result.
+func (s *chromeSession) runWorker(t testing.TB, args workerArgs) workerResult {
+	t.Helper()
+	results := s.runWorkers(t, []workerArgs{args})
+	return results[0]
+}
+
+// runWorkers starts a group of workers concurrently and checks their results.
+func (s *chromeSession) runWorkers(t testing.TB, args []workerArgs) []workerResult {
+	t.Helper()
+	return s.runWorkersScript(t, `async ({ workers }) => {
+  return await window.runOpfsWorkers(workers)
+}`, map[string]any{"workers": mapWorkerArgs(args)})
+}
+
+// runBlockedLockWorkers queues writers behind a holder and then releases it.
+func (s *chromeSession) runBlockedLockWorkers(t testing.TB, holder workerArgs, workers []workerArgs) []workerResult {
+	t.Helper()
+	return s.runWorkersScript(t, `async ({ holder, workers }) => {
+  return await window.runOpfsBlockedLockWorkers(holder, workers)
+}`, map[string]any{
+		"holder":  mapSingleWorkerArg(holder),
+		"workers": mapWorkerArgs(workers),
+	})
+}
+
+// runTerminatedLockHolderWorkers queues writers before terminating the current lock holder.
+func (s *chromeSession) runTerminatedLockHolderWorkers(
+	t testing.TB,
+	holder workerArgs,
+	workers []workerArgs,
+) []workerResult {
+	t.Helper()
+	return s.runWorkersScript(t, `async ({ holder, workers }) => {
+  return await window.runOpfsTerminatedLockHolderWorkers(holder, workers)
+}`, map[string]any{
+		"holder":  mapSingleWorkerArg(holder),
+		"workers": mapWorkerArgs(workers),
+	})
+}
+
+// runHeldLockCheck runs a lock probe while another worker holds the lock.
+func (s *chromeSession) runHeldLockCheck(t testing.TB, holder, check workerArgs) []workerResult {
+	t.Helper()
+	return s.runWorkersScript(t, `async ({ holder, check }) => {
+  return await window.runOpfsHeldLockCheck(holder, check)
+}`, map[string]any{
+		"holder": mapSingleWorkerArg(holder),
+		"check":  mapSingleWorkerArg(check),
+	})
+}
+
+// runWorkersScript checks and logs every worker's terminal result.
+func (s *chromeSession) runWorkersScript(t testing.TB, script string, args map[string]any) []workerResult {
+	// Collect worker results and report each unsuccessful scenario.
+	t.Helper()
+	results, err := s.evalWorkersScript(t, script, args, runWorkersScriptTimeout(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, res := range results {
+		if !res.ok {
+			t.Fatalf("worker scenario=%s worker=%d failed: %s", res.scenario, res.worker, res.err)
+		}
+		t.Logf("worker scenario=%s worker=%d ok=%t duration=%dms", res.scenario, res.worker, res.ok, res.durationMS)
+	}
+	return results
+}
+
+// evalWorkersScript bounds browser evaluation and preserves the last progress on failure.
+func (s *chromeSession) evalWorkersScript(
+	t testing.TB,
+	script string,
+	args map[string]any,
+	timeout time.Duration,
+) ([]workerResult, error) {
+	// Require a live test context and a usable worker watchdog deadline.
+	t.Helper()
+	if timeout < runWorkersScriptWatchdogMin {
+		timeout = runWorkersScriptWatchdogMin
+	}
+	if err := testContext(t).Err(); err != nil {
+		return nil, errors.Wrap(err, "opfs worker script context")
+	}
+
+	// Evaluate the worker script and retain watchdog progress on browser failures.
+	raw, err := s.page.Evaluate(opfsWorkerScriptEnvelope, map[string]any{
+		"script":    script,
+		"args":      args,
+		"timeoutMs": int(timeout / time.Millisecond),
+	})
+	if err != nil {
+		state := s.readWorkerScriptState()
+		if state != nil {
+			return nil, errors.Errorf("evaluate opfs worker script: %v; %s", err, state.describe("evaluate error"))
+		}
+		return nil, errors.Wrap(err, "evaluate opfs worker script")
+	}
+
+	// Decode the worker envelope and return its terminal result or failure.
+	env, err := decodeWorkerScriptEnvelope(raw)
+	if err != nil {
+		return nil, err
+	}
+	switch env.status {
+	case "ok":
+		return env.results, nil
+	case "timeout":
+		return nil, errors.New(env.describe("timeout"))
+	case "exception":
+		return nil, errors.New(env.describe("exception"))
+	default:
+		return nil, errors.Errorf("unexpected opfs worker script status %q", env.status)
+	}
+}
+
+// readWorkerScriptState reads the browser watchdog snapshot when evaluation fails.
+func (s *chromeSession) readWorkerScriptState() *workerScriptEnvelope {
+	// Read and decode the browser watchdog state after evaluation fails.
+	raw, err := s.page.Evaluate(`() => window.__opfsChromeWorkerWatchdog?.snapshot?.() ?? null`)
+	if err != nil || raw == nil {
+		return nil
+	}
+	env, err := decodeWorkerScriptEnvelope(raw)
+	if err != nil {
+		return nil
+	}
+	return env
+}
+
+// testContext returns the test lifetime context when the testing implementation supports it.
+func testContext(t testing.TB) context.Context {
+	ctxT, ok := t.(interface {
+		Context() context.Context
+	})
+	if !ok {
+		return context.Background()
+	}
+	return ctxT.Context()
+}
+
+// runWorkersScriptTimeout leaves time for diagnostics before the Go test deadline.
+func runWorkersScriptTimeout(t testing.TB) time.Duration {
+	// Reserve time for diagnostics before the test deadline.
+	deadlineT, ok := t.(interface {
+		Deadline() (time.Time, bool)
+	})
+	if !ok {
+		return runWorkersScriptWatchdogDefault
+	}
+	deadline, ok := deadlineT.Deadline()
+	if !ok {
+		return runWorkersScriptWatchdogDefault
+	}
+	timeout := time.Until(deadline) - runWorkersScriptWatchdogMargin
+	if timeout < runWorkersScriptWatchdogMin {
+		return runWorkersScriptWatchdogMin
+	}
+	return timeout
+}
+
+// buildAssets builds the worker program into the disposable asset directory.
+func buildAssets(dir string) error {
+	// Build and publish the worker program and browser assets.
+	if err := buildWasm(filepath.Join(dir, "testprog.wasm")); err != nil {
+		return err
+	}
+	wasmExec, err := wasmExecPath()
+	if err != nil {
+		return err
+	}
+	if err := copyFile(wasmExec, filepath.Join(dir, "wasm_exec.js")); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(indexHTML), 0o644); err != nil {
+		return errors.Wrap(err, "write index")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "worker.js"), []byte(workerJS), 0o644); err != nil {
+		return errors.Wrap(err, "write worker")
+	}
+	return nil
+}
+
+// buildWasm compiles the selected worker with the requested Go or TinyGo toolchain.
+func buildWasm(out string) error {
+	// Resolve the module root within the worker compiler deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+
+	// Build the worker program.
+	program := "./e2e/opfschrome/testprog"
+
+	// Compile with TinyGo when the worker scenario requests it.
+	if os.Getenv(tinyGoEnv) == "1" || strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		// Resolve and report the TinyGo worker compiler arguments.
+		envelope, err := resolveTinyGoBuildEnvelope()
+		if err != nil {
+			return err
+		}
+		args := append([]string{"build"}, envelope.args()...)
+		args = append(args, "-o", out, program)
+		os.Stderr.WriteString("opfs chrometest wasm build: compiler=tinygo version=" +
+			strconv.Quote(tinyGoVersion(ctx)) + " envelope=" + envelope.String() +
+			" args=" + strings.Join(args, " ") + "\n")
+
+		// Compile the TinyGo worker within the build deadline.
+		start := time.Now()
+		cmd := exec.CommandContext(ctx, "tinygo", args...)
+		cmd.Dir = root
+		data, err := cmd.CombinedOutput()
+		if err != nil {
+			return errors.Errorf("tinygo build js/wasm failed: %v\n%s", err, data)
+		}
+
+		// Inspect the TinyGo artifact and report its timing and features.
+		info, err := os.Stat(out)
+		if err != nil {
+			return errors.Wrap(err, "stat TinyGo wasm artifact")
+		}
+		os.Stderr.WriteString("opfs chrometest wasm build result: compiler=tinygo elapsed=" +
+			time.Since(start).Round(time.Millisecond).String() + " artifact_bytes=" +
+			strconv.FormatInt(info.Size(), 10) + " wasm_features=" + wasmFeatureEvidence(ctx, out) + "\n")
+		return nil
+	}
+
+	// Compile the worker with the standard Go WebAssembly target.
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, program)
+	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
+	cmd.Dir = root
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		return errors.Errorf("go build js/wasm failed: %v\n%s", err, data)
+	}
+	return nil
+}
+
+// tinyGoBuildEnvelope records the exact TinyGo target and compiler settings.
+type tinyGoBuildEnvelope struct {
+	// profile selects the compiler default policy.
+	profile string
+	// target names the TinyGo build target.
+	target string
+	// opt overrides optimization when nonempty.
+	opt string
+	// panicStrategy selects panic reporting.
+	panicStrategy string
+	// gc overrides garbage collection when nonempty.
+	gc string
+	// scheduler selects goroutine scheduling.
+	scheduler string
+	// stackSize overrides stack size when nonempty.
+	stackSize string
+	// llvmFeatures overrides target features when nonempty.
+	llvmFeatures string
+}
+
+// resolveTinyGoBuildEnvelope validates the profile and resolves requested compiler settings.
+func resolveTinyGoBuildEnvelope() (*tinyGoBuildEnvelope, error) {
+	// Resolve and validate the requested TinyGo compiler profile.
+	profile := strings.TrimSpace(os.Getenv(tinyGoProfileEnv))
+	if profile == "" {
+		profile = tinyGoProfileCustom
+	}
+	if profile != tinyGoProfileCustom && profile != tinyGoTargetDefault && profile != tinyGoBldrFeatures {
+		return nil, errors.Errorf("unsupported %s=%q, expected custom, target-default, or bldr-features", tinyGoProfileEnv, profile)
+	}
+
+	// Apply compiler overrides and defaults for the selected TinyGo profile.
+	env := &tinyGoBuildEnvelope{
+		profile:       profile,
+		target:        "wasm",
+		opt:           strings.TrimSpace(os.Getenv(tinyGoOptEnv)),
+		panicStrategy: strings.TrimSpace(os.Getenv(tinyGoPanicEnv)),
+		gc:            strings.TrimSpace(os.Getenv(tinyGoGCEnv)),
+		scheduler:     strings.TrimSpace(os.Getenv(tinyGoSchedulerEnv)),
+		stackSize:     strings.TrimSpace(os.Getenv(tinyGoStackEnv)),
+		llvmFeatures:  strings.TrimSpace(os.Getenv(tinyGoLLVMEnv)),
+	}
+	if env.panicStrategy == "" {
+		env.panicStrategy = "print"
+	}
+	if env.scheduler == "" {
+		env.scheduler = "asyncify"
+	}
+	if profile == tinyGoTargetDefault || profile == tinyGoBldrFeatures {
+		if env.stackSize == "" {
+			env.stackSize = gocompiler.TinyGoDefaultStackSize
+		}
+	}
+	if profile == tinyGoBldrFeatures && env.llvmFeatures == "" {
+		env.llvmFeatures = strings.Join(gocompiler.GetDefaultTinygoLlvmFeatures(), ",")
+	}
+	return env, nil
+}
+
+// args returns explicit compiler arguments, preserving target defaults when unset.
+func (e *tinyGoBuildEnvelope) args() []string {
+	// Encode explicit TinyGo compiler overrides as command arguments.
+	args := []string{"-target", e.target}
+	if e.opt != "" {
+		args = append(args, "-opt="+e.opt)
+	}
+	if e.scheduler != "" {
+		args = append(args, "-scheduler="+e.scheduler)
+	}
+	if e.panicStrategy != "" {
+		args = append(args, "-panic="+e.panicStrategy)
+	}
+	if e.gc != "" {
+		args = append(args, "-gc="+e.gc)
+	}
+	if e.stackSize != "" {
+		args = append(args, "-stack-size="+e.stackSize)
+	}
+	if e.llvmFeatures != "" {
+		args = append(args, "-llvm-features="+e.llvmFeatures)
+	}
+
+	return args
+}
+
+// String renders the selected compiler envelope for reproducible probe output.
+func (e *tinyGoBuildEnvelope) String() string {
+	// Resolve target feature and garbage collector defaults for diagnostics.
+	features := e.llvmFeatures
+	if features == "" {
+		features = "target-default"
+	}
+	gc := e.gc
+	if gc == "" {
+		gc = "target-default"
+	}
+
+	// Resolve optimization and stack defaults for diagnostics.
+	opt := e.opt
+	if opt == "" {
+		opt = "target-default"
+	}
+	stack := e.stackSize
+	if stack == "" {
+		stack = "target-default"
+	}
+
+	return strings.Join([]string{
+		tinyGoProfileEnv + "=" + e.profile,
+		tinyGoOptEnv + "=" + opt,
+		tinyGoPanicEnv + "=" + e.panicStrategy,
+		tinyGoGCEnv + "=" + gc,
+		tinyGoSchedulerEnv + "=" + e.scheduler,
+		tinyGoStackEnv + "=" + stack,
+		tinyGoLLVMEnv + "=" + features,
+		"target=" + e.target,
+		"bldr_concepts=" + strings.Join([]string{
+			gocompiler.TinyGoProfileEnv,
+			gocompiler.TinyGoOptEnv,
+			gocompiler.TinyGoPanicStrategyEnv,
+			gocompiler.TinyGoGCEnv,
+			gocompiler.TinyGoSchedulerEnv,
+			gocompiler.TinyGoStackSizeEnv,
+			gocompiler.TinyGoLLVMFeaturesEnv,
+		}, ","),
+	}, " ")
+}
+
+// tinyGoVersion reads the compiler version within a bounded subprocess lifetime.
+func tinyGoVersion(ctx context.Context) string {
+	// Read the TinyGo compiler version within a bounded subprocess.
+	versionCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(versionCtx, "tinygo", "version")
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		return err.Error()
+	}
+
+	return strings.TrimSpace(string(data))
+}
+
+// wasmFeatureEvidence summarizes available feature evidence from the compiled artifact.
+func wasmFeatureEvidence(ctx context.Context, wasmPath string) string {
+	// Inspect the WebAssembly artifact within a bounded subprocess.
+	objdumpCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(objdumpCtx, "wasm-objdump", "-x", wasmPath)
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		return "wasm-objdump-error=" + err.Error()
+	}
+
+	// Collect enabled and disabled target features from the artifact dump.
+	var features []string
+	inTargetFeatures := false
+	for line := range strings.SplitSeq(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, `name: "target_features"`) {
+			inTargetFeatures = true
+			continue
+		}
+		if !inTargetFeatures {
+			continue
+		}
+		if strings.HasPrefix(line, "- [+]") || strings.HasPrefix(line, "- [-]") {
+			features = append(features, strings.Join(strings.Fields(line), " "))
+			continue
+		}
+		if len(features) != 0 && line != "" {
+			break
+		}
+	}
+	if len(features) == 0 {
+		return "target_features=none"
+	}
+
+	return strings.Join(features, ";")
+}
+
+// wasmExecPath finds the runtime glue corresponding to the selected compiler.
+func wasmExecPath() (string, error) {
+	// Find runtime glue for the selected TinyGo compiler.
+	if os.Getenv(tinyGoEnv) == "1" || strings.EqualFold(os.Getenv(tinyGoEnv), "true") {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "tinygo", "env", "TINYGOROOT")
+		data, err := cmd.Output()
+		if err != nil {
+			return "", errors.Wrap(err, "tinygo env TINYGOROOT")
+		}
+
+		// Validate the compiler root before selecting its runtime glue.
+		tinyGoRoot := strings.TrimSpace(string(data))
+		if tinyGoRoot == "" {
+			return "", errors.New("tinygo env TINYGOROOT returned empty path")
+		}
+
+		return filepath.Join(tinyGoRoot, "targets", "wasm_exec.js"), nil
+	}
+
+	// Find standard Go runtime glue when TinyGo is not selected.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "env", "GOROOT")
+	data, err := cmd.Output()
+	if err != nil {
+		return "", errors.Wrap(err, "go env GOROOT")
+	}
+	goroot := strings.TrimSpace(string(data))
+	if goroot == "" {
+		return "", errors.New("go env GOROOT returned empty path")
+	}
+
+	return filepath.Join(goroot, "lib", "wasm", "wasm_exec.js"), nil
+}
+
+// repoRoot finds the module root used for worker builds.
+func repoRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", errors.New("go.mod not found")
+		}
+		dir = parent
+	}
+}
+
+// copyFile copies one generated asset into the test server directory.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return errors.Wrap(err, "read "+src)
+	}
+	return os.WriteFile(dst, data, 0o644)
+}
+
+// newServer serves test assets with the browser isolation headers required by workers.
+func newServer(dir string) *httptest.Server {
+	mux := http.NewServeMux()
+	fs := http.FileServer(http.Dir(dir))
+	mux.HandleFunc("/", func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		rw.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
+		fs.ServeHTTP(rw, req)
+	})
+	return httptest.NewServer(mux)
+}
+
+// decodeWorkerScriptEnvelope decodes terminal status, progress, and worker results.
+func decodeWorkerScriptEnvelope(raw any) (*workerScriptEnvelope, error) {
+	// Decode worker terminal status and any completed results.
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.Errorf("unexpected worker script envelope %T", raw)
+	}
+	results, err := decodeWorkerResults(m["results"])
+	if err != nil && m["results"] != nil {
+		return nil, err
+	}
+	return &workerScriptEnvelope{
+		status:    stringField(m, "status"),
+		results:   results,
+		progress:  decodeWorkerScriptProgress(m["progress"]),
+		exception: stringField(m, "exception"),
+		timeoutMS: intField(m, "timeoutMs"),
+	}, nil
+}
+
+// decodeWorkerScriptProgress decodes optional progress while retaining field presence.
+func decodeWorkerScriptProgress(raw any) workerScriptProgress {
+	// Decode optional worker progress while retaining field presence.
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return workerScriptProgress{}
+	}
+	worker, hasWorker := intFieldOK(m, "worker")
+	offset, hasOffset := intFieldOK(m, "offset")
+	total, hasTotal := intFieldOK(m, "total")
+	return workerScriptProgress{
+		scenario:  stringField(m, "scenario"),
+		worker:    worker,
+		hasWorker: hasWorker,
+		phase:     stringField(m, "phase"),
+		offset:    offset,
+		hasOffset: hasOffset,
+		total:     total,
+		hasTotal:  hasTotal,
+	}
+}
+
+// decodeWorkerResults decodes the worker identity, status, and supported timing fields.
+func decodeWorkerResults(raw any) ([]workerResult, error) {
+	// Decode each worker result and its supported timing fields.
+	list, ok := raw.([]any)
+	if !ok {
+		return nil, errors.Errorf("unexpected result type %T", raw)
+	}
+	results := make([]workerResult, len(list))
+	for i, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, errors.Errorf("unexpected result item %T", item)
+		}
+		results[i] = workerResult{
+			scenario: stringField(m, "scenario"),
+			worker:   intField(m, "worker"),
+			ok:       boolField(m, "ok"),
+			err:      stringField(m, "error"),
+			durationMS: intField(
+				m,
+				"durationMs",
+			),
+			opNanos: int64Field(m, "opNanos"),
+			ops:     int64Field(m, "ops"),
+		}
+	}
+
+	return results, nil
+}
+
+// mapWorkerArgs converts worker configurations to browser argument objects.
+func mapWorkerArgs(args []workerArgs) []map[string]any {
+	out := make([]map[string]any, len(args))
+	for i, arg := range args {
+		out[i] = mapSingleWorkerArg(arg)
+	}
+	return out
+}
+
+// mapSingleWorkerArg encodes one worker configuration for browser dispatch.
+func mapSingleWorkerArg(arg workerArgs) map[string]any {
+	return map[string]any{
+		"scenario":   arg.scenario,
+		"root":       arg.root,
+		"worker":     arg.worker,
+		"workers":    arg.workers,
+		"iterations": arg.iterations,
+		"batch":      arg.batch,
+	}
+}
+
+// stringField reads an optional string from a browser result object.
+func stringField(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// boolField reads an optional boolean from a browser result object.
+func boolField(m map[string]any, key string) bool {
+	if v, ok := m[key].(bool); ok {
+		return v
+	}
+	return false
+}
+
+// intField reads a browser integer or returns zero when absent.
+func intField(m map[string]any, key string) int {
+	v, _ := intFieldOK(m, key)
+	return v
+}
+
+// intFieldOK reads a browser integer while retaining field presence.
+func intFieldOK(m map[string]any, key string) (int, bool) {
+	switch v := m[key].(type) {
+	case int:
+		return v, true
+	case float64:
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
+// int64Field reads a browser integer as int64 or returns zero when absent.
+func int64Field(m map[string]any, key string) int64 {
+	v, _ := int64FieldOK(m, key)
+	return v
+}
+
+// int64FieldOK reads a browser integer as int64 while retaining field presence.
+func int64FieldOK(m map[string]any, key string) (int64, bool) {
+	switch v := m[key].(type) {
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+// workerArgs selects one worker action and its workload dimensions.
+type workerArgs struct {
+	// scenario selects the worker action.
+	scenario string
+	// root names the disposable shared OPFS directory.
+	root string
+	// worker identifies one concurrent worker.
+	worker int
+	// workers counts the expected publishers.
+	workers int
+	// iterations sets operation count or total bytes for this scenario.
+	iterations int
+	// batch sets batch size or readback window for this scenario.
+	batch int
+}
+
+// workerResult contains one worker's terminal status and optional operation timings.
+type workerResult struct {
+	// scenario identifies the completed action.
+	scenario string
+	// worker identifies the worker instance.
+	worker int
+	// ok reports successful completion.
+	ok bool
+	// err contains the terminal error when unsuccessful.
+	err string
+	// durationMS measures total worker duration in milliseconds.
+	durationMS int
+	// opNanos measures only the requested storage operations in nanoseconds.
+	opNanos int64
+	// ops counts the measured storage operations.
+	ops int64
+}
+
+// workerScriptEnvelope contains watchdog status and any completed worker results.
+type workerScriptEnvelope struct {
+	// status distinguishes success, timeout, and browser exception.
+	status string
+	// results contains completed worker results.
+	results []workerResult
+	// progress retains the last reported worker phase.
+	progress workerScriptProgress
+	// exception contains the browser exception text.
+	exception string
+	// timeoutMS records the evaluation deadline in milliseconds.
+	timeoutMS int
+}
+
+// describe renders terminal status together with the last worker progress.
+func (e *workerScriptEnvelope) describe(status string) string {
+	// Describe the worker script status, progress, and browser exception.
+	parts := []string{"opfs worker script " + status}
+	if e.timeoutMS != 0 {
+		parts = append(parts, "after "+strconv.Itoa(e.timeoutMS)+"ms")
+	}
+	parts = append(parts, "last progress "+e.progress.describe())
+	if e.exception == "" {
+		parts = append(parts, "browser exception=none")
+	} else {
+		parts = append(parts, "browser exception="+e.exception)
+	}
+	return strings.Join(parts, ": ")
+}
+
+// workerScriptProgress retains the latest worker phase and optional progress coordinates.
+type workerScriptProgress struct {
+	// scenario identifies the reporting action.
+	scenario string
+	// worker identifies the reporting worker when hasWorker is set.
+	worker int
+	// hasWorker distinguishes worker zero from an absent worker.
+	hasWorker bool
+	// phase names the current operation stage.
+	phase string
+	// offset records completed progress when hasOffset is set.
+	offset int
+	// hasOffset distinguishes progress zero from absent progress.
+	hasOffset bool
+	// total records the target count when hasTotal is set.
+	total int
+	// hasTotal distinguishes a zero target from an absent target.
+	hasTotal bool
+}
+
+// describe renders the latest progress coordinates for failure diagnostics.
+func (p workerScriptProgress) describe() string {
+	// Describe the available worker progress coordinates for diagnostics.
+	if p.scenario == "" && !p.hasWorker && p.phase == "" && !p.hasOffset && !p.hasTotal {
+		return "none"
+	}
+	parts := make([]string, 0, 5)
+	if p.scenario != "" {
+		parts = append(parts, "scenario="+p.scenario)
+	}
+	if p.hasWorker {
+		parts = append(parts, "worker="+strconv.Itoa(p.worker))
+	}
+	if p.phase != "" {
+		parts = append(parts, "phase="+p.phase)
+	}
+	if p.hasOffset {
+		parts = append(parts, "offset="+strconv.Itoa(p.offset))
+	}
+	if p.hasTotal {
+		parts = append(parts, "total="+strconv.Itoa(p.total))
+	}
+
+	return strings.Join(parts, " ")
+}
+
+// opfsWorkerScriptEnvelope bounds page evaluation and returns watchdog state so
+// worker hangs report the last browser-side marker before the Go test timeout.
+const opfsWorkerScriptEnvelope = `async ({ script, args, timeoutMs }) => {
+  const watchdog = window.__opfsChromeWorkerWatchdog
+  if (!watchdog) {
+    throw new Error('OPFS worker watchdog is not installed')
+  }
+  watchdog.reset()
+  const run = (async () => {
+    try {
+      const fn = (0, eval)('(' + script + ')')
+      const results = await fn(args)
+      return {
+        ...watchdog.snapshot(),
+        status: 'ok',
+        results,
+      }
+    } catch (reason) {
+      watchdog.exception(reason)
+      return {
+        ...watchdog.snapshot(),
+        status: 'exception',
+        timeoutMs,
+      }
+    }
+  })()
+  const timeout = new Promise((resolve) => {
+    setTimeout(() => {
+      resolve({
+        ...watchdog.snapshot(),
+        status: 'timeout',
+        timeoutMs,
+      })
+    }, timeoutMs)
+  })
+  return await Promise.race([run, timeout])
+}`
+
+// indexHTML hosts the browser worker lifecycle and synchronization helpers.
+const indexHTML = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>opfs chrome test</title>
+  </head>
+  <body>
+    <script type="module">
+      window.__opfsChromeWorkerWatchdog = createOpfsChromeWorkerWatchdog()
+      window.runOpfsWorkers = async (workers) => {
+        return await waitWorkers(workers.map((args) => runWorker(args)))
+      }
+
+      window.runOpfsWorkersStaged = async (readyWorkers, workers) => {
+        const ready = readyWorkers.map((args) => runWorker(args))
+        const readyResults = await Promise.all(ready.map((item) => item.ready))
+        if (readyResults.some((result) => result.kind === 'result' && !result.ok)) {
+          return compactResults(readyResults)
+        }
+        const started = workers.map((args) => runWorker(args))
+        return await waitWorkers([...ready, ...started])
+      }
+
+      window.runOpfsBlockedLockWorkers = async (holderArgs, workers) => {
+        const holder = runWorker(holderArgs)
+        const holderReady = await holder.ready
+        if (holderReady.kind === 'result') {
+          return compactResults([holderReady])
+        }
+        const queued = workers.map((args) => runWorker(args))
+        const queuedReady = await Promise.all(queued.map((item) => item.ready))
+        if (queuedReady.some((result) => result.kind === 'result' && !result.ok)) {
+          holder.stop()
+          return compactResults(queuedReady)
+        }
+        const release = new BroadcastChannel('opfs-chrometest-counter-release:' + holderArgs.root)
+        release.postMessage({ type: 'release' })
+        release.close()
+        return await waitWorkers([holder, ...queued])
+      }
+
+      window.runOpfsHeldLockCheck = async (holderArgs, checkArgs) => {
+        const holder = runWorker(holderArgs)
+        const holderReady = await holder.ready
+        if (holderReady.kind === 'result') {
+          return compactResults([holderReady])
+        }
+        const check = runWorker(checkArgs)
+        const checkResults = await waitWorkers([check])
+        if (checkResults.some((result) => !result.ok)) {
+          holder.stop()
+          return checkResults
+        }
+        const release = new BroadcastChannel('opfs-chrometest-counter-release:' + holderArgs.root)
+        release.postMessage({ type: 'release' })
+        release.close()
+        const holderResults = await waitWorkers([holder])
+        return [...checkResults, ...holderResults]
+      }
+
+      window.runOpfsTerminatedLockHolderWorkers = async (holderArgs, workers) => {
+        const holder = runWorker(holderArgs)
+        const holderReady = await holder.ready
+        if (holderReady.kind === 'result') {
+          return compactResults([holderReady])
+        }
+        const queued = workers.map((args) => runWorker(args))
+        const queuedReady = await Promise.all(queued.map((item) => item.ready))
+        if (queuedReady.some((result) => result.kind === 'result' && !result.ok)) {
+          holder.stop()
+          return compactResults(queuedReady)
+        }
+        holder.stop()
+        return await waitWorkers(queued)
+      }
+
+      window.runOpfsTerminateReadyWorker = async (args) => {
+        const worker = runWorker(args)
+        const ready = await worker.ready
+        if (ready.kind === 'result') {
+          return compactResults([ready])
+        }
+        worker.stop()
+        return [{
+          kind: 'result',
+          scenario: args.scenario,
+          worker: args.worker ?? 0,
+          ok: true,
+          durationMs: 0,
+        }]
+      }
+
+      function waitWorkers(items) {
+        return new Promise((resolve) => {
+          const results = new Array(items.length)
+          let remaining = items.length
+          let resolved = false
+          for (const [index, item] of items.entries()) {
+            item.done.then((result) => {
+              if (resolved) {
+                return
+              }
+              results[index] = result
+              if (!result.ok) {
+                resolved = true
+                for (const other of items) {
+                  other.stop()
+                }
+                resolve(compactResults(results))
+                return
+              }
+              remaining--
+              if (remaining === 0) {
+                resolved = true
+                resolve(results)
+              }
+            })
+          }
+        })
+      }
+
+      function compactResults(results) {
+        return results.filter((result) => result)
+      }
+
+      function createOpfsChromeWorkerWatchdog() {
+        let progress = null
+        let exception = ''
+        return {
+          reset: () => {
+            progress = null
+            exception = ''
+          },
+          record: (data) => {
+            progress = normalizeProgress(data)
+          },
+          exception: (reason) => {
+            exception = describeBrowserError(reason)
+          },
+          snapshot: () => ({
+            status: 'state',
+            progress,
+            exception,
+          }),
+        }
+      }
+
+      function normalizeProgress(data) {
+        const progress = {
+          scenario: data?.scenario ?? '',
+          worker: data?.worker ?? 0,
+          phase: data?.phase ?? '',
+        }
+        if (data?.offset !== undefined) {
+          progress.offset = data.offset
+        }
+        if (data?.total !== undefined) {
+          progress.total = data.total
+        }
+        return progress
+      }
+
+      function recordWorkerProgress(data, phase) {
+        window.__opfsChromeWorkerWatchdog.record({
+          scenario: data?.scenario ?? '',
+          worker: data?.worker ?? 0,
+          phase: data?.phase ?? phase,
+          offset: data?.offset,
+          total: data?.total,
+        })
+      }
+
+      function describeBrowserError(reason) {
+        if (!reason) {
+          return ''
+        }
+        if (typeof reason === 'string') {
+          return reason
+        }
+        if (typeof reason.stack === 'string') {
+          return reason.stack
+        }
+        if (typeof reason.message === 'string') {
+          return reason.message
+        }
+        return String(reason)
+      }
+
+      function runWorker(args) {
+        let readyResolve
+        recordWorkerProgress(args, 'start')
+        const worker = new Worker('/worker.js', { type: 'classic' })
+        const ready = new Promise((resolve) => {
+          readyResolve = resolve
+        })
+        const done = new Promise((resolve) => {
+          const fail = (message) => {
+            worker.terminate()
+            window.__opfsChromeWorkerWatchdog.exception(message)
+            const data = {
+              kind: 'result',
+              scenario: args.scenario,
+              worker: args.worker ?? 0,
+              ok: false,
+              error: message,
+            }
+            recordWorkerProgress(data, 'worker-error')
+            readyResolve(data)
+            resolve(data)
+          }
+          worker.onmessage = (event) => {
+            const data = event.data
+            if (data.kind === 'ready') {
+              recordWorkerProgress(data, 'ready')
+              readyResolve(data)
+              return
+            }
+            if (data.kind === 'progress') {
+              recordWorkerProgress(data, 'progress')
+              console.log(formatProgress(data))
+              return
+            }
+            if (data.kind === 'result') {
+              recordWorkerProgress(data, data.ok ? 'result-ok' : 'result-error')
+              worker.terminate()
+              readyResolve(data)
+              resolve(data)
+            }
+          }
+          worker.onerror = (event) => {
+            fail(event.message)
+          }
+          worker.postMessage(args)
+        })
+        return {
+          ready,
+          done,
+          stop: () => {
+            worker.terminate()
+          },
+        }
+      }
+
+      function formatProgress(data) {
+        let msg = 'opfs worker progress scenario=' + (data.scenario ?? '') +
+          ' worker=' + (data.worker ?? 0) +
+          ' phase=' + (data.phase ?? '')
+        if (data.offset !== undefined || data.total !== undefined) {
+          msg += ' offset=' + (data.offset ?? 0) + ' total=' + (data.total ?? 0)
+        }
+        return msg
+      }
+    </script>
+  </body>
+</html>
+`
+
+// workerJS loads the compiled Go program inside a disposable worker.
+const workerJS = `importScripts('/wasm_exec.js')
+
+self.__BLDR_TINYGO_STORED_BYTES = new Map()
+self.__BLDR_TINYGO_STORED_BYTES_NEXT_ID = 1
+self.__BLDR_TINYGO_WEB_LOCK_RELEASES = new Map()
+self.__BLDR_TINYGO_WEB_LOCK_RELEASE_NEXT_ID = 1
+self.__BLDR_TINYGO_WEB_LOCK_RELEASE_OPS = new Map()
+self.__BLDR_TINYGO_WEB_LOCK_REQUESTS = new Map()
+self.__BLDR_TINYGO_COPY_BYTES = (bytes) => {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new TypeError('expected Uint8Array')
+  }
+  const copy = new Uint8Array(bytes.byteLength)
+  copy.set(bytes)
+  return copy
+}
+self.__BLDR_TINYGO_STORE_BYTES = (bytes) => {
+  const id = self.__BLDR_TINYGO_STORED_BYTES_NEXT_ID++
+  self.__BLDR_TINYGO_STORED_BYTES.set(id, bytes)
+  return id
+}
+self.__BLDR_TINYGO_RUNTIME_EXITED = false
+self.__BLDR_TINYGO_OPFS_RUNTIME_TASKS = new Set()
+self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE = (writable) => {
+  if (!writable) {
+    return Promise.resolve()
+  }
+  try {
+    return writable.abort()
+  } catch (reason) {
+    return Promise.reject(reason)
+  }
+}
+self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE_QUIETLY = (writable) => {
+  void self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE(writable).catch(() => {})
+}
+self.__BLDR_TINYGO_TRACK_OPFS_TASK = (task) => {
+  const tracked = Promise.resolve(task)
+    .then(() => undefined, () => undefined)
+    .finally(() => self.__BLDR_TINYGO_OPFS_RUNTIME_TASKS.delete(tracked))
+  self.__BLDR_TINYGO_OPFS_RUNTIME_TASKS.add(tracked)
+  return tracked
+}
+self.__BLDR_TINYGO_AWAIT_OPFS_TASKS = async () => {
+  while (self.__BLDR_TINYGO_OPFS_RUNTIME_TASKS.size !== 0) {
+    await Promise.all([...self.__BLDR_TINYGO_OPFS_RUNTIME_TASKS])
+  }
+}
+self.__BLDR_TINYGO_CREATE_OPFS_WRITABLE = (handle, opts) => {
+  if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+    return Promise.resolve(undefined)
+  }
+  const created = opts ? handle.createWritable(opts) : handle.createWritable()
+  return created.then(async (writable) => {
+    if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+      await self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE(writable).catch(() => {})
+      return undefined
+    }
+    return writable
+  })
+}
+self.__BLDR_TINYGO_EXPORT = (go, name) => {
+  const fn = go._inst?.exports?.[name]
+  if (typeof fn !== 'function') {
+    throw new Error('missing TinyGo export ' + name)
+  }
+  return fn
+}
+self.__BLDR_TINYGO_READ_STRING = (go, ptr, len) => {
+  const memory = go._inst?.exports?.memory
+  if (!(memory instanceof WebAssembly.Memory)) {
+    throw new Error('TinyGo runtime memory is not initialized')
+  }
+  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr >>> 0, len))
+}
+self.__BLDR_TINYGO_MEMORY_VIEW = (go, ptr, len) => {
+  const memory = go._inst?.exports?.memory
+  if (!(memory instanceof WebAssembly.Memory)) {
+    throw new Error('TinyGo runtime memory is not initialized')
+  }
+  return new Uint8Array(memory.buffer, ptr >>> 0, len)
+}
+self.__BLDR_TINYGO_UNBOX_VALUE = (go, rawRef) => {
+  const ref = typeof rawRef === 'bigint' ? rawRef : BigInt(rawRef)
+  const nanHead = 0x7ff80000n
+  if (((ref >> 32n) & nanHead) !== nanHead) {
+    throw new Error('TinyGo numeric js.Value refs are unsupported here')
+  }
+  const id = Number(ref & 0xffffffffn)
+  const value = go._values?.[id]
+  if (value === undefined) {
+    throw new Error('TinyGo js.Value ref ' + id + ' is unavailable')
+  }
+  return value
+}
+self.__BLDR_TINYGO_BOX_VALUE = (go, value) => {
+  const nanHead = 0x7ff80000n
+  if (typeof value === 'number') {
+    if (Number.isNaN(value)) {
+      return nanHead << 32n
+    }
+    if (value === 0) {
+      return (nanHead << 32n) | 1n
+    }
+    const buf = new ArrayBuffer(8)
+    const view = new DataView(buf)
+    view.setFloat64(0, value, true)
+    return view.getBigInt64(0, true)
+  }
+  switch (value) {
+    case undefined:
+      return 0n
+    case null:
+      return (nanHead << 32n) | 2n
+    case true:
+      return (nanHead << 32n) | 3n
+    case false:
+      return (nanHead << 32n) | 4n
+  }
+  if (!go._values || !go._ids || !go._goRefCounts || !go._idPool) {
+    throw new Error('TinyGo js.Value table is not initialized')
+  }
+  let id = go._ids.get(value)
+  if (id === undefined) {
+    id = go._idPool.pop()
+    if (id === undefined) {
+      id = BigInt(go._values.length)
+    }
+    const index = Number(id)
+    go._values[index] = value
+    go._goRefCounts[index] = 0
+    go._ids.set(value, id)
+  }
+  go._goRefCounts[Number(id)]++
+  let typeFlag = 1n
+  switch (typeof value) {
+    case 'string':
+      typeFlag = 2n
+      break
+    case 'symbol':
+      typeFlag = 3n
+      break
+    case 'function':
+      typeFlag = 4n
+      break
+  }
+  return id | ((nanHead | typeFlag) << 32n)
+}
+self.__BLDR_TINYGO_OPFS_RESOLVE_REF = (opID, value) => {
+  const go = self.__BLDR_TINYGO_CURRENT_GO
+  const ref = self.__BLDR_TINYGO_BOX_VALUE(go, value)
+  self.__BLDR_TINYGO_OPFS_RESOLVE(
+    opID,
+    Number((ref >> 32n) & 0xffffffffn),
+    Number(ref & 0xffffffffn),
+  )
+}
+self.__BLDR_TINYGO_DEFER_QUEUE = []
+self.__BLDR_TINYGO_DEFER_SCHEDULED = false
+self.__BLDR_TINYGO_DEFER_CHANNEL = new MessageChannel()
+self.__BLDR_TINYGO_DEFER_CHANNEL.port1.onmessage = () => {
+  self.__BLDR_TINYGO_DEFER_SCHEDULED = false
+  const cb = self.__BLDR_TINYGO_DEFER_QUEUE.shift()
+  if (cb) {
+    cb()
+  }
+  if (self.__BLDR_TINYGO_DEFER_QUEUE.length !== 0) {
+    self.__BLDR_TINYGO_DEFER_SCHEDULED = true
+    self.__BLDR_TINYGO_DEFER_CHANNEL.port2.postMessage(undefined)
+  }
+}
+self.__BLDR_TINYGO_DEFER = (cb) => {
+  self.__BLDR_TINYGO_DEFER_QUEUE.push(cb)
+  if (!self.__BLDR_TINYGO_DEFER_SCHEDULED) {
+    self.__BLDR_TINYGO_DEFER_SCHEDULED = true
+    self.__BLDR_TINYGO_DEFER_CHANNEL.port2.postMessage(undefined)
+  }
+}
+self.__BLDR_TINYGO_CALL_EXPORT = (go, fn, ...args) => {
+  fn(...args)
+  const scheduler = go._inst?.exports?.go_scheduler
+  if (typeof scheduler === 'function') {
+    self.__BLDR_TINYGO_DEFER(() => scheduler())
+    return
+  }
+  if (typeof go._resume === 'function') {
+    self.__BLDR_TINYGO_DEFER(() => go._resume.call(go))
+  }
+}
+self.__BLDR_TINYGO_OPFS_RESOLVE = (opID, ...values) => {
+  const go = self.__BLDR_TINYGO_CURRENT_GO
+  const resolve = self.__BLDR_TINYGO_EXPORT(go, 'BLDR_OPFS_HELPER_RESOLVE')
+  self.__BLDR_TINYGO_DEFER(() => {
+    if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+      return
+    }
+    self.__BLDR_TINYGO_CALL_EXPORT(go, resolve, opID, values.length, values[0] ?? 0, values[1] ?? 0)
+  })
+}
+self.__BLDR_TINYGO_OPFS_REJECT = (opID, code) => {
+  const go = self.__BLDR_TINYGO_CURRENT_GO
+  const reject = self.__BLDR_TINYGO_EXPORT(go, 'BLDR_OPFS_HELPER_REJECT')
+  self.__BLDR_TINYGO_DEFER(() => {
+    if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+      return
+    }
+    self.__BLDR_TINYGO_CALL_EXPORT(go, reject, opID, code)
+  })
+}
+self.__BLDR_TINYGO_REJECT_OPFS_WRITABLE_FAILURE = async (opID, writable, reason) => {
+  const abortReason = await self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE(writable)
+    .then(() => undefined, (value) => value)
+  const report = abortReason === undefined ? reason : abortReason
+  if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+    self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(report))
+  }
+}
+self.__BLDR_TINYGO_STORE_WEB_LOCK_RELEASE = (release, opID) => {
+  const id = self.__BLDR_TINYGO_WEB_LOCK_RELEASE_NEXT_ID++
+  self.__BLDR_TINYGO_WEB_LOCK_RELEASES.set(id, release)
+  if (opID !== undefined) {
+    self.__BLDR_TINYGO_WEB_LOCK_RELEASE_OPS.set(id, opID)
+    const request = self.__BLDR_TINYGO_WEB_LOCK_REQUESTS.get(opID)
+    if (request) {
+      request.releaseID = id
+    }
+  }
+  return id
+}
+self.__BLDR_TINYGO_RELEASE_WEB_LOCK = (releaseID) => {
+  const opID = self.__BLDR_TINYGO_WEB_LOCK_RELEASE_OPS.get(releaseID)
+  self.__BLDR_TINYGO_WEB_LOCK_RELEASE_OPS.delete(releaseID)
+  if (opID !== undefined) {
+    self.__BLDR_TINYGO_WEB_LOCK_REQUESTS.delete(opID)
+  }
+  const release = self.__BLDR_TINYGO_WEB_LOCK_RELEASES.get(releaseID)
+  self.__BLDR_TINYGO_WEB_LOCK_RELEASES.delete(releaseID)
+  if (!release) {
+    return 0
+  }
+  release()
+  return 1
+}
+self.__BLDR_TINYGO_CANCEL_WEB_LOCK = (opID) => {
+  const request = self.__BLDR_TINYGO_WEB_LOCK_REQUESTS.get(opID)
+  if (!request) {
+    return 0
+  }
+  request.canceled = true
+  if (request.releaseID !== undefined) {
+    const release = self.__BLDR_TINYGO_WEB_LOCK_RELEASES.get(request.releaseID)
+    self.__BLDR_TINYGO_RELEASE_WEB_LOCK(request.releaseID)
+    return release ? 1 : 0
+  }
+  if (request.abort) {
+    request.abort.abort()
+  }
+  return 1
+}
+self.BLDR_TINYGO_NEW_BYTES ??= (len) => new Uint8Array(len)
+self.BLDR_TINYGO_TAKE_STORED_BYTES ??= (id) => {
+  const bytes = self.__BLDR_TINYGO_STORED_BYTES.get(id)
+  self.__BLDR_TINYGO_STORED_BYTES.delete(id)
+  return bytes
+}
+self.BLDR_TINYGO_JS_CALL ??= (target, method, ...args) => {
+  const fn = target[method]
+  if (typeof fn !== 'function') {
+    throw new TypeError('method ' + String(method) + ' is not callable')
+  }
+  return fn.apply(target, args)
+}
+self.BLDR_TINYGO_JS_NEW ??= (ctor, ...args) => new ctor(...args)
+self.BLDR_TINYGO_PROMISE_ERROR_CODE ??= (reason) => {
+  let name = ''
+  if (reason && typeof reason === 'object') {
+    if (typeof reason.name === 'string') {
+      name = reason.name
+    }
+    if (!name && reason.constructor && typeof reason.constructor.name === 'string') {
+      name = reason.constructor.name
+    }
+  }
+  if (!name) {
+    name = String(reason)
+  }
+  if (name.includes('NotFoundError')) {
+    return 1
+  }
+  if (name.includes('NoModificationAllowedError')) {
+    return 2
+  }
+  if (name.includes('QuotaExceededError')) {
+    return 3
+  }
+  return 0
+}
+self.BLDR_TINYGO_PROMISE_AWAIT ??= (promise, resolve, reject) => {
+  promise.then(resolve).catch((reason) => reject(self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+}
+self.__BLDR_TINYGO_OPFS_WRITE_STREAM_ID ??= 1
+self.__BLDR_TINYGO_OPFS_WRITE_STREAMS ??= new Map()
+self.__BLDR_TINYGO_OPFS_READ_SNAPSHOT_ID ??= 1
+self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS ??= new Map()
+self.__BLDR_TINYGO_ABORT_OPFS_WRITE_STREAM ??= (streamID, strict = false) => {
+  const stream = self.__BLDR_TINYGO_OPFS_WRITE_STREAMS.get(streamID)
+  if (!stream) {
+    return Promise.resolve(false)
+  }
+  self.__BLDR_TINYGO_TRACK_OPFS_TASK(stream.chain)
+  const abort = strict
+    ? self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE(stream.writable)
+    : self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE(stream.writable).catch(() => {})
+  const aborted = abort.then(() => {
+    self.__BLDR_TINYGO_OPFS_WRITE_STREAMS.delete(streamID)
+    return true
+  })
+  self.__BLDR_TINYGO_TRACK_OPFS_TASK(aborted)
+  return aborted
+}
+self.BLDR_TINYGO_PUSH_BYTES ??= (sink, bytes) => {
+  try {
+    sink.push(self.__BLDR_TINYGO_COPY_BYTES(bytes))
+    return true
+  } catch {
+    return false
+  }
+}
+self.BLDR_TINYGO_POST_BYTES ??= (port, bytes) => {
+  try {
+    port.postMessage(self.__BLDR_TINYGO_COPY_BYTES(bytes))
+    return true
+  } catch {
+    return false
+  }
+}
+self.__BLDR_TINYGO_ENCODE_NAMES ??= (names) => {
+  const encoder = new TextEncoder()
+  const encoded = names.map((name) => encoder.encode(name))
+  let size = 4
+  for (const name of encoded) {
+    size += 4 + name.byteLength
+  }
+  const bytes = new Uint8Array(size)
+  const writeUint32 = (off, value) => {
+    bytes[off] = (value >>> 24) & 0xff
+    bytes[off + 1] = (value >>> 16) & 0xff
+    bytes[off + 2] = (value >>> 8) & 0xff
+    bytes[off + 3] = value & 0xff
+    return off + 4
+  }
+  let off = writeUint32(0, encoded.length)
+  for (const name of encoded) {
+    off = writeUint32(off, name.byteLength)
+    bytes.set(name, off)
+    off += name.byteLength
+  }
+  return bytes
+}
+self.BLDR_OPFS_READ_FILE ??= (dir, name, opID) => {
+  dir.getFileHandle(name)
+    .then((handle) => handle.getFile())
+    .then((file) => file.arrayBuffer())
+    .then((buf) => {
+      const bytes = new Uint8Array(buf)
+      self.__BLDR_TINYGO_OPFS_RESOLVE(opID, self.__BLDR_TINYGO_STORE_BYTES(bytes), bytes.byteLength)
+    })
+    .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+}
+self.BLDR_OPFS_READ_AT ??= (handle, dst, off, opID) => {
+  const dstLen = dst.byteLength
+  handle.getFile()
+    .then(async (file) => {
+      if (off >= file.size || dstLen === 0) {
+        self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 0)
+        return
+      }
+      const end = Math.min(off + dstLen, file.size)
+      const buf = await file.slice(off, end).arrayBuffer()
+      const bytes = new Uint8Array(buf)
+      if (bytes.byteLength !== 0) {
+        dst.subarray(0, bytes.byteLength).set(bytes)
+      }
+      self.__BLDR_TINYGO_OPFS_RESOLVE(opID, bytes.byteLength)
+    })
+    .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+}
+self.BLDR_OPFS_LIST_DIRECTORY ??= (dir, opID) => {
+  ;(async () => {
+    const names = []
+    for await (const [name] of dir.entries()) {
+      names.push(name)
+    }
+    const bytes = self.__BLDR_TINYGO_ENCODE_NAMES(names)
+    self.__BLDR_TINYGO_OPFS_RESOLVE(opID, self.__BLDR_TINYGO_STORE_BYTES(bytes), bytes.byteLength)
+  })().catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+}
+self.BLDR_OPFS_WRITE_AT ??= (handle, data, off, keepExisting, opID) => {
+  const writeData = self.__BLDR_TINYGO_COPY_BYTES(data)
+  const state = {}
+  const opts = keepExisting ? { keepExistingData: true } : undefined
+  const task = self.__BLDR_TINYGO_CREATE_OPFS_WRITABLE(handle, opts)
+    .then(async (next) => {
+      if (!next) {
+        return
+      }
+      state.writable = next
+      if (off !== 0) {
+        await next.seek(off)
+      }
+      if (writeData.byteLength !== 0) {
+        await next.write(writeData)
+      }
+      await next.close()
+      if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+        return
+      }
+      self.__BLDR_TINYGO_OPFS_RESOLVE(opID, writeData.byteLength)
+    })
+    .catch(async (reason) => {
+      await self.__BLDR_TINYGO_REJECT_OPFS_WRITABLE_FAILURE(opID, state.writable, reason)
+    })
+  self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+}
+self.BLDR_OPFS_WRITE_FILE ??= (dir, name, data, opID) => {
+  const writeData = self.__BLDR_TINYGO_COPY_BYTES(data)
+  const state = {}
+  const task = dir.getFileHandle(name, { create: true })
+    .then((handle) => self.__BLDR_TINYGO_CREATE_OPFS_WRITABLE(handle))
+    .then(async (next) => {
+      if (!next) {
+        return
+      }
+      state.writable = next
+      if (writeData.byteLength !== 0) {
+        await next.write(writeData)
+      }
+      await next.close()
+      if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+        return
+      }
+      self.__BLDR_TINYGO_OPFS_RESOLVE(opID, writeData.byteLength)
+    })
+    .catch(async (reason) => {
+      await self.__BLDR_TINYGO_REJECT_OPFS_WRITABLE_FAILURE(opID, state.writable, reason)
+    })
+  self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+}
+
+let __opfsChrometestCurrentArgs = null
+function __opfsChrometestErrorText(reason) {
+  if (reason && typeof reason === 'object' && typeof reason.stack === 'string') {
+    return reason.stack
+  }
+  if (reason && typeof reason === 'object' && typeof reason.message === 'string') {
+    return reason.message
+  }
+  return String(reason)
+}
+function __opfsChrometestPostUnhandled(reason) {
+  const args = __opfsChrometestCurrentArgs ?? {}
+  self.postMessage({
+    kind: 'result',
+    scenario: args.scenario ?? '',
+    worker: args.worker ?? 0,
+    ok: false,
+    error: __opfsChrometestErrorText(reason),
+  })
+}
+self.onerror = (message, source, lineno, colno, error) => {
+  __opfsChrometestPostUnhandled(error || (String(message) + ' at ' + source + ':' + lineno + ':' + colno))
+  return true
+}
+self.onunhandledrejection = (event) => {
+  __opfsChrometestPostUnhandled(event.reason)
+}
+
+
+self.onmessage = async (event) => {
+  const args = event.data
+  __opfsChrometestCurrentArgs = args
+  const go = new Go()
+  self.__BLDR_TINYGO_CURRENT_GO = go
+  go.argv = [
+    'testprog',
+    args.scenario ?? '',
+    args.root ?? '',
+    String(args.worker ?? 0),
+    String(args.workers ?? 1),
+    String(args.iterations ?? 1),
+    String(args.batch ?? 1),
+  ]
+  self.__OPFS_CHROMETEST_ARGS = go.argv
+  if (go.importObject.gojs && typeof go.importObject.gojs['runtime.getRandomData'] !== 'function') {
+    go.importObject.gojs['runtime.getRandomData'] = (ptr, len) => {
+      const memory = go._inst?.exports.memory
+      if (!(memory instanceof WebAssembly.Memory)) {
+        throw new Error('TinyGo runtime memory is not initialized')
+      }
+      crypto.getRandomValues(new Uint8Array(memory.buffer, ptr >>> 0, len))
+    }
+  }
+  if (go.importObject.gojs) {
+    go.importObject.gojs['bldr.opfs.acquireWebLock'] ??= (opID, namePtr, nameLen, exclusive, ifAvailable) => {
+      const resolve = self.__BLDR_TINYGO_EXPORT(go, 'BLDR_OPFS_WEB_LOCK_RESOLVE')
+      const reject = self.__BLDR_TINYGO_EXPORT(go, 'BLDR_OPFS_WEB_LOCK_REJECT')
+      const released = self.__BLDR_TINYGO_EXPORT(go, 'BLDR_OPFS_WEB_LOCK_RELEASED')
+      const locks = self.navigator?.locks
+      if (!locks) {
+        self.__BLDR_TINYGO_DEFER(() => self.__BLDR_TINYGO_CALL_EXPORT(go, reject, opID, 0))
+        return
+      }
+      const opts = { mode: exclusive ? 'exclusive' : 'shared' }
+      const abort = ifAvailable ? undefined : new AbortController()
+      if (abort) {
+        opts.signal = abort.signal
+      }
+      if (ifAvailable) {
+        opts.ifAvailable = true
+      }
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      const request = { abort }
+      self.__BLDR_TINYGO_WEB_LOCK_REQUESTS.set(opID, request)
+      let acquired = false
+      locks.request(name, opts, (lock) => {
+        if (ifAvailable && !lock) {
+          self.__BLDR_TINYGO_WEB_LOCK_REQUESTS.delete(opID)
+          self.__BLDR_TINYGO_DEFER(() => self.__BLDR_TINYGO_CALL_EXPORT(go, resolve, opID, 0, 0))
+          return undefined
+        }
+        return new Promise((releaseLock) => {
+          if (request.canceled) {
+            releaseLock()
+            self.__BLDR_TINYGO_WEB_LOCK_REQUESTS.delete(opID)
+            return
+          }
+          acquired = true
+          const releaseID = self.__BLDR_TINYGO_STORE_WEB_LOCK_RELEASE(releaseLock, opID)
+          self.__BLDR_TINYGO_DEFER(() => self.__BLDR_TINYGO_CALL_EXPORT(go, resolve, opID, releaseID, 1))
+        })
+      }).then(() => {
+        if (acquired) {
+          self.__BLDR_TINYGO_DEFER(() => self.__BLDR_TINYGO_CALL_EXPORT(go, released, opID))
+        }
+      }).catch((reason) => {
+        self.__BLDR_TINYGO_WEB_LOCK_REQUESTS.delete(opID)
+        if (request.canceled) {
+          return
+        }
+        self.__BLDR_TINYGO_DEFER(() => self.__BLDR_TINYGO_CALL_EXPORT(go, reject, opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+      })
+    }
+    go.importObject.gojs['bldr.opfs.cancelWebLock'] ??= (opID) => {
+      return self.__BLDR_TINYGO_CANCEL_WEB_LOCK(opID)
+    }
+    go.importObject.gojs['bldr.opfs.releaseWebLock'] ??= (releaseID) => {
+      return self.__BLDR_TINYGO_RELEASE_WEB_LOCK(releaseID)
+    }
+    go.importObject.gojs['bldr.opfs.getRootRef'] ??= (opID) => {
+      self.navigator.storage.getDirectory()
+        .then((dir) => self.__BLDR_TINYGO_OPFS_RESOLVE_REF(opID, dir))
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.getDirectoryRef'] ??= (opID, parentRef, namePtr, nameLen, create) => {
+      const parent = self.__BLDR_TINYGO_UNBOX_VALUE(go, parentRef)
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      parent.getDirectoryHandle(name, { create: Boolean(create) })
+        .then((dir) => self.__BLDR_TINYGO_OPFS_RESOLVE_REF(opID, dir))
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.openFileRef'] ??= (opID, dirRef, namePtr, nameLen, create) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      const opts = create ? { create: true } : undefined
+      const filePromise = opts ? dir.getFileHandle(name, opts) : dir.getFileHandle(name)
+      filePromise
+        .then((handle) => self.__BLDR_TINYGO_OPFS_RESOLVE_REF(opID, handle))
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.openReadSnapshotRef'] ??= (opID, dirRef, namePtr, nameLen) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      const task = dir.getFileHandle(name)
+        .then((handle) => handle.getFile())
+        .then((file) => {
+          if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+            return
+          }
+          const snapshotID = self.__BLDR_TINYGO_OPFS_READ_SNAPSHOT_ID++
+          self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS.set(snapshotID, file)
+          self.__BLDR_TINYGO_OPFS_RESOLVE(opID, snapshotID, file.size)
+        })
+        .catch((reason) => {
+          if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+            self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason))
+          }
+        })
+      self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+    }
+    go.importObject.gojs['bldr.opfs.fileExistsRef'] ??= (opID, dirRef, namePtr, nameLen) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      dir.getFileHandle(name)
+        .then(() => self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 1))
+        .catch((reason) => {
+          const code = self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)
+          if (code === 1) {
+            self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 0)
+            return
+          }
+          self.__BLDR_TINYGO_OPFS_REJECT(opID, code)
+        })
+    }
+    go.importObject.gojs['bldr.opfs.deleteEntryRef'] ??= (opID, dirRef, namePtr, nameLen, recursive) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      dir.removeEntry(name, { recursive: Boolean(recursive) })
+        .then(() => self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 1))
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.yieldMicrotask'] ??= (opID) => {
+      queueMicrotask(() => self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 1))
+    }
+    go.importObject.gojs['bldr.opfs.sizeRef'] ??= (opID, handleRef) => {
+      const handle = self.__BLDR_TINYGO_UNBOX_VALUE(go, handleRef)
+      handle.getFile()
+        .then((file) => self.__BLDR_TINYGO_OPFS_RESOLVE(opID, file.size))
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.truncateRef'] ??= (opID, handleRef, size) => {
+      const handle = self.__BLDR_TINYGO_UNBOX_VALUE(go, handleRef)
+      const state = {}
+      const task = self.__BLDR_TINYGO_CREATE_OPFS_WRITABLE(handle, { keepExistingData: true })
+        .then(async (next) => {
+          if (!next) {
+            return
+          }
+          state.writable = next
+          await next.truncate(Number(size))
+          await next.close()
+          if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+            return
+          }
+          self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 1)
+        })
+        .catch(async (reason) => {
+          await self.__BLDR_TINYGO_REJECT_OPFS_WRITABLE_FAILURE(opID, state.writable, reason)
+        })
+      self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+    }
+    go.importObject.gojs['bldr.opfs.takeStoredBytes'] ??= (bytesID, ptr, len) => {
+      const bytes = self.BLDR_TINYGO_TAKE_STORED_BYTES(bytesID)
+      if (!bytes || bytes.byteLength !== len) {
+        return 0
+      }
+      if (len !== 0) {
+        self.__BLDR_TINYGO_MEMORY_VIEW(go, ptr, len).set(bytes)
+      }
+      return 1
+    }
+    go.importObject.gojs['bldr.opfs.readFileRef'] ??= (opID, dirRef, namePtr, nameLen) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      dir.getFileHandle(name)
+        .then((handle) => handle.getFile())
+        .then((file) => file.arrayBuffer())
+        .then((buf) => {
+          const bytes = new Uint8Array(buf)
+          self.__BLDR_TINYGO_OPFS_RESOLVE(opID, self.__BLDR_TINYGO_STORE_BYTES(bytes), bytes.byteLength)
+        })
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.readAtRef'] ??= (opID, handleRef, dstPtr, dstLen, off) => {
+      const handle = self.__BLDR_TINYGO_UNBOX_VALUE(go, handleRef)
+      const offset = Number(off)
+      handle.getFile()
+        .then(async (file) => {
+          if (offset >= file.size || dstLen === 0) {
+            self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 0)
+            return
+          }
+          const end = Math.min(offset + dstLen, file.size)
+          const buf = await file.slice(offset, end).arrayBuffer()
+          const bytes = new Uint8Array(buf)
+          if (bytes.byteLength !== 0) {
+            self.__BLDR_TINYGO_MEMORY_VIEW(go, dstPtr, bytes.byteLength).set(bytes)
+          }
+          self.__BLDR_TINYGO_OPFS_RESOLVE(opID, bytes.byteLength)
+        })
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.readSnapshotAtRef'] ??= (opID, snapshotID, dstPtr, dstLen, off) => {
+      const file = self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS.get(snapshotID)
+      if (!file) {
+        self.__BLDR_TINYGO_OPFS_REJECT(opID, 1)
+        return
+      }
+      const offset = Number(off)
+      const task = (async () => {
+        if (offset >= file.size || dstLen === 0) {
+          self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 0)
+          return
+        }
+        const end = Math.min(offset + dstLen, file.size)
+        const buf = await file.slice(offset, end).arrayBuffer()
+        if (
+          self.__BLDR_TINYGO_RUNTIME_EXITED ||
+          self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS.get(snapshotID) !== file
+        ) {
+          return
+        }
+        const bytes = new Uint8Array(buf)
+        if (bytes.byteLength !== 0) {
+          self.__BLDR_TINYGO_MEMORY_VIEW(go, dstPtr, bytes.byteLength).set(bytes)
+        }
+        self.__BLDR_TINYGO_OPFS_RESOLVE(opID, bytes.byteLength)
+      })().catch((reason) => {
+        if (
+          !self.__BLDR_TINYGO_RUNTIME_EXITED &&
+          self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS.get(snapshotID) === file
+        ) {
+          const code = reason?.name === 'NotReadableError'
+            ? 1
+            : self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)
+          self.__BLDR_TINYGO_OPFS_REJECT(opID, code)
+        }
+      })
+      self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+    }
+    go.importObject.gojs['bldr.opfs.closeReadSnapshotRef'] ??= (opID, snapshotID) => {
+      if (!self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS.has(snapshotID)) {
+        self.__BLDR_TINYGO_OPFS_REJECT(opID, 1)
+        return
+      }
+      self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS.delete(snapshotID)
+      self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 1)
+    }
+    go.importObject.gojs['bldr.opfs.listDirectoryRef'] ??= (opID, dirRef) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      ;(async () => {
+        const names = []
+        for await (const [name] of dir.entries()) {
+          names.push(name)
+        }
+        const bytes = self.__BLDR_TINYGO_ENCODE_NAMES(names)
+        self.__BLDR_TINYGO_OPFS_RESOLVE(opID, self.__BLDR_TINYGO_STORE_BYTES(bytes), bytes.byteLength)
+      })().catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.writeAtRef'] ??= (opID, handleRef, dataPtr, dataLen, off, keepExisting) => {
+      const handle = self.__BLDR_TINYGO_UNBOX_VALUE(go, handleRef)
+      const state = {}
+      try {
+        const writeData = self.__BLDR_TINYGO_COPY_BYTES(self.__BLDR_TINYGO_MEMORY_VIEW(go, dataPtr, dataLen))
+        const opts = keepExisting ? { keepExistingData: true } : undefined
+        const task = self.__BLDR_TINYGO_CREATE_OPFS_WRITABLE(handle, opts)
+          .then(async (next) => {
+            if (!next) {
+              return
+            }
+            state.writable = next
+            const offset = Number(off)
+            if (offset !== 0) {
+              await next.seek(offset)
+            }
+            if (writeData.byteLength !== 0) {
+              await next.write(writeData)
+            }
+            await next.close()
+            if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+              return
+            }
+            self.__BLDR_TINYGO_OPFS_RESOLVE(opID, writeData.byteLength)
+          })
+          .catch(async (reason) => {
+            await self.__BLDR_TINYGO_REJECT_OPFS_WRITABLE_FAILURE(opID, state.writable, reason)
+          })
+        self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+      } catch (reason) {
+        self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE_QUIETLY(state.writable)
+        if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+          self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason))
+        }
+      }
+    }
+    go.importObject.gojs['bldr.opfs.writeFileRef'] ??= (opID, dirRef, namePtr, nameLen, dataPtr, dataLen) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      const state = {}
+      try {
+        const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+        const writeData = self.__BLDR_TINYGO_COPY_BYTES(self.__BLDR_TINYGO_MEMORY_VIEW(go, dataPtr, dataLen))
+        const task = dir.getFileHandle(name, { create: true })
+          .then((handle) => self.__BLDR_TINYGO_CREATE_OPFS_WRITABLE(handle))
+          .then(async (next) => {
+            if (!next) {
+              return
+            }
+            state.writable = next
+            if (writeData.byteLength !== 0) {
+              await next.write(writeData)
+            }
+            await next.close()
+            if (self.__BLDR_TINYGO_RUNTIME_EXITED) {
+              return
+            }
+            self.__BLDR_TINYGO_OPFS_RESOLVE(opID, writeData.byteLength)
+          })
+          .catch(async (reason) => {
+            await self.__BLDR_TINYGO_REJECT_OPFS_WRITABLE_FAILURE(opID, state.writable, reason)
+          })
+        self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+    } catch (reason) {
+      self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE_QUIETLY(state.writable)
+      if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+        self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason))
+      }
+    }
+  }
+    go.importObject.gojs['bldr.opfs.openWriteStreamRef'] ??= (opID, dirRef, namePtr, nameLen) => {
+      const dir = self.__BLDR_TINYGO_UNBOX_VALUE(go, dirRef)
+      const state = {}
+      try {
+        const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+        const task = dir.getFileHandle(name, { create: true })
+          .then((handle) => self.__BLDR_TINYGO_CREATE_OPFS_WRITABLE(handle))
+          .then((next) => {
+            if (!next) {
+              return
+            }
+            state.writable = next
+            const streamID = self.__BLDR_TINYGO_OPFS_WRITE_STREAM_ID++
+            self.__BLDR_TINYGO_OPFS_WRITE_STREAMS.set(streamID, {
+              writable: next,
+              chain: Promise.resolve(),
+            })
+            self.__BLDR_TINYGO_OPFS_RESOLVE(opID, streamID)
+          })
+          .catch(async (reason) => {
+            await self.__BLDR_TINYGO_REJECT_OPFS_WRITABLE_FAILURE(opID, state.writable, reason)
+          })
+        self.__BLDR_TINYGO_TRACK_OPFS_TASK(task)
+      } catch (reason) {
+        self.__BLDR_TINYGO_ABORT_OPFS_WRITABLE_QUIETLY(state.writable)
+        if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+          self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason))
+        }
+      }
+    }
+    go.importObject.gojs['bldr.opfs.writeStreamRef'] ??= (opID, streamID, dataPtr, dataLen) => {
+      const stream = self.__BLDR_TINYGO_OPFS_WRITE_STREAMS.get(streamID)
+      if (!stream) {
+        self.__BLDR_TINYGO_OPFS_REJECT(opID, 1)
+        return
+      }
+      try {
+        const writeData = self.__BLDR_TINYGO_COPY_BYTES(self.__BLDR_TINYGO_MEMORY_VIEW(go, dataPtr, dataLen))
+        stream.chain = stream.chain
+          .then(async () => {
+            if (writeData.byteLength !== 0) {
+              await stream.writable.write(writeData)
+            }
+            self.__BLDR_TINYGO_OPFS_RESOLVE(opID, writeData.byteLength)
+          })
+          .catch((reason) => {
+            if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+              self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason))
+            }
+          })
+      } catch (reason) {
+        if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+          self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason))
+        }
+      }
+    }
+    go.importObject.gojs['bldr.opfs.closeWriteStreamRef'] ??= (opID, streamID) => {
+      const stream = self.__BLDR_TINYGO_OPFS_WRITE_STREAMS.get(streamID)
+      if (!stream) {
+        self.__BLDR_TINYGO_OPFS_REJECT(opID, 1)
+        return
+      }
+      stream.chain = stream.chain
+        .then(async () => {
+          await stream.writable.close()
+          self.__BLDR_TINYGO_OPFS_WRITE_STREAMS.delete(streamID)
+          self.__BLDR_TINYGO_OPFS_RESOLVE(opID, 1)
+        })
+        .catch((reason) => {
+          if (!self.__BLDR_TINYGO_RUNTIME_EXITED) {
+            self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason))
+          }
+        })
+    }
+    go.importObject.gojs['bldr.opfs.abortWriteStreamRef'] ??= (opID, streamID) => {
+      Promise.resolve(self.__BLDR_TINYGO_ABORT_OPFS_WRITE_STREAM(streamID, true))
+        .then((aborted) => self.__BLDR_TINYGO_OPFS_RESOLVE(opID, aborted ? 1 : 0))
+        .catch((reason) => self.__BLDR_TINYGO_OPFS_REJECT(opID, self.BLDR_TINYGO_PROMISE_ERROR_CODE(reason)))
+    }
+    go.importObject.gojs['bldr.opfs.broadcastChannelNewRef'] ??= (namePtr, nameLen) => {
+      const name = self.__BLDR_TINYGO_READ_STRING(go, namePtr, nameLen)
+      return self.__BLDR_TINYGO_BOX_VALUE(go, new BroadcastChannel(name))
+    }
+    go.importObject.gojs['bldr.opfs.broadcastSendRef'] ??= (channelRef, shardID, generationHi, generationLo) => {
+      const channel = self.__BLDR_TINYGO_UNBOX_VALUE(go, channelRef)
+      const msg = new Uint8Array(10)
+      const sid = shardID & 0xffff
+      const hi = generationHi >>> 0
+      const lo = generationLo >>> 0
+      msg[0] = (sid >>> 8) & 0xff
+      msg[1] = sid & 0xff
+      msg[2] = (hi >>> 24) & 0xff
+      msg[3] = (hi >>> 16) & 0xff
+      msg[4] = (hi >>> 8) & 0xff
+      msg[5] = hi & 0xff
+      msg[6] = (lo >>> 24) & 0xff
+      msg[7] = (lo >>> 16) & 0xff
+      msg[8] = (lo >>> 8) & 0xff
+      msg[9] = lo & 0xff
+      channel.postMessage(msg)
+    }
+    go.importObject.gojs['bldr.opfs.broadcastCloseRef'] ??= (channelRef) => {
+      self.__BLDR_TINYGO_UNBOX_VALUE(go, channelRef).close()
+    }
+  }
+  const res = await WebAssembly.instantiateStreaming(fetch('/testprog.wasm'), go.importObject)
+  try {
+    await go.run(res.instance)
+  } finally {
+    self.__BLDR_TINYGO_RUNTIME_EXITED = true
+    for (const [streamID] of self.__BLDR_TINYGO_OPFS_WRITE_STREAMS) {
+      void self.__BLDR_TINYGO_ABORT_OPFS_WRITE_STREAM(streamID)
+    }
+    self.__BLDR_TINYGO_OPFS_READ_SNAPSHOTS.clear()
+    await self.__BLDR_TINYGO_AWAIT_OPFS_TASKS()
+  }
+}
+`
+
+// chrometestGPUEnabled reports whether the operator opted into the full
+// GPU-optimized chromium channel (E2E_CHROMIUM_GPU) instead of the
+// CPU-rendered headless shell.
+func chrometestGPUEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("E2E_CHROMIUM_GPU"))) {
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return true
+	}
+}

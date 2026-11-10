@@ -1,0 +1,102 @@
+//go:build !js
+
+package bldr_plugin_compiler
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+
+	"github.com/s4wave/spacewave/bldr/distpath"
+	bldr_plugin "github.com/s4wave/spacewave/bldr/plugin"
+	"github.com/s4wave/spacewave/bldr/util/npm"
+	bldr_web_bundler "github.com/s4wave/spacewave/bldr/web/bundler"
+	bldr_vite "github.com/s4wave/spacewave/bldr/web/bundler/vite"
+	web_pkg "github.com/s4wave/spacewave/bldr/web/pkg"
+	web_pkg_external "github.com/s4wave/spacewave/bldr/web/pkg/external"
+	web_pkg_vite "github.com/s4wave/spacewave/bldr/web/pkg/vite"
+	"github.com/sirupsen/logrus"
+)
+
+// BuildDirectWebPkgs builds the BldrExternal web packages directly using Vite.
+//
+// This is used when web packages are declared but no esbuild/vite sub-manifests
+// exist to build them (e.g. in the saucer flow).
+// Returns the web pkg refs, source files, and import map entries mapping
+// logical specifiers to hashed output paths.
+func BuildDirectWebPkgs(
+	ctx context.Context,
+	le *logrus.Entry,
+	distSourcePath string,
+	sourcePath string,
+	workingPath string,
+	outAssetsPath string,
+	isRelease bool,
+	jsMinification bool,
+	jsSourcemaps bool,
+	webPkgConfigs []*bldr_web_bundler.WebPkgRefConfig,
+) (web_pkg.WebPkgRefSlice, []string, []web_pkg_vite.ImportMapEntry, error) {
+	// Resolve the working and output asset paths to absolute paths.
+	var err error
+	workingPath, err = filepath.Abs(workingPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	outAssetsPath, err = filepath.Abs(outAssetsPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Install dist deps (cached: skips if package.json unchanged; the shared
+	// cache reuses one install across projects).
+	buildPkgsDir, err := npm.EnsureSharedBunInstall(
+		ctx, le, workingPath,
+		distpath.Resolve(distSourcePath, "dist", "deps", "package.json"),
+		filepath.Join(workingPath, "build", "web-pkgs"),
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Get web package refs with resolved source paths.
+	refs := web_pkg_external.GetBldrDistWebPkgRefs(buildPkgsDir, distSourcePath)
+	refs = bldr_web_bundler.MergeWebPkgRefConfigImports(refs, webPkgConfigs)
+
+	// Build web packages with Vite via a one-shot process.
+	le.Debug("building web packages with vite")
+	outWebPkgsPath := filepath.Join(outAssetsPath, bldr_plugin.PluginAssetsWebPkgsDir)
+	viteWorkingPath, err := os.MkdirTemp("", "bldr-vite-web-pkgs-")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer os.RemoveAll(viteWorkingPath)
+
+	// Run the one-shot Vite bundler and collect the built outputs.
+	var importMapEntries []web_pkg_vite.ImportMapEntry
+	var srcFiles []string
+	err = web_pkg_vite.RunOneShot(ctx, le, distSourcePath, sourcePath, viteWorkingPath, func(ctx context.Context, client bldr_vite.SRPCViteBundlerClient) error {
+		_, builtSrcFiles, entries, buildErr := web_pkg_vite.BuildWebPkgsViteWithManagedRoot(
+			ctx,
+			le,
+			sourcePath,
+			workingPath,
+			refs,
+			nil,
+			outWebPkgsPath,
+			bldr_plugin.PluginWebPkgHttpPrefix,
+			isRelease,
+			jsMinification,
+			jsSourcemaps,
+			client,
+			filepath.Join(viteWorkingPath, "cache"),
+		)
+		srcFiles = builtSrcFiles
+		importMapEntries = entries
+		return buildErr
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return refs, srcFiles, importMapEntries, nil
+}

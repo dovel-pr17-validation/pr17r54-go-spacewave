@@ -1,0 +1,235 @@
+package psecho
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/util/keyed"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	dex_session "github.com/s4wave/spacewave/db/dex/session"
+	"github.com/s4wave/spacewave/net/link"
+	"github.com/s4wave/spacewave/net/stream"
+)
+
+// WithLocalOnly is a shorthand for bucket_lookup.WithLocalOnly.
+var WithLocalOnly = bucket_lookup.WithLocalOnly
+
+// getBucketLookup builds a bucket lookup handle.
+// Returns the lookup, a release function, and any error.
+func (c *Controller) getBucketLookup(ctx context.Context) (bucket_lookup.Lookup, func(), error) {
+	// Resolve the bucket lookup and retain its directive until release.
+	lkv, _, lkRef, err := bucket_lookup.ExBuildBucketLookup(ctx, c.b, false, c.cc.GetBucketId(), nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	lk, err := lkv.GetLookup(ctx)
+	if err != nil {
+		lkRef.Release()
+		return nil, nil, err
+	}
+	if lk == nil {
+		lkRef.Release()
+		return nil, nil, nil
+	}
+	return lk, func() { lkRef.Release() }, nil
+}
+
+func filterLocalExistingBlocks(
+	ctx context.Context,
+	lk bucket_lookup.Lookup,
+	refs []*block.BlockRef,
+) ([]*block.BlockRef, error) {
+	// Prefer the batch existence lookup for the requested references.
+	found, err := lk.LookupBlockExistsBatch(ctx, refs, WithLocalOnly())
+	if err != nil {
+		return filterLocalExistingBlocksIndividually(ctx, lk, refs), nil
+	}
+	if len(found) != len(refs) {
+		return nil, errors.Errorf("lookup exists batch returned %d results for %d refs", len(found), len(refs))
+	}
+
+	// Queue references confirmed present in the local store.
+	queued := make([]*block.BlockRef, 0, len(refs))
+	for i, ok := range found {
+		if ok {
+			queued = append(queued, refs[i])
+		}
+	}
+	return queued, nil
+}
+
+func filterLocalExistingBlocksIndividually(
+	ctx context.Context,
+	lk bucket_lookup.Lookup,
+	refs []*block.BlockRef,
+) []*block.BlockRef {
+	queued := make([]*block.BlockRef, 0, len(refs))
+	for _, ref := range refs {
+		_, ok, err := lk.LookupBlock(ctx, ref, WithLocalOnly())
+		if err == nil && ok {
+			queued = append(queued, ref)
+		}
+	}
+	return queued
+}
+
+// buildIncomingRoutine constructs a routine for an incoming stream session.
+func (c *Controller) buildIncomingRoutine(key sessionKey) (keyed.Routine, struct{}) {
+	return func(ctx context.Context) error {
+		return c.runIncomingStream(ctx, key)
+	}, struct{}{}
+}
+
+// runIncomingStream handles an incoming sync stream.
+func (c *Controller) runIncomingStream(ctx context.Context, key sessionKey) error {
+	// Claim the queued incoming stream for this peer session.
+	var ms link.MountedStream
+	c.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		ms = c.incoming[key]
+		delete(c.incoming, key)
+	})
+	if ms == nil {
+		return nil
+	}
+
+	// Identify the incoming peer when reporting stream failures.
+	le := c.le.WithField("remote-peer", key.PeerID.String()).WithField("direction", "incoming")
+
+	// Hold the link open while processing.
+	_, lnkRef, err := c.b.AddDirective(
+		ctx,
+		link.NewEstablishLinkWithPeer(ms.GetLink().GetLocalPeer(), ms.GetPeerID()),
+		nil,
+	)
+	if err != nil {
+		ms.GetStream().Close()
+		return err
+	}
+	defer lnkRef.Release()
+	defer ms.GetStream().Close()
+
+	// Receive requested blocks through the configured exchange session.
+	sess := dex_session.NewDexSession(
+		ms.GetStream(),
+		int(c.cc.GetChunkSizeOrDefault()),
+		c.cc.GetMaxBlockSizeOrDefault(),
+	)
+	for {
+		// Stop receiving blocks when the incoming stream context is canceled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Receive the next block or finish when the peer ends its stream.
+		reqID, ref, data, err := sess.ReceiveBlock(c.cc.GetMaxBlockSizeOrDefault())
+		if err != nil {
+			le.WithError(err).Debug("incoming stream ended")
+			return nil
+		}
+
+		// Refuse bytes that do not match their ref.
+		if err := ref.VerifyData(data, true); err != nil {
+			le.WithError(err).Warn("received block does not match its ref")
+			continue
+		}
+
+		// Hand the block to the lookups waiting for it, which removes it from
+		// the want list. It is not stored, as Resolve describes.
+		var wanted bool
+		c.bcast.HoldLock(func(bcast func(), _ func() <-chan struct{}) {
+			w := c.wants[ref.MarshalString()]
+			if w != nil && w.data == nil {
+				w.data, wanted = data, true
+				bcast()
+			}
+		})
+		if !wanted {
+			_ = sess.SendCancel(reqID)
+			continue
+		}
+		le.WithField("ref", ref.MarshalString()).Debug("received block from peer")
+	}
+}
+
+// buildOutgoingRoutine constructs a routine for an outgoing stream session.
+func (c *Controller) buildOutgoingRoutine(key sessionKey) (keyed.Routine, struct{}) {
+	return func(ctx context.Context) error {
+		return c.runOutgoingStream(ctx, key)
+	}, struct{}{}
+}
+
+// runOutgoingStream handles an outgoing sync stream to push blocks.
+func (c *Controller) runOutgoingStream(ctx context.Context, key sessionKey) error {
+	// Identify the outgoing peer when reporting stream failures.
+	le := c.le.WithField("remote-peer", key.PeerID.String()).WithField("direction", "outgoing")
+
+	// Open a stream to the remote peer.
+	ms, rel, err := link.OpenStreamWithPeerEx(
+		ctx, c.b, syncProtocolID,
+		c.peerID, key.PeerID,
+		c.cc.GetTransportId(),
+		stream.OpenOpts{},
+	)
+	if err != nil {
+		return errors.Wrap(err, "open stream")
+	}
+	defer rel()
+	defer ms.GetStream().Close()
+
+	// Send queued blocks through the configured exchange session.
+	sess := dex_session.NewDexSession(
+		ms.GetStream(),
+		int(c.cc.GetChunkSizeOrDefault()),
+		c.cc.GetMaxBlockSizeOrDefault(),
+	)
+	for {
+		// Stop sending blocks when the outgoing stream context is canceled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Pop next ref from send queue.
+		var ref *block.BlockRef
+		c.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+			rp, ok := c.remotePeers[key.PeerID]
+			if !ok || len(rp.sendQueue) == 0 {
+				return
+			}
+			ref = rp.sendQueue[0]
+			rp.sendQueue = rp.sendQueue[1:]
+		})
+		if ref == nil {
+			le.Debug("send queue empty, closing outgoing stream")
+			return nil
+		}
+
+		// Look up the block data.
+		lk, lkRel, lerr := c.getBucketLookup(ctx)
+		if lerr != nil || lk == nil {
+			le.WithError(lerr).Warn("failed to get bucket lookup for outgoing")
+			continue
+		}
+		data, ok, lerr := lk.LookupBlock(ctx, ref, WithLocalOnly())
+		lkRel()
+		if lerr != nil || !ok {
+			continue
+		}
+
+		// Send the block.
+		le.WithField("ref", ref.MarshalString()).Debug("sending block to peer")
+		if err := sess.SendBlock(c.nextRequestID(), ref, data); err != nil {
+			return errors.Wrap(err, "send block")
+		}
+	}
+}
+
+// nextRequestID generates the next request ID.
+func (c *Controller) nextRequestID() uint64 {
+	var id uint64
+	c.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		c.nextNonce++
+		id = c.nextNonce
+	})
+	return id
+}

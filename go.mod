@@ -1,0 +1,194 @@
+module github.com/s4wave/spacewave
+
+go 1.27.0
+
+tool github.com/s4wave/goscript/cmd/goscript
+
+replace (
+	github.com/cloudflare/circl => github.com/aperturerobotics/circl v1.6.4-0.20261026102657-7415ab3046b7
+	github.com/dolthub/go-mysql-server => github.com/aperturerobotics/go-mysql-server v0.20.1-0.20261024013424-a1751f2da19d
+	github.com/dolthub/jsonpath => github.com/aperturerobotics/jsonpath v0.1.1-0.20260922211658-605a6e457746
+	github.com/dolthub/vitess => github.com/aperturerobotics/vitess v0.0.0-20261108201950-8dc30550ec17 // aperture
+	github.com/go-git/go-git/v6 => github.com/aperturerobotics/go-git/v6 v6.0.0-alpha.3.0.20261003021338-72ab61d58aa6
+	github.com/pion/datachannel => github.com/aperturerobotics/pion-datachannel v1.6.4-0.20261105123030-289a2b049b5f // main
+	github.com/pion/ice/v4 => github.com/aperturerobotics/pion-ice/v4 v4.0.0-20260923005200-d591ff5895c0
+	github.com/pion/webrtc/v4 => github.com/aperturerobotics/pion-webrtc/v4 v4.2.16-0.20260922235615-c5c6104de130
+	github.com/prometheus/prometheus => github.com/aperturerobotics/prometheus-lite v1.8.2-0.20261019050928-a707a2bc1598 // master
+	github.com/sirupsen/logrus => github.com/aperturerobotics/logrus v1.10.2-0.20260922042813-73f013325281 // master
+	github.com/tetratelabs/wazero => github.com/aperturerobotics/wazero v0.0.0-20261015230425-cef9eb51e433 // wazevo-check-exit-countdown
+)
+
+require (
+	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5
+	filippo.io/age v1.3.2
+	filippo.io/edwards25519 v1.2.0
+	github.com/Microsoft/go-winio v0.6.4
+	github.com/aperturerobotics/bbolt v0.0.0-20261024221644-3def6903e63a // master
+	github.com/aperturerobotics/bldr-saucer v0.4.4
+	github.com/aperturerobotics/cayley v0.15.1-0.20261026172548-43cf8e6be6cb
+	github.com/aperturerobotics/cli v1.1.1-0.20261024231437-afc764ba6d68 // master
+	github.com/aperturerobotics/common v0.38.3
+	github.com/aperturerobotics/controllerbus v0.53.6-0.20261101202130-19d64da664cd // master
+	github.com/aperturerobotics/cpp-yamux v0.0.0-20261024231300-09c82549af7a
+	github.com/aperturerobotics/esbuild v0.24.1-0.20260219011422-6d4b923e2023 // https://github.com/evanw/esbuild/pull/3413 [rejected]
+	github.com/aperturerobotics/fastjson v0.1.2-0.20261024220211-b654d1d5b5aa
+	github.com/aperturerobotics/fsnotify v1.9.1-0.20261007093243-45a75ed654f0 // master
+	github.com/aperturerobotics/go-brotli-decoder v1.3.0
+	github.com/aperturerobotics/go-kvfile v0.10.1-0.20261024231416-0a1dc13010cd // master
+	github.com/aperturerobotics/go-multiaddr v0.17.1-0.20260514224402-c193991c3ce5
+	github.com/aperturerobotics/go-prometheus-client-lite v1.23.3-0.20261024041454-92147463582b
+	github.com/aperturerobotics/go-quickjs-wasi-reactor v0.15.2-0.20261026103803-2730c79cc47e
+	github.com/aperturerobotics/go-quickjs-wasi-reactor/wazero-quickjs v0.0.0-20261026103803-2730c79cc47e
+	github.com/aperturerobotics/go-websocket v1.8.15-0.20261024221652-c1205734f50c
+	github.com/aperturerobotics/go-winjob v0.0.0-20261024222822-b7a5589690d2
+	github.com/aperturerobotics/json-iterator-lite v1.1.0 // latest
+	github.com/aperturerobotics/protobuf-go-lite v0.19.1-0.20261028131920-f644656fc4a7 // master
+	github.com/aperturerobotics/starpc v0.52.4-0.20261024233818-0a9074172c29 // master
+	github.com/aperturerobotics/util v1.34.10-0.20261108210205-d8754415b105 // master
+	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/cloudflare/circl v1.6.5
+	github.com/cockroachdb/apd/v3 v3.2.3
+	github.com/creack/pty v1.1.24
+	github.com/dolthub/go-mysql-server v0.20.1-0.20261030230720-02aadeeae4f1
+	github.com/dolthub/vitess v0.0.0-20261014211039-3e903c0f05d3
+	github.com/dustin/go-humanize v1.1.0
+	github.com/fatih/color v1.19.0
+	github.com/fclairamb/ftpserverlib v0.32.7
+	github.com/ghodss/yaml v1.0.0
+	github.com/go-git/go-billy/v6 v6.0.0-beta.1.0.20261109134749-d67c9b5cfb14 // main
+	github.com/go-git/go-git/v6 v6.0.0-beta.1.0.20261109134919-12b788e49978 // main
+	github.com/go-sql-driver/mysql v1.10.1
+	github.com/goccy/go-json v0.12.0
+	github.com/gomodule/redigo v2.0.0+incompatible
+	github.com/google/pprof v0.0.0-20261026192309-dbd0ed30aa88
+	github.com/google/uuid v1.6.0
+	github.com/hack-pad/safejs v0.1.1
+	github.com/jezek/xgb v1.3.1
+	github.com/jlaffaye/ftp v0.2.4
+	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
+	github.com/klauspost/compress v1.20.3
+	github.com/libp2p/go-yamux/v5 v5.1.0
+	github.com/manifoldco/promptui v0.9.0
+	github.com/mattn/go-isatty v0.0.24
+	github.com/mattn/go-sqlite3 v2.0.3+incompatible
+	github.com/mr-tron/base58 v1.3.0
+	github.com/mxschmitt/playwright-go v0.6201.1
+	github.com/ncruces/go-sqlite3 v0.36.0
+	github.com/pierrec/lz4/v4 v4.1.33
+	github.com/pion/datachannel v1.6.3
+	github.com/pion/logging v0.2.4
+	github.com/pion/sdp/v3 v3.0.20
+	github.com/pion/transport/v5 v5.1.4
+	github.com/pion/turn/v5 v5.1.2
+	github.com/pion/webrtc/v4 v4.2.26
+	github.com/pkg/errors v0.9.1
+	github.com/pkg/sftp v1.13.12
+	github.com/prometheus/common v0.73.1
+	github.com/prometheus/prometheus v0.315.1
+	github.com/quic-go/quic-go v0.64.1
+	github.com/restic/chunker v0.5.0
+	github.com/s4wave/goscript v0.6.4
+	github.com/sasha-s/go-deadlock v0.3.9
+	github.com/satori/go.uuid v1.2.0
+	github.com/sergi/go-diff v1.4.0
+	github.com/sirupsen/logrus v1.10.2
+	github.com/spf13/afero v1.15.0
+	github.com/spf13/cast v1.10.0
+	github.com/tetratelabs/wazero v1.12.1-0.20261019203559-ef2dd2f85376
+	github.com/tidwall/btree v1.8.2
+	github.com/vmihailenco/msgpack/v5 v5.4.1
+	github.com/whilp/git-urls v1.0.0
+	github.com/zeebo/blake3 v0.2.4
+	go.starlark.net v0.0.0-20261021141710-4f4267fb140d
+	golang.org/x/crypto v0.58.0
+	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e
+	golang.org/x/mod v0.43.0 // latest
+	golang.org/x/sync v0.24.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/term v0.47.0
+	golang.org/x/time v0.16.0
+	golang.org/x/tools v0.52.0 // latest
+	google.golang.org/protobuf v1.36.12
+	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
+	gorm.io/gorm v1.31.2
+	gotest.tools/v3 v3.5.2
+	modernc.org/sqlite v1.61.1
+)
+
+require (
+	filippo.io/hpke v0.4.0 // indirect
+	github.com/aperturerobotics/abseil-cpp v0.0.0-20260131110040-4bb56e2f9017 // indirect
+	github.com/aperturerobotics/go-multibase v0.4.0 // indirect
+	github.com/aperturerobotics/go-protoc-gen-prost v0.0.0-20261003014807-d46d22154f35 // indirect
+	github.com/aperturerobotics/go-protoc-wasi v0.0.0-20260808023521-7b1595380c3f // indirect
+	github.com/aperturerobotics/protobuf v0.0.0-20260203024654-8201686529c4 // indirect
+	github.com/aperturerobotics/saucer v0.0.0-20260317232052-4db05a4e0b4c // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bwesterb/go-ristretto v1.2.4 // indirect
+	github.com/chzyer/readline v1.5.1 // indirect
+	github.com/deckarep/golang-set/v2 v2.8.0 // indirect
+	github.com/dolthub/flatbuffers/v23 v23.3.3-dh.2 // indirect
+	github.com/dolthub/go-icu-regex v0.0.0-20260610153742-72563bc7ca83 // indirect
+	github.com/dolthub/jsonpath v0.0.2-0.20260807003725-336cd89c1c76 // indirect
+	github.com/emirpasic/gods v1.18.1 // indirect
+	github.com/facette/natsort v0.0.0-20181210072756-2cd4dd1e2dcb // indirect
+	github.com/go-stack/stack v1.8.1 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/grafana/regexp v0.0.0-20250905093917-f7b3be9d1853 // indirect
+	github.com/hashicorp/golang-lru v0.5.4 // indirect
+	github.com/jinzhu/inflection v1.0.0 // indirect
+	github.com/jinzhu/now v1.1.5 // indirect
+	github.com/kevinburke/ssh_config v1.6.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/kr/fs v0.1.0 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
+	github.com/kr/text v0.2.0 // indirect
+	github.com/lestrrat-go/strftime v1.2.0 // indirect
+	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/minio/sha256-simd v1.0.1 // indirect
+	github.com/multiformats/go-multihash v0.2.3 // indirect
+	github.com/multiformats/go-varint v0.0.7 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/ncruces/go-sqlite3-wasm/v6 v6.4.35401 // indirect
+	github.com/ncruces/go-strftime v1.1.0 // indirect
+	github.com/ncruces/julianday v1.0.0 // indirect
+	github.com/pandatix/go-abnf v0.5.3 // indirect
+	github.com/petermattis/goid v0.0.0-20250813065127-a731cc31b4fe // indirect
+	github.com/pion/dtls/v3 v3.1.9 // indirect
+	github.com/pion/ice/v4 v4.4.4 // indirect
+	github.com/pion/interceptor v0.1.49 // indirect
+	github.com/pion/mdns/v2 v2.2.1 // indirect
+	github.com/pion/randutil v0.1.0 // indirect
+	github.com/pion/rtcp v1.2.17 // indirect
+	github.com/pion/rtp v1.10.5 // indirect
+	github.com/pion/sctp v1.12.0 // indirect
+	github.com/pion/srtp/v3 v3.1.0 // indirect
+	github.com/pion/stun/v4 v4.0.1 // indirect
+	github.com/pjbgf/sha1cd v0.6.0 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/prometheus/client_golang v1.24.1 // indirect
+	github.com/prometheus/client_model v0.6.3 // indirect
+	github.com/prometheus/procfs v0.21.1 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/rogpeppe/go-internal v1.16.0 // indirect
+	github.com/spaolacci/murmur3 v1.1.0 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+	github.com/wlynxg/anet v0.0.5 // indirect
+	github.com/xrash/smetrics v0.0.0-20261013231157-39c47d93efba // indirect
+	github.com/zeebo/assert v1.3.0 // indirect
+	go.opentelemetry.io/otel v1.44.0 // indirect
+	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/telemetry v0.0.0-20261009151841-97e8ea77aa2a // indirect
+	golang.org/x/text v0.43.0 // indirect
+	gopkg.in/src-d/go-errors.v1 v1.0.0 // indirect
+	gopkg.in/yaml.v2 v2.4.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+	lukechampine.com/blake3 v1.2.1 // indirect
+	modernc.org/libc v1.79.0 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.12.1 // indirect
+)

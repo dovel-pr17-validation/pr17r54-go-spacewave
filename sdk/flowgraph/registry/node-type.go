@@ -1,0 +1,60 @@
+// Package flowgraph_registry carries plugin node declarations and compiler RPCs.
+package flowgraph_registry
+
+import (
+	"slices"
+	"strings"
+
+	"github.com/pkg/errors"
+)
+
+// Validate requires a namespaced type ID, a display name and distinct config
+// declarations, with the plugin config IDs a subset of the config IDs.
+//
+// A plugin type ID is a slash-separated path of nonempty segments, such as
+// "flowgraph/stream-echo". Core node type IDs are bare, so the slash keeps a
+// plugin from claiming a core ID and having the Device compile a core node
+// with the plugin's compiler.
+func (n *NodeType) Validate() error {
+	// Require metadata that the Device uses to resolve and label the node.
+	if n.GetTypeId() == "" || n.GetDisplayName() == "" {
+		return errors.New("node type ID and display name are required")
+	}
+
+	// Keep plugin IDs disjoint from the bare core IDs.
+	segments := strings.Split(n.GetTypeId(), "/")
+	if len(segments) < 2 || slices.Contains(segments, "") {
+		return errors.Errorf("node type ID %q must be a slash-separated namespaced path", n.GetTypeId())
+	}
+
+	// Keep the allowed controller set unambiguous.
+	ids := make(map[string]struct{}, len(n.GetConfigIds()))
+	for _, id := range n.GetConfigIds() {
+		if _, exists := ids[id]; id == "" || exists {
+			return errors.New("node type config IDs must be nonempty and distinct")
+		}
+		ids[id] = struct{}{}
+	}
+
+	// Run in the plugin only configs the compiler declares, each once.
+	plugin := make(map[string]struct{}, len(n.GetPluginConfigIds()))
+	for _, id := range n.GetPluginConfigIds() {
+		if _, declared := ids[id]; !declared {
+			return errors.Errorf("plugin config ID %q is not a declared config ID", id)
+		}
+		if _, exists := plugin[id]; exists {
+			return errors.Errorf("plugin config ID %q is listed twice", id)
+		}
+		plugin[id] = struct{}{}
+	}
+
+	// Keep the service grant unambiguous.
+	services := make(map[string]struct{}, len(n.GetPluginServiceIds()))
+	for _, id := range n.GetPluginServiceIds() {
+		if _, exists := services[id]; id == "" || exists {
+			return errors.New("plugin service IDs must be nonempty and distinct")
+		}
+		services[id] = struct{}{}
+	}
+	return nil
+}

@@ -1,0 +1,185 @@
+package block_store_rpc_lookup
+
+import (
+	"bytes"
+	"context"
+	"testing"
+
+	volume_kvtx "github.com/s4wave/spacewave/db/volume/common/kvtx"
+
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/configset"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/s4wave/spacewave/db/block"
+	block_rpc "github.com/s4wave/spacewave/db/block/rpc"
+	block_store_rpc_server_bucket "github.com/s4wave/spacewave/db/block/store/rpc/server/bucket"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	lookup_concurrent "github.com/s4wave/spacewave/db/bucket/lookup/concurrent"
+	"github.com/s4wave/spacewave/db/testbed"
+	"github.com/s4wave/spacewave/net/hash"
+	bifrost_rpc "github.com/s4wave/spacewave/net/rpc"
+	"github.com/sirupsen/logrus"
+)
+
+// TestBlockStoreRPCLookup tests the block store rpc lookup controller.
+func TestBlockStoreRPCLookup(t *testing.T) {
+	// Prepare the RPC block-store test context and debug logger.
+	ctx := context.Background()
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	le := logrus.NewEntry(log)
+
+	// Start the storage testbed serving the source block over RPC.
+	serverTb, err := testbed.NewTestbed(ctx, le.WithField("testbed", "server"))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer serverTb.Release()
+
+	// Store a tracked leaf so the RPC reply can carry known empty refs.
+	serverBkt, _, serverBktRef, err := bucket.ExBuildBucketAPI(ctx, serverTb.Bus, false, serverTb.BucketId, serverTb.Volume.GetID(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverBktRef.Release()
+	sampleBlockBody := []byte("How hard are these tests? What exactly was in that phonebook of a contract I signed?")
+	samplePutOpts := &block.PutOpts{HashType: hash.HashType_HashType_BLAKE3, RefsKnown: true}
+	sampleBlockRef, _, err := serverBkt.GetBucket().PutBlock(ctx, sampleBlockBody, samplePutOpts)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	le.Infof("put sample block ref %v", sampleBlockRef.MarshalString())
+
+	// Create the RPC server, handles LookupRpcService
+	serviceID := block_rpc.SRPCBlockStoreServiceID
+	bucketID := serverTb.BucketId
+	serverCtrl := block_store_rpc_server_bucket.NewController(serverTb.Bus, &block_store_rpc_server_bucket.Config{
+		BucketId:  bucketID,
+		ServiceId: serviceID,
+	})
+	serverRel, err := serverTb.Bus.AddController(ctx, serverCtrl, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer serverRel()
+
+	// create the srpc server
+	server := srpc.NewServer(bifrost_rpc.NewInvoker(serverTb.Bus, "test-server", false))
+	srpcClient := srpc.NewClient(srpc.NewServerPipe(server))
+
+	// Create the client
+	clientTb, err := testbed.NewTestbed(ctx, le.WithField("testbed", "client"))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer clientTb.Release()
+	clientTb.StaticResolver.AddFactory(NewFactory(clientTb.Bus))
+
+	// Add the client controller
+	clientServiceID := "test-server/" + serviceID
+	clientCtrl := bifrost_rpc.NewClientController(
+		clientTb.Logger,
+		clientTb.Bus,
+		controller.NewInfo("test/lookup/client", controller.MustParseVersion("0.0.1"), ""),
+		srpcClient,
+		[]string{"test-server/"},
+	)
+	clientRel, err := clientTb.Bus.AddController(ctx, clientCtrl, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer clientRel()
+
+	// Create the bucket in the client
+	// override the bucket config with v2
+	bucketLkConfig, err := bucket.NewLookupConfig(configset.NewControllerConfig(1, &lookup_concurrent.Config{
+		// enable looking up via directive
+		NotFoundBehavior:  lookup_concurrent.NotFoundBehavior_NotFoundBehavior_LOOKUP_DIRECTIVE,
+		WritebackBehavior: lookup_concurrent.WritebackBehavior_WritebackBehavior_ALL,
+	}))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	bucketConf, err := bucket.NewConfig(bucketID, 2, bucketLkConfig)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	_, err = bucket.ExApplyBucketConfig(ctx, clientTb.Bus, bucket.NewApplyBucketConfig(bucketConf, nil, []string{clientTb.Volume.GetID()}))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the lookup controller
+	_, _, lookupCtrlRel, err := loader.WaitExecControllerRunning(
+		ctx,
+		clientTb.Bus,
+		resolver.NewLoadControllerWithConfig(NewConfig(bucketID, clientServiceID)),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer lookupCtrlRel.Release()
+
+	// Create the bucket lookup handle
+	lkr, _, lkRef, err := bucket_lookup.ExBuildBucketLookup(ctx, clientTb.Bus, false, bucketID, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer lkRef.Release()
+
+	// Acquire the configured client bucket lookup interface.
+	lk, err := lkr.GetLookup(ctx)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Fetch the sample block through the RPC-backed bucket lookup.
+	lkDat, lkFound, err := lk.LookupBlock(ctx, sampleBlockRef.Clone())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Verify the RPC-backed lookup returns the original block bytes.
+	if !lkFound {
+		t.FailNow()
+	}
+	if !bytes.Equal(lkDat, sampleBlockBody) {
+		t.FailNow()
+	}
+
+	// check if write-back worked
+	readBkt, _, readBktRef, err := bucket.ExBuildBucketAPI(ctx, clientTb.Bus, false, bucketID, clientTb.Volume.GetID(), nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	defer readBktRef.Release()
+
+	// Verify the RPC-fetched block was written back into the client bucket.
+	ex, err := readBkt.GetBucket().GetBlockExists(ctx, sampleBlockRef.Clone())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !ex {
+		t.Fatal("expected to write back block to bucket but did not")
+	}
+
+	// Serve bytes stored below the volume without their references over the
+	// same RPC route, without caching a false leaf.
+	untrackedData := []byte("untracked block")
+	untrackedRef, _, err := serverTb.Volume.(*volume_kvtx.Volume).Store.PutBlock(ctx, untrackedData, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := lk.LookupBlock(ctx, untrackedRef)
+	if err != nil || !found || !bytes.Equal(got, untrackedData) {
+		t.Fatalf("untracked lookup = %q/%v/%v", got, found, err)
+	}
+	cached, err := readBkt.GetBucket().GetBlockExists(ctx, untrackedRef)
+	if err != nil || cached {
+		t.Fatalf("untracked writeback = %v/%v, want absent", cached, err)
+	}
+}

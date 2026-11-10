@@ -1,0 +1,65 @@
+import type { ReactNode } from 'react'
+import { Route } from '@s4wave/web/router/router.js'
+import { PlanSelectionPage } from './PlanSelectionPage.js'
+import { PlanPageRouter } from './PlanPageRouter.js'
+import { UpgradeRouter } from './UpgradeRouter.js'
+import { UpgradeLoginPage } from './UpgradeLoginPage.js'
+import { MigrateDecisionPage } from './MigrateDecisionPage.js'
+import { VerifyEmailPage } from './VerifyEmailPage.js'
+import { DeleteCloudAccountPage } from './DeleteCloudAccountPage.js'
+import { NoActiveBillingAccountPage } from './NoActiveBillingAccountPage.js'
+import { LocalSessionSetup } from '@s4wave/app/session/setup/LocalSessionSetup.js'
+import { SessionFlowFrame } from '@s4wave/app/session/SessionFlowFrame.js'
+import type { SessionMetadata } from '@s4wave/core/session/session.pb.js'
+
+// SpacewaveSessionRoutesOptions configures shared route wrappers.
+export interface SpacewaveSessionRoutesOptions {
+  fallbackPath: string
+}
+
+// spacewaveSessionRoutes returns spacewave-specific route elements (plan,
+// billing, upgrade, email verification) for use inside SessionContainer's
+// Routes. Returns an array of Route elements that collectRoutes can flatten.
+export function spacewaveSessionRoutes(
+  metadata?: SessionMetadata,
+  options: SpacewaveSessionRoutesOptions = { fallbackPath: '../' },
+): ReactNode[] {
+  const frame = (children: ReactNode) => (
+    <SessionFlowFrame fallbackPath={options.fallbackPath}>
+      {children}
+    </SessionFlowFrame>
+  )
+
+  return [
+    <Route key="plan-success" path="/plan/success">
+      {frame(<PlanSelectionPage checkoutResult="success" />)}
+    </Route>,
+    <Route key="plan-cancel" path="/plan/cancel">
+      {frame(<PlanSelectionPage checkoutResult="cancel" />)}
+    </Route>,
+    <Route key="plan-upgrade-login" path="/plan/upgrade/login">
+      {frame(<UpgradeLoginPage />)}
+    </Route>,
+    <Route key="plan-upgrade" path="/plan/upgrade">
+      {frame(<UpgradeRouter />)}
+    </Route>,
+    <Route key="plan-migrate" path="/plan/migrate">
+      {frame(<MigrateDecisionPage />)}
+    </Route>,
+    <Route key="plan-free" path="/plan/free">
+      {frame(<LocalSessionSetup mode="cloud" metadata={metadata} />)}
+    </Route>,
+    <Route key="plan-no-active" path="/plan/no-active">
+      {frame(<NoActiveBillingAccountPage />)}
+    </Route>,
+    <Route key="plan" path="/plan">
+      {frame(<PlanPageRouter />)}
+    </Route>,
+    <Route key="verify-email" path="/verify-email">
+      <VerifyEmailPage />
+    </Route>,
+    <Route key="delete-account" path="/delete-account">
+      <DeleteCloudAccountPage />
+    </Route>,
+  ]
+}

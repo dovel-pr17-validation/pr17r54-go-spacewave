@@ -1,0 +1,276 @@
+package kvtx
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+
+	"github.com/s4wave/spacewave/db/tx"
+)
+
+// TxStoreTx implements the Tx interface backed by a TxOps
+// See TxStore.
+type TxStoreTx struct {
+	// tx is the underlying tx
+	tx TxOps
+	// rmtx guards discarded field
+	rmtx sync.RWMutex
+	// discarded indicates the tx was already discarded
+	discarded bool
+	// wrote records writes for the owning TxStore, nil outside a TxStore.
+	wrote *atomic.Bool
+}
+
+// NewTxStoreTx constructs a new TxStoreTx from a TxOps.
+func NewTxStoreTx(ops TxOps) (*TxStoreTx, error) {
+	if ops == nil {
+		return nil, errors.New("tx ops cannot be empty")
+	}
+	return &TxStoreTx{tx: ops}, nil
+}
+
+// GetTxOps returns the transaction ops object.
+func (t *TxStoreTx) GetTxOps() TxOps {
+	return t.tx
+}
+
+// Get returns values for a key.
+func (t *TxStoreTx) Get(ctx context.Context, key []byte) (data []byte, found bool, err error) {
+	// Validate the requested keys and hold the virtual transaction lifecycle lock.
+	if len(key) == 0 {
+		return nil, false, ErrEmptyKey
+	}
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Reject access through a discarded virtual transaction.
+	if t.discarded {
+		return nil, false, tx.ErrDiscarded
+	}
+
+	return t.tx.Get(ctx, key)
+}
+
+// GetBatch returns values for multiple keys.
+func (t *TxStoreTx) GetBatch(ctx context.Context, keys [][]byte) ([][]byte, []bool, error) {
+	// Validate the requested keys and hold the virtual transaction lifecycle lock.
+	for _, key := range keys {
+		if len(key) == 0 {
+			return nil, nil, ErrEmptyKey
+		}
+	}
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Reject access through a discarded virtual transaction.
+	if t.discarded {
+		return nil, nil, tx.ErrDiscarded
+	}
+
+	return GetBatch(ctx, t.tx, keys)
+}
+
+// Prefetch forwards the prefetch to the transaction.
+func (t *TxStoreTx) Prefetch(ctx context.Context, keys [][]byte) error {
+	// Hold the virtual transaction lifecycle lock.
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Reject access through a discarded virtual transaction.
+	if t.discarded {
+		return tx.ErrDiscarded
+	}
+	return Prefetch(ctx, t.tx, keys)
+}
+
+// AtCommit defers fn to the commit of the underlying transaction, or runs it
+// at once when that transaction does not defer. The deferred write counts as
+// a write of the owning store.
+func (t *TxStoreTx) AtCommit(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {
+	// Hold the virtual transaction lifecycle lock.
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Reject access through a discarded virtual transaction.
+	if t.discarded {
+		return tx.ErrDiscarded
+	}
+
+	// Defer to the underlying transaction, or run against this one.
+	t.markWrote()
+	if d, ok := t.tx.(AtCommitTxOps); ok {
+		return d.AtCommit(ctx, fn)
+	}
+	return fn(ctx, t)
+}
+
+// Size returns the number of keys in the store.
+func (t *TxStoreTx) Size(ctx context.Context) (uint64, error) {
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	if t.discarded {
+		return 0, tx.ErrDiscarded
+	}
+
+	return t.tx.Size(ctx)
+}
+
+// Set sets the value of a key.
+// This will not be committed until Commit is called.
+func (t *TxStoreTx) Set(ctx context.Context, key, value []byte) error {
+	// Require a nonempty key for the virtual transaction write.
+	if len(key) == 0 {
+		return ErrEmptyKey
+	}
+
+	// note: we don't write discarded field, so use RLock
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Reject writes through a discarded virtual transaction.
+	if t.discarded {
+		return tx.ErrDiscarded
+	}
+
+	// Record the write for the owning store and apply it.
+	t.markWrote()
+	return t.tx.Set(ctx, key, value)
+}
+
+// Delete deletes a key.
+// This will not be committed until Commit is called.
+// Not found should not return an error.
+func (t *TxStoreTx) Delete(ctx context.Context, key []byte) error {
+	// Require a nonempty key for the virtual transaction write.
+	if len(key) == 0 {
+		return ErrEmptyKey
+	}
+
+	// note: we don't write discarded field, so use RLock
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Reject writes through a discarded virtual transaction.
+	if t.discarded {
+		return tx.ErrDiscarded
+	}
+
+	// Record the write for the owning store and apply it.
+	t.markWrote()
+	return t.tx.Delete(ctx, key)
+}
+
+// ScanPrefix iterates over keys with a prefix.
+//
+// Note: neither key nor value should be retained outside cb() without
+// copying.
+//
+// Note: the ordering of the scan is not necessarily sorted.
+func (t *TxStoreTx) ScanPrefix(ctx context.Context, prefix []byte, cb func(key, value []byte) error) error {
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	if t.discarded {
+		return tx.ErrDiscarded
+	}
+
+	return t.tx.ScanPrefix(ctx, prefix, cb)
+}
+
+// ScanPrefixKeys iterates over keys only with a prefix.
+func (t *TxStoreTx) ScanPrefixKeys(ctx context.Context, prefix []byte, cb func(key []byte) error) error {
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	if t.discarded {
+		return tx.ErrDiscarded
+	}
+
+	return t.tx.ScanPrefixKeys(ctx, prefix, cb)
+}
+
+// Iterate returns an iterator with a given key prefix.
+//
+// Should always return non-nil, with error field filled if necessary.
+// If sort, iterates in sorted order, reverse reverses the key iteration.
+// The prefix is NOT clipped from the output keys.
+// If !sort, reverse MAY have no effect.
+// Must call Next() or Seek() before valid.
+// Some implementations return BlockIterator.
+func (t *TxStoreTx) Iterate(ctx context.Context, prefix []byte, sort, reverse bool) Iterator {
+	// Hold the virtual transaction lifecycle lock while creating its iterator.
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Return an error iterator when the virtual transaction has ended.
+	if t.discarded {
+		return NewErrIterator(tx.ErrDiscarded)
+	}
+
+	return t.tx.Iterate(ctx, prefix, sort, reverse)
+}
+
+// Exists checks if a key exists.
+func (t *TxStoreTx) Exists(ctx context.Context, key []byte) (bool, error) {
+	// Validate the requested keys and hold the virtual transaction lifecycle lock.
+	if len(key) == 0 {
+		return false, ErrEmptyKey
+	}
+	t.rmtx.RLock()
+	defer t.rmtx.RUnlock()
+
+	// Reject access through a discarded virtual transaction.
+	if t.discarded {
+		return false, tx.ErrDiscarded
+	}
+
+	return t.tx.Exists(ctx, key)
+}
+
+// Commit ends the transaction. The operations already reached the underlying
+// transaction, so Commit only marks it finished: it returns ErrDiscarded after
+// Commit or Discard, and so does every later operation.
+func (t *TxStoreTx) Commit(ctx context.Context) error {
+	return t.discardOnce()
+}
+
+// Discard cancels the transaction.
+// If called after Commit, does nothing.
+// Cannot return an error.
+// Can be called unlimited times.
+func (t *TxStoreTx) Discard() {
+	_ = t.discardOnce()
+}
+
+// markWrote records a write for the owning TxStore.
+func (t *TxStoreTx) markWrote() {
+	if t.wrote != nil {
+		t.wrote.Store(true)
+	}
+}
+
+// discardOnce locks & discards the tx, returns ErrDiscarded if already discarded
+func (t *TxStoreTx) discardOnce() error {
+	// Mark the virtual transaction discarded under its lifecycle lock.
+	t.rmtx.Lock()
+	discarded := t.discarded
+	if !discarded {
+		t.discarded = true
+	}
+	t.rmtx.Unlock()
+
+	// Report whether this call found an already discarded virtual transaction.
+	if discarded {
+		return tx.ErrDiscarded
+	}
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ Tx            = (*TxStoreTx)(nil)
+	_ PrefetchTxOps = (*TxStoreTx)(nil)
+	_ AtCommitTxOps = (*TxStoreTx)(nil)
+)

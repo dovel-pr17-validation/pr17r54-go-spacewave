@@ -1,0 +1,37 @@
+package spacewave_chat
+
+import (
+	"context"
+
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// AuthenticatedOperation selects the verified transaction signer on replay.
+func (o *UpdateChatReadPositionOp) AuthenticatedOperation() {}
+
+// Validate requires a channel, a valid author and a valid receipt timestamp.
+func (o *UpdateChatReadPositionOp) Validate() error {
+	if o.GetObjectKey() == "" {
+		return world.ErrEmptyObjectKey
+	}
+	if err := validateAuthor(o.GetAuthor()); err != nil {
+		return err
+	}
+	return o.GetTimestamp().Validate(false)
+}
+
+// ApplyWorldOp advances the accepted person's receipt in replay order.
+func (o *UpdateChatReadPositionOp) ApplyWorldOp(ctx context.Context, _ *logrus.Entry, ws world.WorldState, sender peer.ID) (bool, error) {
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+	resource, err := newReplayResource(ctx, o.GetObjectKey(), sender)
+	if err != nil {
+		return false, err
+	}
+	return false, resource.applyReadPosition(ctx, ws, o.GetAuthor(), o.GetNextIndex(), o.ThreadRootKey, o.GetTimestamp())
+}
+
+var _ world.AuthenticatedOperation = (*UpdateChatReadPositionOp)(nil)

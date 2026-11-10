@@ -1,0 +1,338 @@
+package gocompiler
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+	goscript_compiler "github.com/s4wave/goscript/compiler"
+	bldr_buildbudget "github.com/s4wave/spacewave/bldr/util/buildbudget"
+	"github.com/sirupsen/logrus"
+)
+
+// GoScriptStartupCacheEnvKeys returns env keys that affect GoScript artifact
+// identity. The compiler cache root only changes reuse cost, not output bytes.
+func GoScriptStartupCacheEnvKeys() []string {
+	return nil
+}
+
+// GoScriptCompileOptions configures one goscript compile invocation.
+type GoScriptCompileOptions struct {
+	// WorkDir is the module directory used for package loading.
+	WorkDir string
+	// OutputPath receives the generated TypeScript package tree.
+	OutputPath string
+	// CacheRoot selects the optional compiler cache directory.
+	CacheRoot string
+	// Packages names the package patterns to compile.
+	Packages []string
+	// BuildFlags selects Go package build constraints.
+	BuildFlags []string
+	// Env supplies environment overrides for package loading.
+	Env []string
+	// OverrideDirs supplies GoScript source override directories.
+	OverrideDirs []string
+	// BindingRoots supplies dependency roots containing TypeScript bindings.
+	BindingRoots []string
+	// DeferredFunctions names exported function boundaries loaded on first invocation.
+	DeferredFunctions []string
+	// ProtobufTypeScriptBinding uses generated TypeScript protobuf bindings.
+	ProtobufTypeScriptBinding bool
+	// EliminateDeadCode leaves the code a program cannot reach out of the
+	// output.
+	EliminateDeadCode bool
+}
+
+// GoScriptCompilerCacheRootFromEnv resolves the compiler cache root for a Bldr
+// build working path. The cache lives under the user cache directory unless
+// the environment overrides it, so resetting a Bldr state root keeps it. An
+// empty result disables the cache.
+func GoScriptCompilerCacheRootFromEnv(buildPath string) (string, error) {
+	rawRoot := strings.TrimSpace(os.Getenv(GoScriptCompilerCacheRootEnv))
+	switch rawRoot {
+	case "off":
+		return "", nil
+	case "":
+		userCacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return "", errors.Wrap(err, "resolve GoScript compiler cache root")
+		}
+		return filepath.Join(userCacheDir, "goscript"), nil
+	}
+	return ResolveGoScriptCompilerCacheRoot(buildPath, rawRoot)
+}
+
+// ResolveGoScriptCompilerCacheRoot resolves rawRoot for a Bldr build path.
+// Absolute roots are used directly; relative roots live under the Bldr state
+// root that owns the build path.
+func ResolveGoScriptCompilerCacheRoot(buildPath, rawRoot string) (string, error) {
+	// Return an empty root or use absolute roots directly.
+	rawRoot = strings.TrimSpace(rawRoot)
+	if rawRoot == "" {
+		return "", nil
+	}
+	if filepath.IsAbs(rawRoot) {
+		return filepath.Clean(rawRoot), nil
+	}
+
+	// Reject relative roots that escape the .bldr state root.
+	cleanRoot := filepath.Clean(rawRoot)
+	if cleanRoot == "." || cleanRoot == ".." || strings.HasPrefix(cleanRoot, ".."+string(filepath.Separator)) {
+		return "", errors.Errorf("%s relative path escapes .bldr state root: %s", GoScriptCompilerCacheRootEnv, rawRoot)
+	}
+	stateRoot := goScriptBldrStateRootForBuildPath(buildPath)
+	if stateRoot == "" {
+		return "", errors.Errorf("%s relative path requires a .bldr build path: %s", GoScriptCompilerCacheRootEnv, buildPath)
+	}
+	return filepath.Join(stateRoot, cleanRoot), nil
+}
+
+func goScriptBldrStateRootForBuildPath(buildPath string) string {
+	buildPath = strings.TrimSpace(buildPath)
+	if buildPath == "" {
+		return ""
+	}
+	for dir := filepath.Clean(buildPath); ; dir = filepath.Dir(dir) {
+		if isGoScriptBldrStateRootName(filepath.Base(dir)) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+	}
+}
+
+func isGoScriptBldrStateRootName(name string) bool {
+	return name == ".bldr" || strings.HasPrefix(name, ".bldr-")
+}
+
+// GoScriptBindingRoots returns dependency module roots containing protobuf
+// TypeScript siblings. The main module is covered by GoScript's source root.
+func GoScriptBindingRoots(ctx context.Context, workDir string, env ...string) ([]string, error) {
+	// List all non-main module directories under the work dir.
+	cmd := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-m", "-f", "{{if not .Main}}{{.Dir}}{{end}}", "all")
+	cmd.Env = append(os.Environ(), GetDefaultEnv()...)
+	cmd.Env = append(cmd.Env, env...)
+	cmd.Dir = workDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return nil, errors.Errorf("go list modules failed: %s", strings.TrimSpace(string(out)))
+		}
+		return nil, err
+	}
+
+	// Keep module directories that contain protobuf TypeScript siblings.
+	var roots []string
+	seen := make(map[string]struct{})
+	for moduleDir := range strings.SplitSeq(string(out), "\n") {
+		moduleDir = strings.TrimSpace(moduleDir)
+		if moduleDir == "" {
+			continue
+		}
+		dir := filepath.Clean(moduleDir)
+		if _, ok := seen[dir]; ok || !goScriptBindingRootHasProtobufTypeScript(dir) {
+			continue
+		}
+		seen[dir] = struct{}{}
+		roots = append(roots, dir)
+	}
+
+	// Return the roots in a stable order.
+	slices.Sort(roots)
+	return roots, nil
+}
+
+func goScriptBindingRootHasProtobufTypeScript(root string) bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		// Stop the walk on errors or once a sibling is found.
+		if err != nil {
+			return err
+		}
+		if found {
+			return filepath.SkipAll
+		}
+		if entry.IsDir() {
+			if path != root && (entry.Name() == "node_modules" || entry.Name() == "vendor") {
+				return filepath.SkipDir
+			}
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				return relErr
+			}
+			depth := 0
+			if rel != "." {
+				depth = strings.Count(rel, string(filepath.Separator)) + 1
+			}
+			if depth > 6 {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(entry.Name(), ".pb.ts") {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// GoListImportPath returns the import path for the package in workDir under the given build flags.
+func GoListImportPath(ctx context.Context, workDir string, buildFlags []string, env ...string) (string, error) {
+	// Assemble the go list arguments with validated build flags.
+	args := []string{"list"}
+	for _, flag := range buildFlags {
+		flag = strings.TrimSpace(flag)
+		if flag == "" {
+			return "", errors.New("go list build flag cannot be empty")
+		}
+		args = append(args, flag)
+	}
+	args = append(args, "-f", "{{.ImportPath}}", ".")
+
+	// Run go list in the work dir and extract the import path.
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Env = append(os.Environ(), GetDefaultEnv()...)
+	cmd.Env = append(cmd.Env, env...)
+	cmd.Dir = workDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", errors.Errorf("go list import path failed: %s", strings.TrimSpace(string(out)))
+		}
+		return "", err
+	}
+
+	// Return the trimmed import path from the go list output.
+	importPath := strings.TrimSpace(string(out))
+	if importPath == "" {
+		return "", errors.New("go list import path returned empty path")
+	}
+	return importPath, nil
+}
+
+// ExecGoScriptCompile compiles Go packages to a GoScript TypeScript package
+// tree in a child process of the current executable, so the gigabytes of
+// syntax and type data the compiler holds return to the system when it exits.
+// The child receives opts.Env in its environment.
+func ExecGoScriptCompile(ctx context.Context, le *logrus.Entry, opts GoScriptCompileOptions) error {
+	// Validate the options before waiting for the build budget.
+	if _, _, err := newGoScriptConfig(opts); err != nil {
+		return err
+	}
+
+	// Acquire a compile permit from the build budget.
+	budget, err := bldr_buildbudget.Default()
+	if err != nil {
+		return err
+	}
+	waitStart := time.Now()
+	permit, err := budget.Acquire(ctx, bldr_buildbudget.GoScriptCompileWeight)
+	if err != nil {
+		return err
+	}
+	defer permit.Release()
+
+	// Run the compile in a worker process and log the duration.
+	timeStart := time.Now()
+	if err := runGoScriptWorker(ctx, le, opts); err != nil {
+		return err
+	}
+	le.
+		WithField("compiler", "goscript").
+		WithField("dur", time.Since(timeStart).String()).
+		WithField("budget-wait", timeStart.Sub(waitStart).String()).
+		Info("compiled plugin TypeScript package tree")
+	return nil
+}
+
+// compileGoScript runs the GoScript compiler over the packages of opts in
+// this process.
+func compileGoScript(ctx context.Context, le *logrus.Entry, opts GoScriptCompileOptions) error {
+	// Build the configuration and compile the packages.
+	conf, packages, err := newGoScriptConfig(opts)
+	if err != nil {
+		return err
+	}
+	comp, err := goscript_compiler.NewCompiler(conf, le, nil)
+	if err != nil {
+		return err
+	}
+	_, err = comp.CompilePackages(ctx, packages...)
+	return err
+}
+
+// newGoScriptConfig validates opts and returns the compiler configuration and
+// the packages to compile.
+func newGoScriptConfig(opts GoScriptCompileOptions) (*goscript_compiler.Config, []string, error) {
+	// Validate the required compile options.
+	if strings.TrimSpace(opts.WorkDir) == "" {
+		return nil, nil, errors.New("goscript work dir cannot be empty")
+	}
+	if strings.TrimSpace(opts.OutputPath) == "" {
+		return nil, nil, errors.New("goscript output path cannot be empty")
+	}
+	if len(opts.Packages) == 0 {
+		return nil, nil, errors.New("goscript packages cannot be empty")
+	}
+	for _, env := range opts.Env {
+		if strings.TrimSpace(env) == "" {
+			return nil, nil, errors.New("goscript env cannot be empty")
+		}
+	}
+
+	// Build the compiler configuration from the options.
+	conf := &goscript_compiler.Config{
+		Dir:                       opts.WorkDir,
+		DeferredFunctions:         slices.Clone(opts.DeferredFunctions),
+		OutputPath:                opts.OutputPath,
+		ProtobufTypeScriptBinding: opts.ProtobufTypeScriptBinding,
+		EliminateDeadCode:         opts.EliminateDeadCode,
+	}
+	if opts.CacheRoot != "" {
+		cacheRoot := strings.TrimSpace(opts.CacheRoot)
+		if cacheRoot == "" {
+			return nil, nil, errors.New("goscript cache root cannot be empty")
+		}
+		conf.CacheRoot = cacheRoot
+	}
+	packages := make([]string, 0, len(opts.Packages))
+	for _, pkg := range opts.Packages {
+		pkg = strings.TrimSpace(pkg)
+		if pkg == "" {
+			return nil, nil, errors.New("goscript package cannot be empty")
+		}
+		packages = append(packages, pkg)
+	}
+	for _, flag := range opts.BuildFlags {
+		flag = strings.TrimSpace(flag)
+		if flag == "" {
+			return nil, nil, errors.New("goscript build flag cannot be empty")
+		}
+		conf.BuildFlags = append(conf.BuildFlags, flag)
+	}
+	for _, dir := range opts.OverrideDirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return nil, nil, errors.New("goscript override dir cannot be empty")
+		}
+		conf.OverrideDirs = append(conf.OverrideDirs, dir)
+	}
+	for _, root := range opts.BindingRoots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			return nil, nil, errors.New("goscript binding root cannot be empty")
+		}
+		conf.AdditionalBindingRoots = append(conf.AdditionalBindingRoots, root)
+	}
+	return conf, packages, nil
+}

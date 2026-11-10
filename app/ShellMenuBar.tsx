@@ -1,0 +1,336 @@
+import { CommandSurface } from '@s4wave/sdk/command/command.pb.js'
+import { useMemo, useCallback } from 'react'
+import { LuMenu } from 'react-icons/lu'
+
+import { cn } from '@s4wave/web/style/utils.js'
+import { AppLogo } from '@s4wave/web/images/AppLogo.js'
+import {
+  Menubar,
+  MenubarContent,
+  MenubarItem,
+  MenubarMenu,
+  MenubarSeparator,
+  MenubarShortcut,
+  MenubarSub,
+  MenubarSubContent,
+  MenubarSubTrigger,
+  MenubarTrigger,
+} from '@s4wave/web/ui/Menubar.js'
+import {
+  useCommands,
+  useInvokeCommand,
+  useOpenCommand,
+} from '@s4wave/web/command/index.js'
+import { formatKeybindingHint } from '@s4wave/web/command/CommandPalette.js'
+import type { CommandState } from '@s4wave/sdk/command/registry/registry.pb.js'
+import {
+  getCommandMenuBinding,
+  type KeybindingGraph,
+} from '@s4wave/web/command/KeybindingResolver.js'
+import { useKeybindingGraph } from '@s4wave/web/command/useKeybindingGraph.js'
+
+// MenuNode represents a node in the menu tree.
+interface MenuNode {
+  label: string
+  commandId?: string
+  keybindings?: string[]
+  hasSubItems?: boolean
+  enabled?: boolean
+  children: Map<string, MenuNode>
+  group: number
+  order: number
+}
+
+interface MenuSeparatorNode {
+  separatorKey: string
+}
+
+// topLevelMenus defines the order of top-level menus.
+const topLevelMenus = ['File', 'Go', 'Edit', 'View', 'Tools', 'Help']
+
+// buildMenuTree builds a tree of MenuNode from the active commands.
+function buildMenuTree(
+  commands: CommandState[],
+  bindingGraph: KeybindingGraph,
+): Map<string, MenuNode> {
+  const root = new Map<string, MenuNode>()
+  const seen = new Set<string>()
+
+  for (const cmd of commands) {
+    const commandId = cmd.command?.commandId
+    if (!commandId || seen.has(commandId)) continue
+    if (!cmd.active) continue
+    seen.add(commandId)
+    const menuPath = cmd.command?.menuPath
+    if (!menuPath) continue
+
+    const segments = menuPath.split('/')
+    if (segments.length < 2) continue
+
+    const topName = segments[0]
+    let topNode = root.get(topName)
+    if (!topNode) {
+      topNode = {
+        label: topName,
+        children: new Map(),
+        group: 0,
+        order: 0,
+      }
+      root.set(topName, topNode)
+    }
+
+    // Walk remaining segments to find or create the leaf node.
+    let parent = topNode
+    for (let i = 1; i < segments.length; i++) {
+      const seg = segments[i]
+      if (i === segments.length - 1) {
+        // Leaf node: the actual command.
+        const nodeEnabled = cmd.enabled !== false
+        const menuBinding = getCommandMenuBinding(bindingGraph, commandId)
+        parent.children.set(seg, {
+          label: seg,
+          commandId,
+          keybindings: menuBinding ? [menuBinding] : [],
+          hasSubItems: cmd.command?.hasSubItems,
+          enabled: nodeEnabled,
+          children: new Map(),
+          group: cmd.command?.menuGroup ?? 0,
+          order: cmd.command?.menuOrder ?? 0,
+        })
+      } else {
+        // Intermediate node: submenu.
+        let sub = parent.children.get(seg)
+        if (!sub) {
+          sub = {
+            label: seg,
+            children: new Map(),
+            group: 0,
+            order: 0,
+          }
+          parent.children.set(seg, sub)
+        }
+        parent = sub
+      }
+    }
+  }
+
+  return root
+}
+
+// sortedGroupedChildren returns children sorted by group then order,
+// with separators between groups indicated by null entries.
+function sortedGroupedChildren(
+  children: Map<string, MenuNode>,
+): (MenuNode | MenuSeparatorNode)[] {
+  const items = Array.from(children.values())
+  items.sort((a, b) => {
+    if (a.group !== b.group) return a.group - b.group
+    return a.order - b.order
+  })
+
+  const result: (MenuNode | MenuSeparatorNode)[] = []
+  let lastGroup = -1
+  for (const item of items) {
+    if (lastGroup >= 0 && item.group !== lastGroup) {
+      result.push({ separatorKey: `sep-${lastGroup}-${item.group}` })
+    }
+    result.push(item)
+    lastGroup = item.group
+  }
+  return result
+}
+
+function isMenuSeparator(
+  item: MenuNode | MenuSeparatorNode,
+): item is MenuSeparatorNode {
+  return 'separatorKey' in item
+}
+
+// MenuItemRenderer renders a single menu item or submenu.
+function MenuItemRenderer({
+  node,
+  onSelectCommand,
+}: {
+  node: MenuNode
+  onSelectCommand: (node: MenuNode) => void
+}) {
+  if (node.children.size > 0 && !node.commandId) {
+    const items = sortedGroupedChildren(node.children)
+    return (
+      <MenubarSub>
+        <MenubarSubTrigger>{node.label}</MenubarSubTrigger>
+        <MenubarSubContent data-phone-menu>
+          {items.map((child) => {
+            if (isMenuSeparator(child)) {
+              return <MenubarSeparator key={child.separatorKey} />
+            }
+            return (
+              <MenuItemRenderer
+                key={child.label}
+                node={child}
+                onSelectCommand={onSelectCommand}
+              />
+            )
+          })}
+        </MenubarSubContent>
+      </MenubarSub>
+    )
+  }
+
+  const disabled = node.enabled === false
+  return (
+    <MenubarItem
+      disabled={disabled}
+      onSelect={() => !disabled && node.commandId && onSelectCommand(node)}
+      variant={disabled ? 'dimmed' : 'default'}
+    >
+      {node.label}
+      {node.keybindings && node.keybindings.length > 0 && (
+        <MenubarShortcut>
+          {formatKeybindingHint(node.keybindings)}
+        </MenubarShortcut>
+      )}
+    </MenubarItem>
+  )
+}
+
+function EmptyMenuItem() {
+  return (
+    <MenubarItem disabled variant="dimmed">
+      No items
+    </MenubarItem>
+  )
+}
+
+/** ShellMenuBar renders command access beside the shell tabs, with a touch menu on phones. */
+export function ShellMenuBar() {
+  const commands = useCommands()
+  const invokeCommand = useInvokeCommand()
+  const openCommand = useOpenCommand()
+  const bindingGraph = useKeybindingGraph(commands, {
+    surface: CommandSurface.WEB,
+  })
+
+  const menuTree = useMemo(
+    () => buildMenuTree(commands, bindingGraph),
+    [commands, bindingGraph],
+  )
+
+  const handleSelectCommand = useCallback(
+    (node: MenuNode) => {
+      if (!node.commandId) return
+      if (node.hasSubItems) {
+        openCommand(node.commandId)
+        return
+      }
+      invokeCommand(node.commandId)
+    },
+    [invokeCommand, openCommand],
+  )
+
+  const handleLogoClick = useCallback(() => {
+    openCommand('spacewave.view.palette')
+  }, [openCommand])
+
+  return (
+    <div className="shell-menu-bar flex h-full shrink-0 items-center gap-px pr-1 pl-1.5">
+      <button
+        type="button"
+        aria-label="Open command palette"
+        className="shell-menu-palette -mt-px flex size-7 cursor-pointer items-center justify-center"
+        onClick={handleLogoClick}
+        title="Open command palette"
+      >
+        <AppLogo className="size-7" />
+      </button>
+      <div className="shell-menu-mobile hidden h-full items-center">
+        <Menubar variant="shell" className="h-full">
+          <MenubarMenu>
+            <MenubarTrigger asChild>
+              <button
+                type="button"
+                aria-label="Open app menu"
+                className="text-topbar-button-text hover:text-topbar-button-text-hi hover:bg-pulldown-hover rounded-menu-button flex size-7 items-center justify-center pointer-coarse:size-11"
+              >
+                <LuMenu className="size-5" />
+              </button>
+            </MenubarTrigger>
+            <MenubarContent align="start" data-phone-menu>
+              {topLevelMenus.map((name) => {
+                const node = menuTree.get(name)
+                const items = node ? sortedGroupedChildren(node.children) : []
+                return (
+                  <MenubarSub key={name}>
+                    <MenubarSubTrigger className="pointer-coarse:min-h-11">
+                      {name}
+                    </MenubarSubTrigger>
+                    <MenubarSubContent data-phone-menu>
+                      {items.length ? (
+                        items.map((item) =>
+                          isMenuSeparator(item) ? (
+                            <MenubarSeparator key={item.separatorKey} />
+                          ) : (
+                            <MenuItemRenderer
+                              key={item.commandId ?? item.label}
+                              node={item}
+                              onSelectCommand={handleSelectCommand}
+                            />
+                          ),
+                        )
+                      ) : (
+                        <EmptyMenuItem />
+                      )}
+                    </MenubarSubContent>
+                  </MenubarSub>
+                )
+              })}
+            </MenubarContent>
+          </MenubarMenu>
+        </Menubar>
+      </div>
+      <div
+        className={cn(
+          'shell-menu-collapsible flex h-full items-center gap-px overflow-hidden transition-all duration-200 select-none',
+          'narrow:w-0 narrow:opacity-0',
+        )}
+      >
+        <Menubar variant="shell" className="h-full">
+          {topLevelMenus.map((name) => {
+            const node = menuTree.get(name)
+            const items = node ? sortedGroupedChildren(node.children) : []
+            return (
+              <MenubarMenu key={name}>
+                <MenubarTrigger asChild>
+                  <button
+                    type="button"
+                    className="rounded-menu-button text-topbar-button-text hover:text-topbar-button-text-hi hover:bg-pulldown-hover data-[state=open]:text-topbar-button-text-hi data-[state=open]:bg-pulldown-hover text-topbar-menu ui-text-shadow flex h-5 items-center justify-center px-1.75 whitespace-nowrap transition-colors"
+                  >
+                    {name}
+                  </button>
+                </MenubarTrigger>
+                <MenubarContent align="start">
+                  {items.length ? (
+                    items.map((item) => {
+                      if (isMenuSeparator(item)) {
+                        return <MenubarSeparator key={item.separatorKey} />
+                      }
+                      return (
+                        <MenuItemRenderer
+                          key={item.commandId ?? item.label}
+                          node={item}
+                          onSelectCommand={handleSelectCommand}
+                        />
+                      )
+                    })
+                  ) : (
+                    <EmptyMenuItem />
+                  )}
+                </MenubarContent>
+              </MenubarMenu>
+            )
+          })}
+        </Menubar>
+      </div>
+    </div>
+  )
+}

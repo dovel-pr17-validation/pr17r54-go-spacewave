@@ -1,0 +1,268 @@
+package rwc
+
+import (
+	"context"
+	"encoding/binary"
+	"io"
+	"math"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/pkg/errors"
+)
+
+// PacketConn implements a PacketConn with a Read-Write-Closer.
+//
+// Writes a little-endian 4 byte length prefix before each packet.
+// All messages sent to/from the wrong addresses are dropped.
+type PacketConn struct {
+	// ctx is the context
+	ctx context.Context
+	// ctxCancel is the context canceler
+	ctxCancel context.CancelFunc
+	// rwc is the read-write-closer
+	rwc io.ReadWriteCloser
+	// laddr is the local addr
+	laddr net.Addr
+	// raddr is the remote addr
+	raddr net.Addr
+	// maxPacketSize is the maximum allowed packet size
+	maxPacketSize uint32
+
+	ar       sync.Pool   // packet arena
+	rd       time.Time   // read deadline
+	packetCh chan []byte // packet ch
+	closeErr error
+}
+
+// NewPacketConn constructs a new packet conn and starts the rx pump.
+func NewPacketConn(
+	ctx context.Context,
+	rwc io.ReadWriteCloser,
+	laddr, raddr net.Addr,
+	maxPacketSize uint32,
+	bufferPacketN int,
+) *PacketConn {
+	// Prepare the PacketConn lifetime and receive queue capacity.
+	ctx, ctxCancel := context.WithCancel(ctx) //nolint:gosec // cancel stored on PacketConn and called by Close
+	if bufferPacketN <= 0 {
+		bufferPacketN = 10
+	}
+
+	// Start the PacketConn receive pump on the underlying stream.
+	c := &PacketConn{
+		ctx:           ctx,
+		ctxCancel:     ctxCancel,
+		rwc:           rwc,
+		laddr:         laddr,
+		raddr:         raddr,
+		maxPacketSize: maxPacketSize,
+		packetCh:      make(chan []byte, bufferPacketN),
+	}
+	go func() {
+		_ = c.rxPump()
+	}()
+	return c
+}
+
+// LocalAddr returns the local network address.
+func (p *PacketConn) LocalAddr() net.Addr {
+	return p.laddr
+}
+
+// RemoteAddr returns the bound remote network address.
+func (p *PacketConn) RemoteAddr() net.Addr {
+	return p.raddr
+}
+
+// ReadFrom reads a packet from the connection,
+// copying the payload into p. It returns the number of
+// bytes copied into p and the return address that
+// was on the packet.
+// It returns the number of bytes read (0 <= n <= len(p))
+// and any error encountered. Callers should always process
+// the n > 0 bytes returned before considering the error err.
+// ReadFrom can be made to time out and return an error after a
+// fixed time limit; see SetDeadline and SetReadDeadline.
+func (p *PacketConn) ReadFrom(pk []byte) (n int, addr net.Addr, err error) {
+	// Apply the configured read deadline to the connection context.
+	deadline := p.rd
+	ctx := p.ctx
+	if !deadline.IsZero() {
+		var ctxCancel context.CancelFunc
+		ctx, ctxCancel = context.WithDeadline(ctx, deadline)
+		defer ctxCancel()
+	}
+
+	// Wait for the next complete packet or a connection close.
+	var pkt []byte
+	var ok bool
+	select {
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	case pkt, ok = <-p.packetCh:
+		if !ok {
+			err = p.closeErr
+			if err == nil {
+				err = io.EOF
+			}
+			return 0, nil, err
+		}
+	}
+
+	// Copy the packet into the caller's buffer and return its address.
+	pl := len(pkt)
+	copy(pk, pkt)
+	p.ar.Put(&pkt)
+	if len(pk) < pl {
+		return len(pk), p.raddr, io.ErrShortBuffer
+	}
+	return pl, p.raddr, nil
+}
+
+// WriteTo writes a packet with payload p to addr.
+// Write deadlines are not supported; see SetWriteDeadline.
+func (p *PacketConn) WriteTo(pkt []byte, addr net.Addr) (n int, err error) {
+	// Reject empty packets before checking the destination address.
+	if len(pkt) == 0 {
+		return 0, nil
+	}
+
+	// Enforce the packet connection's bound remote address.
+	if addr != p.raddr {
+		as := addr.String()
+		rs := p.raddr.String()
+		if as != rs {
+			return 0, errors.Errorf("packet conn bound to %s and cannot write to %s", rs, as)
+		}
+	}
+
+	// Encode the payload length and write one framed packet.
+	pktLen := len(pkt)
+	if pktLen > math.MaxInt32 {
+		return 0, errors.New("message too large: exceeds maximum uint32 value")
+	}
+
+	// Reserve an arena buffer for the length-prefixed packet.
+	buf := p.getArenaBuf(pktLen + 4)
+	binary.LittleEndian.PutUint32(buf, uint32(pktLen))
+	copy(buf[4:], pkt)
+
+	// Require the underlying stream to write the entire framed packet.
+	n, err = p.rwc.Write(buf)
+	if err == nil && n < len(buf) {
+		err = errors.Errorf("expected conn to write %d bytes in one call but wrote %d", len(buf), n)
+	}
+
+	// Release the packet buffer and propagate any stream write error.
+	p.ar.Put(&buf)
+	if err != nil {
+		return n, err
+	}
+
+	return n - 4, nil
+}
+
+// SetDeadline sets the read deadline associated with the connection.
+// It is equivalent to calling SetReadDeadline.
+//
+// Write deadlines are not supported; see SetWriteDeadline.
+//
+// A zero value for t means ReadFrom will not time out.
+func (p *PacketConn) SetDeadline(t time.Time) error {
+	p.rd = t
+	return nil
+}
+
+// SetReadDeadline sets the deadline for future ReadFrom calls
+// and any currently-blocked ReadFrom call.
+// A zero value for t means ReadFrom will not time out.
+func (p *PacketConn) SetReadDeadline(t time.Time) error {
+	p.rd = t
+	return nil
+}
+
+// SetWriteDeadline is a no-op: PacketConn does not support write
+// deadlines, because writes go through a plain blocking ReadWriteCloser.
+func (p *PacketConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+// Close closes the connection.
+// Any blocked ReadFrom or WriteTo operations will be unblocked and return errors.
+func (p *PacketConn) Close() error {
+	p.ctxCancel()
+	return p.rwc.Close()
+}
+
+// getArenaBuf returns a buf from the packet arena with at least the given size.
+func (p *PacketConn) getArenaBuf(size int) []byte {
+	// Recover a reusable packet buffer from the connection arena.
+	var buf []byte
+	bufp := p.ar.Get()
+	if bufp != nil {
+		buf = *bufp.(*[]byte)
+	}
+
+	// Resize the packet buffer to the requested size or its full capacity.
+	if size != 0 {
+		if cap(buf) < size {
+			buf = make([]byte, size)
+		} else {
+			buf = buf[:size]
+		}
+	} else {
+		buf = buf[:cap(buf)]
+	}
+
+	return buf
+}
+
+// rxPump receives messages from the underlying connection.
+func (p *PacketConn) rxPump() (rerr error) {
+	defer func() {
+		p.closeErr = rerr
+		close(p.packetCh)
+	}()
+
+	// Read and validate each packet header from the underlying stream.
+	var header [4]byte
+	for {
+		select {
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		default:
+		}
+
+		// Read the fixed-size packet header.
+		_, err := io.ReadFull(p.rwc, header[:])
+		if err != nil {
+			return err
+		}
+
+		// Reject packet lengths outside the configured bounds.
+		pktLen := binary.LittleEndian.Uint32(header[:])
+		if pktLen == 0 {
+			return errors.New("received header indicating zero packet size")
+		}
+		if pktLen > p.maxPacketSize {
+			return errors.Errorf("indicated packet size %d larger than max size %d", pktLen, p.maxPacketSize)
+		}
+
+		// Read the payload and enqueue it for callers.
+		pktBuf := p.getArenaBuf(int(pktLen))
+		_, err = io.ReadFull(p.rwc, pktBuf)
+		if err != nil {
+			return err
+		}
+		select {
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		case p.packetCh <- pktBuf:
+		}
+	}
+}
+
+// _ is a type assertion
+var _ net.PacketConn = (*PacketConn)(nil)

@@ -1,0 +1,256 @@
+syntax = "proto3";
+package s4wave.vm;
+
+import "google/protobuf/timestamp.proto";
+import "github.com/aperturerobotics/common/typeid/typeid.proto";
+
+option go_package = "github.com/s4wave/spacewave/sdk/vm;s4wave_vm";
+
+// VmState is the desired state of a virtual machine instance.
+enum VmState {
+  // VmState_STOPPED means the VM should not be running.
+  VmState_STOPPED = 0;
+  // VmState_STARTING means a runtime is starting the VM. A request for it
+  // asks for RUNNING.
+  VmState_STARTING = 1;
+  // VmState_RUNNING means the VM should be running.
+  VmState_RUNNING = 2;
+  // VmState_STOPPING means a runtime is stopping the VM. A request for it
+  // asks for STOPPED.
+  VmState_STOPPING = 3;
+  // VmState_ERROR is reserved for observed runtime failures.
+  VmState_ERROR = 4;
+}
+
+// V86RuntimeStatus is a status reported by an instanced V86 runtime plugin.
+enum V86RuntimeStatus {
+  // V86RuntimeStatus_UNKNOWN is unset.
+  V86RuntimeStatus_UNKNOWN = 0;
+  // V86RuntimeStatus_BOOTING means the emulator is loading or booting.
+  V86RuntimeStatus_BOOTING = 1;
+  // V86RuntimeStatus_READY means the v86min guest-ready marker was observed.
+  V86RuntimeStatus_READY = 2;
+  // V86RuntimeStatus_STOPPED means the emulator stopped cleanly.
+  V86RuntimeStatus_STOPPED = 3;
+  // V86RuntimeStatus_ERROR means the emulator reached a terminal failure.
+  V86RuntimeStatus_ERROR = 4;
+}
+
+// V86Config contains configuration for a V86 virtual machine.
+message V86Config {
+  // MemoryMb is the memory size in megabytes.
+  uint32 memory_mb = 1;
+  // VgaMemoryMb is the VGA memory size in megabytes.
+  uint32 vga_memory_mb = 2;
+  // Networking enables network support.
+  bool networking = 3;
+  // SerialEnabled enables a serial console on COM1 bridged to the viewer.
+  bool serial_enabled = 4;
+  // BootArgs is appended to the kernel command line at boot time.
+  string boot_args = 5;
+  // Mounts lists workspace/home/other v86fs mounts to attach after boot.
+  repeated VmMount mounts = 6;
+  // RuntimePluginId is the plugin that hosts the instanced V86 runtime.
+  // Empty defaults to spacewave-v86.
+  string runtime_plugin_id = 7;
+}
+
+// VmMount is a v86fs mount bound to a UnixFS object in the Space.
+message VmMount {
+  // Path is the guest filesystem path at which the mount is attached.
+  string path = 1;
+  // ObjectKey is the UnixFS object key providing the mount contents.
+  string object_key = 2;
+  // Writable controls whether the guest can write into the mount.
+  bool writable = 3;
+}
+
+// VmV86 represents an x86 virtual machine instance via v86 emulation.
+// Linked to BIOS, kernel, and rootfs images via graph edges.
+message VmV86 {
+  option (typeid.id) = "vm/v86";
+
+  // State is the desired VM state. Runtime observations are in observed_state.
+  VmState state = 1;
+  // Name is the human-readable name of this VM instance.
+  string name = 2;
+  // Config contains V86-specific configuration.
+  V86Config config = 3;
+  // CreatedAt is the creation timestamp.
+  .google.protobuf.Timestamp created_at = 4;
+  // ErrorMessage is the terminal diagnostic for the observed generation.
+  string error_message = 5;
+  // ObservedState is the runtime state committed by the VM resource owner.
+  VmState observed_state = 6;
+  // RunGeneration fences runtime reports from prior starts or stops.
+  uint64 run_generation = 7;
+  // Links (via graph edges, not proto fields):
+  //   v86/image           -> V86Image object (required; supplies default
+  //                           v86image/wasm, v86image/bios/seabios,
+  //                           v86image/bios/vgabios, v86image/kernel,
+  //                           v86image/rootfs edges)
+  //   v86/kernel-override -> UnixFS object (optional, per-VM kernel override)
+  //   v86/rootfs-override -> UnixFS object (optional, per-VM rootfs override)
+  //   v86/bios-override   -> UnixFS object (optional, per-VM BIOS override)
+  //   v86/wasm-override   -> UnixFS object (optional, per-VM emulator override)
+}
+
+// CreateVmV86Op creates a new VmV86 world object. The V86Image at
+// =image_object_key= supplies the four UnixFS asset edges (WASM, BIOS, kernel,
+// rootfs). Optional per-asset =*_override_object_key= fields override the
+// corresponding asset at resolve time without rewriting the V86Image.
+message CreateVmV86Op {
+  option (typeid.id) = "vm/v86/create";
+
+  // ObjectKey is the key to create the VM at.
+  string object_key = 1;
+  // Name is the display name.
+  string name = 2;
+  // Config contains V86-specific configuration.
+  V86Config config = 3;
+  // Timestamp is the creation timestamp.
+  .google.protobuf.Timestamp timestamp = 4;
+  // ImageObjectKey points at a V86Image providing default asset edges. Required.
+  string image_object_key = 5;
+  // KernelOverrideObjectKey optionally overrides the kernel resolved from the
+  // linked V86Image. Points at a UnixFS object.
+  string kernel_override_object_key = 6;
+  // RootfsOverrideObjectKey optionally overrides the rootfs resolved from the
+  // linked V86Image. Points at a UnixFS object.
+  string rootfs_override_object_key = 7;
+  // BiosOverrideObjectKey optionally overrides the BIOS resolved from the
+  // linked V86Image. Points at a UnixFS object.
+  string bios_override_object_key = 8;
+  // WasmOverrideObjectKey optionally overrides the emulator WASM resolved from
+  // the linked V86Image. Points at a UnixFS object.
+  string wasm_override_object_key = 9;
+}
+
+// SetV86ConfigOp mutates the mutable V86Config on an existing VmV86 object.
+// Immutable fields (name, created_at) on the VmV86 block are preserved.
+message SetV86ConfigOp {
+  option (typeid.id) = "vm/v86/set-config";
+
+  // ObjectKey is the object key of the VmV86 to update.
+  string object_key = 1;
+  // Config is the new configuration to apply. Replaces the stored Config.
+  V86Config config = 2;
+}
+
+// SetV86StateOp changes the desired state of an existing VmV86 object.
+// STARTING and STOPPING are accepted as compatibility aliases for RUNNING
+// and STOPPED.
+message SetV86StateOp {
+  option (typeid.id) = "vm/v86/set-state";
+
+  // ObjectKey is the object key of the VmV86 to update.
+  string object_key = 1;
+  // State is the target state to transition to.
+  VmState state = 2;
+  // ErrorMessage is an optional diagnostic for legacy callers. Runtime
+  // diagnostics are written by the resource owner.
+  string error_message = 3;
+}
+
+// V86RuntimeStatusService reports generation-fenced runtime observations.
+service V86RuntimeStatusService {
+  // ReportStatus records a runtime status for the owning VM generation.
+  rpc ReportStatus(ReportV86RuntimeStatusRequest)
+      returns (ReportV86RuntimeStatusResponse);
+}
+
+// ReportV86RuntimeStatusRequest is a typed status report from an instanced
+// V86 runtime plugin.
+message ReportV86RuntimeStatusRequest {
+  // ObjectKey identifies the VM resource receiving the report.
+  string object_key = 1;
+  // RunGeneration fences reports from prior runtime instances.
+  uint64 run_generation = 2;
+  // Status is the runtime observation being reported.
+  V86RuntimeStatus status = 3;
+  // ErrorMessage is required for V86RuntimeStatus_ERROR.
+  string error_message = 4;
+}
+
+// ReportV86RuntimeStatusResponse acknowledges a runtime status report.
+message ReportV86RuntimeStatusResponse {
+  // Accepted is false when the report does not match the active generation.
+  bool accepted = 1;
+  // RunGeneration is the route generation used for the report.
+  uint64 run_generation = 2;
+  // Rejection explains why a report was not accepted.
+  string rejection = 3;
+  // Config is the VM configuration the runtime boots with. It is set on an
+  // accepted report so the runtime reads it once per generation.
+  V86Config config = 4;
+}
+
+// V86Image is a curated bundle of v86 assets (WASM emulator, SeaBIOS, VGA BIOS,
+// kernel, rootfs) linked through graph edges. The object itself carries
+// metadata; the five UnixFS targets are attached via v86image/wasm,
+// v86image/bios/seabios, v86image/bios/vgabios, v86image/kernel, v86image/rootfs.
+message V86Image {
+  option (typeid.id) = "vm/image/v86";
+
+  // Name is the human-readable name of the image.
+  string name = 1;
+  // Version identifies this revision of the image.
+  string version = 2;
+  // Platform identifies the target VM platform. Must be "v86".
+  string platform = 3;
+  // Distro is the distribution name, e.g. "debian".
+  string distro = 4;
+  // KernelVersion is the kernel version string, e.g. "6.1.0-13-686".
+  string kernel_version = 5;
+  // Description is a free-form description of the image.
+  string description = 6;
+  // Tags is a list of discovery tags, e.g. ["default", "browser"].
+  repeated string tags = 7;
+  // CreatedAt is the creation timestamp.
+  .google.protobuf.Timestamp created_at = 8;
+  // CdnSource locates the published image whose assets this image reads
+  // lazily. Unset when every asset edge points at an object in this Space.
+  VmImageCdnSource cdn_source = 9;
+  // Links (via graph edges, not proto fields):
+  //   v86image/wasm          -> UnixFS object (emulator WASM binary)
+  //   v86image/bios/seabios  -> UnixFS object (SeaBIOS)
+  //   v86image/bios/vgabios  -> UnixFS object (VGA BIOS)
+  //   v86image/kernel        -> UnixFS object (kernel image)
+  //   v86image/rootfs        -> UnixFS object (rootfs archive)
+}
+
+// VmImageCdnSource locates a VM image in a published CDN Space. An image
+// without its own asset edges resolves each asset through this source.
+message VmImageCdnSource {
+  // SpaceId is the CDN Space ULID.
+  string space_id = 1;
+  // ObjectKey is the image object key in the CDN Space.
+  string object_key = 2;
+}
+
+// CreateV86ImageOp creates a new V86Image world object. Metadata is supplied
+// inline; the five UnixFS edges are set separately via SetGraphQuad.
+message CreateV86ImageOp {
+  option (typeid.id) = "vm/image/v86/create";
+
+  // ObjectKey is the key to create the V86Image at.
+  string object_key = 1;
+  // Image carries the metadata for the new V86Image. Name / platform / tags
+  // are required; the remaining fields are optional.
+  V86Image image = 2;
+  // Timestamp is the creation timestamp. Stored on the block as CreatedAt.
+  .google.protobuf.Timestamp timestamp = 3;
+}
+
+// SetV86ImageMetadataOp replaces the metadata fields on an existing V86Image.
+// The four UnixFS edges are immutable post-create; use graph-quad ops on a
+// fresh V86Image to change asset bindings.
+message SetV86ImageMetadataOp {
+  option (typeid.id) = "vm/image/v86/set-metadata";
+
+  // ObjectKey is the key of the V86Image to update.
+  string object_key = 1;
+  // Image carries the new metadata. CreatedAt is preserved from the stored
+  // block; any CreatedAt on the supplied V86Image is ignored.
+  V86Image image = 2;
+}

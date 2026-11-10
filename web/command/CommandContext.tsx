@@ -1,0 +1,298 @@
+import {
+  createContext,
+  useCallback,
+  use,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from 'react'
+import { useWatchStateRpc } from '@aptre/bldr-react'
+import type { Resource } from '@aptre/bldr-sdk/hooks/useResource.js'
+import { useResourcesContext } from '@aptre/bldr-sdk/hooks/ResourcesContext.js'
+import {
+  ResourceClientError,
+  type Client as ResourceClient,
+} from '@aptre/bldr-sdk/resource/client.js'
+import { ResourceFailureCode } from '@aptre/bldr-sdk/resource/resource.pb.js'
+import { ResourceFailureError } from '@aptre/bldr-sdk/resource/rpc-stream.js'
+import type { Root } from '@s4wave/sdk/root'
+import type { LookupMethod } from 'starpc'
+import { CommandSurface } from '@s4wave/sdk/command/command.pb.js'
+import {
+  CommandRegistryResourceServiceClient,
+  type CommandRegistryResourceService,
+} from '@s4wave/sdk/command/registry/registry_srpc.pb.js'
+import {
+  WatchCommandsRequest,
+  WatchCommandsResponse,
+  type CommandState,
+} from '@s4wave/sdk/command/registry/registry.pb.js'
+
+// SubItem is an item in a command's sub-item list.
+export interface SubItem {
+  id: string
+  label: string
+  description?: string
+  // iconName is a react-icons icon identifier (e.g. "LuLayoutGrid").
+  iconName?: string
+  // experimental renders the shared experimental marker.
+  experimental?: boolean
+}
+
+// SubItemsCallback provides sub-items for a command's palette sub-list.
+export type SubItemsCallback = (
+  query: string,
+  signal: AbortSignal,
+) => Promise<SubItem[]>
+
+// OpenCommandHandler opens the command palette focused on a command.
+// For commands with sub-items, this opens directly in sub-item mode.
+type OpenCommandHandler = (commandId: string) => void
+
+// CommandContextValue provides command registry state and operations.
+interface CommandContextValue {
+  // commands is the full registry from WatchCommands.
+  commands: CommandState[]
+  // invokeCommand sends a command invocation through the registry.
+  invokeCommand: (commandId: string, args?: Record<string, string>) => void
+  // openCommand opens the command palette focused on a command.
+  // For commands with sub-items, this opens directly in sub-item mode.
+  openCommand: (commandId: string) => void
+  // service is the command registry service client.
+  service: CommandRegistryResourceService | null
+  // adoptResource adopts a pending server resource and returns its release.
+  adoptResource: (resourceId: number) => (() => void) | null
+  // attachResource attaches a client-side handler resource to the root client.
+  attachResource: (
+    label: string,
+    mux: LookupMethod,
+    signal?: AbortSignal,
+  ) => Promise<{ resourceId: number; cleanup: () => void }>
+  // getSubItems fetches sub-items through the registry.
+  getSubItems: (
+    commandId: string,
+    query: string,
+    signal: AbortSignal,
+  ) => Promise<SubItem[]>
+  // registerOpenCommand registers the palette's open handler.
+  // Called by CommandPalette on mount. Returns a cleanup function.
+  registerOpenCommand: (handler: OpenCommandHandler) => () => void
+}
+
+const CommandContext = createContext<CommandContextValue | null>(null)
+
+const commandWatchRetryOpts = {
+  errorCb(err: unknown) {
+    if (isCommandLifecycleError(err)) return
+    console.warn('Retry: retrying after error', { error: err })
+  },
+}
+
+// CommandProvider subscribes to the command registry and provides command
+// state and invocation to descendant components.
+export function CommandProvider({
+  rootResource,
+  children,
+}: {
+  rootResource: Resource<Root>
+  children: ReactNode
+}) {
+  const root = rootResource.value
+  const resources = useResourcesContext()
+  const resourceClient = resources?.client ?? null
+  const openCommandRef = useRef<OpenCommandHandler | null>(null)
+
+  const watchFn = useCallback(
+    (
+      _: WatchCommandsRequest,
+      signal: AbortSignal,
+    ): AsyncIterable<WatchCommandsResponse> | null => {
+      if (!root) return null
+      const svc: CommandRegistryResourceService =
+        new CommandRegistryResourceServiceClient(root.client)
+      return svc.WatchCommands({ surface: CommandSurface.WEB }, signal)
+    },
+    [root],
+  )
+
+  const watchState = useWatchStateRpc<
+    WatchCommandsResponse,
+    WatchCommandsRequest
+  >(
+    watchFn,
+    { surface: CommandSurface.WEB },
+    WatchCommandsRequest.equals,
+    WatchCommandsResponse.equals,
+    commandWatchRetryOpts,
+  )
+
+  const service = useMemo<CommandRegistryResourceService | null>(() => {
+    if (!root) return null
+    return new CommandRegistryResourceServiceClient(root.client)
+  }, [root])
+
+  const adoptResource = useCallback(
+    (resourceId: number): (() => void) | null => {
+      if (!root || resourceId === 0 || root.resourceRef.released) return null
+      const ref = root.resourceRef.createRef(resourceId)
+      return () => ref.release()
+    },
+    [root],
+  )
+
+  const attachResource = useCallback(
+    (
+      label: string,
+      mux: LookupMethod,
+      signal?: AbortSignal,
+    ): Promise<{ resourceId: number; cleanup: () => void }> => {
+      const client: ResourceClient | null = resourceClient
+      if (!client) {
+        return Promise.reject(new Error('resource client unavailable'))
+      }
+      return client.attachResource(label, mux, signal)
+    },
+    [resourceClient],
+  )
+
+  const registerOpenCommand = useCallback(
+    (handler: OpenCommandHandler): (() => void) => {
+      openCommandRef.current = handler
+      return () => {
+        if (openCommandRef.current === handler) {
+          openCommandRef.current = null
+        }
+      }
+    },
+    [],
+  )
+
+  const openCommand = useCallback((commandId: string) => {
+    openCommandRef.current?.(commandId)
+  }, [])
+
+  const invokeCommand = useCallback(
+    (commandId: string, args?: Record<string, string>) => {
+      if (!service) return
+      service
+        .InvokeCommand({ commandId, args, surface: CommandSurface.WEB })
+        .catch((err) => {
+          console.error('InvokeCommand failed:', commandId, err)
+        })
+    },
+    [service],
+  )
+
+  const getSubItems = useCallback(
+    async (
+      commandId: string,
+      query: string,
+      signal: AbortSignal,
+    ): Promise<SubItem[]> => {
+      if (!service) return []
+      const resp = await service.GetSubItems(
+        { commandId, query, surface: CommandSurface.WEB },
+        signal,
+      )
+      return (resp.items ?? []).flatMap((item) =>
+        item.id
+          ? [
+              {
+                id: item.id,
+                label: item.label ?? '',
+                description: item.description || undefined,
+                iconName: item.iconName || undefined,
+                experimental: item.experimental ?? false,
+              },
+            ]
+          : [],
+      )
+    },
+    [service],
+  )
+
+  const commands = useMemo<CommandState[]>(
+    () => watchState?.commands ?? [],
+    [watchState],
+  )
+
+  const value = useMemo<CommandContextValue>(
+    () => ({
+      commands,
+      invokeCommand,
+      openCommand,
+      service,
+      adoptResource,
+      attachResource,
+      getSubItems,
+      registerOpenCommand,
+    }),
+    [
+      commands,
+      invokeCommand,
+      openCommand,
+      service,
+      adoptResource,
+      attachResource,
+      getSubItems,
+      registerOpenCommand,
+    ],
+  )
+
+  return (
+    <CommandContext.Provider value={value}>{children}</CommandContext.Provider>
+  )
+}
+
+// emptyCommandContext is a no-op context value for components rendered
+// outside a CommandProvider (e.g. in E2E tests without a live Root).
+const emptyCommandContext: CommandContextValue = {
+  commands: [],
+  invokeCommand: () => {},
+  openCommand: () => {},
+  service: null,
+  adoptResource: () => null,
+  attachResource: () => Promise.resolve({ resourceId: 0, cleanup: () => {} }),
+  getSubItems: () => Promise.resolve([]),
+  registerOpenCommand: () => () => {},
+}
+
+// useCommandContext returns the command context value, or a no-op
+// default if no CommandProvider is present in the tree.
+export function useCommandContext(): CommandContextValue {
+  return use(CommandContext) ?? emptyCommandContext
+}
+
+// useCommands returns the current command registry state.
+export function useCommands(): CommandState[] {
+  return useCommandContext().commands
+}
+
+// useInvokeCommand returns a function to invoke commands by ID.
+export function useInvokeCommand(): CommandContextValue['invokeCommand'] {
+  return useCommandContext().invokeCommand
+}
+
+// useOpenCommand returns a function to open the palette focused on a command.
+export function useOpenCommand(): CommandContextValue['openCommand'] {
+  return useCommandContext().openCommand
+}
+
+// useCommandService returns the command registry service client.
+export function useCommandService(): CommandRegistryResourceService | null {
+  return useCommandContext().service
+}
+
+// isCommandLifecycleError reports whether err ended the command's Resource
+// client or route rather than the command itself.
+export function isCommandLifecycleError(err: unknown): boolean {
+  if (err instanceof ResourceClientError) {
+    return err.code === 'CONNECTION_FAILED'
+  }
+  if (!(err instanceof ResourceFailureError)) return false
+  const code = err.failure.code
+  return (
+    code === ResourceFailureCode.CLIENT_RELEASED ||
+    code === ResourceFailureCode.RESOURCE_OR_CLIENT_RELEASED
+  )
+}

@@ -1,0 +1,388 @@
+package execution_controller
+
+import (
+	"context"
+	"time"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	"github.com/aperturerobotics/controllerbus/directive"
+	protobuf_go_lite "github.com/aperturerobotics/protobuf-go-lite"
+	"github.com/aperturerobotics/util/backoff"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/world"
+	world_control "github.com/s4wave/spacewave/db/world/control"
+	forge_execution "github.com/s4wave/spacewave/forge/execution"
+	execution_transaction "github.com/s4wave/spacewave/forge/execution/tx"
+	forge_target "github.com/s4wave/spacewave/forge/target"
+	forge_value "github.com/s4wave/spacewave/forge/value"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// Version is the version of the controller implementation.
+var Version = controller.MustParseVersion("0.0.1")
+
+// ControllerID is the ID of the controller.
+const ControllerID = "forge/execution"
+
+// Controller implements the Execution controller.
+// An Execution is an attempt to process a given Target.
+// Usually constructed & managed by the Pass controller.
+// Spawns "exec" controllers on the provided bus.
+type Controller struct {
+	// le is the root logger.
+	le *logrus.Entry
+	// bus is the execution controller bus.
+	bus bus.Bus
+	// conf is the config.
+	conf *Config
+	// uniqueID is the derived unique ID.
+	uniqueID string
+	// claimID identifies this controller instance across Execute retries.
+	claimID string
+	// claimLease is how long this controller's claim stays live between renewals.
+	claimLease time.Duration
+	// peerID is the parsed peer ID.
+	peerID peer.ID
+	// busEngine is the bus World engine handle.
+	busEngine *world.BusEngine
+	// ws is the World state for busEngine.
+	ws world.WorldState
+	// objLoop is the object tracking loop.
+	objLoop *world_control.WatchLoop
+	// execRoutine executes the target under its granted claim.
+	execRoutine *routine.StateRoutineContainer[*ExecConfig]
+	// reclaimRoutine reclaims the Execution once the lease of a claim this
+	// controller cannot run under expires.
+	reclaimRoutine *routine.StateRoutineContainer[*reclaimableClaim]
+	// cancelCtx closes once durable cancellation is observed, including for late listeners.
+	cancelCtx context.Context
+	// cancel signals durable cancellation independently of controller restarts.
+	cancel context.CancelFunc
+}
+
+// NewController constructs a new Execution controller.
+// Note: exec.controller instances will be run on the given bus.
+func NewController(
+	le *logrus.Entry,
+	bus bus.Bus,
+	conf *Config,
+) *Controller {
+	// Derive the peer and durable claim identity for this Execution controller.
+	peerID, _ := conf.ParsePeerID()
+	uniqueID := conf.BuildUniqueID()
+	claimID := conf.GetClaimId()
+	if claimID == "" {
+		claimID = uniqueID
+	}
+
+	// Resolve the claim lease, falling back to the default when it is invalid.
+	claimLease, err := conf.ParseClaimLease()
+	if err != nil {
+		claimLease = forge_execution.DefaultClaimLease
+	}
+
+	// Connect the Execution controller to its World state and cancellation signal.
+	c := &Controller{
+		le:         le,
+		bus:        bus,
+		conf:       conf,
+		uniqueID:   uniqueID,
+		peerID:     peerID,
+		claimID:    claimID,
+		claimLease: claimLease,
+	}
+	c.cancelCtx, c.cancel = context.WithCancel(context.Background())
+	c.busEngine = world.NewBusEngine(nil, bus, conf.GetEngineId())
+	c.ws = world.NewEngineWorldState(c.busEngine, true)
+	c.objLoop = world_control.NewWatchLoop(
+		le.WithField("control-loop", "execution"),
+		conf.GetObjectKey(),
+		c.ProcessState,
+	)
+
+	// Reconcile the target execution routine as its configuration changes.
+	c.execRoutine = routine.NewStateRoutineContainerWithLogger(
+		protobuf_go_lite.CompareEqualVT[*ExecConfig](),
+		le.WithField("routine", "execution"),
+	)
+	c.execRoutine.SetStateRoutine(c.executeWithConfig)
+
+	// Reclaim the Execution when a claim this controller cannot run under expires.
+	c.reclaimRoutine = routine.NewStateRoutineContainerWithLogger(
+		compareReclaimableClaim,
+		le.WithField("routine", "reclaim"),
+		routine.WithRetry(&backoff.Backoff{}),
+	)
+	c.reclaimRoutine.SetStateRoutine(c.reclaimExpiredClaim)
+	return c
+}
+
+// StartControllerWithConfig starts a execution controller with a config.
+// Waits for the controller to start.
+// Returns a Release function to close the controller when done.
+func StartControllerWithConfig(
+	ctx context.Context,
+	b bus.Bus,
+	conf *Config,
+) (*Controller, directive.Reference, error) {
+	// Wait for the configured Execution controller to become available on the bus.
+	ctrli, _, ctrlRef, err := loader.WaitExecControllerRunning(
+		ctx,
+		b,
+		resolver.NewLoadControllerWithConfig(conf),
+		nil,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Require the loaded controller to expose the Execution controller API.
+	cl, ok := ctrli.(*Controller)
+	if !ok {
+		ctrlRef.Release()
+		return nil, nil, block.ErrUnexpectedType
+	}
+	return cl, ctrlRef, nil
+}
+
+// CancelWaitCh returns a channel that closes once durable cancellation of
+// the execution has been observed.
+func (c *Controller) CancelWaitCh() <-chan struct{} {
+	return c.cancelCtx.Done()
+}
+
+// GetControllerInfo returns information about the controller.
+func (c *Controller) GetControllerInfo() *controller.Info {
+	return controller.NewInfo(
+		ControllerID,
+		Version,
+		"execution controller",
+	)
+}
+
+// Execute executes the controller.
+// Returning nil ends execution.
+// Returning an error triggers a retry with backoff.
+func (c *Controller) Execute(ctx context.Context) error {
+	// Bind the target routine and World engine to the Execution lifecycle.
+	c.execRoutine.SetContext(ctx, true)
+	c.reclaimRoutine.SetContext(ctx, true)
+	c.busEngine.SetContext(ctx)
+
+	// Reconcile Execution state until its watch ends or the lifecycle is canceled.
+	err := c.objLoop.Execute(ctx, c.ws)
+	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	return err
+}
+
+// ProcessState implements the state reconciliation loop.
+//
+// NOTE: the Execution may be updated by the controller several times during
+// execution.
+func (c *Controller) ProcessState(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	obj world.ObjectState, // may be nil if not found
+	rootRef *bucket.ObjectRef, rev uint64,
+) (waitForChanges bool, err error) {
+	execConfig, reclaimable, waitForChanges, err := c.processExecutionState(ctx, le, ws, obj, rootRef, rev)
+	c.execRoutine.SetState(execConfig)
+	c.reclaimRoutine.SetState(reclaimable)
+	return waitForChanges, err
+}
+
+// processExecutionState reconciles the Execution state and returns the exec
+// routine config to apply, or nil to clear the routine. It also returns the
+// claim to reclaim once its lease expires, or nil when this controller may run
+// the Execution.
+func (c *Controller) processExecutionState(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	obj world.ObjectState, // may be nil if not found
+	rootRef *bucket.ObjectRef, rev uint64,
+) (execConfig *ExecConfig, reclaimable *reclaimableClaim, waitForChanges bool, err error) {
+	// Wait for the Execution object before reconciling its durable state.
+	if obj == nil {
+		le.Debug("object does not exist, waiting")
+		return nil, nil, true, nil
+	}
+
+	// unmarshal Execution state + build read cursor
+	var exState *forge_execution.Execution
+	_, err = world.AccessObject(ctx, ws.AccessWorldState, rootRef, func(bcs *block.Cursor) error {
+		var berr error
+		exState, berr = forge_execution.UnmarshalExecution(ctx, bcs)
+		return berr
+	})
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	// An invalid record stays invalid until it is rewritten, so wait for the
+	// next write instead of returning an error the loop would retry at once.
+	if err := exState.Validate(); err != nil {
+		le.WithError(err).Warn("execution state is invalid, waiting for a change")
+		return nil, nil, true, nil
+	}
+
+	// locally specified peer id
+	peerID := c.peerID
+	if len(peerID) == 0 {
+		// use the peer ID specified on the state
+		peerID, err = exState.ParsePeerID()
+		if err != nil {
+			return nil, nil, true, errors.Wrap(err, "parse peer id on execution state")
+		}
+	}
+
+	// check if completed
+	currState := exState.GetExecutionState()
+	if currState == forge_execution.State_ExecutionState_CANCELING {
+		c.cancel()
+	}
+	if currState == forge_execution.State_ExecutionState_COMPLETE {
+		le.Debug("execution is marked as complete")
+		return nil, nil, false, nil
+	}
+
+	// Require a local peer before claiming or observing work for recovery.
+	_, _, peerRef, err := peer.GetPeerWithID(ctx, c.bus, peerID, false, nil)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	defer peerRef.Release()
+
+	// Claim pending executions and adopt active pre-claim executions without
+	// starting side effects until this controller observes its durable claim.
+	if currState == forge_execution.State_ExecutionState_PENDING ||
+		exState.GetClaim() == nil {
+		// Preserve placement authority for the initial claim.
+		if err := exState.CheckPeerID(peerID); err != nil {
+			return nil, nil, true, err
+		}
+
+		// Start the claim before the watch permits target execution.
+		le.Debugf("claiming execution with peer id: %s", peerID.String())
+		txd := execution_transaction.NewTxStart(peerID, time.Now().Add(c.claimLease), c.claimID)
+		_, _, err = obj.ApplyObjectOp(ctx, txd, peerID)
+		if err != nil {
+			var heldErr *execution_transaction.ClaimHeldError
+			if errors.As(err, &heldErr) {
+				return nil, nil, true, nil
+			}
+			return nil, nil, false, err
+		}
+		// The control loop observes the durable claim before starting work.
+		return nil, nil, true, nil
+	}
+
+	// Run only a claim granted to this controller whose lease stays live past the
+	// fence of its Lease. A restarted controller derives the id of its previous
+	// run's claim, so a matching id alone does not show a live holder. Observe any
+	// other claim without starting its target, and reclaim the Execution once its
+	// lease expires.
+	claim := exState.GetClaim()
+	if claim.GetClaimId() != c.claimID || claim.LeaseExpired(time.Now().Add(forge_execution.ClaimClockSkew)) {
+		le.Debug("observing execution claim this controller cannot run under")
+		reclaimable = &reclaimableClaim{peerID: peerID, claim: claim}
+		return nil, reclaimable, true, nil
+	}
+
+	// Require the authoritative peer before executing this controller's claim.
+	if err := exState.CheckPeerID(peerID); err != nil {
+		return nil, nil, true, err
+	}
+
+	// RUNNING and CANCELING both retain adapter custody. Cancellation is
+	// delivered to the target while the routine retains its settlement context.
+	if currState != forge_execution.State_ExecutionState_RUNNING &&
+		currState != forge_execution.State_ExecutionState_CANCELING {
+		return nil, nil, true, errors.Wrapf(
+			forge_value.ErrUnknownState,
+			"%s", currState.String(),
+		)
+	}
+
+	// Normalize fields that change while the same target is running.
+	execConfigState := exState.CloneVT()
+	execConfigState.Result = nil
+	execConfigState.ExecutionState = forge_execution.State_ExecutionState_RUNNING
+	execConfigState.LogEntries = nil
+	execConfigState.WaitingPluginId = ""
+	if execConfigState.ValueSet == nil {
+		execConfigState.ValueSet = &forge_target.ValueSet{}
+	}
+	execConfigState.ValueSet.Outputs = nil
+
+	// Refresh the target configuration only when the Execution inputs change.
+	prevConfigState := c.execRoutine.GetState()
+	if prevClaim := prevConfigState.GetExecution().GetClaim(); prevClaim.GetClaimId() == exState.GetClaim().GetClaimId() &&
+		prevClaim.GetEpoch() == exState.GetClaim().GetEpoch() {
+		execConfigState.Claim.LeaseExpiresAt = prevClaim.GetLeaseExpiresAt()
+	}
+
+	// Resolve changed target inputs while preserving a live routine on renewal.
+	if !prevConfigState.GetExecution().EqualVT(execConfigState) {
+		var tgt *forge_target.Target
+		_, err = world.AccessObject(ctx, ws.AccessWorldState, nil, func(bcs *block.Cursor) error {
+			// Read the target from the Execution's saved target reference.
+			bcs = bcs.Detach(true)
+			bcs.ClearAllRefs()
+			bcs.SetRefAtCursor(exState.GetTargetRef(), true)
+
+			// Decode the target configuration from its block cursor.
+			var berr error
+			tgt, berr = forge_target.UnmarshalTarget(ctx, bcs)
+			return berr
+		})
+		if err != nil {
+			return nil, nil, true, errors.Wrap(err, "lookup target configuration")
+		}
+
+		// Couple the normalized Execution state with its resolved target.
+		execConfig = &ExecConfig{
+			Execution: execConfigState,
+			Target:    tgt,
+		}
+	}
+	if execConfig == nil {
+		execConfig = prevConfigState
+	}
+
+	return execConfig, nil, true, nil
+}
+
+// CheckExecControllerConfig checks if the controller config is OK to execute.
+func (c *Controller) CheckExecControllerConfig(ctx context.Context, conf config.Config) error {
+	// no-op - allow all
+	return nil
+}
+
+// HandleDirective asks if the handler can resolve the directive.
+func (c *Controller) HandleDirective(ctx context.Context, inst directive.Instance) ([]directive.Resolver, error) {
+	return nil, nil
+}
+
+// Close releases any resources used by the controller.
+// Error indicates any issue encountered releasing.
+func (c *Controller) Close() error {
+	return nil
+}
+
+// _ is a type assertion
+var _ world_control.WatchLoopHandler = (*Controller)(nil).ProcessState
+
+// _ is a type assertion
+var _ controller.Controller = (*Controller)(nil)

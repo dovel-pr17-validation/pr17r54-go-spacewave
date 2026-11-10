@@ -1,0 +1,93 @@
+package world
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/s4wave/spacewave/db/coord"
+
+	"github.com/aperturerobotics/cayley/graph"
+)
+
+var (
+	// ErrHistoryUnavailable is returned if the world storage implementation
+	// does not implement looking up the world state at a given seqno.
+	ErrHistoryUnavailable = errors.New("world history not available")
+	// ErrWorldStorageUnavailable is returned if world storage access is unavailable.
+	ErrWorldStorageUnavailable = errors.New("world storage not available")
+	// ErrStateNotFound is returned if the state lookup returned not found.
+	ErrStateNotFound = errors.New("world state not found")
+	// ErrObjectExists returns if the object exists already.
+	ErrObjectExists = errors.New("object already exists")
+	// ErrObjectNotFound is returned if an object was not found.
+	// Note: this is only returned in error conditions.
+	// Most lookup functions return value, ok, error.
+	ErrObjectNotFound = errors.New("object not found")
+	// ErrQuadNotFound is returned if a graph quad was not found.
+	// Note: this is only returned in error conditions.
+	// Most lookup functions return value, ok, error.
+	ErrQuadNotFound = graph.ErrQuadNotExist
+	// ErrEmptyObjectKey returns if the object key was empty.
+	ErrEmptyObjectKey = errors.New("object key cannot be empty")
+	// ErrUnhandledOp is returned if the operation type was unhandled.
+	ErrUnhandledOp = errors.New("operation type was not handled")
+	// ErrEmptyOp is returned if the operation type ID or operation object are empty.
+	ErrEmptyOp = errors.New("operation type id and body cannot be empty")
+	// ErrEmptyChange is returned if the changelog entry was empty.
+	ErrEmptyChange = errors.New("changelog entry cannot be empty")
+	// ErrEmptyEngineID is returned if the engine id was empty.
+	ErrEmptyEngineID = errors.New("engine id cannot be empty")
+	// ErrSuperseded is returned for a candidate another candidate replaced as
+	// the head after its base. The writer rebases and runs its change again.
+	ErrSuperseded = errors.New("world candidate superseded")
+	// ErrEngineRetired is returned by a World engine its owner retired, and by
+	// the transactions it ended open, once a successor serves the World: the
+	// caller runs its change again on the successor. It is a supersession.
+	ErrEngineRetired = fmt.Errorf("world engine retired: %w", ErrSuperseded)
+	// ErrDurabilityUnknown is returned for a commit whose candidate may have
+	// become durable when the wait for its decision ended, such as at an
+	// unmount. It never means the commit failed: the next open reconciles
+	// the head, so the writer reads the World before it writes again.
+	ErrDurabilityUnknown = errors.New("world commit durability unknown")
+	// ErrUnexpectedChangeType is returned when a change with an unexpected
+	// ChangeType is encountered. Typically wrapped with name of type.
+	ErrUnexpectedChangeType = errors.New("change type was unexpected")
+	// ErrUnexpectedRev is returned if the revision field was unexpected.
+	ErrUnexpectedRev = errors.New("object rev unexpected")
+	// ErrGraphPathResultLimit is returned if a graph path query has no result limit.
+	ErrGraphPathResultLimit = errors.New("graph path result limit must be non-zero")
+	// ErrGraphPathStepLimit is returned if a graph path step has no per-key limit.
+	ErrGraphPathStepLimit = errors.New("graph path step limit must be non-zero")
+	// ErrGraphPathPredicate is returned if a graph path step has no predicate.
+	ErrGraphPathPredicate = errors.New("graph path step predicate cannot be empty")
+	// ErrGraphPathDirection is returned if a graph path step has no valid direction.
+	ErrGraphPathDirection = errors.New("graph path step direction is invalid")
+	// ErrGraphEdgeBucketLimit is returned if a grouped edge query has no per-origin limit.
+	ErrGraphEdgeBucketLimit = errors.New("graph edge bucket limit must be non-zero")
+	// ErrGraphEdgeBucketDirection is returned if a grouped edge query direction is invalid.
+	ErrGraphEdgeBucketDirection = errors.New("graph edge bucket direction is invalid")
+
+	// ErrNilQuad is returned if the quad is nil and cannot be.
+	ErrNilQuad = errors.New("quad cannot be nil")
+	// ErrEmptyQuadSubject is returned if the subject field was empty.
+	ErrEmptyQuadSubject = errors.New("quad subject cannot be empty")
+	// ErrEmptyQuadPred is returned if the predicate field was empty.
+	ErrEmptyQuadPred = errors.New("quad predicate cannot be empty")
+	// ErrEmptyQuadObject is returned if the object field was empty.
+	ErrEmptyQuadObject = errors.New("quad object cannot be empty")
+	// ErrQuadSubjectNotIRI indicates a quad subject must be an IRI.
+	ErrQuadSubjectNotIRI = errors.New("quad subject must be an iri")
+	// ErrQuadObjectNotIRI indicates a quad object must be an IRI.
+	ErrQuadObjectNotIRI = errors.New("quad object must be an iri")
+	// ErrNotIRI is returned if the format <object-key> is not used for the graph key.
+	ErrNotIRI = errors.New("quad value must be valid object IRIs")
+)
+
+// IsSuperseded reports whether err says another writer moved the head after
+// the write's base, so the write may run again from a new transaction. Every
+// retry site matches through it, so a change of the sentinel reaches them all.
+// coord.ErrStaleGeneration counts too: a coordinator reports a write lease
+// that lost its generation with it.
+func IsSuperseded(err error) bool {
+	return errors.Is(err, ErrSuperseded) || errors.Is(err, coord.ErrStaleGeneration)
+}

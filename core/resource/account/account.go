@@ -1,0 +1,1191 @@
+package resource_account
+
+import (
+	"context"
+	"crypto/rand"
+	"net/http"
+	"path"
+	"time"
+
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/aperturerobotics/starpc/srpc"
+	"github.com/aperturerobotics/util/ccontainer"
+	"github.com/aperturerobotics/util/refcount"
+	"github.com/pkg/errors"
+	auth_password "github.com/s4wave/spacewave/auth/method/password"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	account_settings "github.com/s4wave/spacewave/core/account/settings"
+	"github.com/s4wave/spacewave/core/provider"
+	provider_local "github.com/s4wave/spacewave/core/provider/local"
+	provider_spacewave "github.com/s4wave/spacewave/core/provider/spacewave"
+	api "github.com/s4wave/spacewave/core/provider/spacewave/api"
+	"github.com/s4wave/spacewave/core/session"
+	"github.com/s4wave/spacewave/core/sobject"
+	bifrost_crypto "github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/keypem"
+	"github.com/s4wave/spacewave/net/peer"
+	s4wave_account "github.com/s4wave/spacewave/sdk/account"
+	s4wave_command "github.com/s4wave/spacewave/sdk/command"
+)
+
+// AccountResource wraps a provider account for resource access.
+type AccountResource struct {
+	mux                 srpc.Invoker
+	account             *provider_spacewave.ProviderAccount
+	localAccount        *provider_local.ProviderAccount
+	localEntityKeyStore *provider_spacewave.EntityKeyStore
+	stepUpRef           *refcount.Ref[struct{}]
+}
+
+var errCloudAccountRequired = errors.New("account operation requires a cloud account")
+
+func (r *AccountResource) requireCloudAccount() (*provider_spacewave.ProviderAccount, error) {
+	if r == nil || r.account == nil {
+		return nil, errCloudAccountRequired
+	}
+	return r.account, nil
+}
+
+// NewAccountResource creates a new AccountResource.
+func NewAccountResource(acc provider.ProviderAccount) *AccountResource {
+	r := &AccountResource{}
+	switch a := acc.(type) {
+	case *provider_spacewave.ProviderAccount:
+		r.account = a
+		r.stepUpRef = a.RetainEntityKeypairStepUp()
+	case *provider_local.ProviderAccount:
+		r.localAccount = a
+		r.localEntityKeyStore = provider_spacewave.NewEntityKeyStore()
+	default:
+		return nil
+	}
+	r.mux = resource_server.NewResourceMux(func(mux srpc.Mux) error {
+		return s4wave_account.SRPCRegisterAccountResourceService(mux, r)
+	})
+	return r
+}
+
+// Release releases any account-resource-scoped step-up retention.
+func (r *AccountResource) Release() {
+	if r.stepUpRef != nil {
+		r.stepUpRef.Release()
+		r.stepUpRef = nil
+	}
+}
+
+// GetMux returns the rpc mux.
+func (r *AccountResource) GetMux() srpc.Invoker {
+	return r.mux
+}
+
+// WatchAccountInfo streams information about this account.
+func (r *AccountResource) WatchAccountInfo(
+	req *s4wave_account.WatchAccountInfoRequest,
+	strm s4wave_account.SRPCAccountResourceService_WatchAccountInfoStream,
+) error {
+	if r.localAccount != nil {
+		return r.watchLocalAccountInfo(strm)
+	}
+	return r.watchCloudAccountInfo(strm)
+}
+
+func (r *AccountResource) watchLocalAccountInfo(
+	strm s4wave_account.SRPCAccountResourceService_WatchAccountInfoStream,
+) error {
+	return watchLocalSettingsStream(
+		strm.Context(),
+		r,
+		strm.Send,
+		func(_ context.Context, settings *account_settings.AccountSettings) (*s4wave_account.WatchAccountInfoResponse, error) {
+			return &s4wave_account.WatchAccountInfoResponse{
+				AccountId:    r.localAccount.GetAccountID(),
+				EntityId:     settings.GetDisplayName(),
+				ProviderId:   r.localAccount.GetProviderID(),
+				KeypairCount: uint32(len(settings.GetEntityKeypairs())), //nolint:gosec // this count is bounded by the loaded account settings.
+			}, nil
+		},
+	)
+}
+
+func (r *AccountResource) watchCloudAccountInfo(
+	strm s4wave_account.SRPCAccountResourceService_WatchAccountInfoStream,
+) error {
+	var prev *s4wave_account.WatchAccountInfoResponse
+	return watchCloudBcast(
+		strm.Context(),
+		r.account.GetAccountBroadcast(),
+		func() (*api.AccountStateResponse, bool) {
+			info := r.account.AccountStateSnapshot()
+			return info, info != nil
+		},
+		func(info *api.AccountStateResponse) *s4wave_account.WatchAccountInfoResponse {
+			return &s4wave_account.WatchAccountInfoResponse{
+				AccountId:     info.AccountId,
+				EntityId:      info.EntityId,
+				ProviderId:    r.account.GetProviderID(),
+				AuthThreshold: info.AuthThreshold,
+				KeypairCount:  info.KeypairCount,
+			}
+		},
+		func(resp *s4wave_account.WatchAccountInfoResponse) bool {
+			if prev != nil && resp.EqualVT(prev) {
+				return false
+			}
+			prev = resp
+			return true
+		},
+		strm.Send,
+	)
+}
+
+// WatchKeybindingOverrides streams account-scope keybinding overrides.
+func (r *AccountResource) WatchKeybindingOverrides(
+	req *s4wave_account.WatchKeybindingOverridesRequest,
+	strm s4wave_account.SRPCAccountResourceService_WatchKeybindingOverridesStream,
+) error {
+	if r.localAccount == nil {
+		return strm.Send(&s4wave_account.WatchKeybindingOverridesResponse{
+			OverrideSet: &s4wave_command.KeybindingOverrideSet{},
+			ReadOnly:    true,
+		})
+	}
+
+	return watchLocalSettingsStream(
+		strm.Context(),
+		r,
+		strm.Send,
+		func(_ context.Context, settings *account_settings.AccountSettings) (*s4wave_account.WatchKeybindingOverridesResponse, error) {
+			overrideSet := settings.GetKeybindingOverrides()
+			if overrideSet == nil {
+				overrideSet = &s4wave_command.KeybindingOverrideSet{}
+			}
+			return &s4wave_account.WatchKeybindingOverridesResponse{
+				OverrideSet: overrideSet.CloneVT(),
+			}, nil
+		},
+	)
+}
+
+// ReplaceKeybindingOverrideSet atomically applies a complete account layer
+// replacement.
+func (r *AccountResource) ReplaceKeybindingOverrideSet(
+	ctx context.Context,
+	req *s4wave_account.ReplaceKeybindingOverrideSetRequest,
+) (*s4wave_account.ReplaceKeybindingOverrideSetResponse, error) {
+	// Require local settings before validating and queuing the account-layer replacement.
+	if r.localAccount == nil {
+		return nil, errors.New("account keybinding overrides require a local account")
+	}
+	if req.GetExpectedOverrideSet() == nil {
+		return nil, errors.New("expected account keybinding override set is required")
+	}
+	if err := account_settings.ValidateKeybindingOverrideSet(req.GetOverrideSet()); err != nil {
+		return nil, err
+	}
+	op := &account_settings.AccountSettingsOp{
+		Op: &account_settings.AccountSettingsOp_ReplaceKeybindingOverrideSet{
+			ReplaceKeybindingOverrideSet: &account_settings.ReplaceKeybindingOverrideSetOp{
+				ExpectedOverrideSet: req.GetExpectedOverrideSet(),
+				OverrideSet:         req.GetOverrideSet(),
+			},
+		},
+	}
+	if err := r.queueLocalAccountSettingsOp(ctx, op); err != nil {
+		return nil, err
+	}
+	return &s4wave_account.ReplaceKeybindingOverrideSetResponse{}, nil
+}
+
+func (r *AccountResource) mountLocalAccountSettingsState(
+	ctx context.Context,
+	release func(),
+) (
+	sobject.SharedObject,
+	func(),
+	ccontainer.Watchable[sobject.SharedObjectStateSnapshot],
+	func(),
+	error,
+) {
+	// Acquire the account settings reference, SharedObject, and state watch.
+	soRef, err := r.localAccount.GetAccountSettingsRef(ctx)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	so, relSO, err := r.localAccount.MountSharedObject(ctx, soRef, release)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	stateCtr, relStateCtr, err := so.AccessSharedObjectState(ctx, release)
+	if err != nil {
+		relSO()
+		return nil, nil, nil, nil, err
+	}
+	return so, relSO, stateCtr, relStateCtr, nil
+}
+
+// queueLocalAccountSettingsOp writes op to the local account settings.
+func (r *AccountResource) queueLocalAccountSettingsOp(
+	ctx context.Context,
+	op *account_settings.AccountSettingsOp,
+) error {
+	// Mount the local account settings.
+	soRef, err := r.localAccount.GetAccountSettingsRef(ctx)
+	if err != nil {
+		return err
+	}
+	so, relSO, err := r.localAccount.MountSharedObject(ctx, soRef, nil)
+	if err != nil {
+		return err
+	}
+	defer relSO()
+
+	// Write the operation.
+	opData, err := op.MarshalVT()
+	if err != nil {
+		return errors.Wrap(err, "marshal account settings op")
+	}
+	_, err = sobject.WriteOperation(ctx, so, opData, account_settings.ProcessAccountSettingsOps)
+	return errors.Wrap(err, "write account settings op")
+}
+
+// watchLocalSettingsStream drives a local account-settings watch loop. It
+// mounts the local account settings shared object, decodes each snapshot into
+// AccountSettings, builds a response with build, diffs it against the previous
+// response via EqualVT, and sends only changed responses through send.
+func watchLocalSettingsStream[T interface{ EqualVT(T) bool }](
+	strmCtx context.Context,
+	r *AccountResource,
+	send func(resp T) error,
+	build func(ctx context.Context, settings *account_settings.AccountSettings) (T, error),
+) error {
+	// Tie the account settings watch lifetime to the RPC stream.
+	ctx, ctxCancel := context.WithCancel(strmCtx)
+	defer ctxCancel()
+
+	// Mount the settings state and release both acquired references on exit.
+	_, relSO, stateCtr, relStateCtr, err := r.mountLocalAccountSettingsState(ctx, ctxCancel)
+	if err != nil {
+		return err
+	}
+	defer relSO()
+	defer relStateCtr()
+
+	// Retain the previous response while the settings watch emits changes.
+	var (
+		prev     T
+		havePrev bool
+	)
+	return ccontainer.WatchChanges(
+		ctx,
+		nil,
+		stateCtr,
+		func(snap sobject.SharedObjectStateSnapshot) error {
+			// Send the response built from each changed settings.
+			settings, err := account_settings.ReadSnapshot(ctx, snap)
+			if err != nil {
+				return err
+			}
+			resp, err := build(ctx, settings)
+			if err != nil {
+				return err
+			}
+			if havePrev && resp.EqualVT(prev) {
+				return nil
+			}
+			prev, havePrev = resp, true
+			return send(resp)
+		},
+		nil,
+	)
+}
+
+// watchCloudBcast drives a bcast-based watch loop. snapshot reads
+// broadcast-guarded state and the wait channel atomically inside one HoldLock
+// per iteration; it must not read state guarded by other locks since that
+// would risk missed-wakeup races. build runs outside the lock and produces
+// the response sent to the client when changed returns true. send is only
+// invoked when snapshot returns valid=true and changed returns true. The
+// loop exits when ctx is canceled or send returns an error.
+func watchCloudBcast[S any, T any](
+	ctx context.Context,
+	bcast accountBroadcaster,
+	snapshot func() (state S, valid bool),
+	build func(state S) T,
+	changed func(resp T) bool,
+	send func(resp T) error,
+) error {
+	for {
+		var (
+			state S
+			valid bool
+			ch    <-chan struct{}
+		)
+		bcast.HoldLock(func(_ func(), getWaitCh func() <-chan struct{}) {
+			state, valid = snapshot()
+			ch = getWaitCh()
+		})
+
+		if valid {
+			resp := build(state)
+			if changed(resp) {
+				if err := send(resp); err != nil {
+					return err
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		}
+	}
+}
+
+// accountBroadcaster is the subset of broadcast.Broadcast used by
+// watchCloudBcast. It is satisfied by *broadcast.Broadcast.
+type accountBroadcaster interface {
+	HoldLock(cb func(broadcast func(), getWaitCh func() <-chan struct{}))
+}
+
+// WatchAuthMethods streams the account auth-method rows for this account.
+func (r *AccountResource) WatchAuthMethods(
+	req *s4wave_account.WatchAuthMethodsRequest,
+	strm s4wave_account.SRPCAccountResourceService_WatchAuthMethodsStream,
+) error {
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return err
+	}
+
+	var prev *s4wave_account.WatchAuthMethodsResponse
+	return watchCloudBcast(
+		strm.Context(),
+		acc.GetAccountBroadcast(),
+		func() ([]*api.AccountAuthMethod, bool) {
+			authMethods := acc.AuthMethodsSnapshot()
+			valid := acc.AccountStateSnapshot() != nil
+			return authMethods, valid
+		},
+		func(authMethods []*api.AccountAuthMethod) *s4wave_account.WatchAuthMethodsResponse {
+			return &s4wave_account.WatchAuthMethodsResponse{
+				AuthMethods: authMethods,
+			}
+		},
+		func(resp *s4wave_account.WatchAuthMethodsResponse) bool {
+			if prev != nil && resp.EqualVT(prev) {
+				return false
+			}
+			prev = resp
+			return true
+		},
+		strm.Send,
+	)
+}
+
+// WatchSessions streams the attached sessions snapshot for this account.
+func (r *AccountResource) WatchSessions(
+	req *s4wave_account.WatchSessionsRequest,
+	strm s4wave_account.SRPCAccountResourceService_WatchSessionsStream,
+) error {
+	if r.localAccount != nil {
+		return r.watchLocalSessions(strm)
+	}
+	return r.watchCloudSessions(strm)
+}
+
+func (r *AccountResource) watchLocalSessions(
+	strm s4wave_account.SRPCAccountResourceService_WatchSessionsStream,
+) error {
+	return watchLocalSettingsStream(
+		strm.Context(),
+		r,
+		strm.Send,
+		r.buildLocalSessionsResponse,
+	)
+}
+
+// buildLocalSessionsResponse renders one WatchSessions response from the
+// account settings snapshot: the mounted session, then one row per paired
+// device and per approved account Session that is not the current peer.
+func (r *AccountResource) buildLocalSessionsResponse(
+	ctx context.Context,
+	settings *account_settings.AccountSettings,
+) (*s4wave_account.WatchSessionsResponse, error) {
+	// Read the active device identity and presentation metadata from account settings.
+	currentPeerID := r.localAccount.GetMountedSessionPeerID(ctx).String()
+	devices := settings.GetPairedDevices()
+	presentations := buildSessionPresentationMap(settings)
+
+	// Build local session rows for the current device and paired devices.
+	sessions := make([]*s4wave_account.AccountSession, 0, len(devices)+1)
+	if currentPeerID != "" {
+		row := &s4wave_account.AccountSession{
+			PeerId:         currentPeerID,
+			CurrentSession: true,
+			Kind: s4wave_account.
+				AccountSessionKind_AccountSessionKind_ACCOUNT_SESSION_KIND_LOCAL_SESSION,
+			Label: settings.GetDisplayName(),
+		}
+		if row.GetLabel() == "" {
+			row.Label = "This device"
+		}
+		applySessionPresentation(row, presentations[currentPeerID])
+		sessions = append(sessions, row)
+	}
+	for _, device := range devices {
+		peerID := device.GetPeerId()
+		if peerID == "" || peerID == currentPeerID {
+			continue
+		}
+		row := &s4wave_account.AccountSession{
+			PeerId: peerID,
+			Kind: s4wave_account.
+				AccountSessionKind_AccountSessionKind_ACCOUNT_SESSION_KIND_LOCAL_SESSION,
+			Label: device.GetDisplayName(),
+		}
+		if row.GetLabel() == "" {
+			row.Label = peerID
+		}
+		if pairedAt := device.GetPairedAt(); pairedAt > 0 {
+			row.CreatedAt = timestamppb.New(time.Unix(pairedAt, 0))
+		}
+		applySessionPresentation(row, presentations[peerID])
+		sessions = append(sessions, row)
+	}
+
+	// Pairing enrolls Sessions as account members without a paired device row.
+	listed := make(map[string]bool, len(sessions))
+	for _, row := range sessions {
+		listed[row.GetPeerId()] = true
+	}
+	for _, member := range settings.GetSessions() {
+		peerID := member.GetPeerId()
+		if member.GetRevoked() || peerID == "" || listed[peerID] {
+			continue
+		}
+		listed[peerID] = true
+		row := &s4wave_account.AccountSession{
+			PeerId: peerID,
+			Kind: s4wave_account.
+				AccountSessionKind_AccountSessionKind_ACCOUNT_SESSION_KIND_LOCAL_SESSION,
+			Label: "Linked session",
+		}
+		applySessionPresentation(row, presentations[peerID])
+		sessions = append(sessions, row)
+	}
+	return &s4wave_account.WatchSessionsResponse{Sessions: sessions}, nil
+}
+
+func (r *AccountResource) watchCloudSessions(
+	strm s4wave_account.SRPCAccountResourceService_WatchSessionsStream,
+) error {
+	// Bind cloud session watching to the RPC stream lifetime.
+	ctx, ctxCancel := context.WithCancel(strm.Context())
+	defer ctxCancel()
+
+	// Retain optional account-settings state and its release functions.
+	var (
+		stateCtr ccontainer.Watchable[sobject.SharedObjectStateSnapshot]
+		relSO    func()
+		relCtr   func()
+	)
+	if ref, err := r.account.GetAccountSettingsRef(ctx); err == nil && ref != nil {
+		if so, releaseSO, err := r.account.MountSharedObject(ctx, ref, ctxCancel); err == nil {
+			if ctr, releaseCtr, err := so.AccessSharedObjectState(ctx, ctxCancel); err == nil {
+				stateCtr = ctr
+				relSO = releaseSO
+				relCtr = releaseCtr
+			} else {
+				releaseSO()
+			}
+		}
+	}
+	if relCtr != nil {
+		defer relCtr()
+	}
+	if relSO != nil {
+		defer relSO()
+	}
+
+	// Build cloud session responses and suppress unchanged snapshots.
+	var prev *s4wave_account.WatchSessionsResponse
+	return watchCloudBcast(
+		ctx,
+		r.account.GetAccountBroadcast(),
+		func() ([]*api.AccountSessionInfo, bool) {
+			return r.account.SessionsSnapshot()
+		},
+		func(rows []*api.AccountSessionInfo) *s4wave_account.WatchSessionsResponse {
+			metadata := buildSessionPresentationMapFromSnapshot(stateCtr)
+			currentPeerID := r.account.GetCurrentSessionPeerID().String()
+			return &s4wave_account.WatchSessionsResponse{
+				Sessions: buildCloudSessionRows(currentPeerID, rows, metadata),
+			}
+		},
+		func(resp *s4wave_account.WatchSessionsResponse) bool {
+			if prev != nil && resp.EqualVT(prev) {
+				return false
+			}
+			prev = resp
+			return true
+		},
+		strm.Send,
+	)
+}
+
+func buildCloudSessionRows(
+	currentPeerID string,
+	rows []*api.AccountSessionInfo,
+	metadata map[string]*account_settings.SessionPresentation,
+) []*s4wave_account.AccountSession {
+	out := make([]*s4wave_account.AccountSession, 0, len(rows))
+	for _, row := range rows {
+		if row == nil || row.GetPeerId() == "" {
+			continue
+		}
+		item := &s4wave_account.AccountSession{
+			PeerId:         row.GetPeerId(),
+			CurrentSession: row.GetPeerId() == currentPeerID,
+			Kind: s4wave_account.
+				AccountSessionKind_AccountSessionKind_ACCOUNT_SESSION_KIND_CLOUD_AUTH_SESSION,
+			Label: row.GetPeerId(),
+		}
+		if row.GetCreatedAt() > 0 {
+			item.CreatedAt = timestamppb.New(time.UnixMilli(row.GetCreatedAt()))
+		}
+		if row.GetLastSeen() > 0 {
+			item.LastSeenAt = timestamppb.New(time.UnixMilli(row.GetLastSeen()))
+		}
+		if row.GetDeviceInfo() != "" {
+			item.Os = row.GetDeviceInfo()
+		}
+		applySessionPresentation(item, metadata[row.GetPeerId()])
+		out = append(out, item)
+	}
+	return out
+}
+
+// buildSessionPresentationMapFromSnapshot returns the Session presentations of
+// the current settings, by peer ID.
+func buildSessionPresentationMapFromSnapshot(
+	stateCtr ccontainer.Watchable[sobject.SharedObjectStateSnapshot],
+) map[string]*account_settings.SessionPresentation {
+	// Read the current settings, if any.
+	if stateCtr == nil {
+		return nil
+	}
+	snap := stateCtr.GetValue()
+	if snap == nil {
+		return nil
+	}
+	settings, err := account_settings.ReadSnapshot(context.Background(), snap)
+	if err != nil {
+		return nil
+	}
+	return buildSessionPresentationMap(settings)
+}
+
+// buildSessionPresentationMap returns the named Session presentations of
+// settings, by peer ID.
+func buildSessionPresentationMap(
+	settings *account_settings.AccountSettings,
+) map[string]*account_settings.SessionPresentation {
+	if settings == nil || len(settings.GetSessionPresentations()) == 0 {
+		return nil
+	}
+	out := make(map[string]*account_settings.SessionPresentation, len(settings.GetSessionPresentations()))
+	for _, pres := range settings.GetSessionPresentations() {
+		if pres == nil || pres.GetPeerId() == "" {
+			continue
+		}
+		out[pres.GetPeerId()] = pres
+	}
+	return out
+}
+
+func applySessionPresentation(
+	row *s4wave_account.AccountSession,
+	pres *account_settings.SessionPresentation,
+) {
+	// Apply each available presentation field to the account session row.
+	if row == nil || pres == nil {
+		return
+	}
+	if pres.GetLabel() != "" {
+		row.Label = pres.GetLabel()
+	}
+	if pres.GetDeviceType() != "" {
+		row.DeviceType = pres.GetDeviceType()
+	}
+	if pres.GetClientName() != "" {
+		row.ClientName = pres.GetClientName()
+	}
+	if pres.GetOs() != "" {
+		row.Os = pres.GetOs()
+	}
+	if pres.GetLocation() != "" {
+		row.Location = pres.GetLocation()
+	}
+}
+
+// ResolveEntityKey resolves the entity private key from an EntityCredential.
+func (r *AccountResource) ResolveEntityKey(ctx context.Context, cred *session.EntityCredential) (bifrost_crypto.PrivKey, peer.ID, error) {
+	// Resolve local credentials directly or load the cloud account for verification.
+	if r.localAccount != nil {
+		return r.resolveLocalEntityKey(cred)
+	}
+	if cred == nil {
+		return nil, "", errors.New("credential is required")
+	}
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, "", errors.Wrap(err, "entity key resolution")
+	}
+
+	// Derive the cloud entity key from the supplied password or PEM credential.
+	password := cred.GetPassword()
+	pemPrivateKey := cred.GetPemPrivateKey()
+	if password != "" {
+		info, err := acc.GetAccountState(ctx)
+		if err != nil {
+			return nil, "", errors.Wrap(err, "fetch account info")
+		}
+		return derivePasswordEntityKey(info.EntityId, []byte(password))
+	}
+	if len(pemPrivateKey) > 0 {
+		return parsePemEntityKey(pemPrivateKey)
+	}
+	return nil, "", errors.New("password or pem_private_key is required")
+}
+
+func (r *AccountResource) resolveLocalEntityKey(cred *session.EntityCredential) (bifrost_crypto.PrivKey, peer.ID, error) {
+	// Resolve a local account credential without contacting the cloud.
+	if cred == nil {
+		return nil, "", errors.New("credential is required")
+	}
+	password := cred.GetPassword()
+	pemPrivateKey := cred.GetPemPrivateKey()
+	if password != "" {
+		return derivePasswordEntityKey(r.localAccount.GetAccountID(), []byte(password))
+	}
+	if len(pemPrivateKey) > 0 {
+		return parsePemEntityKey(pemPrivateKey)
+	}
+	return nil, "", errors.New("password or pem_private_key is required")
+}
+
+func derivePasswordEntityKey(username string, password []byte) (bifrost_crypto.PrivKey, peer.ID, error) {
+	// Derive the entity private key and peer ID from the password parameters.
+	_, entityPriv, err := auth_password.BuildParametersWithUsernamePassword(username, password)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "derive entity key")
+	}
+	entityPeerID, err := peer.IDFromPrivateKey(entityPriv)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "derive entity peer ID")
+	}
+	return entityPriv, entityPeerID, nil
+}
+
+func parsePemEntityKey(pemPrivateKey []byte) (bifrost_crypto.PrivKey, peer.ID, error) {
+	// Parse the PEM private key and derive its peer ID.
+	privKey, err := keypem.ParsePrivKeyPem(pemPrivateKey)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "parse PEM private key")
+	}
+	peerID, err := peer.IDFromPrivateKey(privKey)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "derive peer ID from PEM key")
+	}
+	return privKey, peerID, nil
+}
+
+// buildMultiSigEnvelope builds the typed MultiSigActionEnvelope bytes that
+// entity keys sign. Binding account_id, kind, method, and path to the signed
+// bytes prevents replay across accounts or endpoints.
+func (r *AccountResource) buildMultiSigEnvelope(kind api.MultiSigActionKind, method, reqPath string, actionBody []byte) ([]byte, error) {
+	// Bind the account, request route, and action payload into the signed envelope.
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	env := &api.MultiSigActionEnvelope{
+		AccountId: acc.GetAccountID(),
+		Kind:      kind,
+		Method:    method,
+		Path:      reqPath,
+		Payload:   actionBody,
+	}
+	envBytes, err := env.MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal multi-sig envelope")
+	}
+	return envBytes, nil
+}
+
+// signAndSubmit builds a multi-sig envelope, signs it with the entity key,
+// and submits to the cloud. Returns the parsed MultiSigActionResponse envelope.
+func (r *AccountResource) signAndSubmit(
+	ctx context.Context,
+	method, reqPath string,
+	kind api.MultiSigActionKind,
+	actionBody []byte,
+	entityPriv bifrost_crypto.PrivKey,
+	entityPeerID peer.ID,
+) (*api.MultiSigActionResponse, error) {
+	// Sign the account action envelope and submit its signatures.
+	envelope, err := r.buildMultiSigEnvelope(kind, method, reqPath, actionBody)
+	if err != nil {
+		return nil, err
+	}
+	now := timestamppb.New(time.Now().Truncate(time.Millisecond))
+	payload := provider_spacewave.BuildMultiSigPayload(now, envelope)
+	sig, err := entityPriv.Sign(payload)
+	if err != nil {
+		return nil, errors.Wrap(err, "sign envelope")
+	}
+	return r.sendMultiSig(ctx, method, reqPath, envelope, []*api.EntitySignature{{
+		PeerId:    entityPeerID.String(),
+		Signature: sig,
+		SignedAt:  now,
+	}})
+}
+
+// sendMultiSig wraps envelope bytes and signatures into a MultiSigRequest and
+// sends it to the given cloud path without session-key auth headers. Returns
+// the parsed MultiSigActionResponse envelope.
+func (r *AccountResource) sendMultiSig(
+	ctx context.Context,
+	method, reqPath string,
+	envelope []byte,
+	sigs []*api.EntitySignature,
+) (*api.MultiSigActionResponse, error) {
+	// Resolve the account client and submit the signed action request.
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	cli := acc.GetSessionClient()
+	msReq := &api.MultiSigRequest{
+		Envelope:   envelope,
+		Signatures: sigs,
+	}
+	body, err := marshalMultiSigRequest(msReq)
+	if err != nil {
+		return nil, err
+	}
+	return cli.DoMultiSig(ctx, method, reqPath, body)
+}
+
+// marshalMultiSigRequest encodes a MultiSigRequest using protobuf binary.
+func marshalMultiSigRequest(msReq *api.MultiSigRequest) ([]byte, error) {
+	body, err := msReq.MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal multi-sig request")
+	}
+	return body, nil
+}
+
+// submitTrackedAction resolves or signs the entity multi-sig envelope for an
+// account API mutation, submits it through the multi-sig endpoint, and bumps
+// the local epoch on success. wrapMsg is used to wrap a non-nil send error.
+func (r *AccountResource) submitTrackedAction(
+	ctx context.Context,
+	cred *session.EntityCredential,
+	kind api.MultiSigActionKind,
+	method, reqPath string,
+	actionBody []byte,
+	wrapMsg string,
+) error {
+	// Sign and send the account mutation before advancing the local epoch.
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return err
+	}
+	envelope, sigs, err := r.resolveOrSignWithStore(ctx, cred, kind, method, reqPath, actionBody)
+	if err != nil {
+		return err
+	}
+	if _, err := r.sendMultiSig(ctx, method, reqPath, envelope, sigs); err != nil {
+		return errors.Wrap(err, wrapMsg)
+	}
+	acc.BumpLocalEpoch()
+	return nil
+}
+
+// AddAuthMethod adds a new entity keypair (auth method) to the account.
+func (r *AccountResource) AddAuthMethod(
+	ctx context.Context,
+	req *s4wave_account.AddAuthMethodRequest,
+) (*s4wave_account.AddAuthMethodResponse, error) {
+	// Encode the new keypair action before submitting it to the account.
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	kp := req.GetKeypair()
+	if kp == nil {
+		return nil, errors.New("keypair is required")
+	}
+	actionBody, err := (&api.AddKeypairAction{Keypair: kp}).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal add keypair action")
+	}
+
+	// Submit the add-keypair action and return its response.
+	reqPath := accountAPIPath(acc.GetAccountID(), "keypair", "add")
+	if err := r.submitTrackedAction(
+		ctx,
+		req.GetCredential(),
+		api.MultiSigActionKind_MULTI_SIG_ACTION_KIND_ADD_KEYPAIR,
+		http.MethodPost,
+		reqPath,
+		actionBody,
+		"add auth method",
+	); err != nil {
+		return nil, err
+	}
+	return &s4wave_account.AddAuthMethodResponse{}, nil
+}
+
+// RemoveAuthMethod removes an entity keypair from the account.
+func (r *AccountResource) RemoveAuthMethod(
+	ctx context.Context,
+	req *s4wave_account.RemoveAuthMethodRequest,
+) (*s4wave_account.RemoveAuthMethodResponse, error) {
+	// Encode and submit the account keypair removal.
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	actionBody, err := (&api.RemoveKeypairAction{PeerId: req.GetPeerId()}).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal remove keypair action")
+	}
+	reqPath := accountAPIPath(acc.GetAccountID(), "keypair", "remove")
+	if err := r.submitTrackedAction(
+		ctx,
+		req.GetCredential(),
+		api.MultiSigActionKind_MULTI_SIG_ACTION_KIND_REMOVE_KEYPAIR,
+		http.MethodPost,
+		reqPath,
+		actionBody,
+		"remove auth method",
+	); err != nil {
+		return nil, err
+	}
+	return &s4wave_account.RemoveAuthMethodResponse{}, nil
+}
+
+// SetSecurityLevel updates the auth threshold for the account.
+func (r *AccountResource) SetSecurityLevel(
+	ctx context.Context,
+	req *s4wave_account.SetSecurityLevelRequest,
+) (*s4wave_account.SetSecurityLevelResponse, error) {
+	// Encode and submit the new account authentication threshold.
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	actionBody, err := (&api.UpdateThresholdAction{Threshold: req.GetThreshold()}).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal update threshold action")
+	}
+	reqPath := accountAPIPath(acc.GetAccountID(), "threshold")
+	if err := r.submitTrackedAction(
+		ctx,
+		req.GetCredential(),
+		api.MultiSigActionKind_MULTI_SIG_ACTION_KIND_UPDATE_THRESHOLD,
+		http.MethodPost,
+		reqPath,
+		actionBody,
+		"set security level",
+	); err != nil {
+		return nil, err
+	}
+	return &s4wave_account.SetSecurityLevelResponse{}, nil
+}
+
+// RevokeSession revokes a session by peer ID.
+//
+// When credential is nil and the requested session_peer_id matches the
+// current session, uses the session self-revoke endpoint (no entity key
+// needed). Otherwise falls through to the entity multi-sig path, with
+// key-store fallback.
+func (r *AccountResource) RevokeSession(
+	ctx context.Context,
+	req *s4wave_account.RevokeSessionRequest,
+) (*s4wave_account.RevokeSessionResponse, error) {
+	// Resolve the account and try the credential-free current-session revoke.
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, errors.Wrap(err, "session revoke")
+	}
+	cli := acc.GetSessionClient()
+
+	// Self-revoke path: no credential provided, current session.
+	if req.GetCredential() == nil {
+		currentPeerID := cli.GetPeerID().String()
+		if req.GetSessionPeerId() == currentPeerID {
+			if err := cli.SelfRevoke(ctx); err != nil {
+				return nil, errors.Wrap(err, "self-revoke session")
+			}
+			acc.BumpLocalEpoch()
+			return &s4wave_account.RevokeSessionResponse{}, nil
+		}
+	}
+
+	// Sign and submit the revoke action when self-revoke does not apply.
+	actionBody, err := (&api.RevokeSessionAction{
+		SessionPeerId: req.GetSessionPeerId(),
+	}).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal revoke session action")
+	}
+	reqPath := accountAPIPath(acc.GetAccountID(), "session", req.GetSessionPeerId())
+	if err := r.submitTrackedAction(
+		ctx,
+		req.GetCredential(),
+		api.MultiSigActionKind_MULTI_SIG_ACTION_KIND_REVOKE_SESSION,
+		http.MethodDelete,
+		reqPath,
+		actionBody,
+		"revoke session",
+	); err != nil {
+		return nil, err
+	}
+	return &s4wave_account.RevokeSessionResponse{}, nil
+}
+
+// GenerateBackupKey generates an Ed25519 backup keypair, registers the public
+// key with the account, and returns the private key PEM for the user to store
+// safely.
+func (r *AccountResource) GenerateBackupKey(
+	ctx context.Context,
+	req *s4wave_account.GenerateBackupKeyRequest,
+) (*s4wave_account.GenerateBackupKeyResponse, error) {
+	// Use local settings for local accounts and register a generated cloud backup key.
+	if r.localAccount != nil {
+		return r.generateLocalBackupKey(ctx)
+	}
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	backupPeerID, pemData, err := generateBackupEntityKey()
+	if err != nil {
+		return nil, err
+	}
+	kp := &session.EntityKeypair{
+		PeerId:     backupPeerID.String(),
+		AuthMethod: "pem",
+	}
+	actionBody, err := (&api.AddKeypairAction{Keypair: kp}).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal action")
+	}
+
+	// Register the backup key through the account multi-signature endpoint.
+	reqPath := accountAPIPath(acc.GetAccountID(), "keypair", "add")
+	if err := r.submitTrackedAction(
+		ctx,
+		req.GetCredential(),
+		api.MultiSigActionKind_MULTI_SIG_ACTION_KIND_ADD_KEYPAIR,
+		http.MethodPost,
+		reqPath,
+		actionBody,
+		"register backup key",
+	); err != nil {
+		return nil, err
+	}
+
+	return &s4wave_account.GenerateBackupKeyResponse{
+		PemData: pemData,
+		PeerId:  backupPeerID.String(),
+	}, nil
+}
+
+// ChangePassword changes the account password by deriving a new entity
+// keypair from the new password, registering it, and removing the old one.
+func (r *AccountResource) ChangePassword(
+	ctx context.Context,
+	req *s4wave_account.ChangePasswordRequest,
+) (*s4wave_account.ChangePasswordResponse, error) {
+	// Use the local settings path or load the cloud account for password rotation.
+	if r.localAccount != nil {
+		return r.changeLocalPassword(ctx, req)
+	}
+	acc, err := r.requireCloudAccount()
+	if err != nil {
+		return nil, err
+	}
+	oldPassword := req.GetOldPassword()
+	newPassword := req.GetNewPassword()
+	if oldPassword == "" || newPassword == "" {
+		return nil, errors.New("old_password and new_password are required")
+	}
+
+	// Resolve the old password key before deriving its replacement.
+	oldPriv, oldPeerID, err := r.ResolveEntityKey(ctx, &session.EntityCredential{
+		Credential: &session.EntityCredential_Password{Password: oldPassword},
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve old entity key")
+	}
+
+	// Derive a replacement key using the account entity ID.
+	info, err := acc.GetAccountState(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetch account info")
+	}
+	newPriv, newPeerID, err := derivePasswordEntityKey(info.EntityId, []byte(newPassword))
+	if err != nil {
+		return nil, errors.Wrap(err, "derive new entity key")
+	}
+
+	// Prepare and submit the new keypair signed by the old credential.
+	accountID := acc.GetAccountID()
+	kp := &session.EntityKeypair{
+		PeerId:     newPeerID.String(),
+		AuthMethod: auth_password.MethodID,
+	}
+	addAction, err := (&api.AddKeypairAction{Keypair: kp}).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal add action")
+	}
+	addPath := accountAPIPath(accountID, "keypair", "add")
+	if _, err := r.signAndSubmit(
+		ctx,
+		http.MethodPost,
+		addPath,
+		api.MultiSigActionKind_MULTI_SIG_ACTION_KIND_ADD_KEYPAIR,
+		addAction,
+		oldPriv,
+		oldPeerID,
+	); err != nil {
+		return nil, errors.Wrap(err, "add new keypair")
+	}
+
+	// Remove the old key only after the replacement key has been registered.
+	removeAction, err := (&api.RemoveKeypairAction{PeerId: oldPeerID.String()}).MarshalVT()
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal remove action")
+	}
+	removePath := accountAPIPath(accountID, "keypair", "remove")
+	if _, err := r.signAndSubmit(
+		ctx,
+		http.MethodPost,
+		removePath,
+		api.MultiSigActionKind_MULTI_SIG_ACTION_KIND_REMOVE_KEYPAIR,
+		removeAction,
+		newPriv,
+		newPeerID,
+	); err != nil {
+		return nil, errors.Wrap(err, "remove old keypair")
+	}
+
+	// Advance the local account epoch after both key changes succeed.
+	acc.BumpLocalEpoch()
+
+	return &s4wave_account.ChangePasswordResponse{}, nil
+}
+
+func (r *AccountResource) generateLocalBackupKey(
+	ctx context.Context,
+) (*s4wave_account.GenerateBackupKeyResponse, error) {
+	backupPeerID, pemData, err := generateBackupEntityKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.addLocalEntityKeypair(ctx, &session.EntityKeypair{
+		PeerId:     backupPeerID.String(),
+		AuthMethod: "pem",
+	}); err != nil {
+		return nil, errors.Wrap(err, "add backup keypair")
+	}
+
+	return &s4wave_account.GenerateBackupKeyResponse{
+		PemData: pemData,
+		PeerId:  backupPeerID.String(),
+	}, nil
+}
+
+func (r *AccountResource) changeLocalPassword(
+	ctx context.Context,
+	req *s4wave_account.ChangePasswordRequest,
+) (*s4wave_account.ChangePasswordResponse, error) {
+	// Require both passwords before changing the local credential keypair.
+	oldPassword := req.GetOldPassword()
+	newPassword := req.GetNewPassword()
+	if oldPassword == "" || newPassword == "" {
+		return nil, errors.New("old_password and new_password are required")
+	}
+
+	// Resolve the old and new local keys before replacing the stored keypair.
+	_, oldPeerID, err := r.ResolveEntityKey(ctx, &session.EntityCredential{
+		Credential: &session.EntityCredential_Password{Password: oldPassword},
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve old entity key")
+	}
+	_, newPeerID, err := r.ResolveEntityKey(ctx, &session.EntityCredential{
+		Credential: &session.EntityCredential_Password{Password: newPassword},
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "derive new entity key")
+	}
+	if err := r.addLocalEntityKeypair(ctx, &session.EntityKeypair{
+		PeerId:     newPeerID.String(),
+		AuthMethod: auth_password.MethodID,
+	}); err != nil {
+		return nil, errors.Wrap(err, "add new keypair")
+	}
+	if err := r.removeLocalEntityKeypair(ctx, oldPeerID.String()); err != nil {
+		return nil, errors.Wrap(err, "remove old keypair")
+	}
+	return &s4wave_account.ChangePasswordResponse{}, nil
+}
+
+func (r *AccountResource) addLocalEntityKeypair(ctx context.Context, kp *session.EntityKeypair) error {
+	return r.queueLocalAccountSettingsOp(ctx, &account_settings.AccountSettingsOp{
+		Op: &account_settings.AccountSettingsOp_AddEntityKeypair{
+			AddEntityKeypair: kp,
+		},
+	})
+}
+
+func (r *AccountResource) removeLocalEntityKeypair(ctx context.Context, peerID string) error {
+	return r.queueLocalAccountSettingsOp(ctx, &account_settings.AccountSettingsOp{
+		Op: &account_settings.AccountSettingsOp_RemoveEntityKeypair{
+			RemoveEntityKeypair: &account_settings.RemoveEntityKeypairOp{
+				PeerId: peerID,
+			},
+		},
+	})
+}
+
+func generateBackupEntityKey() (peer.ID, []byte, error) {
+	// Generate the backup key, derive its peer identity, and encode its PEM.
+	backupPriv, _, err := bifrost_crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "generate backup key")
+	}
+	backupPeerID, err := peer.IDFromPrivateKey(backupPriv)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "derive backup peer ID")
+	}
+	pemData, err := keypem.MarshalPrivKeyPem(backupPriv)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "marshal PEM")
+	}
+	return backupPeerID, pemData, nil
+}
+
+// accountAPIPath builds a canonical account API route.
+func accountAPIPath(accountID string, elems ...string) string {
+	return path.Join(append([]string{"/api/account", accountID}, elems...)...)
+}
+
+// _ is a type assertion
+var _ s4wave_account.SRPCAccountResourceServiceServer = (*AccountResource)(nil)

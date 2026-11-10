@@ -1,0 +1,10 @@
+udp:
+  id: bifrost/udp
+  config:
+    listenAddr: :50042
+
+forwarding:
+  id: bifrost/stream/forwarding
+  config:
+    protocolId: my/http/forwarding
+    targetMultiaddr: "/ip4/127.0.0.1/tcp/8080"

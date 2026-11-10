@@ -1,0 +1,101 @@
+package store
+
+import "time"
+
+// PackReaderStats describes the current engine state and counters.
+type PackReaderStats struct {
+	ResidentBytes             int64
+	SpanCount                 int
+	InFlightFetches           int
+	FetchCount                uint64
+	FetchedBytes              int64
+	RangeRequestCount         uint64
+	RangeResponseBytes        int64
+	IndexTailFetchCount       uint64
+	IndexTailFetchBytes       int64
+	IndexTailResponseBytes    int64
+	FullResponseFallbackCount uint64
+	FullResponseFallbackBytes int64
+	LastFullResponseFallback  int64
+	LastFetchAt               time.Time
+	LastFetchBytes            int
+	CurrentWindow             int
+	PublishedBlocks           int
+	WritebackRunning          int
+	VerifyFailures            uint64
+	WritebackCount            uint64
+	WritebackErrors           uint64
+	IndexLoaded               bool
+	// IndexDrops counts indexes dropped above the index byte limit.
+	IndexDrops            uint64
+	IndexCacheHits        uint64
+	IndexCacheMisses      uint64
+	IndexCacheReadErrors  uint64
+	IndexCacheWriteErrors uint64
+	RemoteIndexLoads      uint64
+	RemoteIndexBytes      int64
+	LastRemoteIndexBytes  int64
+}
+
+// TransportStats describes transport-specific fetch counters.
+type TransportStats struct {
+	FullResponseFallbackCount uint64
+	FullResponseFallbackBytes int64
+	LastFullResponseFallback  int64
+}
+
+type transportStatsProvider interface {
+	SnapshotTransportStats() TransportStats
+}
+
+// SnapshotStats returns a snapshot of engine state and counters.
+func (e *PackReader) SnapshotStats() PackReaderStats {
+	var snap PackReaderStats
+	e.bcast.HoldLock(func(_ func(), _ func() <-chan struct{}) {
+		// Snapshot resident byte coverage and payload transport totals.
+		snap.ResidentBytes = e.residentBytes
+		snap.SpanCount = len(e.spans)
+		snap.InFlightFetches = len(e.loading)
+		snap.FetchCount = e.fetchCount
+		snap.FetchedBytes = e.fetchBytes
+		snap.RangeRequestCount = e.fetchCount
+		snap.RangeResponseBytes = e.rangeResponseBytes
+
+		// Snapshot index-tail transport totals.
+		snap.IndexTailFetchCount = e.indexTailFetchCount
+		snap.IndexTailFetchBytes = e.indexTailFetchBytes
+		snap.IndexTailResponseBytes = e.indexTailResponseBytes
+
+		// Include full-response fallback overhead reported by the transport.
+		if provider, ok := e.transport.(transportStatsProvider); ok {
+			transport := provider.SnapshotTransportStats()
+			snap.FullResponseFallbackCount = transport.FullResponseFallbackCount
+			snap.FullResponseFallbackBytes = transport.FullResponseFallbackBytes
+			snap.LastFullResponseFallback = transport.LastFullResponseFallback
+		}
+
+		// Snapshot adaptive transport settings and writeback activity.
+		snap.LastFetchAt = e.lastFetchAt
+		snap.LastFetchBytes = e.lastFetchBytes
+		snap.CurrentWindow = e.currentWindow
+		snap.PublishedBlocks = len(e.published)
+		snap.WritebackRunning = e.writebackRunning
+		snap.VerifyFailures = e.verifyFailures
+		snap.WritebackCount = e.writebackCount
+		snap.WritebackErrors = e.writebackErrors
+
+		// Snapshot index availability and cache outcomes.
+		snap.IndexLoaded = e.indexLoaded
+		snap.IndexDrops = e.indexDrops
+		snap.IndexCacheHits = e.indexCacheHits
+		snap.IndexCacheMisses = e.indexCacheMisses
+		snap.IndexCacheReadErrors = e.indexCacheReadErrors
+		snap.IndexCacheWriteErrors = e.indexCacheWriteErrors
+
+		// Snapshot remote index load counts and byte usage.
+		snap.RemoteIndexLoads = e.remoteIndexLoads
+		snap.RemoteIndexBytes = e.remoteIndexBytes
+		snap.LastRemoteIndexBytes = e.lastRemoteIndexBytes
+	})
+	return snap
+}

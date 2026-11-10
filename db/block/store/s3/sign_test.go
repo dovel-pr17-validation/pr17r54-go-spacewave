@@ -1,0 +1,98 @@
+//go:build !tinygo
+
+package block_store_s3
+
+import (
+	"net/http"
+	"net/url"
+	"testing"
+	"time"
+)
+
+// TestSignV4GetObject verifies the signer against the AWS S3 SigV4 example
+// "GET Object" from the AWS Signature Version 4 documentation.
+//
+// Reference: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+func TestSignV4GetObject(t *testing.T) {
+	// Build the S3 example request with the documented signing inputs.
+	c := &Client{
+		endpoint:  "examplebucket.s3.amazonaws.com",
+		region:    "us-east-1",
+		accessKey: "AKIAIOSFODNN7EXAMPLE",
+		secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		useSSL:    true,
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://examplebucket.s3.amazonaws.com/test.txt", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-9")
+
+	// Sign the example object request at its fixed timestamp.
+	now := time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC)
+	c.signV4(req, emptyPayloadHash, now)
+
+	// Verify the authorization header matches the published object example.
+	want := "AWS4-HMAC-SHA256 Credential=" + c.accessKey + "/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+	got := req.Header.Get("Authorization")
+	if got != want {
+		t.Fatalf("Authorization mismatch:\n want: %s\n  got: %s", want, got)
+	}
+}
+
+// TestSignV4ListObjects verifies query signing against the AWS S3 SigV4
+// example "GET Bucket (List Objects)".
+//
+// Reference: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+func TestSignV4ListObjects(t *testing.T) {
+	// Build the S3 example listing request with the documented signing inputs.
+	c := &Client{
+		endpoint:  "examplebucket.s3.amazonaws.com",
+		region:    "us-east-1",
+		accessKey: "AKIAIOSFODNN7EXAMPLE",
+		secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		useSSL:    true,
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://examplebucket.s3.amazonaws.com/?prefix=J&max-keys=2", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sign the example bucket listing at its fixed timestamp.
+	now := time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC)
+	c.signV4(req, emptyPayloadHash, now)
+
+	// Verify the authorization header matches the published listing example.
+	want := "AWS4-HMAC-SHA256 Credential=" + c.accessKey + "/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
+	got := req.Header.Get("Authorization")
+	if got != want {
+		t.Fatalf("Authorization mismatch:\n want: %s\n  got: %s", want, got)
+	}
+}
+
+// TestPresignV4GetObject verifies the query signer against the AWS S3 SigV4
+// example "GET Object" with query parameters.
+//
+// Reference: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+func TestPresignV4GetObject(t *testing.T) {
+	// Address the example object with the example credentials.
+	c := &Client{
+		region:    "us-east-1",
+		accessKey: "AKIAIOSFODNN7EXAMPLE",
+		secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+	}
+	u, err := url.Parse("https://examplebucket.s3.amazonaws.com/test.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Presign a GET valid for one day at the example time.
+	now := time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC)
+	c.presignV4(http.MethodGet, u, nil, 24*time.Hour, now)
+
+	// The signature matches the published example.
+	want := "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+	if got := u.Query().Get("X-Amz-Signature"); got != want {
+		t.Fatalf("signature mismatch:\n want: %s\n  got: %s", want, got)
+	}
+}

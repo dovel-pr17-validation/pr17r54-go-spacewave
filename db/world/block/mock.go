@@ -1,0 +1,82 @@
+package world_block
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	block_mock "github.com/s4wave/spacewave/db/block/mock"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	"github.com/s4wave/spacewave/db/world"
+	world_mock "github.com/s4wave/spacewave/db/world/mock"
+	"github.com/sirupsen/logrus"
+)
+
+// BuildMockWorldState builds a mock world state.
+func BuildMockWorldState(ctx context.Context, le *logrus.Entry, write bool, ocs *bucket_lookup.Cursor, verbose bool) (*WorldState, error) {
+	return BuildWorldStateFromCursor(
+		ctx,
+		le,
+		write,
+		ocs,
+		world.NewWorldStorageFromCursor(ocs),
+		world_mock.LookupMockOp,
+		verbose,
+	)
+}
+
+// BuildMockObject builds a mock object in a world.
+func BuildMockObject(ctx context.Context, ws world.WorldState, objKey string) (world.ObjectState, error) {
+	// Choose a default key and build the example block through a stage held
+	// until the object adopts it.
+	if objKey == "" {
+		objKey = "test-obj-1"
+	}
+	stage, err := ws.StageWorldState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stage.Release()
+	var oref *bucket.ObjectRef
+	err = stage.AccessWorldState(ctx, nil, func(bls *bucket_lookup.Cursor) error {
+		// Write the example block and return its root ref.
+		oref = bls.GetRef() // note: clones the ref
+		obtx, obcs := bls.BuildTransactionAtRef(nil, nil)
+		exb := &block_mock.Example{Msg: "Hello from " + objKey}
+		obcs.SetBlock(exb, true)
+		var err error
+		oref.RootRef, _, err = obtx.Write(ctx, true)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Register the newly written root reference as a world object.
+	var createdObject world.ObjectState
+	createdObject, err = ws.CreateObject(ctx, objKey, oref)
+	world.ReleaseObjectState(createdObject)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read back the object to confirm registration succeeded.
+	objState, found, err := ws.GetObject(ctx, objKey)
+	if err != nil {
+		world.ReleaseObjectState(objState)
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("expected to find object after create")
+	}
+	return objState, nil
+}
+
+// MockObject is the mock object block.
+type MockObject = block_mock.Example
+
+// UnmarshalMockObject unmarshals a block from a block cursor.
+func UnmarshalMockObject(ctx context.Context, bcs *block.Cursor) (*block_mock.Example, error) {
+	return block.UnmarshalBlock[block_mock.Example](ctx, bcs)
+}

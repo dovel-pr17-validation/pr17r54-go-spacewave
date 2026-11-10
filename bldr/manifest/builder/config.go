@@ -1,0 +1,209 @@
+//go:build !js
+
+package bldr_manifest_builder
+
+import (
+	"context"
+	"path/filepath"
+	"slices"
+
+	timestamp "github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/osfs"
+	"github.com/pkg/errors"
+	manifest "github.com/s4wave/spacewave/bldr/manifest"
+	manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/bucket"
+	unixfs_sync "github.com/s4wave/spacewave/db/unixfs/sync"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+	"github.com/sirupsen/logrus"
+)
+
+type manifestCommitTimestampContextKey struct{}
+
+// Validate validates the configuration.
+func (c *BuilderConfig) Validate() error {
+	// Validate the engine id, manifest meta, and build policy.
+	if len(c.GetEngineId()) == 0 {
+		return world.ErrEmptyEngineID
+	}
+	if err := c.GetManifestMeta().Validate(false); err != nil {
+		return err
+	}
+	if err := c.GetBuildPolicy().Validate(); err != nil {
+		return err
+	}
+
+	// Validate the peer id field.
+	if len(c.GetPeerId()) == 0 {
+		return peer.ErrEmptyPeerID
+	}
+	if _, err := c.ParsePeerID(); err != nil {
+		return err
+	}
+
+	// Validate the absolute source and working paths.
+	if c.GetSourcePath() == "" {
+		return errors.Wrap(manifest.ErrEmptyPath, "source path")
+	}
+	if !filepath.IsAbs(c.GetSourcePath()) {
+		return errors.New("source path must be absolute")
+	}
+	if c.GetWorkingPath() == "" {
+		return errors.Wrap(manifest.ErrEmptyPath, "working path")
+	}
+	if !filepath.IsAbs(c.GetWorkingPath()) {
+		return errors.New("working path must be absolute")
+	}
+
+	// Validate each dependency manifest id.
+	for i, dep := range c.GetDeps() {
+		if err := manifest.ValidateManifestID(dep, false); err != nil {
+			return errors.Wrapf(err, "deps[%d]", i)
+		}
+	}
+	return nil
+}
+
+// withManifestCommitTimestamp stores a fixed commit timestamp in the context.
+func withManifestCommitTimestamp(ctx context.Context, ts *timestamp.Timestamp) context.Context {
+	// A nil timestamp leaves the context unchanged.
+	if ts == nil {
+		return ctx
+	}
+
+	// Store a clone of the timestamp under the context key.
+	return context.WithValue(ctx, manifestCommitTimestampContextKey{}, ts.CloneVT())
+}
+
+// ParsePeerID parses the peer id field.
+func (c *BuilderConfig) ParsePeerID() (peer.ID, error) {
+	return confparse.ParsePeerID(c.GetPeerId())
+}
+
+// CommitManifest creates and applies a manifest from in-memory dist and
+// assets filesystems.
+func (c *BuilderConfig) CommitManifest(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	meta *manifest.ManifestMeta,
+	entrypointFilename string,
+	distFs,
+	assetsFs billy.Filesystem,
+) (*manifest.Manifest, *bucket.ObjectRef, error) {
+	// Parse the peer id and capture the fixed commit timestamp.
+	pid, err := c.ParsePeerID()
+	if err != nil {
+		return nil, nil, err
+	}
+	ts := ManifestCommitTimestamp(ctx)
+
+	// Create the manifest with the dist and assets filesystems through a stage
+	// held until the store op adopts it.
+	stage, err := ws.StageWorldState(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer stage.Release()
+	manifestValue := manifest.NewManifest(meta, entrypointFilename)
+	manifestValue.Deps = slices.Clone(c.GetDeps())
+	manifestRef, err := world.AccessObject(ctx, stage.AccessWorldState, nil, func(bcs *block.Cursor) error {
+		return manifest.CreateManifestWithBilly(ctx, bcs, manifestValue, distFs, assetsFs, ts)
+	})
+	if err != nil {
+		return nil, manifestRef, err
+	}
+
+	// Apply the store manifest world op under the manifest's object key.
+	objectKey := manifest.NewManifestArtifactKey(manifestRef)
+	manifestValue.GetMeta().Logger(le).
+		WithField("object-key", objectKey).
+		WithField("link-object-keys", c.GetLinkObjectKeys()).
+		Info("committing manifest to world")
+	_, _, err = ws.ApplyWorldOp(
+		ctx,
+		manifest_world.NewStoreManifestOp(
+			objectKey,
+			c.GetLinkObjectKeys(),
+			manifest.NewManifestRef(
+				manifestValue.GetMeta(),
+				manifestRef,
+			),
+		),
+		pid,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifestValue, manifestRef, nil
+}
+
+// CommitManifestWithPaths is a shortcut for CommitManifest with on-disk paths.
+func (c *BuilderConfig) CommitManifestWithPaths(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	meta *manifest.ManifestMeta,
+	entrypointFilename string,
+	distFsPath,
+	assetsFsPath string,
+) (*manifest.Manifest, *bucket.ObjectRef, error) {
+	// Open the dist filesystem when a path is given.
+	var distFs billy.Filesystem
+	if distFsPath != "" {
+		distFs = osfs.New(distFsPath, osfs.WithBoundOS())
+	}
+
+	// Open the assets filesystem when a path is given.
+	var assetsFs billy.Filesystem
+	if assetsFsPath != "" {
+		assetsFs = osfs.New(assetsFsPath, osfs.WithBoundOS())
+	}
+
+	// Commit the manifest from the opened filesystems.
+	return c.CommitManifest(ctx, le, ws, meta, entrypointFilename, distFs, assetsFs)
+}
+
+// CheckoutManifest checks out the manifest's dist and assets to on-disk
+// paths, delegating to manifest_world.CheckoutManifest with
+// DeleteMode_DURING.
+//
+// If either of the paths are empty, they will be skipped.
+// If manifestRef is nil, it defaults to the reference chosen by accessFunc.
+func (c *BuilderConfig) CheckoutManifest(
+	ctx context.Context,
+	le *logrus.Entry,
+	accessFunc world.AccessWorldStateFunc,
+	manifestRef *bucket.ObjectRef,
+	distFsPath,
+	assetsFsPath string,
+) (*manifest.Manifest, error) {
+	return manifest_world.CheckoutManifest(
+		ctx,
+		le,
+		accessFunc,
+		manifestRef,
+		distFsPath,
+		assetsFsPath,
+		unixfs_sync.DeleteMode_DeleteMode_DURING,
+		nil,
+		nil,
+	)
+}
+
+// ManifestCommitTimestamp returns the lifecycle's fixed build time when set,
+// otherwise the current time. Callers capture it once per build.
+func ManifestCommitTimestamp(ctx context.Context) *timestamp.Timestamp {
+	// Return the fixed timestamp when the context carries one.
+	ts, ok := ctx.Value(manifestCommitTimestampContextKey{}).(*timestamp.Timestamp)
+	if ok && ts != nil {
+		return ts.CloneVT()
+	}
+
+	// Otherwise use the current time.
+	return timestamp.Now()
+}

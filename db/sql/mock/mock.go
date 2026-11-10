@@ -1,0 +1,98 @@
+//go:build !js
+
+// Package sql_mock exercises a SqlStore through the stdlib high-level *sql.DB
+// API (sql.Tx, sql.Rows.Scan), which pulls reflect via convert.go. The browser
+// GoScript build never opens a *sql.DB, so this native-only test helper stays
+// out of the web closure.
+package sql_mock
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	hydra_sql "github.com/s4wave/spacewave/db/sql"
+	"github.com/sirupsen/logrus"
+)
+
+// TestSqlStore_Basic performs basic tests on a SqlDB.
+func TestSqlStore_Basic(ctx context.Context, le *logrus.Entry, db hydra_sql.SqlStore, dsn string) error {
+	// Open the store as a *sql.DB.
+	sqlDB := hydra_sql.NewSqlDb(db, dsn)
+
+	// printQuery runs a query in tx, or on the DB when tx is nil, and returns
+	// the number of rows it read.
+	printQuery := func(tx *sql.Tx, query string) (int, error) {
+		// Run the query in the transaction or on the DB.
+		le.Infof("QUERY: %s", query)
+		var r *sql.Rows
+		var err error
+		if tx != nil {
+			r, err = tx.Query(query)
+		} else {
+			r, err = sqlDB.Query(query)
+		}
+		if err != nil {
+			return 0, err
+		}
+		defer r.Close()
+
+		// Count the rows, logging each row's columns.
+		var nrows int
+		for r.Next() {
+			nrows++
+			cols, err := r.Columns()
+			if err != nil {
+				return 0, err
+			}
+			for ci, col := range cols {
+				le.Infof("COL %d: %v", ci, col)
+			}
+		}
+
+		// Next stops on an error as well as at the end of the rows.
+		if err := r.Err(); err != nil {
+			return 0, err
+		}
+
+		// Close the rows to end the query.
+		le.Infof("END QUERY: %d rows", nrows)
+		return nrows, r.Close()
+	}
+
+	// Read the table before any insert.
+	tableName := "test-table"
+	_, err := printQuery(nil, fmt.Sprintf("SELECT * FROM `%s`", tableName))
+	if err != nil {
+		return err
+	}
+
+	// Insert three rows in one transaction.
+	tx, err := sqlDB.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return err
+	}
+	for i := range 3 {
+		_, err = printQuery(
+			tx,
+			fmt.Sprintf(
+				"INSERT INTO `%s` (name, email, created_at, phone_numbers) VALUES ('entry-%d', 'account-%d@email.com', NOW(), '[\"555-555-555%d\"]')",
+				tableName,
+				i, i, i,
+			),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Commit the inserts.
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
+
+	// Read the table again after the commit.
+	_, err = printQuery(nil, fmt.Sprintf("SELECT * FROM `%s`", tableName))
+	return err
+}

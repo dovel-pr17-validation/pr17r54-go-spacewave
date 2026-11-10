@@ -1,0 +1,84 @@
+// Package s4wave_vm_world registers VM ObjectTypes in the Space World.
+package s4wave_vm_world
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/starpc/srpc"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	unixfs_v86fs "github.com/s4wave/spacewave/db/unixfs/v86fs"
+	"github.com/s4wave/spacewave/db/world"
+	s4wave_process "github.com/s4wave/spacewave/sdk/process"
+	s4wave_vm "github.com/s4wave/spacewave/sdk/vm"
+	"github.com/s4wave/spacewave/sdk/world/objecttype"
+	"github.com/sirupsen/logrus"
+)
+
+// VmV86Type is the ObjectType for vm/v86 objects.
+var VmV86Type = objecttype.NewObjectType(s4wave_vm.VmV86TypeID, vmV86Factory)
+
+// V86ImageType is the ObjectType for vm/image/v86 objects.
+// V86Image is metadata-only; block state is read through the objectState prop.
+var V86ImageType = objecttype.NewObjectType(s4wave_vm.V86ImageTypeID, v86ImageReadOnlyFactory)
+
+// v86ImageReadOnlyFactory is a minimal factory for the read-only V86Image type.
+func v86ImageReadOnlyFactory(
+	ctx context.Context,
+	le *logrus.Entry,
+	b bus.Bus,
+	engine world.Engine,
+	ws world.WorldState,
+	objectKey string,
+) (srpc.Invoker, func(), error) {
+	if ws == nil {
+		return nil, nil, objecttype.ErrWorldStateRequired
+	}
+	return nil, func() {}, nil
+}
+
+// vmV86Factory creates a V86 resource with PersistentExecutionService and V86fsService.
+func vmV86Factory(
+	ctx context.Context,
+	le *logrus.Entry,
+	b bus.Bus,
+	engine world.Engine,
+	ws world.WorldState,
+	objectKey string,
+) (srpc.Invoker, func(), error) {
+	// Require World state and use the engine-backed state when available.
+	if ws == nil {
+		return nil, nil, objecttype.ErrWorldStateRequired
+	}
+	resourceWS := ws
+	if engine != nil {
+		resourceWS = world.NewEngineWorldState(engine, true)
+	}
+
+	// Serve v86fs mounts from the VM's graph edges and linked image.
+	mounts := newV86MountResolver(ctx, le, b, resourceWS, objectKey)
+	v86fsServer := unixfs_v86fs.NewServer(le, mounts.resolve)
+
+	// Pre-populate the v86fs dynamic mount table from V86Config.Mounts so the
+	// guest learns about workspace/home/etc. mounts via MOUNT_NOTIFY frames
+	// when the v86fs session joins.
+	mountCleanup, err := registerV86ConfigMounts(ctx, le, resourceWS, objectKey, v86fsServer)
+	if err != nil {
+		mounts.release()
+		return nil, nil, err
+	}
+
+	// The runtime plugin loads and calls back through the plugin bus.
+	pluginBus := objecttype.PluginBusFromContext(ctx, b)
+	resource := newV86Resource(le, objectKey, resourceWS, pluginBus, v86fsServer, mounts)
+	mux := resource_server.NewResourceMux(func(mux srpc.Mux) error {
+		if err := s4wave_process.SRPCRegisterPersistentExecutionService(mux, resource); err != nil {
+			return err
+		}
+		return unixfs_v86fs.SRPCRegisterV86FsService(mux, v86fsServer)
+	})
+	return mux, func() {
+		mountCleanup()
+		mounts.release()
+	}, nil
+}

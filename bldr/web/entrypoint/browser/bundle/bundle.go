@@ -1,0 +1,1344 @@
+//go:build !js
+
+package entrypoint_browser_bundle
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aperturerobotics/fastjson"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/bldr/distpath"
+	bldr_platform "github.com/s4wave/spacewave/bldr/platform"
+	bldr_util_buildcache "github.com/s4wave/spacewave/bldr/util/buildcache"
+	"github.com/s4wave/spacewave/bldr/util/npm"
+	bldr_web_bundler_rolldown "github.com/s4wave/spacewave/bldr/web/bundler/rolldown"
+	bldr_vite "github.com/s4wave/spacewave/bldr/web/bundler/vite"
+	web_entrypoint_index "github.com/s4wave/spacewave/bldr/web/entrypoint/index"
+	web_pkg_external "github.com/s4wave/spacewave/bldr/web/pkg/external"
+	web_pkg_vite "github.com/s4wave/spacewave/bldr/web/pkg/vite"
+	"github.com/sirupsen/logrus"
+)
+
+// BrowserBundleResult contains the output filenames from a browser bundle build.
+type BrowserBundleResult struct {
+	// EntrypointPath is the path to the entrypoint mjs relative to the build dir.
+	EntrypointPath string
+	// EntrypointDecompressedSize is the byte size of EntrypointPath after HTTP decompression.
+	EntrypointDecompressedSize int64
+	// ServiceWorkerFilename is the output filename of the service worker.
+	ServiceWorkerFilename string
+	// SharedWorkerFilename is the output filename of the shared worker.
+	SharedWorkerFilename string
+	// OpfsWorkerFilename is the output filename of the OPFS protocol worker.
+	OpfsWorkerFilename string
+	// CSSPaths contains CSS output file paths relative to the build dir.
+	CSSPaths []string
+}
+
+// DefaultManifestBundle describes the browser-discoverable manifest bundle
+// transport for first-boot range reads.
+type DefaultManifestBundle struct {
+	Metadata string `json:"metadata"`
+	Pack     string `json:"pack"`
+}
+
+// BuildManifest is the manifest.json structure written alongside index.html.
+// The prerender build script reads this to discover asset URLs.
+type BuildManifest struct {
+	Entrypoint string `json:"entrypoint"`
+	// EntrypointDecompressedSize is the byte size of Entrypoint after HTTP decompression.
+	EntrypointDecompressedSize int64                  `json:"entrypointDecompressedSize,omitempty"`
+	ServiceWorker              string                 `json:"serviceWorker"`
+	SharedWorker               string                 `json:"sharedWorker"`
+	Wasm                       string                 `json:"wasm,omitempty"`
+	OpfsWorker                 string                 `json:"opfsWorker,omitempty"`
+	RequiredStaticAssets       []string               `json:"requiredStaticAssets,omitempty"`
+	CSS                        []string               `json:"css"`
+	AutoStart                  bool                   `json:"autoStart,omitempty"`
+	DefaultManifestBundle      *DefaultManifestBundle `json:"defaultManifestBundle,omitempty"`
+}
+
+const stableBootFilename = "boot.mjs"
+
+// rendererBootPath is the origin-absolute boot script path in the renderer
+// index, so pathname routes such as /landing/drive load the same script.
+const rendererBootPath = "/" + stableBootFilename
+
+// WriteBuildManifest writes a manifest.json to the given directory.
+func WriteBuildManifest(dir string, manifest *BuildManifest) error {
+	// The entrypoint tree owns the runtime, split modules, web packages, and
+	// immutable kvfile. Every executable asset must survive an offline restart.
+	var runtimeAssets []string
+	err := fs.WalkDir(os.DirFS(dir), "entrypoint", func(path string, entry fs.DirEntry, err error) error {
+		if os.IsNotExist(err) && path == "entrypoint" {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() && !strings.HasSuffix(path, ".map") {
+			runtimeAssets = append(runtimeAssets, "/"+path)
+		}
+		return nil
+	})
+	if err != nil {
+		return errors.Wrap(err, "enumerate browser runtime assets")
+	}
+	manifest.RequiredStaticAssets = runtimeAssets
+	if err := writeBrowserReleaseManifest(dir, manifest); err != nil {
+		return err
+	}
+
+	// Encode the manifest fields into a JSON object.
+	var a fastjson.Arena
+	obj := a.NewObject()
+	obj.Set("entrypoint", a.NewString(manifest.Entrypoint))
+	if manifest.EntrypointDecompressedSize > 0 {
+		obj.Set("entrypointDecompressedSize", a.NewNumberString(strconv.FormatInt(manifest.EntrypointDecompressedSize, 10)))
+	}
+	obj.Set("serviceWorker", a.NewString(manifest.ServiceWorker))
+	obj.Set("sharedWorker", a.NewString(manifest.SharedWorker))
+	if manifest.Wasm != "" {
+		obj.Set("wasm", a.NewString(manifest.Wasm))
+	}
+	if manifest.OpfsWorker != "" {
+		obj.Set("opfsWorker", a.NewString(manifest.OpfsWorker))
+	}
+
+	// Encode the CSS and required static asset path lists.
+	css := a.NewArray()
+	for _, path := range manifest.CSS {
+		css.SetArrayItem(len(css.GetArray()), a.NewString(path))
+	}
+	obj.Set("css", css)
+	assets := a.NewArray()
+	for _, path := range manifest.RequiredStaticAssets {
+		assets.SetArrayItem(len(assets.GetArray()), a.NewString(path))
+	}
+	obj.Set("requiredStaticAssets", assets)
+
+	// Write the manifest JSON into the build directory.
+	data := obj.MarshalTo(nil)
+	return os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0o644)
+}
+
+func writeBrowserReleaseManifest(dir string, manifest *BuildManifest) error {
+	// Hash the release generation ID from the cached file set.
+	generationID, err := browserReleaseGenerationID(dir, manifest)
+	if err != nil {
+		return err
+	}
+
+	// Encode the release header and shell asset fields.
+	var a fastjson.Arena
+	obj := a.NewObject()
+	obj.Set("schemaVersion", a.NewNumberInt(1))
+	obj.Set("generationId", a.NewString(generationID))
+	if manifest.AutoStart {
+		obj.Set("autoStart", a.NewTrue())
+	}
+
+	// Encode the shell asset paths and CSS list.
+	shellAssets := a.NewObject()
+	shellAssets.Set("entrypoint", a.NewString(manifest.Entrypoint))
+	if manifest.EntrypointDecompressedSize > 0 {
+		shellAssets.Set("entrypointDecompressedSize", a.NewNumberString(strconv.FormatInt(manifest.EntrypointDecompressedSize, 10)))
+	}
+	shellAssets.Set("serviceWorker", a.NewString(manifest.ServiceWorker))
+	shellAssets.Set("sharedWorker", a.NewString(manifest.SharedWorker))
+	if manifest.Wasm != "" {
+		shellAssets.Set("wasm", a.NewString(manifest.Wasm))
+	}
+	if manifest.OpfsWorker != "" {
+		shellAssets.Set("opfsWorker", a.NewString(manifest.OpfsWorker))
+	}
+
+	// Encode the CSS list into the shell assets object.
+	css := a.NewArray()
+	for _, path := range manifest.CSS {
+		css.SetArrayItem(len(css.GetArray()), a.NewString(path))
+	}
+	shellAssets.Set("css", css)
+	obj.Set("shellAssets", shellAssets)
+
+	// Encode the prerendered routes and required static assets.
+	routes := a.NewArray()
+	routes.SetArrayItem(0, a.NewString("/"))
+	obj.Set("prerenderedRoutes", routes)
+	assets := a.NewArray()
+	for _, path := range manifest.RequiredStaticAssets {
+		assets.SetArrayItem(len(assets.GetArray()), a.NewString(path))
+	}
+	obj.Set("requiredStaticAssets", assets)
+
+	// Encode the default manifest bundle, if present.
+	if manifest.DefaultManifestBundle != nil {
+		bundle := a.NewObject()
+		bundle.Set("metadata", a.NewString(manifest.DefaultManifestBundle.Metadata))
+		bundle.Set("pack", a.NewString(manifest.DefaultManifestBundle.Pack))
+		obj.Set("defaultManifestBundle", bundle)
+	}
+
+	// Write the release manifest JSON into the build directory.
+	data := obj.MarshalTo(nil)
+	return os.WriteFile(filepath.Join(dir, "browser-release.json"), data, 0o644)
+}
+
+// browserReleaseGenerationID hashes the path and content of every file the
+// service worker caches for the release, plus the prerendered index. The
+// service worker keys its release cache by this ID, so any content change must
+// produce a new ID. Paths served outside dir, such as a dev frontend, are
+// hashed by path alone.
+func browserReleaseGenerationID(dir string, manifest *BuildManifest) (string, error) {
+	// Collect the service worker's cached asset paths from the build manifest.
+	paths := []string{
+		manifest.Entrypoint,
+		manifest.ServiceWorker,
+		manifest.SharedWorker,
+		manifest.OpfsWorker,
+		manifest.Wasm,
+		"index.html",
+	}
+
+	// Collect the cached asset paths from the build manifest.
+	paths = append(paths, manifest.CSS...)
+	paths = append(paths, manifest.RequiredStaticAssets...)
+	if bundle := manifest.DefaultManifestBundle; bundle != nil {
+		paths = append(paths, bundle.Metadata, bundle.Pack)
+	}
+	for i, path := range paths {
+		paths[i] = strings.TrimPrefix(path, "/")
+	}
+	slices.Sort(paths)
+	paths = slices.Compact(paths)
+
+	// Hash each path header and asset file content into the generation ID.
+	h := sha256.New()
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		_ = binary.Write(h, binary.BigEndian, uint64(len(path)))
+		_, _ = h.Write([]byte(path))
+		f, err := os.Open(filepath.Join(dir, filepath.FromSlash(path)))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", errors.Wrap(err, "hash browser release asset")
+		}
+		_, err = io.Copy(h, f)
+		_ = f.Close()
+		if err != nil {
+			return "", errors.Wrapf(err, "hash browser release asset %q", path)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// WriteStableBootAsset writes the stable browser boot asset at the build root.
+func WriteStableBootAsset(dir string) error {
+	const bootAsset = `const releasePath='/browser-release.json';
+const bootStateVersion='1000001';
+const bootStateVersionKey='spacewave-browser-app-state-version';
+const bootSessionStateVersionKey='spacewave-browser-tab-state-version';
+const bootStateResetAttemptKey='spacewave-browser-app-state-reset-attempted';
+const bootReloadParam='brr';
+const g=globalThis;
+const bootStorageResetRules=[
+  {area:'localStorage',kind:'key',key:'spacewave-has-session',owner:'browser-boot-session-hint',durability:'derived-shell-hint',resetPolicy:'reset',migrationPolicy:'recompute-from-session-list'},
+  {area:'localStorage',kind:'key',key:'spacewave-has-interacted',owner:'landing-ui',durability:'derived-ui-hint',resetPolicy:'reset',migrationPolicy:'recompute-from-interaction'},
+  {area:'localStorage',kind:'key',key:'spacewave-state-devtools',owner:'devtools-ui',durability:'developer-ui-preference',resetPolicy:'reset',migrationPolicy:'recreate-default-devtools-state'},
+  {area:'localStorage',kind:'key',key:'spacewave-devtools-state',owner:'devtools-ui',durability:'developer-ui-preference',resetPolicy:'reset',migrationPolicy:'recreate-default-devtools-state'},
+  {area:'localStorage',kind:'key',key:'app-persistent',owner:'web-state-atom',durability:'unknown-persistent-state',resetPolicy:'preserve',migrationPolicy:'owner-audit-required-before-reset'},
+  {area:'localStorage',kind:'prefix',key:'tab-state-',owner:'shell-tab-state-atom',durability:'unknown-tab-scoped-state',resetPolicy:'preserve',migrationPolicy:'call-site-audit-required-before-reset'},
+  {area:'sessionStorage',kind:'key',key:'shell-tabs-state',owner:'shell-tabs-ui',durability:'session-ui-state',resetPolicy:'reset',migrationPolicy:'recreate-default-home-tab'},
+  {area:'sessionStorage',kind:'key',key:'shell-tabs-layout',owner:'shell-tabs-ui',durability:'session-ui-state',resetPolicy:'reset',migrationPolicy:'recreate-default-layout'},
+  {area:'sessionStorage',kind:'key',key:'spacewave-sso-start-provider',owner:'sso-start-flow',durability:'transient-auth-workflow-state',resetPolicy:'preserve',migrationPolicy:'auth-flow-owner-reset-only'},
+  {area:'sessionStorage',kind:'key',key:'spacewave-sso-return-to',owner:'sso-start-flow',durability:'transient-auth-workflow-state',resetPolicy:'preserve',migrationPolicy:'auth-flow-owner-reset-only'},
+  {area:'sessionStorage',kind:'key',key:'spacewave-pending-route',owner:'pending-route-flow',durability:'transient-route-workflow-state',resetPolicy:'preserve',migrationPolicy:'pending-route-owner-reset-only'},
+  {area:'sessionStorage',kind:'key',key:'spacewave-auth-handoff-payload',owner:'auth-handoff-flow',durability:'transient-auth-workflow-state',resetPolicy:'preserve',migrationPolicy:'auth-flow-owner-reset-only'}
+];
+g.__swBootStorageResetRules=bootStorageResetRules.map(function(rule){return Object.assign({},rule)});
+function storageResetKeys(area,kind){
+  return bootStorageResetRules
+    .filter(function(rule){return rule.area===area&&rule.kind===kind&&rule.resetPolicy==='reset'})
+    .map(function(rule){return rule.key});
+}
+const bootLocalStorageKeys=storageResetKeys('localStorage','key');
+const bootLocalStoragePrefixes=storageResetKeys('localStorage','prefix');
+const bootSessionStorageKeys=storageResetKeys('sessionStorage','key');
+const bootStatusEvent='spacewave:boot-status';
+const bootDownloadEvent='spacewave-boot-download';
+const startupMarkPrefix='spacewave.startup.';
+const startupMarkEvent='spacewave-startup-mark';
+let bootLastResetDecision='unknown';
+let releasePromise;
+let primePromise;
+let nextStartupMarkSequence=1;
+let bootProgressStallTimer;
+const bootProgressStallDelay=2000;
+// phaseDisplay positions and labels must match the bldr boot-progress ladder
+// (web/bldr/boot-progress.ts) so the bar is continuous across the inline boot
+// script, the entrypoint bundle, and the React loading screen. The entrypoint
+// download fraction maps into the [.08,.26] ladder window.
+const phaseDisplay={
+  loading:{progress:.02,label:'Loading the app shell.'},
+  manifest:{progress:.04,label:'Loading the browser release.'},
+  'manifest-error':{progress:.04,label:'Loading the browser release.'},
+  'manifest-ready':{progress:.06,label:'Browser release found.'},
+  wasm:{progress:.07,label:'Fetching the runtime.'},
+  entrypoint:{progress:.08,label:'Downloading the application.'},
+  'entrypoint-error':{progress:.08,label:'Downloading the application.'}
+};
+const startupPhaseInfo={
+  prepare:{label:'Prepare',detail:'Preparing browser files.'},
+  connect:{label:'Connect',detail:'Connecting the app shell.'},
+  runtime:{label:'Runtime',detail:'Starting the Spacewave runtime.'},
+  frame:{label:'App',detail:'Downloading the app bundle. This can take a while the first time.'},
+  done:{label:'Done',detail:'Spacewave is ready.'}
+};
+const startupPhaseOrder=['prepare','connect','runtime','frame','done'];
+const bootPhaseStartupPhase={loading:'prepare',manifest:'prepare','manifest-ready':'prepare','manifest-error':'prepare',wasm:'connect',entrypoint:'connect','entrypoint-error':'connect',runtime:'runtime',ready:'runtime','runtime-error':'runtime',app:'frame'};
+function clampBootProgress(progress){
+  if(progress===undefined||!Number.isFinite(progress))return undefined;
+  return Math.max(0,Math.min(1,progress));
+}
+function parsePositiveByteLength(value){
+  if(value===null||value===undefined)return undefined;
+  const parsed=Number(value);
+  if(!Number.isFinite(parsed)||parsed<=0)return undefined;
+  return parsed;
+}
+function startupDisplayForBootStatus(status){
+  const id=bootPhaseStartupPhase[status.phase]||'prepare';
+  const info=startupPhaseInfo[id];
+  const entry=phaseDisplay[status.phase]||{progress:.02,label:info.detail};
+  let progress=entry.progress;
+  if((status.phase==='entrypoint'||status.phase==='entrypoint-error')&&status.progress!==undefined)progress=Math.max(progress,.08+status.progress*.18);
+  return {id:id,detail:info.label+': '+entry.label,progress:progress,error:status.state==='error'};
+}
+function markStartupBoundary(label,detail){
+  const name=startupMarkPrefix+label;
+  const sequence=g.__swStartupMarkSequence??nextStartupMarkSequence;
+  g.__swStartupMarkSequence=sequence+1;
+  nextStartupMarkSequence=sequence+1;
+  const markDetail=Object.assign({},detail||{},{label:label,sequence:sequence});
+  g.__swStartupMarks=(g.__swStartupMarks||[]).concat([{name:name,label:label,sequence:sequence,detail:markDetail}]);
+  if(g.performance&&typeof g.performance.mark==='function'){
+    try{g.performance.mark(name,{detail:markDetail})}catch(_){g.performance.mark(name)}
+  }
+  window.dispatchEvent(new CustomEvent(startupMarkEvent,{detail:{name:name,detail:markDetail}}));
+  return name;
+}
+function scheduleBootProgressStall(){
+  if(bootProgressStallTimer!==undefined){
+    window.clearTimeout(bootProgressStallTimer);
+    bootProgressStallTimer=undefined;
+  }
+  const target=document.querySelector('[data-sw-boot-progress]');
+  if(canMutateBootStatusTarget(target))target.removeAttribute('data-sw-boot-progress-stalled');
+  const status=g.__swBootStatus;
+  if(!status||status.state!=='loading')return;
+  if(startupDisplayForBootStatus(status).progress>=1)return;
+  bootProgressStallTimer=window.setTimeout(function(){
+    bootProgressStallTimer=undefined;
+    const current=g.__swBootStatus;
+    if(!current||current.state!=='loading')return;
+    if(startupDisplayForBootStatus(current).progress>=1)return;
+    const currentTarget=document.querySelector('[data-sw-boot-progress]');
+    if(canMutateBootStatusTarget(currentTarget))currentTarget.setAttribute('data-sw-boot-progress-stalled','');
+  },bootProgressStallDelay);
+}
+g.__swBootProgressActivity=scheduleBootProgressStall;
+window.addEventListener(startupMarkEvent,scheduleBootProgressStall);
+function setBootStatus(phase,detail,state,progress){
+  // status.progress carries the raw 0..1 download fraction for the phase, not
+  // a bar position; startupDisplayForBootStatus maps it into the ladder.
+  const status={phase,detail:detail||phase,state:state||'loading',compatibilityVersion:bootStateVersion,lastResetDecision:bootLastResetDecision};
+  const clampedProgress=clampBootProgress(progress);
+  if(clampedProgress!==undefined)status.progress=clampedProgress;
+  const display=startupDisplayForBootStatus(status);
+  g.__swBootStatus=status;
+  const target=document.querySelector('[data-sw-boot-status]');
+  if(canMutateBootStatusTarget(target))target.textContent=display.detail;
+  const stateTarget=document.querySelector('[data-sw-boot-state]');
+  if(canMutateBootStatusTarget(stateTarget))stateTarget.setAttribute('data-sw-boot-state',status.state);
+  const pct=Math.round(display.progress*100);
+  const progressTarget=document.querySelector('[data-sw-boot-progress]');
+  if(canMutateBootStatusTarget(progressTarget)){
+    progressTarget.style.width=pct+'%';
+    progressTarget.style.transition='width 200ms';
+    progressTarget.setAttribute('aria-valuenow',String(pct));
+    progressTarget.removeAttribute('data-sw-boot-progress-stalled');
+  }
+  const progressLabel=document.querySelector('[data-sw-boot-progress-label]');
+  if(canMutateBootStatusTarget(progressLabel))progressLabel.textContent=pct+'%';
+  updateStaticPhaseRail(display.id,status.state);
+  markStartupBoundary('boot-status.'+phase,{source:'boot',phase:phase,state:status.state,progress:status.progress});
+  window.dispatchEvent(new CustomEvent(bootStatusEvent,{detail:status}));
+}
+function setBootResetDecision(decision,detail){
+  bootLastResetDecision=decision;
+  g.__swBootRecoveryStatus={compatibilityVersion:bootStateVersion,lastResetDecision:decision,detail:detail||''};
+  if(g.__swBootStatus)g.__swBootStatus=Object.assign({},g.__swBootStatus,{compatibilityVersion:bootStateVersion,lastResetDecision:decision});
+}
+function updateStaticPhaseRail(currentID,bootState){
+  const currentIdx=startupPhaseOrder.indexOf(currentID);
+  for(let i=0;i<startupPhaseOrder.length;i++){
+    const phaseID=startupPhaseOrder[i];
+    const target=document.querySelector('[data-sw-boot-phase="'+phaseID+'"]');
+    if(!canMutateBootStatusTarget(target))continue;
+    const phaseState=i<currentIdx?'complete':i===currentIdx&&bootState==='error'?'error':i===currentIdx?'current':'pending';
+    target.setAttribute('data-sw-boot-phase-state',phaseState);
+    const dot=target.querySelector('[data-sw-boot-phase-dot]');
+    if(dot)dot.style.background=phaseState==='error'?'var(--color-destructive,#ef4444)':phaseState==='pending'?'color-mix(in srgb,var(--color-foreground,#fafafa) 15%,transparent)':'var(--color-brand,var(--color-logo-blue,#4f8cff))';
+    const label=target.querySelector('[data-sw-boot-phase-label]');
+    if(label)label.style.color=phaseState==='error'?'var(--color-destructive,#ef4444)':phaseState==='current'?'var(--color-foreground,#fafafa)':phaseState==='complete'?'color-mix(in srgb,var(--color-foreground-alt,#a1a1aa) 70%,transparent)':'color-mix(in srgb,var(--color-foreground-alt,#a1a1aa) 40%,transparent)';
+  }
+}
+function canMutateBootStatusTarget(target){
+  if(!target)return false;
+  const root=target.closest('#bldr-root[data-prerendered]');
+  if(!root)return true;
+  return !!target.closest('#sw-loading');
+}
+function rewriteStaticHandoffLinks(){
+  g.__swStaticHandoffLinks=true;
+  const landing=document.getElementById('sw-landing');
+  if(!landing)return;
+  for(const link of landing.querySelectorAll('a[href^="/quickstart/"]')){
+    const href=link.getAttribute('href');
+    if(href)link.setAttribute('href','#'+href);
+  }
+}
+function setBootError(phase,err){
+  const msg=err&&err.message?err.message:String(err);
+  setBootStatus(phase,msg,'error',g.__swBootStatus&&g.__swBootStatus.progress);
+}
+function storageGet(storage,key){
+  try{return storage&&storage.getItem?storage.getItem(key):null}catch(_){return null}
+}
+function storageSet(storage,key,value){
+  try{if(storage&&storage.setItem)storage.setItem(key,value)}catch(_){}
+}
+function storageRemove(storage,key){
+  try{if(storage&&storage.removeItem)storage.removeItem(key)}catch(_){}
+}
+function storageRemoveKnown(storage,keys,prefixes){
+  try{
+    if(!storage||!storage.removeItem)return;
+    for(const key of keys)storage.removeItem(key);
+    if(!prefixes||!storage.key)return;
+    const matched=[];
+    for(let i=0;i<storage.length;i++){
+      const key=storage.key(i);
+      if(key&&prefixes.some(function(prefix){return key.startsWith(prefix)}))matched.push(key);
+    }
+    for(const key of matched)storage.removeItem(key);
+  }catch(_){}
+}
+async function unregisterServiceWorkersForBootReset(){
+  if(!navigator.serviceWorker||typeof navigator.serviceWorker.getRegistrations!=='function')return;
+  const registrations=await navigator.serviceWorker.getRegistrations();
+  await Promise.all(registrations.map(function(registration){return registration.unregister()}));
+}
+async function clearCachesForBootReset(){
+  if(!g.caches||typeof g.caches.keys!=='function')return;
+  const cacheNames=await g.caches.keys();
+  await Promise.all(cacheNames.map(function(cacheName){return g.caches.delete(cacheName)}));
+}
+async function clearOpfsForBootReset(){
+  if(!navigator.storage||typeof navigator.storage.getDirectory!=='function')return;
+  const root=await navigator.storage.getDirectory();
+  const names=[];
+  for await(const entry of root.entries())names.push(entry[0]);
+  await Promise.all(names.map(function(name){return root.removeEntry(name,{recursive:true})}));
+}
+async function isLoginRequiredResponse(response){
+  if(response.status!==401)return false;
+  try{
+    const body=await response.clone().json();
+    return body&&body.error&&body.error.code==='login_required';
+  }catch(_){return false}
+}
+async function recoverSignedOutSession(response){
+  if(!await isLoginRequiredResponse(response))return false;
+  await Promise.allSettled([
+    unregisterServiceWorkersForBootReset(),
+    clearCachesForBootReset(),
+    clearOpfsForBootReset()
+  ]);
+  window.location.replace('/login');
+  return true;
+}
+function clearBootResetReloadParam(){
+  try{
+    if(!window.history||typeof window.history.replaceState!=='function')return;
+    const next=new URL(window.location.href);
+    if(!next.searchParams.has(bootReloadParam))return;
+    next.searchParams.delete(bootReloadParam);
+    window.history.replaceState(window.history.state,'',next.toString());
+  }catch(_){}
+}
+function reloadAfterBootStateReset(){
+  try{window.location.reload()}catch(_){}
+  try{
+    const next=new URL(window.location.href);
+    next.searchParams.set(bootReloadParam,String(Date.now()));
+    window.location.replace(next.toString());
+    return;
+  }catch(_){}
+  try{window.location.href=window.location.href}catch(_){}
+}
+function settledAllFulfilled(results){
+  return results.every(function(result){return result.status==='fulfilled'});
+}
+function clearBootSessionState(){
+  storageRemoveKnown(sessionStorage,bootSessionStorageKeys,[]);
+  storageSet(sessionStorage,bootSessionStateVersionKey,bootStateVersion);
+}
+async function resetHistoricalStateForBoot(){
+  const storedVersion=storageGet(localStorage,bootStateVersionKey);
+  // A missing marker is not evidence of incompatible state. A fresh browser
+  // starts directly, and missing shell metadata must never erase user files.
+  if(!storedVersion){
+    storageSet(localStorage,bootStateVersionKey,bootStateVersion);
+    storageSet(sessionStorage,bootSessionStateVersionKey,bootStateVersion);
+    setBootResetDecision('initialized','no stored compatibility version');
+    clearBootResetReloadParam();
+    return false;
+  }
+  if(storedVersion===bootStateVersion){
+    if(storageGet(sessionStorage,bootSessionStateVersionKey)!==bootStateVersion){
+      clearBootSessionState();
+      setBootResetDecision('tab-session-state-reset','tab session version mismatch');
+    }else{
+      setBootResetDecision('current','stored compatibility version current');
+    }
+    clearBootResetReloadParam();
+    storageRemove(sessionStorage,bootStateResetAttemptKey);
+    return false;
+  }
+  if(storageGet(sessionStorage,bootStateResetAttemptKey)===bootStateVersion){
+    clearBootSessionState();
+    setBootResetDecision('attempt-guard','reset already attempted in this tab');
+    clearBootResetReloadParam();
+    return false;
+  }
+  setBootResetDecision('reset-started','stored compatibility version mismatch');
+  setBootStatus('loading','Updating Spacewave app shell...');
+  clearBootSessionState();
+  storageRemoveKnown(localStorage,bootLocalStorageKeys,bootLocalStoragePrefixes);
+  storageSet(sessionStorage,bootStateResetAttemptKey,bootStateVersion);
+  const cleanupResults=await Promise.allSettled([
+    unregisterServiceWorkersForBootReset(),
+    clearCachesForBootReset(),
+    clearOpfsForBootReset()
+  ]);
+  if(settledAllFulfilled(cleanupResults)){
+    storageSet(localStorage,bootStateVersionKey,bootStateVersion);
+    setBootResetDecision('reset-complete','shell cleanup completed');
+  }else{
+    setBootResetDecision('reset-cleanup-failed','shell cleanup did not fully complete');
+  }
+  reloadAfterBootStateReset();
+  return true;
+}
+function absPath(path){
+  if(!path)return'';
+  if(/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(path))return path;
+  return path.startsWith('/')?path:'/'+path;
+}
+// Boot download registry: the pre-module mirror of the bldr boot-downloads
+// registry. Producers report streamed bytes per boot asset; the static loading
+// shell renders one bar per download and the same snapshot/event feed the
+// React loading screen once it mounts. No polling: every change dispatches
+// bootDownloadEvent.
+function readBootDownloads(){return g.__swBootDownloads||[]}
+function bootDownloadFraction(d){if(d.state==='complete')return 1;if(d.total===undefined)return undefined;return Math.max(0,Math.min(1,d.loaded/d.total))}
+function formatBootBytes(bytes){if(!bytes||bytes<=0)return'0 B';const sizes=['B','KiB','MiB','GiB'];const i=Math.min(sizes.length-1,Math.floor(Math.log(bytes)/Math.log(1024)));return parseFloat((bytes/Math.pow(1024,i)).toFixed(1))+' '+sizes[i]}
+function bootDownloadDetail(d){if(d.state==='error')return d.error||'Failed';if(d.total!==undefined)return formatBootBytes(d.loaded)+' / '+formatBootBytes(d.total);if(d.loaded>0)return formatBootBytes(d.loaded);return''}
+function upsertBootDownload(id,patch){
+  const current=readBootDownloads();
+  const index=current.findIndex(function(d){return d.id===id});
+  const base=index>=0?current[index]:{id:id,label:id,loaded:0,state:'active'};
+  const next=Object.assign({},base,patch,{id:id});
+  g.__swBootDownloads=index>=0?current.map(function(d,i){return i===index?next:d}):current.concat([next]);
+  renderBootDownloads();
+  window.dispatchEvent(new CustomEvent(bootDownloadEvent,{detail:readBootDownloads()}));
+}
+function beginBootDownload(id,label,total){const patch={label:label,loaded:0,state:'active'};if(total&&Number.isFinite(total)&&total>0)patch.total=total;upsertBootDownload(id,patch)}
+function advanceBootDownload(id,loaded,total){const patch={loaded:Math.max(0,loaded),state:'active'};if(total&&Number.isFinite(total)&&total>0)patch.total=total;upsertBootDownload(id,patch)}
+function completeBootDownload(id){const cur=readBootDownloads().find(function(d){return d.id===id});const patch={state:'complete'};if(cur&&cur.total!==undefined)patch.loaded=cur.total;upsertBootDownload(id,patch)}
+function failBootDownload(id,error){const patch={state:'error'};if(error!==undefined)patch.error=error;upsertBootDownload(id,patch)}
+async function streamBootDownload(id,label,response,totalHint,onProgress){
+  const total=(totalHint&&totalHint>0)?totalHint:parsePositiveByteLength(response.headers&&response.headers.get?response.headers.get('content-length'):undefined);
+  beginBootDownload(id,label,total);
+  if(onProgress)onProgress(0,total);
+  const parts=[];
+  let loaded=0;
+  if(response.body&&response.body.getReader){
+    const reader=response.body.getReader();
+    try{
+      for(;;){
+        const read=await reader.read();
+        if(read.done)break;
+        const value=read.value;
+        if(!value||value.byteLength===0)continue;
+        parts.push(value);
+        loaded+=value.byteLength;
+        advanceBootDownload(id,loaded,total);
+        if(onProgress)onProgress(loaded,total);
+      }
+    }catch(err){failBootDownload(id,err&&err.message?err.message:String(err));throw err}
+    finally{reader.releaseLock()}
+  }else{
+    const body=await response.arrayBuffer();
+    parts.push(body);
+    loaded=body.byteLength;
+    advanceBootDownload(id,loaded,total);
+    if(onProgress)onProgress(loaded,total);
+  }
+  completeBootDownload(id);
+  if(onProgress)onProgress(total!==undefined?total:loaded,total);
+  return parts;
+}
+async function streamRuntimeDownload(wasmUrl){
+  try{
+    const response=await fetch(wasmUrl);
+    if(!response.ok)throw new Error('failed to load runtime: '+response.status);
+    await streamBootDownload('runtime','Runtime',response);
+  }catch(err){
+    failBootDownload('runtime',err&&err.message?err.message:String(err));
+    console.error('boot.mjs: failed to stream runtime wasm',err);
+  }
+}
+function renderBootDownloadRow(container,id){
+  let row=container.querySelector('[data-sw-boot-download="'+id+'"]');
+  if(row)return row;
+  row=document.createElement('div');
+  row.setAttribute('data-sw-boot-download',id);
+  row.style.cssText='display:flex;flex-direction:column;gap:0.25rem;width:100%';
+  const head=document.createElement('div');
+  head.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:0.5rem;font-size:0.7rem';
+  const label=document.createElement('span');
+  label.setAttribute('data-sw-boot-download-label','');
+  label.style.cssText='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:color-mix(in srgb,var(--color-foreground,#fafafa) 85%,transparent)';
+  const detail=document.createElement('span');
+  detail.setAttribute('data-sw-boot-download-detail','');
+  detail.style.cssText='flex-shrink:0;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-variant-numeric:tabular-nums;color:color-mix(in srgb,var(--color-foreground-alt,#a1a1aa) 70%,transparent)';
+  head.appendChild(label);head.appendChild(detail);
+  const track=document.createElement('div');
+  track.style.cssText='position:relative;height:0.375rem;width:100%;overflow:hidden;border-radius:9999px;background:color-mix(in srgb,var(--color-foreground,#fafafa) 8%,transparent)';
+  const bar=document.createElement('div');
+  bar.setAttribute('data-sw-boot-download-bar','');
+  bar.style.cssText='height:100%;border-radius:9999px;background:var(--color-brand,var(--color-logo-blue,#4f8cff));transition:width 200ms';
+  track.appendChild(bar);
+  row.appendChild(head);row.appendChild(track);
+  container.appendChild(row);
+  return row;
+}
+function renderBootDownloads(){
+  if(typeof document==='undefined'||!document.querySelector)return;
+  const container=document.querySelector('[data-sw-boot-downloads]');
+  if(!canMutateBootStatusTarget(container)||typeof document.createElement!=='function')return;
+  // Completed downloads retire from the list so a finished byte counter never
+  // lingers under later boot phases; failed rows stay visible as evidence.
+  const downloads=readBootDownloads().filter(function(d){return d.state!=='complete'});
+  container.style.display=downloads.length?'flex':'none';
+  const seen={};
+  for(const d of downloads){
+    seen[d.id]=true;
+    const row=renderBootDownloadRow(container,d.id);
+    const labelEl=row.querySelector('[data-sw-boot-download-label]');
+    if(labelEl)labelEl.textContent=d.label;
+    const detailEl=row.querySelector('[data-sw-boot-download-detail]');
+    if(detailEl){
+      detailEl.textContent=bootDownloadDetail(d);
+      detailEl.style.color=d.state==='error'?'var(--color-destructive,#ef4444)':'color-mix(in srgb,var(--color-foreground-alt,#a1a1aa) 70%,transparent)';
+    }
+    const bar=row.querySelector('[data-sw-boot-download-bar]');
+    if(bar){
+      const frac=bootDownloadFraction(d);
+      if(frac===undefined&&d.state!=='error'){
+        bar.style.width='33%';
+        bar.classList.toggle('animate-progress-indeterminate',true);
+      }else{
+        bar.classList.toggle('animate-progress-indeterminate',false);
+        bar.style.width=Math.round((frac||0)*100)+'%';
+        bar.style.background=d.state==='error'?'var(--color-destructive,#ef4444)':'var(--color-brand,var(--color-logo-blue,#4f8cff))';
+      }
+    }
+  }
+  const rows=container.querySelectorAll('[data-sw-boot-download]');
+  for(const row of rows){
+    const id=row.getAttribute('data-sw-boot-download');
+    if(!seen[id])row.remove();
+  }
+}
+function loadRelease(){
+  if(releasePromise)return releasePromise;
+  setBootStatus('manifest','Loading browser release...');
+  releasePromise=fetch(releasePath,{cache:'no-cache'}).then(async function(resp){
+    if(await recoverSignedOutSession(resp))return new Promise(function(){});
+    if(!resp.ok)throw new Error('failed to load browser release manifest: '+resp.status);
+    const release=await resp.json();
+    const shellAssets=release.shellAssets||{};
+    const entrypoint=absPath(shellAssets.entrypoint);
+    const wasm=absPath(shellAssets.wasm);
+    const serviceWorker=absPath(shellAssets.serviceWorker);
+    const entrypointDecompressedSize=parsePositiveByteLength(shellAssets.entrypointDecompressedSize);
+    if(!entrypoint)throw new Error('browser release manifest missing shellAssets.entrypoint');
+    if(!serviceWorker)throw new Error('browser release manifest missing shellAssets.serviceWorker');
+    g.__swEntry=entrypoint;
+    g.__swServiceWorker=serviceWorker;
+    g.__swGenerationId=release.generationId||'';
+    setBootStatus('manifest-ready','Browser release found.');
+    return {entrypoint,entrypointDecompressedSize,wasm,serviceWorker,autoStart:release.autoStart===true};
+  });
+  return releasePromise;
+}
+function primeRelease(){
+  if(primePromise)return primePromise;
+  primePromise=loadRelease().then(function(release){
+    if(release.wasm){
+      setBootStatus('wasm','Preparing runtime...');
+      void streamRuntimeDownload(release.wasm);
+    }
+    return release;
+  });
+  return primePromise;
+}
+let entrypointStreamPromise;
+async function streamEntrypointModule(release){
+  const response=await fetch(release.entrypoint,{credentials:'same-origin'});
+  if(await recoverSignedOutSession(response))return new Promise(function(){});
+  if(!response.ok)throw new Error('failed to load entrypoint bundle: '+response.status);
+  const total=release.entrypointDecompressedSize||parsePositiveByteLength(response.headers&&response.headers.get?response.headers.get('content-length'):undefined);
+  // The app shell bundle download is part of the connect phase (entrypoint),
+  // not the later app frame phase; its byte fraction advances the entrypoint
+  // ladder window.
+  const dlDetail=phaseDisplay.entrypoint.label;
+  if(total!==undefined)setBootStatus('entrypoint',dlDetail,'loading',0);
+  else setBootStatus('entrypoint',dlDetail);
+  await streamBootDownload('app','Application',response,total,function(loaded,streamTotal){
+    if(streamTotal!==undefined)setBootStatus('entrypoint',dlDetail,'loading',loaded/streamTotal);
+  });
+  if(total!==undefined)setBootStatus('entrypoint',dlDetail,'loading',1);
+}
+function primeEntrypoint(release){
+  if(!entrypointStreamPromise)entrypointStreamPromise=streamEntrypointModule(release);
+  return entrypointStreamPromise;
+}
+async function importEntrypoint(release){
+  await primeEntrypoint(release);
+  return await import(release.entrypoint);
+}
+function startBoot(){
+  rewriteStaticHandoffLinks();
+  let readyResolve;
+  g.__swReady=new Promise(function(resolve){readyResolve=resolve});
+  g.__swReadyResolve=readyResolve;
+  g.__swDeferBoot=true;
+  let imported=false;
+  function doImport(){
+    if(imported)return;
+    imported=true;
+    setBootStatus('entrypoint','Starting application...');
+    void primeRelease()
+      .then(function(release){return importEntrypoint(release)})
+      .catch(function(err){setBootError('entrypoint-error',err);console.error('boot.mjs: failed to import entrypoint',err)});
+  }
+  void primeRelease()
+    .then(function(release){
+      if(release.autoStart||window.location.hash.length>1||localStorage.getItem('spacewave-has-session')){
+        document.documentElement.setAttribute('data-sw-boot-visibility','loading');
+        doImport();
+        return;
+      }
+      void primeEntrypoint(release).catch(function(err){console.error('boot.mjs: failed to preload entrypoint',err)});
+      function onInteract(){
+        doImport();
+        document.removeEventListener('click',onInteract);
+        document.removeEventListener('scroll',onInteract);
+        document.removeEventListener('keydown',onInteract);
+      }
+      document.addEventListener('click',onInteract);
+      document.addEventListener('scroll',onInteract,{passive:true});
+      document.addEventListener('keydown',onInteract);
+      if(document.readyState==='loading')window.addEventListener('load',function(){setTimeout(doImport,1000)},{once:true});
+      else setTimeout(doImport,1000);
+    })
+    .catch(function(err){setBootError('manifest-error',err);console.error('boot.mjs: failed to load release manifest',err)});
+}
+(function(){
+  void resetHistoricalStateForBoot()
+    .then(function(resetStarted){if(!resetStarted)startBoot()})
+    .catch(function(err){console.error('boot.mjs: failed to reset historical browser state',err);startBoot()});
+})();`
+
+	return os.WriteFile(filepath.Join(dir, stableBootFilename), []byte(bootAsset), 0o644)
+}
+
+// DefaultBanner is the default banner applied to code files.
+func DefaultBanner() map[string]string {
+	return map[string]string{
+		"js": "// © 2018-2025 Aperture Robotics, LLC. <support@aperture.us>\n// All rights reserved.",
+	}
+}
+
+func serviceWorkerSpec(minify, sourcemaps, devMode bool) browserScriptSpec {
+	entryFileNames := "sw.mjs"
+	if !devMode {
+		entryFileNames = "sw-[hash].mjs"
+	}
+	return browserScriptSpec{
+		name:           "sw",
+		inputPath:      "web/bldr/service-worker.ts",
+		entryFileNames: entryFileNames,
+		format:         "iife",
+		globalName:     "BldrServiceWorker",
+		minify:         minify,
+		sourcemaps:     sourcemaps,
+		devMode:        devMode,
+	}
+}
+
+func sharedWorkerSpec(minify, sourcemaps, devMode bool) browserScriptSpec {
+	entryFileNames := "shw.mjs"
+	if !devMode {
+		entryFileNames = "shw-[hash].mjs"
+	}
+	return browserScriptSpec{
+		name:           "shw",
+		inputPath:      "web/bldr/shared-worker.ts",
+		entryFileNames: entryFileNames,
+		format:         "es",
+		minify:         minify,
+		sourcemaps:     sourcemaps,
+		devMode:        devMode,
+	}
+}
+
+func opfsWorkerSpec(minify, sourcemaps, devMode bool) browserScriptSpec {
+	entryFileNames := "opfs-worker.mjs"
+	if !devMode {
+		entryFileNames = "opfs-worker-[hash].mjs"
+	}
+	return browserScriptSpec{
+		name:           "opfs-worker",
+		inputPath:      "web/bldr/opfs-worker.ts",
+		entryFileNames: entryFileNames,
+		format:         "es",
+		minify:         minify,
+		sourcemaps:     sourcemaps,
+		devMode:        devMode,
+	}
+}
+
+func buildWorkerBundle(
+	ctx context.Context,
+	le *logrus.Entry,
+	stateDir,
+	bldrDistRoot,
+	buildDir string,
+	spec browserScriptSpec,
+) (string, *bldr_web_bundler_rolldown.BuildResult, error) {
+	// Build the worker script and check its entrypoint output location.
+	result, err := buildBrowserScript(ctx, le, stateDir, bldrDistRoot, buildDir, spec)
+	if err != nil {
+		return "", nil, err
+	}
+	filename := result.GetEntrypointOutputs()[spec.name]
+	if filepath.Dir(filename) != "." {
+		return "", nil, errors.Errorf("%s output is not at build root: %s", spec.name, filename)
+	}
+	return filename, result, nil
+}
+
+// BuildServiceWorkerBundle builds the service worker through the direct owner.
+func BuildServiceWorkerBundle(
+	ctx context.Context,
+	le *logrus.Entry,
+	stateDir,
+	bldrDistRoot,
+	buildDir string,
+	minify,
+	sourcemaps,
+	devMode bool,
+) (string, error) {
+	filename, _, err := buildWorkerBundle(
+		ctx, le, stateDir, bldrDistRoot, buildDir,
+		serviceWorkerSpec(minify, sourcemaps, devMode),
+	)
+	return filename, err
+}
+
+// BuildSharedWorkerBundle builds the shared worker through the direct owner.
+func BuildSharedWorkerBundle(
+	ctx context.Context,
+	le *logrus.Entry,
+	stateDir,
+	bldrDistRoot,
+	buildDir string,
+	minify,
+	sourcemaps,
+	devMode bool,
+) (string, error) {
+	filename, _, err := buildWorkerBundle(
+		ctx, le, stateDir, bldrDistRoot, buildDir,
+		sharedWorkerSpec(minify, sourcemaps, devMode),
+	)
+	return filename, err
+}
+
+// BuildOpfsWorkerBundle builds the OPFS protocol worker through the direct owner.
+func BuildOpfsWorkerBundle(
+	ctx context.Context,
+	le *logrus.Entry,
+	stateDir,
+	bldrDistRoot,
+	buildDir string,
+	minify,
+	sourcemaps,
+	devMode bool,
+) (string, error) {
+	filename, _, err := buildWorkerBundle(
+		ctx, le, stateDir, bldrDistRoot, buildDir,
+		opfsWorkerSpec(minify, sourcemaps, devMode),
+	)
+	return filename, err
+}
+
+// BuildRendererIndex builds the web renderer index.html.
+//
+// importMap contains the web pkg import map entries (from BuildWebPkgsBundle).
+func BuildRendererIndex(buildDir, entrypointPath string, importMap web_entrypoint_index.ImportMap) error {
+	indexHTML, err := renderIndexHTML(entrypointPath, importMap)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(buildDir, "index.html"), indexHTML, 0o644)
+}
+
+// renderIndexHTML renders the web renderer index.html to bytes.
+func renderIndexHTML(entrypointPath string, importMap web_entrypoint_index.ImportMap) ([]byte, error) {
+	indexHTML, err := web_entrypoint_index.RenderIndexHTML(web_entrypoint_index.IndexData{
+		ImportMap:      importMap,
+		EntrypointPath: entrypointPath,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []byte(indexHTML), nil
+}
+
+// BrowserIceServer is a trusted ICE server embedded in the document shell.
+type BrowserIceServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+const defaultBrowserStunServer = "stun:stun.l.google.com:19302"
+
+func resolveBrowserIceServers(servers []BrowserIceServer) []BrowserIceServer {
+	if len(servers) != 0 {
+		return servers
+	}
+	return []BrowserIceServer{{URLs: []string{defaultBrowserStunServer}}}
+}
+
+func encodeBrowserIceServers(servers []BrowserIceServer) string {
+	var arena fastjson.Arena
+	encoded := arena.NewArray()
+	for serverIndex, server := range servers {
+		encodedServer := arena.NewObject()
+		urls := arena.NewArray()
+		for urlIndex, url := range server.URLs {
+			urls.SetArrayItem(urlIndex, arena.NewString(url))
+		}
+		encodedServer.Set("urls", urls)
+		if server.Username != "" {
+			encodedServer.Set("username", arena.NewString(server.Username))
+		}
+		if server.Credential != "" {
+			encodedServer.Set("credential", arena.NewString(server.Credential))
+		}
+		encoded.SetArrayItem(serverIndex, encodedServer)
+	}
+	return string(encoded.MarshalTo(nil))
+}
+
+func browserRendererSpec(
+	sourcesRoot,
+	bldrDistRoot,
+	buildDir,
+	runtimeJsPath,
+	runtimeSwPath,
+	runtimeShwPath,
+	runtimeOpfsWorkerPath,
+	webStartupSrcPath,
+	entrypointHash string,
+	minify,
+	sourcemaps,
+	forceDedicatedWorkers,
+	forceMessagePortWorkerComms,
+	devMode bool,
+	browserIceServers []BrowserIceServer,
+	browserIceServersEndpoint string,
+) (ConfigFreeRendererOpts, error) {
+	// Resolve the renderer output directory, public path, and ICE server list.
+	outputDir := filepath.Join(buildDir, "entrypoint")
+	publicPath := "/entrypoint/"
+	if entrypointHash != "" {
+		outputDir = filepath.Join(outputDir, entrypointHash)
+		publicPath = "/entrypoint/" + entrypointHash + "/"
+	}
+	browserIceServers = resolveBrowserIceServers(browserIceServers)
+
+	// Start the defines map the renderer build injects into the bundle.
+	defines := map[string]string{
+		"BLDR_IS_BROWSER": "true",
+		"BLDR_DEBUG":      strconv.FormatBool(devMode),
+	}
+
+	// Define the runtime worker script paths the shell can locate.
+	if runtimeJsPath != "" {
+		defines["BLDR_RUNTIME_JS"] = strconv.Quote(runtimeJsPath)
+	}
+	if runtimeSwPath != "" {
+		defines["BLDR_SW_JS"] = strconv.Quote(runtimeSwPath)
+	}
+	if runtimeShwPath != "" {
+		defines["BLDR_SHW_JS"] = strconv.Quote(runtimeShwPath)
+	}
+	if runtimeOpfsWorkerPath != "" {
+		defines["BLDR_OPFS_WORKER_JS"] = strconv.Quote(runtimeOpfsWorkerPath)
+	}
+
+	// Point the startup module define at the dist-relative sources path.
+	if webStartupSrcPath != "" {
+		distSourcesDirToSourcesRoot, err := filepath.Rel(bldrDistRoot, sourcesRoot)
+		if err != nil {
+			return ConfigFreeRendererOpts{}, err
+		}
+		defines["BLDR_STARTUP_JS"] = strconv.Quote(
+			filepath.Join(distSourcesDirToSourcesRoot, "../..", webStartupSrcPath),
+		)
+	}
+
+	// Define the worker communication and ICE server feature flags.
+	if forceDedicatedWorkers {
+		defines["BLDR_FORCE_DEDICATED_WORKERS"] = "true"
+	}
+	if forceMessagePortWorkerComms {
+		defines["BLDR_FORCE_MESSAGEPORT_WORKER_COMMS"] = "true"
+	}
+	if len(browserIceServers) != 0 {
+		defines["BLDR_BROWSER_ICE_SERVERS"] = encodeBrowserIceServers(browserIceServers)
+	}
+	if browserIceServersEndpoint != "" {
+		defines["BLDR_BROWSER_ICE_SERVERS_ENDPOINT"] = strconv.Quote(browserIceServersEndpoint)
+	}
+	return ConfigFreeRendererOpts{
+		OutputDir:  outputDir,
+		PublicPath: publicPath,
+		Defines:    defines,
+		Minify:     minify,
+		Sourcemaps: sourcemaps,
+	}, nil
+}
+
+// BuildRendererBundle builds the browser renderer with config-free Vite.
+func BuildRendererBundle(
+	le *logrus.Entry,
+	sourcesRoot,
+	bldrDistRoot,
+	buildDir,
+	runtimeJsPath,
+	runtimeSwPath,
+	runtimeShwPath,
+	runtimeOpfsWorkerPath,
+	webStartupSrcPath,
+	entrypointHash string,
+	minify,
+	sourcemaps,
+	forceDedicatedWorkers,
+	forceMessagePortWorkerComms,
+	devMode bool,
+	browserIceServers []BrowserIceServer,
+	browserIceServersEndpoint string,
+	webPkgImportMap web_entrypoint_index.ImportMap,
+) ([]string, error) {
+	// Render the renderer index.html into the build directory.
+	le.Debug("generating web renderer bundle")
+	if err := BuildRendererIndex(buildDir, rendererBootPath, webPkgImportMap); err != nil {
+		return nil, err
+	}
+
+	// Build the config-free renderer spec from the runtime paths.
+	spec, err := browserRendererSpec(
+		sourcesRoot,
+		bldrDistRoot,
+		buildDir,
+		runtimeJsPath,
+		runtimeSwPath,
+		runtimeShwPath,
+		runtimeOpfsWorkerPath,
+		webStartupSrcPath,
+		entrypointHash,
+		minify,
+		sourcemaps,
+		forceDedicatedWorkers,
+		forceMessagePortWorkerComms,
+		devMode,
+		browserIceServers,
+		browserIceServersEndpoint,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the renderer bundle with the spec.
+	output, err := BuildRenderer(
+		context.Background(),
+		le,
+		buildDir,
+		bldrDistRoot,
+		buildDir,
+		spec,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return output.CSSPaths, nil
+}
+
+// BuildBrowserBundle builds and outputs the web & service worker files.
+//
+// stateDir is the directory where bun will be downloaded if not found in PATH.
+// webStartupSrcPath is the path to the startup js module to load for the react app entrypoint (can be empty).
+// entrypointHash, if set, builds into /entrypoint/{entrypointHash}/...
+func BuildBrowserBundle(
+	ctx context.Context,
+	le *logrus.Entry,
+	stateDir,
+	sourcesRoot,
+	bldrDistRoot,
+	buildDir,
+	runtimeJsPath,
+	runtimeSwPath,
+	runtimeShwPath,
+	webStartupSrcPath string,
+	entrypointHash string,
+	minify,
+	sourcemaps,
+	devMode,
+	forceDedicatedWorkers,
+	forceMessagePortWorkerComms bool,
+	browserIceServers []BrowserIceServer,
+	browserIceServersEndpoint string,
+) (*BrowserBundleResult, error) {
+	// Create the build directory and stop early on a cancelled context.
+	if err := os.MkdirAll(buildDir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Take the exclusive build lock, releasing it when the bundle completes.
+	buildLock, err := bldr_util_buildcache.LockFile(filepath.Join(buildDir, bundleCacheDirName, "build.lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = buildLock.Close() }()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Install the shared dist dependencies into the state directory.
+	buildPkgsDir, err := EnsureBldrDistDepsInstall(ctx, le, stateDir, bldrDistRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	// The bundle cache reuses unchanged worker and renderer outputs across builds
+	// by validating each bundle's source-file identities and config digest.
+	// cachedBundleElapsed accumulates only the cached bundle phases so the log
+	// reports their reuse savings without the uncached web-package build.
+	cache := newBundleCache(le, buildDir, bldrDistRoot)
+	var cachedBundleElapsed time.Duration
+	workersStart := time.Now()
+
+	// service worker
+	swFilename, err := buildServiceWorkerCached(ctx, stateDir, cache, bldrDistRoot, buildDir, buildPkgsDir, minify, sourcemaps, devMode)
+	if err != nil {
+		return nil, err
+	}
+
+	// shared worker
+	shwFilename, err := buildSharedWorkerCached(ctx, stateDir, cache, bldrDistRoot, buildDir, buildPkgsDir, minify, sourcemaps, devMode)
+	if err != nil {
+		return nil, err
+	}
+
+	// OPFS protocol worker
+	opfsWorkerFilename, err := buildOpfsWorkerCached(ctx, stateDir, cache, bldrDistRoot, buildDir, buildPkgsDir, minify, sourcemaps, devMode)
+	if err != nil {
+		return nil, err
+	}
+	cachedBundleElapsed += time.Since(workersStart)
+
+	// replace the filename in runtimeSwPath with the sw filename
+	runtimeSwPath = filepath.Join(filepath.Dir(runtimeSwPath), swFilename)
+
+	// replace the filename in runtimeShwPath with the shw filename
+	runtimeShwPath = filepath.Join(filepath.Dir(runtimeShwPath), shwFilename)
+
+	// place the OPFS worker beside sw.mjs/shw.mjs at the build root
+	runtimeOpfsWorkerPath := filepath.Join(filepath.Dir(runtimeShwPath), opfsWorkerFilename)
+
+	// Parse the native platform the web packages are built for.
+	bldrNativePlatform, err := bldr_platform.ParseNativePlatform("desktop/linux/amd64")
+	if err != nil {
+		return nil, err
+	}
+
+	// Prefix the web package paths with the entrypoint hash directory.
+	pkgsPathPrefix := "/entrypoint"
+	if entrypointHash != "" {
+		pkgsPathPrefix += "/" + entrypointHash
+	}
+
+	// Point the entrypoint directory at the hashed output tree.
+	entrypointDir := filepath.Join(buildDir, "entrypoint")
+	if entrypointHash != "" {
+		entrypointDir = filepath.Join(entrypointDir, entrypointHash)
+	}
+
+	// Build the web packages and collect their import map entries.
+	webPkgImportMap, err := BuildWebPkgsBundle(ctx, le, stateDir, bldrNativePlatform, bldrDistRoot, entrypointDir, pkgsPathPrefix, minify, sourcemaps, devMode)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the renderer bundle and measure the cached phase.
+	rendererStart := time.Now()
+	cssPaths, err := buildRendererCached(ctx, stateDir, cache, sourcesRoot, bldrDistRoot, buildDir, runtimeJsPath, runtimeSwPath, runtimeShwPath, runtimeOpfsWorkerPath, webStartupSrcPath, entrypointHash, minify, sourcemaps, forceDedicatedWorkers, forceMessagePortWorkerComms, devMode, browserIceServers, browserIceServersEndpoint, webPkgImportMap)
+	if err != nil {
+		return nil, err
+	}
+	cachedBundleElapsed += time.Since(rendererStart)
+	if err := WriteStableBootAsset(buildDir); err != nil {
+		return nil, err
+	}
+	le.WithFields(logrus.Fields{
+		"built":   cache.Builds(),
+		"reused":  cache.Reuses(),
+		"elapsed": cachedBundleElapsed.String(),
+	}).Info("browser bundle cache")
+
+	// build the entrypoint path relative to the build dir
+	entrypointPath := "entrypoint"
+	if entrypointHash != "" {
+		entrypointPath += "/" + entrypointHash
+	}
+	entrypointPath += "/entrypoint.mjs"
+
+	// Stat the built entrypoint bundle to report its size.
+	entrypointInfo, err := os.Stat(filepath.Join(buildDir, entrypointPath))
+	if err != nil {
+		return nil, errors.Wrap(err, "stat browser entrypoint bundle")
+	}
+
+	return &BrowserBundleResult{
+		EntrypointPath:             entrypointPath,
+		EntrypointDecompressedSize: entrypointInfo.Size(),
+		ServiceWorkerFilename:      swFilename,
+		SharedWorkerFilename:       shwFilename,
+		CSSPaths:                   cssPaths,
+		OpfsWorkerFilename:         opfsWorkerFilename,
+	}, nil
+}
+
+// BuildWebPkgsBundle builds the web pkg bundle files.
+// devMode selects the package environment independently of minification.
+//
+// stateDir is the directory where bun will be downloaded if not found in PATH.
+// pathPrefix is the prefix to prepend to /pkgs/ for pkg paths
+// Returns the import map entries mapping logical specifiers to hashed output paths.
+func BuildWebPkgsBundle(ctx context.Context, le *logrus.Entry, stateDir string, plat bldr_platform.Platform, bldrDistRoot, buildDir, pathPrefix string, minify, sourcemaps, devMode bool) (web_entrypoint_index.ImportMap, error) {
+	// build to pkgs/
+	outDir := filepath.Join(buildDir, "pkgs")
+
+	// install dist deps (cached: skips if package.json unchanged)
+	// Use stateDir (not buildDir) so the cache survives CleanCreateDir on the build output.
+	buildPkgsDir, err := EnsureBldrDistDepsInstall(ctx, le, stateDir, bldrDistRoot)
+	if err != nil {
+		return web_entrypoint_index.ImportMap{}, err
+	}
+
+	// web pkgs we distribute with bldr
+	refs := web_pkg_external.GetBldrDistWebPkgRefs(buildPkgsDir, bldrDistRoot)
+
+	// if we are in development mode: include test-utils to react-dom
+	if devMode {
+		for _, ref := range refs {
+			if ref.WebPkgId == "react-dom" {
+				ref.Imports = append(ref.Imports, "test-utils.js")
+			}
+		}
+	}
+
+	// Run a one-shot Vite build that produces the web pkg import map.
+	var importMap web_entrypoint_index.ImportMap
+	viteWorkingPath := filepath.Join(stateDir, "vite-web-pkgs")
+	err = web_pkg_vite.RunOneShot(ctx, le, bldrDistRoot, bldrDistRoot, viteWorkingPath, func(ctx context.Context, client bldr_vite.SRPCViteBundlerClient) error {
+		_, _, mapEntries, buildErr := web_pkg_vite.BuildWebPkgsViteWithManagedRoot(
+			ctx,
+			le,
+			buildDir,
+			stateDir,
+			refs,
+			nil,
+			outDir,
+			pathPrefix+"/pkgs/",
+			!devMode,
+			minify,
+			sourcemaps,
+			client,
+			filepath.Join(viteWorkingPath, "cache"),
+		)
+		if buildErr == nil {
+			importMap = web_pkg_vite.BuildImportMapFromEntries(mapEntries)
+		}
+		return buildErr
+	})
+	return importMap, err
+}
+
+func EnsureBldrDistDepsInstall(ctx context.Context, le *logrus.Entry, stateDir, bldrDistRoot string) (string, error) {
+	buildPkgsDir, err := npm.EnsureSharedBunInstall(
+		ctx, le, stateDir,
+		distpath.Resolve(bldrDistRoot, "dist", "deps", "package.json"),
+		filepath.Join(stateDir, "build-web-pkgs"),
+	)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(buildPkgsDir)
+}

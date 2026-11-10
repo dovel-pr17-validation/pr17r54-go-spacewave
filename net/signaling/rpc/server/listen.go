@@ -1,0 +1,98 @@
+package signaling_rpc_server
+
+import (
+	"context"
+
+	signaling "github.com/s4wave/spacewave/net/signaling/rpc"
+)
+
+// Listen watches the list of ongoing sessions with the peer.
+func (s *Server) Listen(req *signaling.ListenRequest, strm signaling.SRPCSignaling_ListenStream) error {
+	// Identify the authenticated signaling peer that will receive session requests.
+	ctx := strm.Context()
+	pid, err := s.ident(ctx)
+	if err != nil {
+		return err
+	}
+	pidStr := pid.String()
+
+	// Register the peer and supersede any previous listen stream.
+	s.mtx.Lock()
+	tkr, existed := s.getPeer(pidStr)
+	if existed {
+		// userp any existing Listen call for this peer
+		tkr.listenNonce++
+		tkr.broadcast()
+	}
+	tkr.listening = true
+	listenNonce := tkr.listenNonce
+	s.mtx.Unlock()
+
+	// Clear the registration when this listen stream exits.
+	// Cleanup when we exit
+	defer func() {
+		s.mtx.Lock()
+		currTkr := s.peers[pidStr]
+		if currTkr == tkr && currTkr.listenNonce == listenNonce {
+			currTkr.listenNonce++
+			currTkr.listening = false
+			currTkr.broadcast()
+			s.maybeReleasePeer(pidStr)
+		}
+		s.mtx.Unlock()
+	}()
+
+	// Reconcile desired peer notifications with the last sent state.
+	sentWant := make(map[string]struct{})
+	for {
+		s.mtx.Lock()
+		if tkr.listenNonce != listenNonce {
+			s.mtx.Unlock()
+			return signaling.ErrUserpedListen
+		}
+		var txWant, txNotWant string
+		for wantPeerID := range tkr.wantPeers {
+			if _, ok := sentWant[wantPeerID]; !ok {
+				txWant = wantPeerID
+				break
+			}
+		}
+		for sentPeerID := range sentWant {
+			if _, ok := tkr.wantPeers[sentPeerID]; !ok {
+				txNotWant = sentPeerID
+				break
+			}
+		}
+		waitCh := tkr.getWaitCh()
+		s.mtx.Unlock()
+
+		// Notify the peer about removed session requests.
+		if txNotWant != "" {
+			if err := strm.Send(&signaling.ListenResponse{
+				Body: &signaling.ListenResponse_ClearPeer{ClearPeer: txNotWant},
+			}); err != nil {
+				return err
+			}
+			delete(sentWant, txNotWant)
+		}
+
+		// Notify the peer about new session requests.
+		if txWant != "" {
+			if err := strm.Send(&signaling.ListenResponse{
+				Body: &signaling.ListenResponse_SetPeer{SetPeer: txWant},
+			}); err != nil {
+				return err
+			}
+			sentWant[txWant] = struct{}{}
+		}
+
+		// Wait for a state change or stream cancellation.
+		if txNotWant == "" && txWant == "" {
+			select {
+			case <-ctx.Done():
+				return context.Canceled
+			case <-waitCh:
+			}
+		}
+	}
+}

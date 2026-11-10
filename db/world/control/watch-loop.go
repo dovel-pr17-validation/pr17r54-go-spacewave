@@ -1,0 +1,278 @@
+package world_control
+
+import (
+	"context"
+	"sync"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/bucket"
+	"github.com/s4wave/spacewave/db/world"
+	"github.com/sirupsen/logrus"
+)
+
+// WatchLoop is a utility for building Controllers which bind to world state,
+// running reconciliation loops until the world reaches a desired state.
+type WatchLoop struct {
+	// le is the logger
+	le *logrus.Entry
+	// objectKey is the object to monitor, if any. When unset the loop
+	// monitors what the handler reads.
+	objectKey string
+	// handler is the watch loop handler
+	handler WatchLoopHandler
+
+	wake watchLoopWakeState
+}
+
+type watchLoopWakeState struct {
+	// mtx guards below fields
+	mtx sync.Mutex
+	// waiter cancels the active world wait when one is registered.
+	waiter *watchLoopWaiter
+	// pending records a Wake call made while no world wait is registered.
+	pending bool
+}
+
+type watchLoopWaiter struct {
+	cancel context.CancelFunc
+}
+
+// WatchLoopHandler is the callback function for the WatchLoop.
+//
+// obj is borrowed for the duration of the call: the loop releases it before the
+// next iteration. A handler that needs the object state afterwards acquires its
+// own handle with world.WorldState.GetObject.
+//
+// le may be nil
+type WatchLoopHandler = func(
+	ctx context.Context,
+	le *logrus.Entry,
+	world world.WorldState,
+	obj world.ObjectState, // may be nil if not found or objkey is empty
+	rootRef *bucket.ObjectRef, // may be nil if not found or objkey is empty
+	objRev uint64, // may be nil if not found or objkey is empty
+) (waitForChanges bool, err error)
+
+// NewWatchLoop constructs a new Control Loop which looks up an Engine on the
+// Bus and calls the Callback when the state changes.
+//
+// objectKey may be empty
+// le may be nil
+func NewWatchLoop(
+	le *logrus.Entry,
+	objectKey string,
+	handler WatchLoopHandler,
+) *WatchLoop {
+	return &WatchLoop{
+		le:        le,
+		objectKey: objectKey,
+		handler:   handler,
+	}
+}
+
+// NewBusWatchLoop constructs a new BusEngine which attaches to an engine
+// running on a controller bus.
+func NewBusWatchLoop(
+	ctx context.Context,
+	le *logrus.Entry,
+	b bus.Bus,
+	engineID string, write bool,
+	objectKey string, handler WatchLoopHandler,
+) (*WatchLoop, *world.BusEngine, world.WorldState) {
+	busEngine := world.NewBusEngine(ctx, b, engineID)
+	ws := world.NewEngineWorldState(busEngine, true)
+	return NewWatchLoop(le, objectKey, handler), busEngine, ws
+}
+
+// ExecuteBusWatchLoop executes an existing WatchLoop with a Bus engine.
+func ExecuteBusWatchLoop(
+	ctx context.Context,
+	b bus.Bus,
+	engineID string, write bool,
+	objLoop *WatchLoop,
+) error {
+	// Run the watch loop against the bus engine and preserve cancellation.
+	busEngine := world.NewBusEngine(ctx, b, engineID)
+	ws := world.NewEngineWorldState(busEngine, true)
+	err := objLoop.Execute(ctx, ws)
+	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	return err
+}
+
+// Wake forces the control loop to re-process the latest object state.
+func (c *WatchLoop) Wake() {
+	c.wake.Wake()
+}
+
+// Wake cancels the registered world wait, or records a pending wake when no
+// wait is registered.
+func (w *watchLoopWakeState) Wake() {
+	w.mtx.Lock()
+	if waiter := w.waiter; waiter != nil {
+		waiter.cancel()
+		w.waiter = nil
+		w.mtx.Unlock()
+		return
+	}
+	w.pending = true
+	w.mtx.Unlock()
+}
+
+// beginWait registers a cancellable world wait, or reports a skipped wait when
+// a pending wake already arrived. The returned finish function unregisters.
+func (w *watchLoopWakeState) beginWait(ctx context.Context) (context.Context, func(), bool) {
+	// Consume a pending wake before registering a new World wait.
+	waitCtx, cancel := context.WithCancel(ctx)
+	w.mtx.Lock()
+	if w.pending {
+		w.pending = false
+		w.mtx.Unlock()
+		cancel()
+		return waitCtx, func() {}, true
+	}
+
+	// Register the active World wait and provide its cleanup callback.
+	waiter := &watchLoopWaiter{cancel: cancel}
+	w.waiter = waiter
+	w.mtx.Unlock()
+	return waitCtx, func() {
+		cancel()
+		w.mtx.Lock()
+		if w.waiter == waiter {
+			w.waiter = nil
+		}
+		w.mtx.Unlock()
+	}, false
+}
+
+// Execute runs the ControlLoop execution loop.
+func (c *WatchLoop) Execute(ctx context.Context, ws world.WorldState) error {
+	if c == nil || c.handler == nil {
+		return nil
+	}
+
+	for {
+		done, err := c.executeOnce(ctx, ws)
+		if done {
+			return err
+		}
+	}
+}
+
+// executeOnce runs one iteration: it reads the watched object, calls the
+// handler, then waits for the next revision. done reports that the loop is
+// finished and Execute should return err.
+//
+// The object-state handle lives for exactly one iteration. A remote world state
+// allocates a server-side resource per GetObject, so a loop that watches a
+// long-running object would otherwise accumulate one handle per revision for as
+// long as it runs.
+func (c *WatchLoop) executeOnce(ctx context.Context, ws world.WorldState) (bool, error) {
+	// Stop once the loop is canceled.
+	if ctx.Err() != nil {
+		return true, context.Canceled
+	}
+
+	// Record the World sequence number the handler observes.
+	seqno, err := ws.GetSeqno(ctx)
+	if err != nil {
+		return true, err
+	}
+
+	// Look up the watched object, if any, for this iteration.
+	var objState world.ObjectState
+	var objFound bool
+	if c.objectKey != "" {
+		objState, objFound, err = ws.GetObject(ctx, c.objectKey)
+		defer world.ReleaseObjectState(objState)
+		if err != nil {
+			return true, err
+		}
+	}
+
+	// Read the object's root and revision, or pass no object when it is absent.
+	var rootRef *bucket.ObjectRef
+	var rev uint64
+	if objFound {
+		rootRef, rev, err = objState.GetRootRef(ctx)
+		if err != nil {
+			return true, err
+		}
+		if c.le != nil {
+			c.le.
+				WithField("object-key", c.objectKey).
+				Debugf("object found at rev %d", rev)
+		}
+	} else {
+		objState = nil
+	}
+
+	// Record the reads of a handler that watches no single object.
+	handlerWs := ws
+	var reads *world.ReadSet
+	if c.objectKey == "" {
+		reads = world.NewReadSet()
+		handlerWs = reads.Track(ws)
+	}
+
+	// Run the handler. An unhandled operation waits for the next change, and
+	// any other error is logged unless it reflects cancellation.
+	waitForChanges, err := c.handler(
+		ctx, c.le,
+		handlerWs, objState,
+		rootRef, rev,
+	)
+	if errors.Is(err, world.ErrUnhandledOp) {
+		if c.le != nil {
+			c.le.Debug("handler skipped unhandled operation")
+		}
+		waitForChanges = true
+		err = nil
+	} else if err != nil && c.le != nil &&
+		(ctx.Err() == nil || !errors.Is(err, context.Canceled)) {
+		le := c.le.WithError(err)
+		if c.objectKey != "" {
+			le = le.WithField("object-key", c.objectKey)
+		}
+		le.
+			WithField("world-seqno", seqno).
+			WithField("wait-for-changes", waitForChanges).
+			Warn("handler returned error")
+	}
+	if !waitForChanges {
+		return true, err
+	}
+
+	// Begin the wait, unless a wake arrived during the iteration.
+	wakeCtx, finishWake, skipWait := c.wake.beginWait(ctx)
+	if skipWait {
+		return false, nil
+	}
+
+	// Wait for the next revision of the watched object, its deletion or its
+	// creation. A loop without an object waits for a change to what the
+	// handler read.
+	switch {
+	case objState != nil:
+		_, err = objState.WaitRev(wakeCtx, rev+1, false)
+		if errors.Is(err, world.ErrObjectNotFound) {
+			err = nil
+		}
+	case c.objectKey != "":
+		_, err = world.WaitObjectRev(wakeCtx, ws, c.objectKey, 0, true)
+	default:
+		_, err = reads.WaitChange(wakeCtx, ws, seqno)
+	}
+	finishWake()
+
+	// Wake cancels the wait context. Storage snapshot initialization may wrap
+	// that cancellation (for example while reading the World root), but it is
+	// still a request to reconcile again, not a terminal controller failure.
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return true, err
+	}
+	return false, nil
+}

@@ -1,0 +1,66 @@
+package bldr_plugin
+
+import (
+	"encoding/base64"
+	"path/filepath"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/net/util/labels"
+)
+
+// NewPluginStartInfo constructs a new PluginStartInfo.
+func NewPluginStartInfo(instanceID, pluginID, instanceKey, manifestRoot string) *PluginStartInfo {
+	return &PluginStartInfo{
+		InstanceId:   instanceID,
+		PluginId:     pluginID,
+		InstanceKey:  instanceKey,
+		ManifestRoot: manifestRoot,
+	}
+}
+
+// UnmarshalPluginStartInfoJsonBase64 unmarshals a base64-encoded JSON string into a PluginStartInfo.
+func UnmarshalPluginStartInfoJsonBase64(data string) (*PluginStartInfo, error) {
+	// Decode the base64-encoded JSON payload.
+	jdat, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, errors.Wrap(err, "decode base64")
+	}
+
+	// Unmarshal the JSON payload into the start info.
+	startInfo := &PluginStartInfo{}
+	if err := startInfo.UnmarshalJSON(jdat); err != nil {
+		return nil, errors.Wrap(err, "unmarshal json")
+	}
+
+	return startInfo, nil
+}
+
+// Validate checks the plugin meta.
+func (m *PluginStartInfo) Validate() error {
+	// Validate the instance ID as a DNS label.
+	if err := labels.ValidateDNSLabel(m.GetInstanceId()); err != nil {
+		return errors.Wrap(err, "instance_id")
+	}
+	// Validate the plugin ID.
+	if err := ValidatePluginID(m.GetPluginId(), true); err != nil {
+		return errors.Wrap(err, "plugin_id")
+	}
+	return nil
+}
+
+// MarshalJsonBase64 marshals the start info to base64-encoded json.
+func (m *PluginStartInfo) MarshalJsonBase64() (string, error) {
+	jdat, err := m.MarshalJSON()
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(jdat), nil
+}
+
+// DebugSocketPath returns the Unix socket where the plugin process serves pprof
+// and its identity, inside the host's private pipe directory. The name is
+// shorter than the plugin pipe's, so it fits wherever the pipe does.
+func (m *PluginStartInfo) DebugSocketPath(pipeRoot string) string {
+	return filepath.Join(pipeRoot, ".dbg-"+m.GetInstanceId())
+}

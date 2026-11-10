@@ -1,0 +1,81 @@
+package git_block
+
+import (
+	"github.com/go-git/go-git/v6/plumbing/format/index"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/net/hash"
+)
+
+// NewTreeEntry constructs a new tree entry from a git tree entry.
+func NewTreeEntry(t *index.TreeEntry) (*TreeEntry, error) {
+	// Convert the Git tree entry metadata and its hash to a storage block.
+	if t == nil {
+		return nil, nil
+	}
+	out := &TreeEntry{
+		Path:    t.Path,
+		Entries: int32(t.Entries), //nolint:gosec
+		Trees:   int32(t.Trees),   //nolint:gosec
+	}
+	var err error
+	out.Hash, err = NewHash(t.Hash)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// IsNil returns if the object is nil.
+func (i *TreeEntry) IsNil() bool {
+	return i == nil
+}
+
+// Validate performs cursory validation of the tree entry.
+func (i *TreeEntry) Validate() error {
+	if err := i.GetHash().Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ApplySubBlock applies a sub-block change with a field id.
+func (i *TreeEntry) ApplySubBlock(id uint32, next block.SubBlock) error {
+	if id == 4 {
+		v, ok := next.(*hash.Hash)
+		if !ok {
+			return block.ErrUnexpectedType
+		}
+		i.Hash = v
+	}
+	return nil
+}
+
+// GetSubBlocks returns all constructed sub-blocks by ID.
+// May return nil, and values may also be nil.
+func (i *TreeEntry) GetSubBlocks() map[uint32]block.SubBlock {
+	m := make(map[uint32]block.SubBlock)
+	m[4] = i.GetHash()
+	return m
+}
+
+// GetSubBlockCtor returns a function which creates or returns the existing
+// sub-block at reference id. Can return nil to indicate invalid reference id.
+func (i *TreeEntry) GetSubBlockCtor(id uint32) block.SubBlockCtor {
+	if id == 4 {
+		return func(create bool) block.SubBlock {
+			v := i.GetHash()
+			if create && v == nil {
+				v = &hash.Hash{}
+				i.Hash = v
+			}
+			return v
+		}
+	}
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ block.Block              = (*TreeEntry)(nil)
+	_ block.BlockWithSubBlocks = (*TreeEntry)(nil)
+)

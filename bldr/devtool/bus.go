@@ -1,0 +1,626 @@
+//go:build !js
+
+package devtool
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/config"
+	configset_controller "github.com/aperturerobotics/controllerbus/controller/configset/controller"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	"github.com/aperturerobotics/controllerbus/controller/resolver/static"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/pkg/errors"
+	bldr "github.com/s4wave/spacewave/bldr"
+	"github.com/s4wave/spacewave/bldr/core"
+	core_devtool "github.com/s4wave/spacewave/bldr/core/devtool"
+	devtool_status "github.com/s4wave/spacewave/bldr/devtool/status"
+	devtool_store "github.com/s4wave/spacewave/bldr/devtool/store"
+	bldr_manifest_world "github.com/s4wave/spacewave/bldr/manifest/world"
+	bldr_project "github.com/s4wave/spacewave/bldr/project"
+	bldr_project_controller "github.com/s4wave/spacewave/bldr/project/controller"
+	bldr_project_watcher "github.com/s4wave/spacewave/bldr/project/watcher"
+	default_storage "github.com/s4wave/spacewave/bldr/storage/default"
+	storage_volume "github.com/s4wave/spacewave/bldr/storage/volume"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	transform_gzip "github.com/s4wave/spacewave/db/block/transform/gzip"
+	"github.com/s4wave/spacewave/db/bucket"
+	node_controller "github.com/s4wave/spacewave/db/node/controller"
+	"github.com/s4wave/spacewave/db/volume"
+	volume_controller "github.com/s4wave/spacewave/db/volume/controller"
+	"github.com/s4wave/spacewave/db/world"
+	world_block_engine "github.com/s4wave/spacewave/db/world/block/engine"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// devtoolTransformConf is the block transform conf to use.
+var devtoolTransformConf = []config.Config{
+	&transform_gzip.Config{CompressionLevel: 9},
+}
+
+// DevtoolBus contains a built devtool bus.
+type DevtoolBus struct {
+	// ctx is canceled when the devtool bus is released.
+	ctx context.Context
+	// b contains the bus.
+	b bus.Bus
+	// le contains the root logger.
+	le *logrus.Entry
+	// sr contains the static resolver.
+	sr *static.Resolver
+	// watch enables watching for changes.
+	watch bool
+	// vars are the named inputs a bldr.star reads with var().
+	vars map[string]string
+	// storageID is the storage engine id.
+	storageID string
+	// worldEngineID is the world engine id for the devtool world.
+	worldEngineID string
+	// engineBucketID is the bucket used for world engine state storage.
+	engineBucketID string
+	// engineObjectStoreID is the bucket used for root world engine state ref.
+	engineObjectStoreID string
+	// pluginHostObjectKey is the object key used for the PluginHost.
+	pluginHostObjectKey string
+	// repoRoot is the project root containing the live module files.
+	repoRoot string
+	// stateRoot is the .bldr state root dir.
+	stateRoot string
+	// distSrcRoot is the path to the web entrypoint sources.
+	distSrcRoot string
+	// pluginsDistRoot is the path to the plugins dist dir.
+	pluginsDistRoot string
+	// pluginsStateRoot is the path to the plugins state dir.
+	pluginsStateRoot string
+	// vol is the volume used for state.
+	vol volume.Volume
+	// volInfo is the volume info for the vol used for state.
+	volInfo *volume.VolumeInfo
+	// volCtrl is the volume controller used for state.
+	volCtrl volume.Controller
+	// peerID is the peerID to use for operations.
+	peerID peer.ID
+	// worldEngine is the world engine instance.
+	worldEngine world.Engine
+	// worldState is the world state instance.
+	worldState world.WorldState
+	// statusProducer publishes devtool status snapshots.
+	statusProducer *devtool_status.BldrDevtoolStatusProducer
+	// release unwinds the controllers, state lock, and devtool context.
+	release func()
+}
+
+// BuildDevtoolBus builds the storage and bus for the devtool.
+// The returned bus owns the shared state lock until Release.
+func BuildDevtoolBus(
+	rctx context.Context,
+	le *logrus.Entry,
+	repoRoot, stateRoot string,
+	watch bool,
+	vars map[string]string,
+) (*DevtoolBus, error) {
+	// Derive the devtool context and a release chain that unwinds every
+	// acquired controller, the state lock, and the context.
+	ctx, ctxCancel := context.WithCancel(rctx)
+	var rels []func()
+	var stateLock *stateLock
+	rel := func() {
+		for _, fn := range rels {
+			fn()
+		}
+		if stateLock != nil {
+			stateLock.release()
+			stateLock = nil
+		}
+		ctxCancel()
+	}
+
+	// Acquire the exclusive devtool state lock before touching storage.
+	var err error
+	stateLock, err = acquireStateLock(ctx, le, stateRoot)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Serve pprof on the debug socket while the lock is held.
+	serveDevtoolDebug(ctx, le, stateRoot)
+
+	// Start the core controller bus and static resolver.
+	b, sr, err := core.NewCoreBus(ctx, le)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Start the devtool status producer and its observer controller.
+	statusProducer := devtool_status.NewBldrDevtoolStatusProducer(nil)
+	statusObserver := devtool_status.NewBldrDevtoolStatusObserver(b, statusProducer)
+	relStatusObserver, err := b.AddController(ctx, statusObserver, nil)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	rels = append(rels, relStatusObserver)
+
+	// Register the devtool controller factories.
+	core_devtool.AddFactories(b, sr)
+
+	// Attach the config-set controller.
+	configSetCtrl, _ := configset_controller.NewController(le, b)
+	relConfigSetCtrl, err := b.AddController(ctx, configSetCtrl, nil)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	rels = append(rels, relConfigSetCtrl)
+
+	// Create the plugin output directories.
+	pluginHostObjectKey := "devtool"
+	pluginsRoot := filepath.Join(stateRoot, "plugin")
+	pluginsDistRoot := filepath.Join(pluginsRoot, "dist")
+	if err := os.MkdirAll(pluginsDistRoot, 0o755); err != nil {
+		rel()
+		return nil, err
+	}
+	pluginsStateRoot := filepath.Join(pluginsRoot, "state")
+	if err := os.MkdirAll(pluginsStateRoot, 0o755); err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Attach the default storage controller to provide separate retained volumes.
+	storageID := default_storage.StorageID
+	storageCtrl := default_storage.NewController(storageID, b, stateRoot)
+	relStorageCtrl, err := b.AddController(ctx, storageCtrl, nil)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	rels = append(rels, relStorageCtrl)
+
+	// Require at least one storage method.
+	storageMethods := storageCtrl.GetStorage()
+	if len(storageMethods) == 0 {
+		rel()
+		return nil, errors.New("no available storage methods")
+	}
+
+	// Register the storage method factories.
+	for _, storageMethod := range storageMethods {
+		storageMethod.AddFactories(b, sr)
+	}
+
+	// Start the devtool storage volume on the default storage controller.
+	volCtrl, volCtrlRef, err := storage_volume.ExecVolumeController(ctx, b, &storage_volume.Config{
+		StorageId:       storageID,
+		StorageVolumeId: "devtool",
+		VolumeConfig: &volume_controller.Config{
+			VolumeIdAlias: []string{"dist"},
+		},
+	})
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	rels = append(rels, volCtrlRef.Release)
+
+	// Wait for the volume handle.
+	vol, err := volCtrl.GetVolume(ctx)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Describe the volume for the devtool bus.
+	volInfo, err := volume.NewVolumeInfo(ctx, volCtrl.GetControllerInfo(), vol)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Start the node controller.
+	dir := resolver.NewLoadControllerWithConfig(&node_controller.Config{})
+	_, _, nodeCtrlRef, err := bus.ExecOneOff(ctx, b, dir, nil, nil)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	rels = append(rels, nodeCtrlRef.Release)
+
+	// Select the devtool World storage identifiers.
+	engineBucketID := devtool_store.BucketID
+	engineObjStoreID := devtool_store.ObjectStoreID
+	engineID := devtool_store.EngineID
+
+	// Create the World engine bucket if it does not exist.
+	bucketConf, err := bucket.NewConfig(engineBucketID, 1, nil)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	_, err = bucket.ExApplyBucketConfig(ctx, b, bucket.NewApplyBucketConfigToVolume(bucketConf, vol.GetID()))
+	if err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Build the block transform config and the engine's initial object ref.
+	transformConf, err := block_transform.NewConfig(devtoolTransformConf)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	initRef := &bucket.ObjectRef{
+		BucketId:      engineBucketID,
+		TransformConf: transformConf,
+	}
+
+	// Configure the devtool World engine on the volume's bucket.
+	engConf := world_block_engine.NewConfig(
+		engineID,
+		vol.GetID(), engineBucketID,
+		engineObjStoreID,
+		initRef,
+		nil,
+		false,
+	)
+
+	// Start the World engine and wrap it in an engine world state.
+	eng, engRef, err := world.StartEngine(ctx, b, engConf, nil)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	rels = append(rels, engRef.Release)
+	worldState := world.NewEngineWorldState(eng, true)
+
+	// Register the plugin host's World operation types.
+	lookupOpCtrl := world.NewLookupOpController("bldr-plugin-host-ops", engineID, world.NewSchema(bldr_manifest_world.WorldTypes).LookupOp)
+	relLookupCtrl, err := b.AddController(ctx, lookupOpCtrl, nil)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	rels = append(rels, relLookupCtrl)
+
+	// Open a transaction to create the plugin host manifest store.
+	engTx, err := eng.NewTransaction(ctx, true)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Create the plugin host manifest store if it does not exist yet.
+	_, err = bldr_manifest_world.CreateManifestStore(ctx, engTx, pluginHostObjectKey)
+	if err != nil {
+		engTx.Discard()
+		rel()
+		return nil, err
+	}
+
+	// Commit the manifest store creation transaction.
+	if err := engTx.Commit(ctx); err != nil {
+		rel()
+		return nil, err
+	}
+
+	// Inspect existing devtool manifests. Native startup now preflights cached
+	// manifests before the scheduler starts, so startup keeps validated cached
+	// manifests instead of deleting everything up front.
+	inspectTx, err := eng.NewTransaction(ctx, true)
+	if err != nil {
+		rel()
+		return nil, err
+	}
+	manifestObjKeys, err := bldr_manifest_world.ListManifests(ctx, inspectTx, pluginHostObjectKey)
+	if err != nil {
+		inspectTx.Discard()
+		rel()
+		return nil, err
+	}
+	if len(manifestObjKeys) > 0 {
+		le.WithField("manifest-count", len(manifestObjKeys)).
+			Info("keeping cached devtool manifests for startup validation")
+	}
+	inspectTx.Discard()
+
+	// Return the devtool bus with its complete cleanup function.
+	distSrcDir := filepath.Join(stateRoot, "src")
+
+	return &DevtoolBus{
+		ctx:                 ctx,
+		b:                   b,
+		le:                  le,
+		sr:                  sr,
+		watch:               watch,
+		vars:                vars,
+		storageID:           storageID,
+		worldEngineID:       engineID,
+		engineBucketID:      engineBucketID,
+		engineObjectStoreID: engineObjStoreID,
+		pluginHostObjectKey: pluginHostObjectKey,
+		repoRoot:            repoRoot,
+		stateRoot:           stateRoot,
+		distSrcRoot:         distSrcDir,
+		pluginsDistRoot:     pluginsDistRoot,
+		pluginsStateRoot:    pluginsStateRoot,
+		vol:                 vol,
+		volInfo:             volInfo,
+		volCtrl:             volCtrl,
+		peerID:              vol.GetPeerID(),
+		worldEngine:         eng,
+		worldState:          worldState,
+		statusProducer:      statusProducer,
+		release:             rel,
+	}, nil
+}
+
+// SyncDistSources syncs the bldr sources and runs npm i and go mod vendor.
+//
+// bldrSum and bldrSrcPath can be empty.
+func (d *DevtoolBus) SyncDistSources(bldrVersion, bldrSum, bldrSrcPath string) error {
+	return bldr.SyncDistSources(d.ctx, d.le, bldr.DistSourceSyncConfig{
+		RepoRoot:    d.repoRoot,
+		DistRoot:    d.distSrcRoot,
+		BldrVersion: bldrVersion,
+		BldrSum:     bldrSum,
+		BldrSrcPath: bldrSrcPath,
+	})
+}
+
+// GetContext returns the context.
+func (d *DevtoolBus) GetContext() context.Context {
+	return d.ctx
+}
+
+// GetBus returns the bus.
+func (d *DevtoolBus) GetBus() bus.Bus {
+	return d.b
+}
+
+// GetLogger returns the root logger.
+func (d *DevtoolBus) GetLogger() *logrus.Entry {
+	return d.le
+}
+
+// GetStaticResolver returns the static controller resolver.
+func (d *DevtoolBus) GetStaticResolver() *static.Resolver {
+	return d.sr
+}
+
+// GetStateRoot returns the root of the state tree.
+func (d *DevtoolBus) GetStateRoot() string {
+	return d.stateRoot
+}
+
+// GetDistSrcDir returns the path to the redistribute sources checked out under StateRoot.
+func (d *DevtoolBus) GetDistSrcDir() string {
+	return d.distSrcRoot
+}
+
+// GetPluginsDistRoot returns the path to the plugins dist files dir.
+func (d *DevtoolBus) GetPluginsDistRoot() string {
+	return d.pluginsDistRoot
+}
+
+// GetPluginsStateRoot returns the path to the plugins state files dir.
+func (d *DevtoolBus) GetPluginsStateRoot() string {
+	return d.pluginsStateRoot
+}
+
+// GetVolume returns the storage volume in use.
+func (d *DevtoolBus) GetVolume() volume.Volume {
+	return d.vol
+}
+
+// GetVolumeInfo returns the storage volume info.
+func (d *DevtoolBus) GetVolumeInfo() *volume.VolumeInfo {
+	return d.volInfo
+}
+
+// GetVolumeController returns the storage volume controller in use.
+func (d *DevtoolBus) GetVolumeController() volume.Controller {
+	return d.volCtrl
+}
+
+// GetWorldEngineID returns the world engine id.
+func (d *DevtoolBus) GetWorldEngineID() string {
+	return d.worldEngineID
+}
+
+// GetStorageID returns the storage controller id.
+func (d *DevtoolBus) GetStorageID() string {
+	return d.storageID
+}
+
+// GetWorldEngine returns the world engine instance.
+func (d *DevtoolBus) GetWorldEngine() world.Engine {
+	return d.worldEngine
+}
+
+// GetWorldState returns the world state handle.
+func (d *DevtoolBus) GetWorldState() world.WorldState {
+	return d.worldState
+}
+
+// GetStatusProducer returns the devtool status producer.
+func (d *DevtoolBus) GetStatusProducer() *devtool_status.BldrDevtoolStatusProducer {
+	return d.statusProducer
+}
+
+// SetCommandStatus publishes the current devtool command lifecycle status.
+func (d *DevtoolBus) SetCommandStatus(command devtool_status.BldrDevtoolCommandStatus) {
+	d.statusProducer.UpdateStatus(func(current *devtool_status.BldrDevtoolStatus) *devtool_status.BldrDevtoolStatus {
+		return current.WithCommand(command)
+	})
+}
+
+// GetPluginHostObjectKey returns the object key for the plugin host.
+func (d *DevtoolBus) GetPluginHostObjectKey() string {
+	return d.pluginHostObjectKey
+}
+
+// StartStorageVolume starts a storage volume.
+// The ID should be unique.
+func (d *DevtoolBus) StartStorageVolume(
+	ctx context.Context,
+	storageVolumeID string,
+	ctrlConf *volume_controller.Config,
+) (volume.Controller, directive.Reference, error) {
+	return storage_volume.ExecVolumeController(ctx, d.GetBus(), &storage_volume.Config{
+		StorageId:       d.storageID,
+		StorageVolumeId: storageVolumeID,
+		VolumeConfig:    ctrlConf,
+	})
+}
+
+// StartProjectController reads the config file & starts the project controller.
+// ConfigPath is the path to the project config.
+// ConfigPath can be empty to start with an empty config.
+// extraPlugins are additional plugin IDs appended to the start config.
+// Returns the directive reference & controller.
+func (d *DevtoolBus) StartProjectController(
+	ctx context.Context,
+	b bus.Bus,
+	repoRoot,
+	configPath string,
+	startWithRemote string,
+	extraPlugins []string,
+) (
+	*bldr_project_watcher.Controller,
+	directive.Reference,
+	error,
+) {
+	return d.StartProjectControllerWithStartup(
+		ctx,
+		b,
+		repoRoot,
+		configPath,
+		startWithRemote,
+		extraPlugins,
+		startWithRemote != "",
+	)
+}
+
+// StartProjectControllerWithStartup reads the config file and starts the project controller.
+func (d *DevtoolBus) StartProjectControllerWithStartup(
+	ctx context.Context,
+	b bus.Bus,
+	repoRoot,
+	configPath string,
+	startWithRemote string,
+	extraPlugins []string,
+	start bool,
+) (
+	*bldr_project_watcher.Controller,
+	directive.Reference,
+	error,
+) {
+	return d.startProjectController(ctx, b, repoRoot, configPath, startWithRemote, extraPlugins, start, false, "", nil)
+}
+
+// StartFrontendProjectController enables the retained graph for watched web startup.
+func (d *DevtoolBus) StartFrontendProjectController(ctx context.Context, b bus.Bus, repoRoot, configPath, startWithRemote string, extraPlugins []string, development bool) (*bldr_project_watcher.Controller, directive.Reference, error) {
+	return d.startProjectController(ctx, b, repoRoot, configPath, startWithRemote, extraPlugins, startWithRemote != "", development && d.watch, "", nil)
+}
+
+// StartProjectControllerWithRemote builds into an already-mounted World capability.
+// The caller retains the mount until the returned project reference is released.
+func (d *DevtoolBus) StartProjectControllerWithRemote(ctx context.Context, repoRoot, configPath, remoteID string, remote *bldr_project.RemoteConfig, frontendRoutePrefix string) (*bldr_project_watcher.Controller, directive.Reference, error) {
+	return d.startProjectController(ctx, d.b, repoRoot, configPath, remoteID, nil, false, frontendRoutePrefix != "" && d.watch, frontendRoutePrefix, map[string]*bldr_project.RemoteConfig{remoteID: remote})
+}
+
+// startProjectController selects the build mode before registering any builders.
+func (d *DevtoolBus) startProjectController(ctx context.Context, b bus.Bus, repoRoot, configPath, startWithRemote string, extraPlugins []string, start, frontendDevelopment bool, frontendRoutePrefix string, remotes map[string]*bldr_project.RemoteConfig) (*bldr_project_watcher.Controller, directive.Reference, error) {
+	// Resolve a relative config path against the repository root.
+	absConfigPath := configPath
+	if configPath != "" && !filepath.IsAbs(configPath) {
+		absConfigPath = filepath.Join(repoRoot, configPath)
+	}
+
+	// Validate the config file upfront so parse errors surface immediately
+	// instead of causing the controller to retry indefinitely.
+	// bldr.star is also accepted as a standalone config source.
+	if absConfigPath != "" {
+		confData, err := os.ReadFile(absConfigPath)
+		if err != nil {
+			// If bldr.yaml is missing, check for bldr.star.
+			starPath := bldr_project_watcher.ResolveStarlarkPath(absConfigPath)
+			if _, serr := os.Stat(starPath); serr != nil {
+				return nil, nil, errors.Wrap(err, "read project config")
+			}
+		} else {
+			testConf := &bldr_project.ProjectConfig{}
+			if err := bldr_project.UnmarshalProjectConfig(confData, testConf); err != nil {
+				return nil, nil, errors.Wrap(err, "parse project config")
+			}
+		}
+	}
+
+	// Build the base project config with the devtool remote and extra plugins.
+	baseProjectConfig := &bldr_project.ProjectConfig{
+		Remotes: map[string]*bldr_project.RemoteConfig{
+			"devtool": {
+				EngineId:       d.worldEngineID,
+				PeerId:         d.peerID.String(),
+				ObjectKey:      d.pluginHostObjectKey,
+				LinkObjectKeys: []string{d.pluginHostObjectKey},
+			},
+		},
+	}
+	if len(extraPlugins) != 0 {
+		baseProjectConfig.Start = &bldr_project.StartConfig{
+			Plugins: extraPlugins,
+		}
+	}
+	projCtrlConf := bldr_project_controller.NewConfig(
+		repoRoot,
+		d.GetStateRoot(),
+		baseProjectConfig,
+		d.watch,
+		start,
+	)
+	projCtrlConf.FetchManifestRemote = startWithRemote
+	projCtrlConf.FrontendDevelopment = frontendDevelopment
+	projCtrlConf.FrontendRoutePrefix = frontendRoutePrefix
+	projWatcherConfig := &bldr_project_watcher.Config{
+		ConfigPath:              absConfigPath,
+		DisableWatch:            !d.watch,
+		ProjectControllerConfig: projCtrlConf,
+		BoundRemotes:            remotes,
+		Vars:                    d.vars,
+	}
+
+	// Start the project watcher controller and wait for it to run.
+	ctrl, _, ctrlRef, err := loader.WaitExecControllerRunning(
+		ctx,
+		b,
+		resolver.NewLoadControllerWithConfig(projWatcherConfig),
+		nil,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Wait for the project controller and attach its status producers.
+	projWatcher := ctrl.(*bldr_project_watcher.Controller)
+	projCtrl, err := projWatcher.GetProjectController().WaitValue(ctx, nil)
+	if err != nil {
+		ctrlRef.Release()
+		return nil, nil, err
+	}
+	devtool_status.AttachProjectStatus(d.statusProducer, projCtrl)
+	devtool_status.AttachManifestBuildStatus(d.statusProducer, projCtrl)
+	return projWatcher, ctrlRef, nil
+}
+
+// Release releases the controllers and state lock and cancels the devtool context.
+func (d *DevtoolBus) Release() {
+	d.release()
+}

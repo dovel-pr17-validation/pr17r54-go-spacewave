@@ -1,0 +1,137 @@
+import { useState } from 'react'
+import { LuMenu, LuX } from 'react-icons/lu'
+import { cn } from '@s4wave/web/style/utils.js'
+import { LegalFooter } from '@s4wave/app/landing/LegalFooter.js'
+import {
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetTitle,
+  SheetTrigger,
+} from '@s4wave/web/ui/sheet.js'
+
+// DocsLayoutProps defines the props for DocsLayout.
+interface DocsLayoutProps {
+  sidebar: React.ReactNode
+  children: React.ReactNode
+  currentSlug?: string
+  mobileTitle?: string
+  // contentWidth selects the content column measure. 'reading' is the prose
+  // measure for article pages; 'wide' is the card-grid measure so hub and
+  // section index pages fill a desktop viewport instead of stranding a gutter.
+  contentWidth?: 'reading' | 'wide'
+}
+
+interface DocsMobileNavProps {
+  portalContainer: HTMLDivElement | null
+  sidebar: React.ReactNode
+  title: string
+}
+
+// DocsMobileNav renders the full-width top bar with the hamburger trigger and
+// the slide-in navigation drawer. It occupies its own row above the content so
+// the trigger spans the viewport rather than sitting beside the content column.
+function DocsMobileNav({
+  portalContainer,
+  sidebar,
+  title,
+}: DocsMobileNavProps) {
+  const [mobileOpen, setMobileOpen] = useState(false)
+
+  return (
+    <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+      <div className="bg-topbar-back flex h-12 min-w-0 items-center gap-1 border-b border-white/10 px-2 @2xl:hidden">
+        <SheetTrigger asChild>
+          <button
+            type="button"
+            aria-label="Open documentation navigation"
+            className="text-foreground-alt hover:bg-foreground/5 hover:text-foreground focus-visible:ring-brand/30 inline-flex size-11 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:ring-1 focus-visible:outline-none"
+          >
+            <LuMenu className="size-4" />
+          </button>
+        </SheetTrigger>
+        <span className="text-foreground min-w-0 truncate text-sm font-semibold">
+          {title}
+        </span>
+      </div>
+      <SheetContent
+        side="left"
+        position="absolute"
+        portalContainer={portalContainer}
+        showCloseButton={false}
+        variant="docs"
+        className="w-70 max-w-(--max-width-docs-sidebar)"
+      >
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+            <SheetTitle variant="docsPlain">Documentation</SheetTitle>
+            <SheetClose asChild>
+              <button
+                type="button"
+                aria-label="Close documentation navigation"
+                className="text-foreground-alt hover:bg-foreground/5 hover:text-foreground focus-visible:ring-brand/30 inline-flex size-11 items-center justify-center rounded-md transition-colors focus-visible:ring-1 focus-visible:outline-none"
+              >
+                <LuX className="size-4" />
+              </button>
+            </SheetClose>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto">{sidebar}</div>
+        </div>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
+// DocsLayout renders the responsive documentation shell: a persistent left rail
+// on wide displays that collapses into a top-bar drawer below the @2xl container
+// breakpoint. The content column carries its own min-w-0 so wide code blocks and
+// tables scroll within it instead of forcing the page to scroll sideways.
+export function DocsLayout({
+  sidebar,
+  children,
+  currentSlug,
+  mobileTitle = 'Documentation',
+  contentWidth = 'reading',
+}: DocsLayoutProps) {
+  const [portalContainer, setPortalContainer] = useState<HTMLDivElement | null>(
+    null,
+  )
+  const maxWidth = contentWidth === 'wide' ? 'max-w-5xl' : 'max-w-3xl'
+
+  return (
+    <div
+      ref={setPortalContainer}
+      className="bg-background-landing @container relative flex w-full flex-1 flex-col overflow-hidden"
+    >
+      {/* Navigation drawer - narrow widths only */}
+      <DocsMobileNav
+        key={currentSlug ?? 'docs-root'}
+        portalContainer={portalContainer}
+        sidebar={sidebar}
+        title={mobileTitle}
+      />
+
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {/* Sidebar - wide widths only */}
+        <aside className="hidden w-58 shrink-0 overflow-y-auto border-r border-white/10 @2xl:block">
+          {sidebar}
+        </aside>
+
+        {/* Content. overflow-x-hidden keeps the scroll region from ever
+            scrolling sideways: wide prose scrolls inside its own bounded box
+            and the shell never gains a horizontal scrollbar. */}
+        <main className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto">
+          <div
+            className={cn(
+              'mx-auto w-full flex-1 px-5 pt-6 pb-20 @2xl:px-8 @2xl:pt-10',
+              maxWidth,
+            )}
+          >
+            {children}
+          </div>
+          <LegalFooter />
+        </main>
+      </div>
+    </div>
+  )
+}

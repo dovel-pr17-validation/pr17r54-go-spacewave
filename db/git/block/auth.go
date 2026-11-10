@@ -1,0 +1,64 @@
+//go:build !goscript
+
+package git_block
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/go-git/go-git/v6/plumbing/client"
+	transport_ssh "github.com/go-git/go-git/v6/plumbing/transport/ssh"
+	"github.com/s4wave/spacewave/net/peer"
+	peer_ssh "github.com/s4wave/spacewave/net/peer/ssh"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// ResolveAuth resolves authentication on a bus from the config.
+// Returns nil, nil if auth not configured.
+func (a *AuthOpts) ResolveAuth(ctx context.Context, b bus.Bus) (client.SSHAuth, error) {
+	// ssh authentication
+	sshAuth := &transport_ssh.PublicKeys{
+		User: a.GetUsername(),
+	}
+	if a.GetPeerId() != "" {
+		peerID, err := a.ParsePeerId()
+		if err != nil {
+			return nil, err
+		}
+
+		peerPriv, _, peerPrivRef, err := peer.GetPeerWithID(ctx, b, peerID, false, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer peerPrivRef.Release()
+
+		privKey, err := peerPriv.GetPrivKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if privKey != nil {
+			sshAuth.Signer, err = peer_ssh.NewSigner(privKey)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(sshAuth.User) != 0 || sshAuth.Signer != nil {
+		return sshAuth, nil
+	}
+
+	return nil, nil
+}
+
+// Validate checks the auth object.
+func (a *AuthOpts) Validate() error {
+	if _, err := a.ParsePeerId(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ParsePeerId parses the authentication peer id.
+func (a *AuthOpts) ParsePeerId() (peer.ID, error) {
+	return confparse.ParsePeerID(a.GetPeerId())
+}

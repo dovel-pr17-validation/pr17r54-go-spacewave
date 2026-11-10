@@ -1,0 +1,1394 @@
+import type { ComponentProps, DragEvent, ReactNode } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { APP_DRAG_MIME, APP_DRAG_VERSION } from '@s4wave/web/dnd/app-drag.js'
+import type { DownloadDragTarget } from '@s4wave/web/dnd/download-url-drag.js'
+import type { IWorldState } from '@s4wave/sdk/world/world-state.js'
+import type {
+  FileEntry,
+  GetFileEntryDetailsCallback,
+} from '@s4wave/web/editors/file-browser/types.js'
+import type { RenderEntryCallback } from '@s4wave/web/editors/file-browser/FileListEntry.js'
+import type { ListStateHandle } from '@s4wave/web/ui/list'
+
+import { UnixFSBrowser, type UnixFSBrowserBodyProps } from './UnixFSBrowser.js'
+import { buildUnixFSEntryAppDragEnvelope } from './unixfs-app-drag.js'
+import type { UnixFSMoveItem } from './move.js'
+
+function CustomBrowserBody({ currentPath }: UnixFSBrowserBodyProps) {
+  return <div data-testid="custom-browser-body">{currentPath}</div>
+}
+
+interface RegisteredCommand {
+  commandId: string
+  enabled?: boolean
+  handler?: () => void
+}
+
+interface MockContextMenuProps {
+  state?: {
+    entry?: FileEntry | null
+    actionEntries?: FileEntry[]
+    moveItems?: UnixFSMoveItem[]
+  }
+  onMove?: (moveItems: UnixFSMoveItem[]) => void
+  onNewFolder?: () => void
+}
+
+interface MockMoveDialogProps {
+  moveItems: UnixFSMoveItem[]
+  onConfirm?: (destinationPath: string) => Promise<void>
+  onOpenChange?: (open: boolean) => void
+}
+
+interface MockFileViewerProps {
+  inlineFileURL?: string
+  path: string
+  stat: {
+    mimeType: string
+  }
+}
+
+interface MockDirEntry extends FileEntry {
+  modTime?: bigint
+  size?: bigint
+}
+
+interface MockFileListProps {
+  entries: FileEntry[]
+  placeholder?: ReactNode
+  dropTargetEntryId?: string | null
+  renderEntry?: RenderEntryCallback
+  getEntryDetails?: GetFileEntryDetailsCallback
+  getDragEnvelope?: (
+    entry: FileEntry,
+    context: { selectedIds: string[] },
+  ) => {
+    version: number
+    items: Array<{
+      id: string
+      label?: string
+      capabilities: Array<{ kind: string }>
+    }>
+  } | null
+  getDownloadDragTarget?: (
+    entry: FileEntry,
+    context: { selectedIds: string[] },
+  ) => DownloadDragTarget | null
+  onContextMenu?: (item: { data: FileEntry }, event: MouseEvent) => void
+  state?: ListStateHandle
+  onEntryDragOver?: (
+    entry: FileEntry,
+    event: DragEvent<HTMLDivElement>,
+  ) => boolean
+  onEntryDragLeave?: (
+    entry: FileEntry,
+    event: DragEvent<HTMLDivElement>,
+  ) => void
+  onEntryDrop?: (entry: FileEntry, event: DragEvent<HTMLDivElement>) => void
+}
+
+interface MockToolbarProps {
+  onNewFolder?: () => void
+  onNavigate?: (path: string) => void
+}
+
+const h = vi.hoisted(() => ({
+  mockAddFiles: vi.fn(),
+  mockExtractNativeUploadSelection: vi.fn(),
+  mockDownloadUnixFSSelection: vi.fn(),
+  mockAppStartupBoundary: vi.fn(),
+  mockLookup: vi.fn(),
+  mockMkdirAll: vi.fn(),
+  mockMknod: vi.fn(),
+  mockNavigate: vi.fn(),
+  mockRootHandleResource: null as ReturnType<typeof buildResource> | null,
+  mockPathHandleResource: null as ReturnType<typeof buildResource> | null,
+  mockEntriesResource: null as ReturnType<typeof buildResource> | null,
+  mockStatResource: null as ReturnType<typeof buildResource> | null,
+  mockRename: vi.fn(),
+  mockRootClone: vi.fn(),
+  mockRootLookupPath: vi.fn(),
+  mockSyncStatus: {
+    packRangeLabel: '2 / 128 KiB',
+    packIndexTailLabel: '1 / 4 KiB',
+    packLookupLabel: '1 opened / 2 candidates',
+    packIndexCacheLabel: '0 hits / 1 misses',
+  },
+  registeredCommands: new Map<string, RegisteredCommand>(),
+  latestFileListProps: null as MockFileListProps | null,
+  latestContextMenuProps: null as MockContextMenuProps | null,
+  latestMoveDialogProps: null as MockMoveDialogProps | null,
+  latestFileViewerProps: null as MockFileViewerProps | null,
+  mockStat: null as {
+    info: { isDir?: boolean }
+    mimeType: string
+  } | null,
+  mockFileEntries: [
+    { id: 'docs', name: 'docs', isDir: true },
+    { id: 'file', name: 'file.txt', isDir: false },
+    { id: 'logo', name: 'logo.png', isDir: false },
+  ] as MockDirEntry[],
+  mockSpaceSharingState: { canManage: true },
+}))
+
+function buildResource<T>(value: T) {
+  return {
+    value,
+    loading: false,
+    error: null,
+    retry: vi.fn(),
+  }
+}
+
+function buildDisposableHandle<T extends object>(
+  value: T,
+): T & {
+  [Symbol.dispose]: () => void
+} {
+  return {
+    [Symbol.dispose]: () => undefined,
+    ...value,
+  }
+}
+
+vi.mock('@s4wave/web/hooks/useUnixFSHandle.js', () => ({
+  useUnixFSRootHandle: () =>
+    h.mockRootHandleResource ??
+    buildResource({
+      clone: h.mockRootClone,
+      lookupPath: h.mockRootLookupPath,
+    }),
+  useUnixFSHandle: () =>
+    h.mockPathHandleResource ??
+    buildResource({
+      lookup: h.mockLookup,
+      mkdirAll: h.mockMkdirAll,
+      mknod: h.mockMknod,
+      rename: h.mockRename,
+    }),
+  useUnixFSHandleListing: () =>
+    h.mockEntriesResource ??
+    buildResource({ entries: h.mockFileEntries, rows: h.mockFileEntries }),
+  useUnixFSHandleStat: () => h.mockStatResource ?? buildResource(h.mockStat),
+}))
+
+vi.mock(
+  '@s4wave/web/editors/file-browser/FileList.js',
+  async (importOriginal) => ({
+    useFileListState: (
+      await importOriginal<
+        typeof import('@s4wave/web/editors/file-browser/FileList.js')
+      >()
+    ).useFileListState,
+    FileList: (props: MockFileListProps) => {
+      h.latestFileListProps = props
+      const {
+        entries,
+        placeholder,
+        dropTargetEntryId,
+        renderEntry,
+        onEntryDragOver,
+        onEntryDragLeave,
+        onEntryDrop,
+      } = props
+      return (
+        <div>
+          {entries.length === 0 ? placeholder : null}
+          {entries.map((entry) => {
+            const defaultNode = <span>{entry.name}</span>
+            return (
+              <div
+                key={entry.id}
+                data-testid={`file-entry-${entry.id}`}
+                data-drop-active={
+                  dropTargetEntryId === entry.id ? 'true' : 'false'
+                }
+                onDragOver={(event) => {
+                  if (!onEntryDragOver?.(entry, event)) return
+                  event.preventDefault()
+                }}
+                onDragLeave={(event) => onEntryDragLeave?.(entry, event)}
+                onDrop={(event) => onEntryDrop?.(entry, event)}
+              >
+                {renderEntry?.({ entry, defaultNode, path: '/' }) ??
+                  defaultNode}
+              </div>
+            )
+          })}
+        </div>
+      )
+    },
+  }),
+)
+
+vi.mock('@s4wave/web/editors/file-browser/Toolbar.js', () => ({
+  Toolbar: ({ onNewFolder, onNavigate }: MockToolbarProps) => (
+    <div>
+      Toolbar
+      <button
+        aria-label="Navigate to root"
+        onClick={() => onNavigate?.('/')}
+        type="button"
+      >
+        Root
+      </button>
+      <button onClick={onNewFolder} title="New folder" type="button">
+        New folder
+      </button>
+    </div>
+  ),
+}))
+
+vi.mock('./UnixFSContextMenu.js', () => ({
+  UnixFSContextMenu: (props: MockContextMenuProps) => {
+    h.latestContextMenuProps = props
+    return null
+  },
+}))
+
+vi.mock('./UnixFSMoveDialog.js', () => ({
+  UnixFSMoveDialog: (props: MockMoveDialogProps) => {
+    h.latestMoveDialogProps = props
+    return null
+  },
+}))
+
+vi.mock('./UnixFSFileViewer.js', () => ({
+  UnixFSFileViewer: (props: MockFileViewerProps) => {
+    h.latestFileViewerProps = props
+    return <div>Viewer</div>
+  },
+}))
+
+vi.mock('@s4wave/app/session/SessionUploadManagerContext.js', () => ({
+  useSessionUploadManager: () => ({
+    addFiles: h.mockAddFiles,
+  }),
+}))
+
+vi.mock('./native-upload.js', () => ({
+  extractNativeUploadSelection: h.mockExtractNativeUploadSelection,
+}))
+
+vi.mock('@s4wave/web/command/useCommand.js', () => ({
+  useCommand: (config: RegisteredCommand) => {
+    h.registeredCommands.set(config.commandId, config)
+  },
+}))
+
+vi.mock('@s4wave/web/contexts/TabActiveContext.js', () => ({
+  useIsTabActive: () => true,
+}))
+
+vi.mock('@s4wave/web/object/TabContext.js', () => ({
+  useTabContext: () => null,
+}))
+
+vi.mock('@s4wave/web/router/router.js', () => ({
+  useNavigate: () => h.mockNavigate,
+}))
+
+vi.mock('@s4wave/web/router/HistoryRouter.js', () => ({
+  localNavigation: (to: { path: string }) => ({ ...to, navigation: 'local' }),
+  useHistory: () => null,
+}))
+
+vi.mock('@s4wave/web/contexts/SpaceContainerContext.js', () => ({
+  SpaceContainerContext: {
+    useContextSafe: () => ({
+      spaceId: 'space-test',
+      spaceSharingState: h.mockSpaceSharingState,
+    }),
+  },
+}))
+
+vi.mock('@s4wave/web/contexts/contexts.js', () => ({
+  useSessionIndex: () => 1,
+}))
+
+vi.mock('../session/SessionSyncStatusContext.js', () => ({
+  useSessionSyncStatus: () => h.mockSyncStatus,
+}))
+
+vi.mock('@s4wave/app/quickstart/startup-boundary.js', () => ({
+  markAppStartupBoundary: h.mockAppStartupBoundary,
+}))
+
+vi.mock('./download.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./download.js')>()
+  return {
+    ...actual,
+    downloadUnixFSSelection: h.mockDownloadUnixFSSelection,
+  }
+})
+
+function createInternalAppDragDataTransfer() {
+  const appDrag = JSON.stringify({
+    version: APP_DRAG_VERSION,
+    items: [{ id: 'docs', capabilities: [] }],
+  })
+  return {
+    items: [{ kind: 'string' }],
+    types: [APP_DRAG_MIME],
+    files: [],
+    getData: (format: string) => (format === APP_DRAG_MIME ? appDrag : ''),
+  }
+}
+
+function createUnixFSEntryAppDragDataTransfer({
+  unixfsId = 'files',
+  currentPath = '/',
+  entryName = 'file.txt',
+  isDir = false,
+}: {
+  unixfsId?: string
+  currentPath?: string
+  entryName?: string
+  isDir?: boolean
+}) {
+  const envelope = buildUnixFSEntryAppDragEnvelope({
+    entry: {
+      id: 'file',
+      name: entryName,
+      isDir,
+    },
+    currentPath,
+    sessionIndex: null,
+    spaceId: null,
+    unixfsId,
+  })
+  if (!envelope) {
+    throw new Error('failed to build UnixFS entry drag envelope')
+  }
+  return {
+    items: [{ kind: 'string' }],
+    types: [APP_DRAG_MIME],
+    files: [],
+    getData: (format: string) =>
+      format === APP_DRAG_MIME ? JSON.stringify(envelope) : '',
+  }
+}
+
+function createInternalTabDragDataTransfer() {
+  return {
+    items: [{ kind: 'string' }],
+    types: ['text/plain'],
+    files: [],
+    getData: (format: string) =>
+      format === 'text/plain' ? '--flexlayout--' : '',
+  }
+}
+
+function createAppDragDataTransferFromEnvelope(envelope: {
+  version: number
+  items: Array<{
+    id: string
+    label?: string
+    capabilities: Array<{ kind: string; value?: unknown }>
+  }>
+}) {
+  const json = JSON.stringify(envelope)
+  return {
+    items: [{ kind: 'string' }],
+    types: [APP_DRAG_MIME],
+    files: [],
+    getData: (format: string) => (format === APP_DRAG_MIME ? json : ''),
+  }
+}
+
+function createNativeFileDataTransfer() {
+  const file = new File(['hello'], 'hello.txt', { type: 'text/plain' })
+  return {
+    items: [{ kind: 'file' }],
+    types: ['Files'],
+    files: [file],
+  }
+}
+
+function setSelection(selectedIds: string[]) {
+  const state = h.latestFileListProps?.state
+  if (!state) {
+    throw new Error('file list did not receive a state')
+  }
+  const [, update] = state
+  update((prev) => ({ ...prev, selectedIds }))
+}
+
+function triggerDownloadCommand() {
+  const handler = h.registeredCommands.get('spacewave.file.download')?.handler
+  if (!handler) {
+    throw new Error('download command was not registered')
+  }
+  handler()
+}
+
+function triggerRenameCommand() {
+  const handler = h.registeredCommands.get('spacewave.file.rename')?.handler
+  if (!handler) {
+    throw new Error('rename command was not registered')
+  }
+  handler()
+}
+
+function triggerRowContextMenu(
+  entry: FileEntry,
+  clientX: number,
+  clientY: number,
+) {
+  const onContextMenu = h.latestFileListProps?.onContextMenu
+  if (!onContextMenu) {
+    throw new Error('file list did not provide onContextMenu')
+  }
+  onContextMenu(
+    { data: entry },
+    new MouseEvent('contextmenu', { clientX, clientY }),
+  )
+}
+
+function getContextMenuActionEntryIds() {
+  return (
+    h.latestContextMenuProps?.state?.actionEntries?.map((entry) => entry.id) ??
+    []
+  )
+}
+
+function getContextMenuMoveItemPaths() {
+  return (
+    h.latestContextMenuProps?.state?.moveItems?.map((item) => item.path) ?? []
+  )
+}
+
+function getLatestDragEnvelope(entry: FileEntry, selectedIds: string[] = []) {
+  return (
+    h.latestFileListProps?.getDragEnvelope?.(entry, { selectedIds }) ?? null
+  )
+}
+
+function getLatestDownloadDragTarget(
+  entry: FileEntry,
+  selectedIds: string[] = [],
+) {
+  return (
+    h.latestFileListProps?.getDownloadDragTarget?.(entry, { selectedIds }) ??
+    null
+  )
+}
+
+function setUserAgent(userAgent: string) {
+  Object.defineProperty(window.navigator, 'userAgent', {
+    value: userAgent,
+    configurable: true,
+  })
+}
+
+function triggerContextMenuMove() {
+  const moveItems = h.latestContextMenuProps?.state?.moveItems ?? []
+  h.latestContextMenuProps?.onMove?.(moveItems)
+}
+
+const unixFSLoadingStageCases: Array<[string, () => void, string]> = [
+  [
+    'root mount',
+    () => {
+      h.mockRootHandleResource = {
+        value: null,
+        loading: true,
+        error: null,
+        retry: vi.fn(),
+      }
+      h.mockEntriesResource = {
+        value: null,
+        loading: true,
+        error: null,
+        retry: vi.fn(),
+      }
+    },
+    'Stage: mounting UnixFS root',
+  ],
+  [
+    'path lookup',
+    () => {
+      h.mockPathHandleResource = {
+        value: null,
+        loading: true,
+        error: null,
+        retry: vi.fn(),
+      }
+      h.mockEntriesResource = {
+        value: null,
+        loading: true,
+        error: null,
+        retry: vi.fn(),
+      }
+    },
+    'Stage: resolving path',
+  ],
+  [
+    'stat',
+    () => {
+      h.mockStatResource = {
+        value: null,
+        loading: true,
+        error: null,
+        retry: vi.fn(),
+      }
+      h.mockEntriesResource = {
+        value: null,
+        loading: true,
+        error: null,
+        retry: vi.fn(),
+      }
+    },
+    'Stage: reading path metadata',
+  ],
+  [
+    'readdir',
+    () => {
+      h.mockEntriesResource = {
+        value: null,
+        loading: true,
+        error: null,
+        retry: vi.fn(),
+      }
+    },
+    'Stage: reading directory entries',
+  ],
+]
+
+// renderBrowser renders the browser at the root of the files UnixFS, with
+// props overriding those defaults.
+function renderBrowser(
+  props: Partial<ComponentProps<typeof UnixFSBrowser>> = {},
+) {
+  return render(
+    <UnixFSBrowser
+      unixfsId="files"
+      basePath="/"
+      currentPath="/"
+      worldState={buildResource({} as IWorldState)}
+      {...props}
+    />,
+  )
+}
+
+// getDragSurface returns the browser's upload drop surface.
+function getDragSurface(container: HTMLElement): Element {
+  const surface = container.querySelector('.bg-file-back')
+  if (!surface) {
+    throw new Error('drag surface not found')
+  }
+  return surface
+}
+
+// select sets the file list selection.
+function select(selectedIds: string[]) {
+  act(() => {
+    setSelection(selectedIds)
+  })
+}
+
+// openContextMenuMove opens the move dialog from the context menu of the
+// first row while docs and file are selected.
+function openContextMenuMove() {
+  select(['docs', 'file'])
+  act(() => {
+    triggerRowContextMenu(h.mockFileEntries[0], 5, 7)
+  })
+  act(() => {
+    triggerContextMenuMove()
+  })
+}
+
+describe('UnixFSBrowser drag gating', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  beforeEach(() => {
+    // Browse as Chrome with every mock reset.
+    setUserAgent(
+      'Mozilla/5.0 AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+    )
+    for (const mock of [
+      h.mockAddFiles,
+      h.mockExtractNativeUploadSelection,
+      h.mockDownloadUnixFSSelection,
+      h.mockAppStartupBoundary,
+      h.mockLookup,
+      h.mockMkdirAll,
+      h.mockMknod,
+      h.mockNavigate,
+      h.mockRename,
+      h.mockRootClone,
+      h.mockRootLookupPath,
+    ]) {
+      mock.mockReset()
+    }
+
+    // Clear the resource overrides.
+    h.mockRootHandleResource = null
+    h.mockPathHandleResource = null
+    h.mockEntriesResource = null
+    h.mockStatResource = null
+
+    // Clear the registered commands and the captured props.
+    h.registeredCommands.clear()
+    h.latestFileListProps = null
+    h.latestContextMenuProps = null
+    h.latestMoveDialogProps = null
+    h.latestFileViewerProps = null
+
+    // Show a root directory with a folder, a text file and an image.
+    h.mockSyncStatus = {
+      packRangeLabel: '2 / 128 KiB',
+      packIndexTailLabel: '1 / 4 KiB',
+      packLookupLabel: '1 opened / 2 candidates',
+      packIndexCacheLabel: '0 hits / 1 misses',
+    }
+    h.mockStat = {
+      info: { isDir: true },
+      mimeType: 'inode/directory',
+    }
+    h.mockFileEntries = [
+      { id: 'docs', name: 'docs', isDir: true },
+      { id: 'file', name: 'file.txt', isDir: false },
+      { id: 'logo', name: 'logo.png', isDir: false },
+    ]
+    h.mockSpaceSharingState = { canManage: true }
+
+    // Resolve lookups to handle 77 and every write successfully.
+    h.mockLookup.mockResolvedValue(buildDisposableHandle({ id: 77 }))
+    h.mockRootClone.mockResolvedValue(
+      buildDisposableHandle({
+        rename: h.mockRename,
+      }),
+    )
+    h.mockRootLookupPath.mockResolvedValue({
+      handle: buildDisposableHandle({
+        id: 77,
+        rename: h.mockRename,
+      }),
+    })
+    h.mockDownloadUnixFSSelection.mockResolvedValue(undefined)
+    h.mockMkdirAll.mockResolvedValue(undefined)
+    h.mockMknod.mockResolvedValue(undefined)
+    h.mockExtractNativeUploadSelection.mockResolvedValue({
+      files: [new File(['hello'], 'hello.txt')],
+      directories: [],
+    })
+  })
+
+  it('exposes matching readdir metadata through file list entry details', async () => {
+    // List entries with and without modification times.
+    h.mockFileEntries = [
+      {
+        id: 'other.txt',
+        name: 'other.txt',
+        isDir: false,
+        size: 16n,
+        modTime: 1_700_000_000n,
+      },
+      {
+        id: 'report.pdf',
+        name: 'report.pdf',
+        isDir: false,
+        size: 4_096n,
+        modTime: 1_725_000_000n,
+      },
+      {
+        id: 'missing-time.txt',
+        name: 'missing-time.txt',
+        isDir: false,
+        size: 8n,
+      },
+      {
+        id: 'zero-time.txt',
+        name: 'zero-time.txt',
+        isDir: false,
+        size: 1n,
+        modTime: 0n,
+      },
+    ]
+    renderBrowser()
+    const getEntryDetails = h.latestFileListProps?.getEntryDetails
+    if (!getEntryDetails) {
+      throw new Error('file list did not provide getEntryDetails')
+    }
+    const signal = new AbortController().signal
+
+    // Each entry's details come from its own listing metadata.
+    await expect(
+      getEntryDetails(0, h.mockFileEntries[1], signal),
+    ).resolves.toEqual({
+      size: 4_096,
+      modTime: new Date(1_725_000_000_000),
+    })
+    await expect(
+      getEntryDetails(2, h.mockFileEntries[2], signal),
+    ).resolves.toEqual({
+      size: 8,
+      modTime: undefined,
+    })
+    await expect(
+      getEntryDetails(3, h.mockFileEntries[3], signal),
+    ).resolves.toEqual({
+      size: 1,
+      modTime: undefined,
+    })
+  })
+
+  it('confirms the top-bar new folder input on Return', async () => {
+    // Name a new folder from the toolbar.
+    const user = userEvent.setup()
+    renderBrowser()
+    await user.click(screen.getByTitle('New folder'))
+    await user.type(
+      screen.getByPlaceholderText('Folder name'),
+      'Projects{Enter}',
+    )
+
+    // Return creates it.
+    await waitFor(() => {
+      expect(h.mockMkdirAll).toHaveBeenCalledWith(['Projects'])
+    })
+  })
+
+  it('marks breadcrumb root navigation as object-local', async () => {
+    // Navigate to the root from a subdirectory.
+    const user = userEvent.setup()
+    renderBrowser({ currentPath: '/docs/images' })
+    await user.click(screen.getByLabelText('Navigate to root'))
+
+    // The navigation stays inside the object.
+    expect(h.mockNavigate).toHaveBeenCalledWith({
+      path: '/',
+      navigation: 'local',
+    })
+  })
+
+  it('disables navigate up at the UnixFS root and enables it in subdirectories', () => {
+    // At the root, navigate up is disabled.
+    const view = renderBrowser()
+    expect(h.registeredCommands.get('spacewave.nav.up')?.enabled).toBe(false)
+
+    // In a subdirectory, it navigates to the parent.
+    view.rerender(
+      <UnixFSBrowser
+        unixfsId="files"
+        basePath="/"
+        currentPath="/docs/images"
+        worldState={buildResource({} as IWorldState)}
+      />,
+    )
+    const navigateUp = h.registeredCommands.get('spacewave.nav.up')
+    expect(navigateUp?.enabled).toBe(true)
+    if (!navigateUp?.handler) throw new Error('navigate up handler missing')
+    navigateUp.handler()
+    expect(h.mockNavigate).toHaveBeenCalledWith({
+      path: '/docs',
+      navigation: 'local',
+    })
+  })
+
+  it('renders owner-provided directory headers above the file list', () => {
+    // Render a directory header that lists the entry names.
+    h.mockFileEntries = [
+      { id: 'guide', name: 'getting-started.md', isDir: false },
+      { id: 'docs', name: 'docs', isDir: true },
+    ]
+    renderBrowser({
+      worldState: buildResource(null),
+      directoryHeader: ({ entries }) => (
+        <div data-testid="owner-directory-header">
+          {entries.map((entry) => entry.name).join(',')}
+        </div>
+      ),
+    })
+
+    // The header and the rows both render.
+    expect(screen.getByTestId('file-entry-guide')).toBeTruthy()
+    expect(screen.getByTestId('file-entry-docs')).toBeTruthy()
+    expect(screen.getByTestId('owner-directory-header').textContent).toBe(
+      'getting-started.md,docs',
+    )
+  })
+
+  it('accepts backend-cleaned directory handles for display paths with dot segments', () => {
+    // The handle reports the cleaned path of a dotted display path.
+    h.mockPathHandleResource = buildResource({
+      getPath: () => 'docs/images',
+      lookup: h.mockLookup,
+      mkdirAll: h.mockMkdirAll,
+      mknod: h.mockMknod,
+      rename: h.mockRename,
+    })
+    renderBrowser({
+      currentPath: '/docs/./images',
+      worldState: buildResource(null),
+    })
+
+    // The listing still renders.
+    expect(screen.getByTestId('file-entry-docs')).toBeTruthy()
+    expect(h.latestFileListProps?.entries).toHaveLength(3)
+  })
+
+  it('shows empty folder actions that create or upload from the current folder', async () => {
+    // Render an empty folder.
+    const user = userEvent.setup()
+    h.mockFileEntries = []
+    renderBrowser({ worldState: buildResource(null) })
+    expect(screen.getByText('This folder is empty')).toBeTruthy()
+
+    // Upload files opens the file picker.
+    const uploadClick = vi.spyOn(
+      screen.getByTestId('unixfs-upload-input'),
+      'click',
+    )
+    await user.click(screen.getByRole('button', { name: 'Upload files' }))
+    expect(uploadClick).toHaveBeenCalledOnce()
+
+    // New folder opens the name input.
+    const newFolderButtons = screen.getAllByRole('button', {
+      name: 'New folder',
+    })
+    await user.click(newFolderButtons[newFolderButtons.length - 1])
+    expect(screen.getByPlaceholderText('Folder name')).toBeTruthy()
+  })
+
+  it('marks generic UnixFS browser startup boundaries without Quickstart labels', async () => {
+    // Render a listing with a seeded file.
+    h.mockFileEntries = [
+      { id: 'guide', name: 'getting-started.md', isDir: false },
+      { id: 'docs', name: 'docs', isDir: true },
+    ]
+    renderBrowser({ worldState: buildResource(null) })
+
+    // The browser marks its generic startup boundaries.
+    await waitFor(() => {
+      expect(h.mockAppStartupBoundary).toHaveBeenCalledWith(
+        'unixfs.browser-mounted',
+        { path: '/' },
+      )
+      expect(h.mockAppStartupBoundary).toHaveBeenCalledWith(
+        'unixfs.first-file-row',
+        {
+          path: '/',
+          entryCount: 2,
+          firstEntryName: 'getting-started.md',
+        },
+      )
+      expect(h.mockAppStartupBoundary).toHaveBeenCalledWith(
+        'unixfs.seeded-file-visible',
+        {
+          path: '/',
+          fileName: 'getting-started.md',
+        },
+      )
+    })
+
+    // It marks no Quickstart boundary.
+    const markedLabels = h.mockAppStartupBoundary.mock.calls.map((call) =>
+      String(call[0]),
+    )
+    expect(markedLabels).not.toContain('quickstart.unixfs-browser-mounted')
+  })
+
+  it('renders a custom browser body under the toolbar instead of the file list', () => {
+    // Render a directory with a custom body.
+    renderBrowser({
+      currentPath: '/gallery',
+      worldState: buildResource(null),
+      browserBody: CustomBrowserBody,
+    })
+
+    // The body replaces the file list under the toolbar.
+    expect(screen.getByText('Toolbar')).toBeDefined()
+    expect(screen.getByTestId('custom-browser-body').textContent).toBe(
+      '/gallery',
+    )
+    expect(h.latestFileListProps).toBeNull()
+  })
+
+  it('lets a custom browser body replace the file viewer branch', () => {
+    // Render a file with a custom body.
+    h.mockStat = {
+      info: { isDir: false },
+      mimeType: 'image/png',
+    }
+    renderBrowser({
+      currentPath: '/gallery/logo.png',
+      worldState: buildResource(null),
+      browserBody: CustomBrowserBody,
+    })
+
+    // The body replaces the file viewer under the toolbar.
+    expect(screen.getByText('Toolbar')).toBeDefined()
+    expect(screen.getByTestId('custom-browser-body').textContent).toBe(
+      '/gallery/logo.png',
+    )
+    expect(h.latestFileViewerProps).toBeNull()
+  })
+
+  it('ignores internal app drags', () => {
+    // Drag an internal app item over the drop surface.
+    const dragSurface = getDragSurface(renderBrowser().container)
+    const dataTransfer = createInternalAppDragDataTransfer()
+    expect(fireEvent.dragOver(dragSurface, { dataTransfer })).toBe(true)
+    expect(screen.queryByText('Drop files to upload')).toBeNull()
+
+    // Dropping it uploads nothing.
+    expect(fireEvent.drop(dragSurface, { dataTransfer })).toBe(true)
+    expect(h.mockAddFiles).not.toHaveBeenCalled()
+  })
+
+  it('ignores internal tab drags', () => {
+    // Drag a tab over the drop surface.
+    const dragSurface = getDragSurface(renderBrowser().container)
+    const dataTransfer = createInternalTabDragDataTransfer()
+    expect(fireEvent.dragOver(dragSurface, { dataTransfer })).toBe(true)
+    expect(screen.queryByText('Drop files to upload')).toBeNull()
+
+    // Dropping it uploads nothing.
+    expect(fireEvent.drop(dragSurface, { dataTransfer })).toBe(true)
+    expect(h.mockAddFiles).not.toHaveBeenCalled()
+  })
+
+  it('accepts native file drags and uploads dropped files', async () => {
+    // Drag native files over the drop surface.
+    const dragSurface = getDragSurface(renderBrowser().container)
+    const dataTransfer = createNativeFileDataTransfer()
+    expect(fireEvent.dragOver(dragSurface, { dataTransfer })).toBe(false)
+    expect(screen.getByText('Drop files to upload')).toBeTruthy()
+
+    // Dropping them uploads the files.
+    expect(fireEvent.drop(dragSurface, { dataTransfer })).toBe(false)
+    await waitFor(() => {
+      expect(h.mockExtractNativeUploadSelection).toHaveBeenCalledTimes(1)
+      expect(h.mockAddFiles).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'hello.txt' }),
+        ]),
+        [],
+      )
+    })
+  })
+
+  it('forwards explicit dropped directories to the upload manager', async () => {
+    // Drop a selection with explicit directories.
+    h.mockExtractNativeUploadSelection.mockResolvedValue({
+      files: [new File(['hello'], 'nested/child.txt')],
+      directories: ['nested', 'nested/empty'],
+    })
+    const dragSurface = getDragSurface(renderBrowser().container)
+    const dataTransfer = createNativeFileDataTransfer()
+    expect(fireEvent.drop(dragSurface, { dataTransfer })).toBe(false)
+
+    // The upload creates the directories.
+    await waitFor(() => {
+      expect(h.mockAddFiles).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.any(Array),
+        ['nested', 'nested/empty'],
+      )
+    })
+  })
+
+  it('moves same-unixfs drags onto folder rows', async () => {
+    // Drag a file of this UnixFS over the docs row.
+    renderBrowser()
+    const folderEntry = screen.getByTestId('file-entry-docs')
+    const dataTransfer = createUnixFSEntryAppDragDataTransfer({})
+    expect(fireEvent.dragOver(folderEntry, { dataTransfer })).toBe(false)
+    expect(folderEntry.getAttribute('data-drop-active')).toBe('true')
+
+    // Dropping it moves the file into docs.
+    expect(fireEvent.drop(folderEntry, { dataTransfer })).toBe(true)
+    await waitFor(() => {
+      expect(h.mockRootLookupPath).toHaveBeenCalledWith('docs', undefined)
+      expect(h.mockRootClone).not.toHaveBeenCalled()
+      expect(h.mockRename).toHaveBeenCalledWith(
+        'file.txt',
+        'file.txt',
+        77,
+        undefined,
+      )
+    })
+  })
+
+  it('confirms inline rename with Enter', async () => {
+    // Start renaming the selected file.
+    const user = userEvent.setup()
+    renderBrowser()
+    select(['file'])
+    act(() => {
+      triggerRenameCommand()
+    })
+
+    // Enter confirms the new name.
+    const input = screen.getByDisplayValue('file.txt')
+    await user.clear(input)
+    await user.type(input, 'renamed.txt{Enter}')
+    await waitFor(() => {
+      expect(h.mockRename).toHaveBeenCalledWith('file.txt', 'renamed.txt')
+    })
+  })
+
+  it('confirms inline rename with the confirm button', async () => {
+    // Start renaming the selected file.
+    const user = userEvent.setup()
+    renderBrowser()
+    select(['file'])
+    act(() => {
+      triggerRenameCommand()
+    })
+
+    // The confirm button confirms the new name.
+    const input = screen.getByDisplayValue('file.txt')
+    await user.clear(input)
+    await user.type(input, 'confirmed.txt')
+    await user.click(screen.getByRole('button', { name: 'Confirm rename' }))
+    await waitFor(() => {
+      expect(h.mockRename).toHaveBeenCalledWith('file.txt', 'confirmed.txt')
+    })
+  })
+
+  it('keeps the toolbar visible during loading transitions without reusable entries', () => {
+    // Load the stat and the listing with nothing to reuse.
+    h.mockEntriesResource = {
+      value: null,
+      loading: true,
+      error: null,
+      retry: vi.fn(),
+    }
+    h.mockStatResource = {
+      value: null,
+      loading: true,
+      error: null,
+      retry: vi.fn(),
+    }
+    renderBrowser({ currentPath: '/test' })
+
+    // The toolbar stays above the loading diagnostics.
+    expect(screen.getByText('Toolbar')).toBeTruthy()
+    expect(screen.getByText('Loading files')).toBeTruthy()
+    expect(
+      screen.getByText('Reading the entry metadata. Path: /test'),
+    ).toBeTruthy()
+    expect(screen.getByText('Stage: reading path metadata')).toBeTruthy()
+    expect(
+      screen.getByText('Pack reads: ranges 2 / 128 KiB; index tail 1 / 4 KiB'),
+    ).toBeTruthy()
+    expect(
+      screen.getByText(
+        'Lookup: 1 opened / 2 candidates; cache 0 hits / 1 misses',
+      ),
+    ).toBeTruthy()
+  })
+
+  it.each(unixFSLoadingStageCases)(
+    'renders %s loading diagnostics',
+    (_, setup, expectedStage) => {
+      // Render the loading case.
+      setup()
+      renderBrowser({ currentPath: '/test' })
+
+      // The diagnostics name its stage.
+      expect(screen.getByTestId('unixfs-loading-diagnostics')).toBeTruthy()
+      expect(screen.getByText(expectedStage)).toBeTruthy()
+    },
+  )
+
+  it('rejects cross-root folder drags without activating move affordances', async () => {
+    // Drag a file of another UnixFS over the docs row.
+    renderBrowser()
+    const folderEntry = screen.getByTestId('file-entry-docs')
+    const dataTransfer = createUnixFSEntryAppDragDataTransfer({
+      unixfsId: 'unixfs/other',
+    })
+    expect(fireEvent.dragOver(folderEntry, { dataTransfer })).toBe(true)
+    expect(folderEntry.getAttribute('data-drop-active')).toBe('false')
+
+    // Dropping it moves nothing.
+    expect(fireEvent.drop(folderEntry, { dataTransfer })).toBe(true)
+    await waitFor(() => {
+      expect(h.mockRename).not.toHaveBeenCalled()
+    })
+  })
+
+  it('enables download command for a single directory selection', async () => {
+    // Select one directory.
+    renderBrowser()
+    select(['docs'])
+
+    // Download is enabled.
+    await waitFor(() => {
+      expect(h.registeredCommands.get('spacewave.file.download')?.enabled).toBe(
+        true,
+      )
+    })
+  })
+
+  it('downloads the whole selection when the command is triggered for multi-select', async () => {
+    // Download a two-entry selection.
+    renderBrowser({ currentPath: '/nested' })
+    select(['docs', 'file'])
+    act(() => {
+      triggerDownloadCommand()
+    })
+
+    // The download carries both entries under the current path.
+    await waitFor(() => {
+      const lastCall = h.mockDownloadUnixFSSelection.mock.calls.at(-1) as
+        | [{ currentPath: string; entries: FileEntry[] }]
+        | undefined
+      expect(lastCall?.[0].currentPath).toBe('/nested')
+      expect(lastCall?.[0].entries.map((entry) => entry.id)).toEqual([
+        'docs',
+        'file',
+      ])
+    })
+  })
+
+  it('targets the whole selection when right-clicking an already-selected row', () => {
+    // Right-click a selected row.
+    renderBrowser()
+    select(['docs', 'file'])
+    act(() => {
+      triggerRowContextMenu(h.mockFileEntries[0], 5, 7)
+    })
+
+    // The menu acts on the whole selection.
+    expect(getContextMenuActionEntryIds()).toEqual(['docs', 'file'])
+    expect(getContextMenuMoveItemPaths()).toEqual(['/docs', '/file.txt'])
+  })
+
+  it('targets only the clicked row when right-clicking an unselected row', () => {
+    // Right-click an unselected row.
+    renderBrowser()
+    select(['docs', 'file'])
+    act(() => {
+      triggerRowContextMenu(h.mockFileEntries[2], 9, 11)
+    })
+
+    // The menu acts on that row alone.
+    expect(getContextMenuActionEntryIds()).toEqual(['logo'])
+    expect(getContextMenuMoveItemPaths()).toEqual(['/logo.png'])
+  })
+
+  it('builds a multi-item drag envelope when dragging a selected row from a multi-selection', () => {
+    // Drag a selected row.
+    renderBrowser()
+    select(['docs', 'file'])
+    const envelope = getLatestDragEnvelope(h.mockFileEntries[1], [
+      'docs',
+      'file',
+    ])
+
+    // The envelope carries every selected item.
+    expect(envelope?.items.map((item) => item.id)).toEqual(['docs', 'file'])
+    expect(
+      envelope?.items.map((item) => item.capabilities.map((cap) => cap.kind)),
+    ).toEqual([
+      ['openable', 'movable'],
+      ['openable', 'movable'],
+    ])
+  })
+
+  it('keeps unselected row drags single-item even when other rows are selected', () => {
+    // Drag an unselected row.
+    renderBrowser()
+    select(['docs', 'file'])
+    const envelope = getLatestDragEnvelope(h.mockFileEntries[2], [
+      'docs',
+      'file',
+    ])
+
+    // The envelope carries only that row.
+    expect(envelope?.items.map((item) => item.id)).toEqual(['logo'])
+  })
+
+  it('builds a direct desktop download target for a file row', () => {
+    // A file row downloads its raw bytes.
+    renderBrowser({ currentPath: '/nested' })
+    expect(getLatestDownloadDragTarget(h.mockFileEntries[1])).toEqual({
+      mimeType: 'application/octet-stream',
+      filename: 'file.txt',
+      url: '/p/spacewave-core/fs/u/1/so/space-test/-/files/-/nested/file.txt',
+    })
+  })
+
+  it('builds a zip desktop download target for a directory row', () => {
+    // A directory row downloads a zip export.
+    renderBrowser({ currentPath: '/nested' })
+    expect(getLatestDownloadDragTarget(h.mockFileEntries[0])).toEqual({
+      mimeType: 'application/zip',
+      filename: 'docs.zip',
+      url: '/p/spacewave-core/export/u/1/so/space-test/-/files/-/nested/docs',
+    })
+  })
+
+  it('builds a multi-entry desktop download target when dragging a selected row', () => {
+    // Drag a selected row to the desktop.
+    renderBrowser({ currentPath: '/nested' })
+    select(['docs', 'file'])
+    const target = getLatestDownloadDragTarget(h.mockFileEntries[1], [
+      'docs',
+      'file',
+    ])
+
+    // The selection downloads as one zip.
+    expect(target?.mimeType).toBe('application/zip')
+    expect(target?.filename).toBe('selection.zip')
+    expect(target?.url).toMatch(
+      /^\/p\/spacewave-core\/export-batch\/u\/1\/so\/space-test\/-\/files\/-\/nested\/.+\/selection\.zip$/,
+    )
+  })
+
+  it('keeps unselected row desktop drags single-entry when another selection exists', () => {
+    // Drag an unselected row to the desktop.
+    renderBrowser({ currentPath: '/nested' })
+    select(['docs', 'file'])
+    const target = getLatestDownloadDragTarget(h.mockFileEntries[2], [
+      'docs',
+      'file',
+    ])
+
+    // Only that file downloads.
+    expect(target).toEqual({
+      mimeType: 'application/octet-stream',
+      filename: 'logo.png',
+      url: '/p/spacewave-core/fs/u/1/so/space-test/-/files/-/nested/logo.png',
+    })
+  })
+
+  it('disables desktop download targets for Firefox while keeping app drag envelopes', () => {
+    // Firefox drags carry the app envelope but no download target.
+    setUserAgent('Mozilla/5.0 Gecko/20100101 Firefox/124.0')
+    renderBrowser({ currentPath: '/nested' })
+    expect(getLatestDownloadDragTarget(h.mockFileEntries[1])).toBeNull()
+    expect(getLatestDragEnvelope(h.mockFileEntries[1])?.items).toHaveLength(1)
+  })
+
+  it('passes an inline raw file url to the file viewer for image files', () => {
+    // View an image file.
+    h.mockStat = {
+      info: { isDir: false },
+      mimeType: 'image/png',
+    }
+    renderBrowser({ unixfsId: 'docs/demo', currentPath: '/nested/logo.png' })
+
+    // The viewer gets the stat and an inline URL.
+    expect(h.latestFileViewerProps?.path).toBe('/nested/logo.png')
+    expect(h.latestFileViewerProps?.stat.mimeType).toBe('image/png')
+    expect(h.latestFileViewerProps?.inlineFileURL).toBe(
+      '/p/spacewave-core/fs/u/1/so/space-test/-/docs/demo/-/nested/logo.png?inline=1',
+    )
+  })
+
+  it('prefers the UnixfsObjectInfo mime type override when provided', () => {
+    // View a generic file with a mime type override.
+    h.mockStat = {
+      info: { isDir: false },
+      mimeType: 'application/octet-stream',
+    }
+    renderBrowser({
+      unixfsId: 'docs/demo',
+      currentPath: '/nested/demo-video',
+      mimeTypeOverride: 'video/mp4',
+    })
+
+    // The viewer uses the override.
+    expect(h.latestFileViewerProps?.stat.mimeType).toBe('video/mp4')
+  })
+
+  it('opens the move dialog from the context menu for the targeted selection', () => {
+    // Open the move dialog for the selection.
+    renderBrowser()
+    openContextMenuMove()
+
+    // The dialog moves both selected items.
+    expect(h.latestMoveDialogProps?.moveItems.map((item) => item.path)).toEqual(
+      ['/docs', '/file.txt'],
+    )
+  })
+
+  it('executes modal moves through the shared move executor', async () => {
+    // Confirm a move of the selection to archive.
+    renderBrowser()
+    openContextMenuMove()
+    await act(async () => {
+      await h.latestMoveDialogProps?.onConfirm?.('/archive')
+    })
+
+    // Both items move into the looked-up archive handle.
+    expect(h.mockRootClone).not.toHaveBeenCalled()
+    expect(h.mockRootLookupPath).toHaveBeenCalledWith('archive', undefined)
+    expect(h.mockRename.mock.calls).toEqual([
+      ['docs', 'docs', 77, undefined],
+      ['file.txt', 'file.txt', 77, undefined],
+    ])
+  })
+
+  it('moves a multi-selection together onto a folder row', async () => {
+    // Build the drag of a two-file selection.
+    renderBrowser()
+    select(['file', 'logo'])
+    const envelope = getLatestDragEnvelope(h.mockFileEntries[1], [
+      'file',
+      'logo',
+    ])
+    if (!envelope) {
+      throw new Error('expected drag envelope')
+    }
+
+    // The docs row accepts it.
+    const folderEntry = screen.getByTestId('file-entry-docs')
+    const dataTransfer = createAppDragDataTransferFromEnvelope(envelope)
+    expect(fireEvent.dragOver(folderEntry, { dataTransfer })).toBe(false)
+    expect(folderEntry.getAttribute('data-drop-active')).toBe('true')
+
+    // Dropping it moves both files.
+    expect(fireEvent.drop(folderEntry, { dataTransfer })).toBe(true)
+    await waitFor(() => {
+      expect(h.mockRename.mock.calls).toEqual([
+        ['file.txt', 'file.txt', 77, undefined],
+        ['logo.png', 'logo.png', 77, undefined],
+      ])
+    })
+  })
+
+  it('rejects invalid self or descendant multi-selection drops without partial moves', async () => {
+    // Build the drag of a selection that includes docs.
+    renderBrowser()
+    select(['docs', 'file'])
+    const envelope = getLatestDragEnvelope(h.mockFileEntries[0], [
+      'docs',
+      'file',
+    ])
+    if (!envelope) {
+      throw new Error('expected drag envelope')
+    }
+
+    // The docs row refuses it.
+    const folderEntry = screen.getByTestId('file-entry-docs')
+    const dataTransfer = createAppDragDataTransferFromEnvelope(envelope)
+    expect(fireEvent.dragOver(folderEntry, { dataTransfer })).toBe(true)
+    expect(folderEntry.getAttribute('data-drop-active')).toBe('false')
+
+    // Dropping it moves nothing.
+    expect(fireEvent.drop(folderEntry, { dataTransfer })).toBe(true)
+    await waitFor(() => {
+      expect(h.mockRename).not.toHaveBeenCalled()
+    })
+  })
+})

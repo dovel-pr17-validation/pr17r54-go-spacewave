@@ -1,0 +1,166 @@
+package logfile
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// writeFile writes name under dir with mtime set to mtime. It fails the
+// test on any I/O error.
+func writeFile(t *testing.T, dir, name string, mtime time.Time) string {
+	// Write the log fixture in the requested directory.
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("entry\n"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+
+	// Set the log fixture age for retention checks.
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("chtimes %s: %v", path, err)
+	}
+	return path
+}
+
+func TestPruneOldLogs_DeletesAged(t *testing.T) {
+	// Create the log directory and retention cutoff.
+	dir := t.TempDir()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	maxAge := 7 * 24 * time.Hour
+
+	// Write expired, recent, and unrelated file fixtures.
+	old := writeFile(t, dir, "20260101-000000.log", now.Add(-30*24*time.Hour))
+	young := writeFile(t, dir, "20260503-000000.log", now.Add(-24*time.Hour))
+	nonLog := writeFile(t, dir, "old.txt", now.Add(-30*24*time.Hour))
+
+	// Prune files older than the retention cutoff.
+	removed, err := PruneOldLogs(dir, maxAge, 0, now)
+	if err != nil {
+		t.Fatalf("PruneOldLogs: %v", err)
+	}
+
+	// Verify pruning removes only the expired log.
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1", removed)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("old log should be removed: stat err = %v", err)
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Errorf("young log should remain: %v", err)
+	}
+	if _, err := os.Stat(nonLog); err != nil {
+		t.Errorf("non-.log file should remain: %v", err)
+	}
+}
+
+func TestPruneOldLogs_KeepsAtCutoff(t *testing.T) {
+	// Create the log directory and retention cutoff.
+	dir := t.TempDir()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	maxAge := 7 * 24 * time.Hour
+
+	// File whose mtime is exactly at the cutoff is kept (Before is strict).
+	atCutoff := writeFile(t, dir, "edge.log", now.Add(-maxAge))
+
+	// Prune the log whose age equals the retention cutoff.
+	removed, err := PruneOldLogs(dir, maxAge, 0, now)
+	if err != nil {
+		t.Fatalf("PruneOldLogs: %v", err)
+	}
+
+	// Verify the log at the exact cutoff remains.
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0 at cutoff", removed)
+	}
+	if _, err := os.Stat(atCutoff); err != nil {
+		t.Errorf("at-cutoff log should remain: %v", err)
+	}
+}
+
+func TestPruneOldLogs_NonExistentDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+	removed, err := PruneOldLogs(dir, time.Hour, 0, time.Now())
+	if err != nil {
+		t.Errorf("non-existent dir should be no-op, got err = %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+}
+
+func TestPruneOldLogs_SkipsSubdirs(t *testing.T) {
+	// Create the log directory and retention cutoff.
+	dir := t.TempDir()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	maxAge := 7 * 24 * time.Hour
+
+	// Create an aged directory with a log filename.
+	subdir := filepath.Join(dir, "old.log")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chtimes(subdir, now.Add(-30*24*time.Hour), now.Add(-30*24*time.Hour)); err != nil {
+		t.Fatalf("chtimes subdir: %v", err)
+	}
+
+	// Prune the directory containing the aged subdirectory.
+	removed, err := PruneOldLogs(dir, maxAge, 0, now)
+	if err != nil {
+		t.Fatalf("PruneOldLogs: %v", err)
+	}
+
+	// Verify pruning preserves the subdirectory.
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+	if _, err := os.Stat(subdir); err != nil {
+		t.Errorf("subdir named *.log should remain: %v", err)
+	}
+}
+
+func TestPruneOldLogs_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	removed, err := PruneOldLogs(dir, time.Hour, 0, time.Now())
+	if err != nil {
+		t.Errorf("empty dir: err = %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+}
+
+func TestPruneOldLogs_KeepsNewest(t *testing.T) {
+	// Create the log directory and reference time.
+	dir := t.TempDir()
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+
+	// Write logs in increasing modification-time order.
+	oldest := writeFile(t, dir, "20260504-080000.log", now.Add(-4*time.Hour))
+	older := writeFile(t, dir, "20260504-090000.log", now.Add(-3*time.Hour))
+	newer := writeFile(t, dir, "20260504-100000.log", now.Add(-2*time.Hour))
+	newest := writeFile(t, dir, "20260504-110000.log", now.Add(-time.Hour))
+
+	// Prune the log directory to its two newest files.
+	removed, err := PruneOldLogs(dir, 7*24*time.Hour, 2, now)
+	if err != nil {
+		t.Fatalf("PruneOldLogs: %v", err)
+	}
+
+	// Verify pruning removed the older logs and retained the newest pair.
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2", removed)
+	}
+	for _, path := range []string{oldest, older} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s should be removed, stat err = %v", path, err)
+		}
+	}
+	for _, path := range []string{newer, newest} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s should be kept: %v", path, err)
+		}
+	}
+}

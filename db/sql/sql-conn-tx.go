@@ -1,0 +1,56 @@
+package sql
+
+import (
+	"database/sql/driver"
+
+	"github.com/s4wave/spacewave/db/tx"
+)
+
+// ConnTx implements driver.Tx attached to a Conn.
+// NOTE: you should use BeginTx to construct this.
+type ConnTx struct {
+	conn *Conn
+	tx   SqlTransaction
+}
+
+// newConnTx constructs a new ConnTx.
+func newConnTx(conn *Conn, tx SqlTransaction) *ConnTx {
+	return &ConnTx{conn: conn, tx: tx}
+}
+
+func (c *ConnTx) Commit() error {
+	// Lock the connection and require its active transaction before finishing it.
+	c.conn.mtx.Lock()
+	defer c.conn.mtx.Unlock()
+	storeTx := c.conn.storeTx
+	if storeTx != c.tx {
+		c.tx.Discard()
+		return tx.ErrDiscarded
+	}
+
+	// Commit the active transaction and clear the connection transaction state.
+	err := storeTx.Commit(c.conn.storeTxCtx)
+	c.conn.storeTx = nil
+	c.conn.storeTxCtx = nil
+	return err
+}
+
+func (c *ConnTx) Rollback() error {
+	// Lock the connection and require its active transaction before finishing it.
+	c.conn.mtx.Lock()
+	defer c.conn.mtx.Unlock()
+	storeTx := c.conn.storeTx
+	if storeTx != c.tx {
+		c.tx.Discard()
+		return tx.ErrDiscarded
+	}
+
+	// Discard the active transaction and clear the connection transaction state.
+	storeTx.Discard()
+	c.conn.storeTx = nil
+	c.conn.storeTxCtx = nil
+	return nil
+}
+
+// _ is a type assertion
+var _ driver.Tx = (*ConnTx)(nil)

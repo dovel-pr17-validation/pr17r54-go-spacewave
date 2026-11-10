@@ -1,0 +1,521 @@
+import { frontendBindingPath } from '@go/github.com/s4wave/spacewave/bldr/frontend/binding.js'
+import type { Binding } from '@go/github.com/s4wave/spacewave/bldr/frontend/frontend.pb.js'
+import { Client as SRPCClient } from 'starpc'
+import type { BackendAPI } from '@aptre/bldr-sdk'
+import {
+  Client as ResourcesClient,
+  ResourceServiceClient,
+  type ClientResourceRef,
+} from '@aptre/bldr-sdk/resource/index.js'
+import { ViewerRegistryResourceServiceClient } from '@s4wave/sdk/viewer/registry/registry_srpc.pb.js'
+import { ViewerSurface } from '@s4wave/sdk/viewer/registry/registry.pb.js'
+import {
+  V86RuntimeStatus,
+  type ReportV86RuntimeStatusResponse,
+} from '@s4wave/sdk/vm/v86.pb.js'
+import {
+  V86RuntimeStatusServiceClient,
+  V86RuntimeStatusServiceServiceName,
+} from '@s4wave/sdk/vm/v86_srpc.pb.js'
+import { FSCursorServiceClient } from '@go/github.com/s4wave/spacewave/db/unixfs/rpc/rpc_srpc.pb.js'
+import { buildFSHandle } from '@go/github.com/s4wave/spacewave/db/unixfs/rpc/client/fs-handle.js'
+import { V86fsServiceServiceName } from '@go/github.com/s4wave/spacewave/db/unixfs/v86fs/v86fs_srpc.pb.js'
+import {
+  startBrowserV86Runtime,
+  type BrowserV86Runtime,
+} from './browser-runner.js'
+import { createV86fsSrpcAdapter, type V86fsAdapter } from './v86fs-bridge.js'
+
+const V86_RUNTIME_V86FS_SERVICE_PREFIX = 'vm/v86-runtime/v86fs/'
+const V86_RUNTIME_STATUS_SERVICE_PREFIX = 'vm/v86-runtime/status/'
+// V86_RUNTIME_INSTANCE_PREFIX marks the plugin instances that run one VmV86;
+// the rest of the instance key is the VM object key. Other instances, such as
+// the one each Space loads, only register the viewer.
+const V86_RUNTIME_INSTANCE_PREFIX = 'vm/v86-runtime/instance/'
+
+type ViteManifestEntry = {
+  frontendBinding?: Binding
+  file?: string
+}
+
+function retainUntilAbort(
+  signal: AbortSignal,
+  refs: ClientResourceRef[],
+  retained: unknown[],
+): void {
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true
+    for (let i = refs.length - 1; i >= 0; --i) {
+      refs[i][Symbol.dispose]()
+    }
+    retained.length = 0
+  }
+  if (signal.aborted) {
+    release()
+    return
+  }
+  signal.addEventListener('abort', release, { once: true })
+}
+
+// resolveAssetPath reads the source binding or snapshot from the asset manifest.
+async function resolveAssetPath(
+  api: BackendAPI,
+  signal: AbortSignal,
+  srcPath: string,
+): Promise<string> {
+  const key = srcPath.replace(/^\.\//, '')
+  const fsSvc = new FSCursorServiceClient(api.client, {
+    service: 'plugin-assets/unixfs.rpc.FSCursorService',
+  })
+  using root = await buildFSHandle(fsSvc, signal)
+  const { handle: manifest } = await root.lookupPath(
+    signal,
+    'v/b/fe/.vite/manifest.json',
+  )
+  using _ = manifest
+  const size = await manifest.getSize(signal)
+  const { data } = await manifest.readAt(signal, 0n, size)
+  const parsed = JSON.parse(new TextDecoder().decode(data)) as Record<
+    string,
+    ViteManifestEntry
+  >
+  const entry = parsed[key]
+  if (entry?.frontendBinding) return frontendBindingPath(entry.frontendBinding)
+  if (entry?.file) {
+    const { pluginId, manifestRoot } = api.startInfo
+    if (!pluginId || !manifestRoot) {
+      throw new Error(
+        'missing plugin id or manifest root in backend start info',
+      )
+    }
+    return api.utils.pluginAssetHttpPath(
+      `${pluginId}/manifest/${manifestRoot}`,
+      'v/b/fe/' + entry.file,
+    )
+  }
+  return srcPath
+}
+
+const S_IFMT = 0o170000
+const S_IFDIR = 0o040000
+
+function isDirectoryMode(mode: number): boolean {
+  return (mode & S_IFMT) === S_IFDIR
+}
+
+// readV86fsMountFile mounts a named v86fs asset and reads the binary file.
+// Imported V86Image single-file assets are FS_NODE directories containing the
+// original filename; direct file roots remain supported for per-VM overrides.
+function readV86fsMountFile(
+  adapter: V86fsAdapter,
+  mountName: string,
+  fileName: string,
+): Promise<Uint8Array> {
+  // readInode reads size bytes, repeating the read because the server
+  // returns at most a bounded chunk per request.
+  const readInode = (inodeId: number, size: number) =>
+    new Promise<Uint8Array>((resolve, reject) => {
+      adapter.onOpen(inodeId, 0, (status: number, handleId: number) => {
+        if (status !== 0) {
+          reject(
+            new Error(
+              'v86fs open "' + mountName + '" failed: status ' + status,
+            ),
+          )
+          return
+        }
+        const buf = new Uint8Array(size)
+        const readFrom = (offset: number) => {
+          adapter.onRead(
+            handleId,
+            offset,
+            size - offset,
+            (status: number, data: Uint8Array) => {
+              if (status !== 0) {
+                adapter.onClose(handleId, () => {})
+                reject(
+                  new Error(
+                    'v86fs read "' + mountName + '" failed: status ' + status,
+                  ),
+                )
+                return
+              }
+              buf.set(data, offset)
+              const next = offset + data.byteLength
+              if (data.byteLength !== 0 && next < size) {
+                readFrom(next)
+                return
+              }
+              adapter.onClose(handleId, () => {})
+              resolve(buf.subarray(0, next))
+            },
+          )
+        }
+        readFrom(0)
+      })
+    })
+
+  return new Promise((resolve, reject) => {
+    adapter.onMount(mountName, (status: number, rootInodeId: number) => {
+      if (status !== 0) {
+        reject(
+          new Error('v86fs mount "' + mountName + '" failed: status ' + status),
+        )
+        return
+      }
+      adapter.onGetattr(
+        rootInodeId,
+        (status: number, _mode: number, size: number) => {
+          if (status !== 0) {
+            reject(
+              new Error(
+                'v86fs getattr "' + mountName + '" failed: status ' + status,
+              ),
+            )
+            return
+          }
+
+          if (!isDirectoryMode(_mode)) {
+            readInode(rootInodeId, size).then(resolve, reject)
+            return
+          }
+
+          adapter.onLookup(
+            rootInodeId,
+            fileName,
+            (
+              status: number,
+              inodeId: number,
+              _mode: number,
+              fileSize: number,
+            ) => {
+              if (status !== 0) {
+                reject(
+                  new Error(
+                    'v86fs lookup "' +
+                      mountName +
+                      '/' +
+                      fileName +
+                      '" failed: status ' +
+                      status,
+                  ),
+                )
+                return
+              }
+              readInode(inodeId, fileSize).then(resolve, reject)
+            },
+          )
+        },
+      )
+    })
+  })
+}
+
+function formatErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function v86RuntimeV86fsServiceID(objectKey: string): string {
+  return (
+    V86_RUNTIME_V86FS_SERVICE_PREFIX + objectKey + '/' + V86fsServiceServiceName
+  )
+}
+function v86RuntimeStatusServiceID(objectKey: string): string {
+  return (
+    V86_RUNTIME_STATUS_SERVICE_PREFIX +
+    objectKey +
+    '/' +
+    V86RuntimeStatusServiceServiceName
+  )
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  const gate = Promise.withResolvers<void>()
+  const onAbort = () => {
+    signal.removeEventListener('abort', onAbort)
+    gate.resolve()
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  return gate.promise
+}
+
+async function reportRuntimeStatus(
+  client: V86RuntimeStatusServiceClient,
+  objectKey: string,
+  generation: bigint,
+  status: V86RuntimeStatus,
+  errorMessage: string,
+  signal?: AbortSignal,
+): Promise<ReportV86RuntimeStatusResponse> {
+  const response = await client.ReportStatus(
+    {
+      objectKey,
+      runGeneration: generation,
+      status,
+      errorMessage,
+    },
+    signal,
+  )
+  if (!response.accepted) {
+    throw new Error(
+      'v86 runtime status report rejected: ' +
+        (response.rejection || 'unknown reason'),
+    )
+  }
+  return response
+}
+
+async function tryReportRuntimeStatus(
+  client: V86RuntimeStatusServiceClient,
+  objectKey: string,
+  generation: bigint,
+  status: V86RuntimeStatus,
+  errorMessage: string,
+): Promise<void> {
+  try {
+    await reportRuntimeStatus(
+      client,
+      objectKey,
+      generation,
+      status,
+      errorMessage,
+    )
+  } catch (err) {
+    console.error(
+      '[spacewave-v86] runtime status report failed:',
+      formatErrorMessage(err),
+    )
+  }
+}
+function waitForRuntimeReady(
+  runtime: BrowserV86Runtime,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) {
+    runtime.stop()
+    return Promise.reject(new Error('v86 runtime startup aborted'))
+  }
+  const gate = Promise.withResolvers<void>()
+  let settled = false
+  const finish = (err?: unknown) => {
+    if (settled) return
+    settled = true
+    signal.removeEventListener('abort', onAbort)
+    if (err) {
+      gate.reject(err instanceof Error ? err : new Error(String(err)))
+    } else {
+      gate.resolve()
+    }
+  }
+  const onAbort = () => {
+    finish(new Error('v86 runtime startup aborted'))
+    runtime.stop()
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  runtime.ready.then(
+    () => finish(),
+    (err: unknown) => finish(err),
+  )
+  return gate.promise
+}
+
+// V86Viewer is the registration of the VM viewer and the clients that keep
+// its Resource refs alive.
+interface V86Viewer {
+  coreClient: SRPCClient
+  resourcesClient: ResourcesClient
+  rootRef: ClientResourceRef
+  viewerRef: ClientResourceRef
+}
+
+// registerV86Viewer registers the VM viewer with the core viewer registry.
+async function registerV86Viewer(
+  api: BackendAPI,
+  signal: AbortSignal,
+): Promise<V86Viewer> {
+  if (!api.startInfo.pluginId) {
+    throw new Error('missing plugin id in backend start info')
+  }
+
+  // Resolve the core Resource tree and the viewer script together.
+  const coreClient = new SRPCClient(api.buildPluginOpenStream('spacewave-core'))
+  const resourcesService = new ResourceServiceClient(coreClient)
+  const resourcesClient = new ResourcesClient(resourcesService, signal)
+  const [rootRef, v86ViewerScript] = await Promise.all([
+    resourcesClient.accessRootResource(),
+    resolveAssetPath(api, signal, './plugin/v86/VmV86Viewer.tsx'),
+  ])
+
+  // Register the viewer and hold its registration Resource.
+  const vrSvc = new ViewerRegistryResourceServiceClient(rootRef.client)
+  const viewer = await vrSvc.RegisterViewer(
+    {
+      registration: {
+        typeId: 'vm/v86',
+        viewerName: 'Virtual Machine',
+        componentId: 'spacewave.v86.viewer',
+        scriptPath: v86ViewerScript,
+        surface: ViewerSurface.WEB,
+      },
+    },
+    signal,
+  )
+  if (!viewer.resourceId) {
+    throw new Error('v86 viewer registration did not return a resource id')
+  }
+  return {
+    coreClient,
+    resourcesClient,
+    rootRef,
+    viewerRef: rootRef.createRef(viewer.resourceId),
+  }
+}
+
+// main is the V86 backend entry point. Startup ends once the viewer is
+// registered, so the host counts the plugin loaded only when it can open VMs.
+// A VM runtime instance then boots its VM and runs it until signal aborts;
+// every other instance holds the viewer registration until then. A failed
+// startup reports through startup alone.
+export default function main(
+  api: BackendAPI,
+  signal: AbortSignal,
+): { startup: Promise<void>; done: Promise<void> } {
+  const viewer = registerV86Viewer(api, signal)
+  const instanceKey = api.startInfo.instanceKey ?? ''
+  const objectKey = instanceKey.startsWith(V86_RUNTIME_INSTANCE_PREFIX)
+    ? instanceKey.slice(V86_RUNTIME_INSTANCE_PREFIX.length)
+    : ''
+  const done = viewer.then(
+    (registered) => {
+      if (objectKey) {
+        return runV86Runtime(registered, objectKey, signal)
+      }
+      retainUntilAbort(
+        signal,
+        [registered.rootRef, registered.viewerRef],
+        [registered.coreClient, registered.resourcesClient],
+      )
+    },
+    () => undefined,
+  )
+  return { startup: viewer.then(() => undefined), done }
+}
+
+// runV86Runtime boots the VM at objectKey and runs it until signal aborts,
+// reporting each runtime status to the VM's controller.
+async function runV86Runtime(
+  { coreClient, rootRef, viewerRef }: V86Viewer,
+  objectKey: string,
+  signal: AbortSignal,
+): Promise<void> {
+  using _rootRef = rootRef
+  using _viewerRef = viewerRef
+
+  const statusClient = new V86RuntimeStatusServiceClient(coreClient, {
+    service: v86RuntimeStatusServiceID(objectKey),
+  })
+  let generation = 0n
+  let runtime: BrowserV86Runtime | undefined
+  let v86fsBridge: ReturnType<typeof createV86fsSrpcAdapter> | undefined
+  const releaseV86fsBridge = () => {
+    if (!v86fsBridge) return
+    v86fsBridge[Symbol.dispose]()
+    v86fsBridge = undefined
+  }
+
+  try {
+    const booting = await reportRuntimeStatus(
+      statusClient,
+      objectKey,
+      generation,
+      V86RuntimeStatus.V86RuntimeStatus_BOOTING,
+      '',
+      signal,
+    )
+    generation = booting.runGeneration ?? 0n
+    if (generation === 0n) {
+      throw new Error('v86 runtime status route did not return a generation')
+    }
+
+    const bridge = createV86fsSrpcAdapter(coreClient, {
+      service: v86RuntimeV86fsServiceID(objectKey),
+    })
+    v86fsBridge = bridge
+
+    console.log('[spacewave-v86] loading v86 binaries from UnixFS...')
+    const [wasmBuf, biosBuf, vgaBiosBuf, kernelBuf] = await Promise.all([
+      readV86fsMountFile(bridge.adapter, 'wasm', 'v86.wasm'),
+      readV86fsMountFile(bridge.adapter, 'seabios', 'seabios.bin'),
+      readV86fsMountFile(bridge.adapter, 'vgabios', 'vgabios.bin'),
+      readV86fsMountFile(bridge.adapter, 'kernel', 'bzImage'),
+    ])
+
+    console.log(
+      '[spacewave-v86] binaries loaded:',
+      `wasm=${wasmBuf.byteLength}`,
+      `bios=${biosBuf.byteLength}`,
+      `vga=${vgaBiosBuf.byteLength}`,
+      `kernel=${kernelBuf.byteLength}`,
+    )
+
+    runtime = await startBrowserV86Runtime({
+      assets: {
+        wasm: wasmBuf,
+        bios: biosBuf,
+        vgaBios: vgaBiosBuf,
+        kernel: kernelBuf,
+      },
+      config: booting.config,
+      objectKey,
+      v86fsAdapter: bridge.adapter,
+      attachV86fsNotifier: bridge.attachNotifier,
+    })
+    await waitForRuntimeReady(runtime, signal)
+    const readyReport = await reportRuntimeStatus(
+      statusClient,
+      objectKey,
+      generation,
+      V86RuntimeStatus.V86RuntimeStatus_READY,
+      '',
+      signal,
+    )
+    generation = readyReport.runGeneration ?? generation
+  } catch (err) {
+    const errorMessage = formatErrorMessage(err)
+    console.error('[spacewave-v86] runtime failed:', errorMessage)
+    runtime?.stop()
+    releaseV86fsBridge()
+    await tryReportRuntimeStatus(
+      statusClient,
+      objectKey,
+      generation,
+      signal.aborted
+        ? V86RuntimeStatus.V86RuntimeStatus_STOPPED
+        : V86RuntimeStatus.V86RuntimeStatus_ERROR,
+      signal.aborted ? '' : errorMessage,
+    )
+    if (signal.aborted) return
+    throw err
+  }
+
+  console.log(
+    '[spacewave-v86] v86 emulator ready, serial channel:',
+    runtime.serialChannelName,
+  )
+  try {
+    await waitForAbort(signal)
+    runtime.stop()
+    await tryReportRuntimeStatus(
+      statusClient,
+      objectKey,
+      generation,
+      V86RuntimeStatus.V86RuntimeStatus_STOPPED,
+      '',
+    )
+  } finally {
+    releaseV86fsBridge()
+  }
+}

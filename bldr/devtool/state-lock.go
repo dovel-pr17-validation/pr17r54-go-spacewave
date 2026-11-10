@@ -1,0 +1,131 @@
+//go:build !js
+
+package devtool
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+)
+
+const stateLockFileName = "state.lock"
+
+type stateLock struct {
+	file    *os.File
+	pidPath string
+}
+
+func acquireStateLock(ctx context.Context, le *logrus.Entry, stateRoot string) (*stateLock, error) {
+	// Fail early if the caller's context is already canceled.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Create the state root if it does not exist.
+	// #nosec G703 -- stateRoot is the caller-selected local build state directory.
+	if err := os.MkdirAll(stateRoot, 0o755); err != nil {
+		return nil, err
+	}
+
+	// Open the fixed-name lock file in the state root.
+	lockPath := filepath.Join(stateRoot, stateLockFileName)
+
+	// #nosec G703 -- lockPath adds a fixed filename to the selected build state directory.
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, errors.Wrap(err, "open bldr state lock")
+	}
+
+	// Describe the lock around the opened lock file.
+	lock := &stateLock{
+		file:    file,
+		pidPath: lockPath + ".pid",
+	}
+
+	// Take the advisory lock, waiting for another bldr process if needed.
+	locked, err := lock.tryLock()
+	if err != nil {
+		lock.closeAfterError()
+		return nil, errors.Wrap(err, "lock bldr state")
+	}
+	if !locked {
+		logStateLockWait(le, lock.waitMessage(stateRoot))
+		if err := lock.lock(); err != nil {
+			lock.closeAfterError()
+			return nil, errors.Wrap(err, "wait for bldr state lock")
+		}
+	}
+
+	// Record this process as the lock holder.
+	if err := ctx.Err(); err != nil {
+		lock.release()
+		return nil, err
+	}
+	if err := lock.writePID(); err != nil {
+		lock.release()
+		return nil, err
+	}
+	return lock, nil
+}
+
+// waitMessage describes the state lock wait, naming the recorded holder.
+func (l *stateLock) waitMessage(stateRoot string) string {
+	if pid := l.readHolderPID(); pid != "" {
+		return "waiting for pid " + pid + " to release bldr state lock: " + stateRoot
+	}
+	return "waiting for another bldr process to release state lock: " + stateRoot
+}
+
+// writePID records this process in the lock's pid file.
+func (l *stateLock) writePID() error {
+	// Write the process id followed by a newline.
+	pid := strconv.AppendInt(nil, int64(os.Getpid()), 10)
+	pid = append(pid, '\n')
+
+	// Store the pid file in the state root.
+	if err := os.WriteFile(l.pidPath, pid, 0o644); err != nil {
+		return errors.Wrap(err, "write bldr state lock pid")
+	}
+	return nil
+}
+
+// readHolderPID returns the pid recorded by the current lock holder, or
+// an empty string.
+func (l *stateLock) readHolderPID() string {
+	data, err := os.ReadFile(l.pidPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// release unlocks and closes the lock file.
+func (l *stateLock) release() {
+	if l == nil || l.file == nil {
+		return
+	}
+	_ = l.unlock()
+	_ = l.file.Close()
+	l.file = nil
+}
+
+// closeAfterError closes the lock file without unlocking, leaving the
+// advisory lock to the OS process teardown.
+func (l *stateLock) closeAfterError() {
+	if l == nil || l.file == nil {
+		return
+	}
+	_ = l.file.Close()
+	l.file = nil
+}
+
+// logStateLockWait logs the state-lock wait through the plumbed logger.
+// logrus entry methods are nil-safe, so a nil entry drops the message.
+func logStateLockWait(le *logrus.Entry, message string) {
+	le.Warn(message)
+}

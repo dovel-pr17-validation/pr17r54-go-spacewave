@@ -1,0 +1,132 @@
+package s4wave_terminal
+
+import (
+	"context"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/aperturerobotics/protobuf-go-lite/types/known/timestamppb"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/db/world"
+	world_types "github.com/s4wave/spacewave/db/world/types"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/sirupsen/logrus"
+)
+
+// NewCreateTerminalOp constructs a new CreateTerminalOp.
+func NewCreateTerminalOp(objKey, name, deviceObjKey, devicePeerID string, ts time.Time) *CreateTerminalOp {
+	return &CreateTerminalOp{
+		ObjectKey:       objKey,
+		Name:            name,
+		DeviceObjectKey: deviceObjKey,
+		DevicePeerId:    devicePeerID,
+		TargetKind:      TerminalTargetKind_TERMINAL_TARGET_KIND_DEVICE,
+		Cols:            DefaultTerminalCols,
+		Rows:            DefaultTerminalRows,
+		Timestamp:       timestamppb.New(ts),
+	}
+}
+
+// NewCreateSshHostTerminalOp constructs a CreateTerminalOp for an SSH Host target.
+func NewCreateSshHostTerminalOp(objKey, name, sshHostObjKey string, ts time.Time) *CreateTerminalOp {
+	return &CreateTerminalOp{
+		ObjectKey:        objKey,
+		Name:             name,
+		SshHostObjectKey: sshHostObjKey,
+		TargetKind:       TerminalTargetKind_TERMINAL_TARGET_KIND_SSH_HOST,
+		Cols:             DefaultTerminalCols,
+		Rows:             DefaultTerminalRows,
+		Timestamp:        timestamppb.New(ts),
+	}
+}
+
+// Validate performs cursory checks on the op.
+func (o *CreateTerminalOp) Validate() error {
+	// Require a terminal object key and name before validating its target.
+	if len(o.GetObjectKey()) == 0 {
+		return world.ErrEmptyObjectKey
+	}
+	if strings.TrimSpace(o.GetName()) == "" {
+		return world.ErrEmptyOp
+	}
+
+	// Validate the terminal target, environment, and creation timestamp.
+	switch effectiveCreateTerminalOpTargetKind(o) {
+	case TerminalTargetKind_TERMINAL_TARGET_KIND_DEVICE:
+		if strings.TrimSpace(o.GetDeviceObjectKey()) == "" {
+			return world.ErrEmptyOp
+		}
+		if strings.TrimSpace(o.GetDevicePeerId()) == "" {
+			return world.ErrEmptyOp
+		}
+	case TerminalTargetKind_TERMINAL_TARGET_KIND_SSH_HOST:
+		if strings.TrimSpace(o.GetSshHostObjectKey()) == "" {
+			return world.ErrEmptyOp
+		}
+	default:
+		return world.ErrEmptyOp
+	}
+	if err := validateTerminalEnvironment(o.GetEnvironment()); err != nil {
+		return err
+	}
+	if err := o.GetTimestamp().Validate(false); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ApplyWorldOp applies the operation as a world operation.
+func (o *CreateTerminalOp) ApplyWorldOp(
+	ctx context.Context,
+	le *logrus.Entry,
+	ws world.WorldState,
+	sender peer.ID,
+) (sysErr bool, err error) {
+	// Validate the terminal creation request before changing World state.
+	if err := o.Validate(); err != nil {
+		return false, err
+	}
+
+	// Build the Terminal record with normalized dimensions and initial session state.
+	cols, rows := NormalizeTerminalFrameSize(o.GetCols(), o.GetRows())
+	terminal := &Terminal{
+		Name:             o.GetName(),
+		DeviceObjectKey:  o.GetDeviceObjectKey(),
+		DevicePeerId:     o.GetDevicePeerId(),
+		SshHostObjectKey: o.GetSshHostObjectKey(),
+		TargetKind:       effectiveCreateTerminalOpTargetKind(o),
+		Command:          o.GetCommand(),
+		Environment:      slices.Clone(o.GetEnvironment()),
+		Cols:             cols,
+		Rows:             rows,
+		State:            TerminalSessionState_TERMINAL_SESSION_STATE_DISCONNECTED,
+		Status:           "not connected",
+		CreatedAt:        o.GetTimestamp(),
+		UpdatedAt:        o.GetTimestamp(),
+	}
+
+	// Create the terminal World object with its initial block.
+	var createdObject world.ObjectState
+	createdObject, _, err = world.CreateWorldObject(ctx, ws, o.GetObjectKey(), func(bcs *block.Cursor) error {
+		bcs.SetBlock(terminal, true)
+		return nil
+	})
+	world.ReleaseObjectState(createdObject)
+	if err != nil {
+		return false, err
+	}
+
+	// Assign the Terminal object type to the newly created record.
+	if err := world_types.SetObjectType(ctx, ws, o.GetObjectKey(), TerminalTypeID); err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+func effectiveCreateTerminalOpTargetKind(o *CreateTerminalOp) TerminalTargetKind {
+	return resolveTerminalTargetKind(o)
+}
+
+var _ world.Operation = (*CreateTerminalOp)(nil)

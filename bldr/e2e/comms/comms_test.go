@@ -1,0 +1,1701 @@
+//go:build !skip_e2e && !js
+
+package comms
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/mxschmitt/playwright-go"
+	"github.com/s4wave/spacewave/bldr/util/gocompiler"
+	web_runtime_goscript_build "github.com/s4wave/spacewave/bldr/web/runtime/goscript/build"
+	"github.com/sirupsen/logrus"
+)
+
+var (
+	testServer *testServerState
+	pwInstance *playwright.Playwright
+	repoRoot   string
+	commsDir   string
+	distDir    string
+)
+
+type testServerState struct {
+	url   string
+	close func()
+}
+
+type goScriptFixtureWorker struct {
+	mainPackagePath string
+	outputName      string
+	// protobufBinding matches production's generated TypeScript message bindings.
+	protobufBinding bool
+	once            sync.Once
+	err             error
+}
+
+var (
+	resourceServiceGoScriptFixtureWorker = goScriptFixtureWorker{
+		mainPackagePath: "github.com/s4wave/spacewave/bldr/e2e/comms/fixtures/go/goscript-resource-service",
+		outputName:      "goscript-resource-service-plugin.js",
+	}
+	opfsStorageGoScriptFixtureWorker = goScriptFixtureWorker{
+		mainPackagePath: "github.com/s4wave/spacewave/bldr/e2e/comms/fixtures/go/goscript-opfs-storage",
+		outputName:      "goscript-opfs-storage-plugin.js",
+		protobufBinding: true,
+	}
+	volumeReplayGoScriptFixtureWorker = goScriptFixtureWorker{
+		mainPackagePath: "github.com/s4wave/spacewave/bldr/e2e/comms/fixtures/go/goscript-volume-replay",
+		outputName:      "goscript-volume-replay-plugin.js",
+	}
+)
+
+// TIER: pr
+// TestMain builds the fixture bundles, starts playwright, and starts the
+// HTTP test server. All tests share the same server and playwright instance.
+func TestMain(m *testing.M) {
+	// Find the repo root (e2e/comms/ is two levels deep).
+	_, thisFile, _, _ := runtime.Caller(0)
+	commsDir = filepath.Dir(thisFile)
+	repoRoot = filepath.Join(commsDir, "..", "..")
+	distDir = filepath.Join(commsDir, "dist")
+
+	// Build fixtures with Vite.
+	fmt.Println("=== Building test fixtures with Vite ===")
+	buildCmd := exec.Command("bun", "run", "vite", "build", "--config", "./e2e/comms/vite.config.ts")
+	buildCmd.Dir = repoRoot
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "vite build failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Build each classic ServiceWorker fixture entry with its own Vite run.
+	for _, swEntry := range []string{
+		"cross-tab-sw",
+		"workers/webdocument-relay-service-worker",
+	} {
+		fmt.Printf("=== Building classic ServiceWorker fixture %s ===\n", swEntry)
+		buildCmd := exec.Command("bun", "run", "vite", "build", "--config", "./e2e/comms/vite.config.ts")
+		buildCmd.Dir = repoRoot
+		buildCmd.Env = append(os.Environ(), "BLDR_COMMS_CLASSIC_SERVICE_WORKER_ENTRY="+swEntry)
+		buildCmd.Stdout = os.Stdout
+		buildCmd.Stderr = os.Stderr
+		if err := buildCmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "classic ServiceWorker fixture build failed for %s: %v\n", swEntry, err)
+			os.Exit(1)
+		}
+	}
+
+	// Verify dist directory has output.
+	if _, err := os.Stat(filepath.Join(distDir, "detect.js")); err != nil {
+		fmt.Fprintf(os.Stderr, "detect.js not found in dist: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Install playwright browsers if needed.
+	if err := playwright.Install(&playwright.RunOptions{
+		Browsers: []string{"chromium", "firefox", "webkit"},
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "playwright install failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Start playwright.
+	pw, err := playwright.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "playwright.Run failed: %v\n", err)
+		os.Exit(1)
+	}
+	pwInstance = pw
+
+	// Start test server.
+	srv, err := newTestServer(distDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "test server failed: %v\n", err)
+		os.Exit(1)
+	}
+	testServer = &testServerState{
+		url:   srv.URL,
+		close: srv.Close,
+	}
+	fmt.Printf("=== Test server at %s ===\n", testServer.url)
+
+	// Run the shared server and playwright instance through every test.
+	code := m.Run()
+
+	// Stop the test server and playwright, then exit with the test result.
+	testServer.close()
+	pwInstance.Stop()
+	os.Exit(code)
+}
+
+// buildGoScriptFixtureWorker compiles one GoScript fixture worker plugin
+// into the comms dist directory.
+func buildGoScriptFixtureWorker(ctx context.Context, repoRoot, commsDir, distDir, mainPackagePath, outputName string, protobufBinding bool) error {
+	// Log the build and derive the output and work directories from the name.
+	le := logrus.NewEntry(logrus.New())
+	le.Infof("building GoScript fixture worker %s", outputName)
+	name := strings.TrimSuffix(outputName, ".js")
+	outputRoot := filepath.Join(commsDir, ".tmp", name)
+	workDir := filepath.Join(commsDir, ".tmp", name+"-work")
+
+	// Start each build from clean output and work directories.
+	if err := os.RemoveAll(outputRoot); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(workDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return err
+	}
+
+	// Resolve production protobuf siblings only for fixtures that select them.
+	var bindingRoots []string
+	if protobufBinding {
+		var err error
+		bindingRoots, err = gocompiler.GoScriptBindingRoots(ctx, repoRoot)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Compile the worker's Go package to TypeScript with its selected bindings.
+	if err := gocompiler.ExecGoScriptCompile(ctx, le, gocompiler.GoScriptCompileOptions{
+		WorkDir:                   repoRoot,
+		OutputPath:                outputRoot,
+		Packages:                  []string{mainPackagePath},
+		BuildFlags:                []string{"-tags=goscript,skip_e2e,purego"},
+		BindingRoots:              bindingRoots,
+		ProtobufTypeScriptBinding: protobufBinding,
+	}); err != nil {
+		return err
+	}
+	_, err := web_runtime_goscript_build.BuildWebGoScriptPluginScript(
+		ctx,
+		le,
+		repoRoot,
+		workDir,
+		outputRoot,
+		filepath.Join(distDir, "workers", outputName),
+		mainPackagePath,
+		false,
+		false,
+		false,
+	)
+	return err
+}
+
+func ensureGoScriptFixtureWorker(t *testing.T, worker *goScriptFixtureWorker) {
+	t.Helper()
+	worker.once.Do(func() {
+		worker.err = buildGoScriptFixtureWorker(
+			context.Background(),
+			repoRoot,
+			commsDir,
+			distDir,
+			worker.mainPackagePath,
+			worker.outputName,
+			worker.protobufBinding,
+		)
+	})
+	if worker.err != nil {
+		t.Fatalf("goscript fixture worker build failed for %s: %v", worker.outputName, worker.err)
+	}
+}
+
+// browserType returns the playwright browser type by name. "chrome" is
+// branded Chrome, launched from chromeExecutable.
+func browserType(name string) playwright.BrowserType {
+	switch name {
+	case "chromium", "chrome":
+		return pwInstance.Chromium
+	case "firefox":
+		return pwInstance.Firefox
+	case "webkit":
+		return pwInstance.WebKit
+	default:
+		panic("unknown browser: " + name)
+	}
+}
+
+// clearHomeACLs removes the ACLs macOS puts on the Library directories of an
+// isolated home, which deny their deletion.
+func clearHomeACLs(home string) {
+	_ = exec.Command("/bin/chmod", "-R", "-N", home).Run()
+}
+
+// chromeExecutable returns the branded Chrome binary for browserName
+// "chrome", taken from CHROME_PATH, or nil for the bundled browser.
+func chromeExecutable(t *testing.T, browserName string) *string {
+	if browserName != "chrome" {
+		return nil
+	}
+	path := os.Getenv("CHROME_PATH")
+	if path == "" {
+		t.Skip("CHROME_PATH is not set")
+	}
+	return &path
+}
+
+func shouldSkipBrowserLaunch(browserName string, err error) bool {
+	if err == nil || browserName != "webkit" {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "Host system is missing dependencies to run browsers")
+}
+
+// runFixture opens a fixture page in the given browser, waits for "DONE" in
+// #log, and returns window.__results as a map.
+func runFixture(t *testing.T, browserName, fixture string) map[string]any {
+	return runFixtureWith(t, browserName, fixture, fixtureRun{})
+}
+
+// fixtureRun configures one fixture page run.
+type fixtureRun struct {
+	// query is the page URL's query string, without the leading "?".
+	query string
+	// timeout bounds the wait for "DONE"; zero selects 30 seconds.
+	timeout time.Duration
+	// allowedBrowserFailures are console errors that do not fail the run.
+	allowedBrowserFailures []string
+	// persistent runs the page in an on-disk profile. Private contexts keep
+	// OPFS and IndexedDB in memory in Chromium and Firefox, so storage
+	// measurements need it; WebKit always uses one.
+	persistent bool
+	// onLine, when set, receives the text of every console message.
+	onLine func(string)
+}
+
+// pageFailures collects the browser-side failures of one page.
+type pageFailures struct {
+	mu   sync.Mutex
+	list []string
+}
+
+// add records one failure.
+func (f *pageFailures) add(failure string) {
+	f.mu.Lock()
+	f.list = append(f.list, failure)
+	f.mu.Unlock()
+}
+
+// String joins the recorded failures.
+func (f *pageFailures) String() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.list, "; ")
+}
+
+// runFixtureWith runs a fixture page like runFixture with the options of run.
+func runFixtureWith(t *testing.T, browserName, fixture string, run fixtureRun) map[string]any {
+	// Hand Safari its own launch path and pick a profile directory where the
+	// browser needs one.
+	t.Helper()
+	if browserName == "safari" {
+		return runSafari(t, fixture, run)
+	}
+	dir := ""
+	if browserName == "webkit" || run.persistent {
+		dir = t.TempDir()
+	}
+
+	// Run the fixture page in the launched context.
+	return runPage(t, launchContext(t, browserName, dir), browserName, fixture, run)
+}
+
+// launchContext launches browserName in a new context that closes with t. A
+// non-empty dir holds an on-disk profile, which WebKit needs for OPFS;
+// otherwise the context is private. "android" connects to the device's
+// Chrome profile instead.
+func launchContext(t *testing.T, browserName, dir string) playwright.BrowserContext {
+	// Connect "android" to the device's Chrome profile and resolve the
+	// remaining browser type and context variables.
+	t.Helper()
+	if browserName == "android" {
+		return androidContext(t)
+	}
+	bt := browserType(browserName)
+	var ctx playwright.BrowserContext
+	var err error
+
+	// Launch a persistent context when the browser needs an on-disk profile.
+	if dir != "" {
+		// On macOS the browsers need an isolated home, whose Library ACLs
+		// must be cleared before the temporary directory is removed.
+		opts := playwright.BrowserTypeLaunchPersistentContextOptions{
+			ExecutablePath: chromeExecutable(t, browserName),
+			Headless:       new(true),
+		}
+		if runtime.GOOS == "darwin" {
+			t.Cleanup(func() { clearHomeACLs(dir) })
+			opts.Env = make(map[string]string)
+			for _, entry := range os.Environ() {
+				key, value, _ := strings.Cut(entry, "=")
+				opts.Env[key] = value
+			}
+			opts.Env["CFFIXED_USER_HOME"] = dir
+		}
+		ctx, err = bt.LaunchPersistentContext(dir, opts)
+	} else {
+		var browser playwright.Browser
+		browser, err = bt.Launch(playwright.BrowserTypeLaunchOptions{
+			ExecutablePath: chromeExecutable(t, browserName),
+			Headless:       new(true),
+		})
+		if err == nil {
+			t.Cleanup(func() { _ = browser.Close() })
+			ctx, err = browser.NewContext()
+		}
+	}
+
+	// Skip unsupported WebKit launches and fail on any other launch error.
+	if err != nil {
+		if shouldSkipBrowserLaunch(browserName, err) {
+			t.Skipf("skip %s: %v", browserName, err)
+		}
+		t.Fatalf("launch %s context: %v", browserName, err)
+	}
+
+	// Close the launched context when the test finishes.
+	t.Cleanup(func() { _ = ctx.Close() })
+	return ctx
+}
+
+// runPage runs a fixture page in ctx, waits for "DONE" in #log, and returns
+// window.__results as a map.
+func runPage(t *testing.T, ctx playwright.BrowserContext, browserName, fixture string, run fixtureRun) map[string]any {
+	t.Helper()
+	_, wait := startPage(t, ctx, browserName, fixture, run)
+	return wait()
+}
+
+// startPage opens a fixture page in ctx and returns it with a function that
+// waits for "DONE" in #log and returns window.__results as a map.
+func startPage(t *testing.T, ctx playwright.BrowserContext, browserName, fixture string, run fixtureRun) (playwright.Page, func() map[string]any) {
+	// Open a new page in the context and collect its browser-side failures.
+	t.Helper()
+	page, err := ctx.NewPage()
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	failures := &pageFailures{}
+
+	// Forward console messages to test log and retain browser-side failures so
+	// fixture crashes do not collapse into opaque DONE timeouts.
+	page.On("console", func(msg playwright.ConsoleMessage) {
+		t.Logf("[%s console.%s] %s", browserName, msg.Type(), msg.Text())
+		if run.onLine != nil {
+			run.onLine(msg.Text())
+		}
+		if msg.Type() == "error" {
+			for _, allowed := range run.allowedBrowserFailures {
+				if strings.Contains(msg.Text(), allowed) {
+					return
+				}
+			}
+			failures.add("console.error: " + msg.Text())
+		}
+	})
+	page.On("pageerror", func(err error) {
+		t.Logf("[%s pageerror] %s", browserName, err.Error())
+		failures.add("pageerror: " + err.Error())
+	})
+
+	// Navigate the page to the fixture URL with its wait timeout.
+	url := fmt.Sprintf("%s/%s.html", testServer.url, fixture)
+	if run.query != "" {
+		url += "?" + run.query
+	}
+	timeout := run.timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
+	// Load the fixture page and return the waiter for its completion.
+	if _, err := page.Goto(url); err != nil {
+		t.Fatalf("goto %s: %v", url, err)
+	}
+	return page, func() map[string]any {
+		t.Helper()
+		return waitPage(t, page, timeout, failures)
+	}
+}
+
+// waitPage waits for "DONE" in the #log of page, fails t on any browser
+// failure, and returns window.__results as a map.
+func waitPage(t *testing.T, page playwright.Page, timeout time.Duration, failures *pageFailures) map[string]any {
+	// Wait for the fixture log to become visible.
+	t.Helper()
+	logSel := page.Locator("#log")
+	if err := logSel.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(30000),
+	}); err != nil {
+		t.Fatalf("wait for #log visible: %v", err)
+	}
+
+	// Wait for "DONE" text.
+	if err := playwright.NewPlaywrightAssertions().Locator(logSel).ToContainText("DONE", playwright.LocatorAssertionsToContainTextOptions{
+		Timeout: new(float64(timeout.Milliseconds())),
+	}); err != nil {
+		text, _ := logSel.TextContent()
+		if failures := failures.String(); failures != "" {
+			t.Fatalf("fixture did not complete (text=%q, browser failures=%s): %v", text, failures, err)
+		}
+		t.Fatalf("fixture did not complete (text=%q): %v", text, err)
+	}
+
+	// Fail the test on any browser-side failure the fixture reported.
+	if failures := failures.String(); failures != "" {
+		t.Fatalf("fixture reported browser failures: %s", failures)
+	}
+
+	// Extract results.
+	results, err := page.Evaluate("window.__results")
+	if err != nil {
+		t.Fatalf("evaluate window.__results: %v", err)
+	}
+
+	// Return the results as an object.
+	resultsMap, ok := results.(map[string]any)
+	if !ok {
+		t.Fatalf("window.__results is not an object: %T", results)
+	}
+	return resultsMap
+}
+
+// TestDetect verifies feature detection probes across all 3 browsers.
+func TestDetect(t *testing.T) {
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Detect the browser's capabilities in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the detection fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "detect")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("detection failed: %v", results["detail"])
+			}
+
+			// Read the capability map from the fixture results.
+			caps, ok := results["caps"].(map[string]any)
+			if !ok {
+				t.Fatalf("caps not a map: %T", results["caps"])
+			}
+
+			// Log the detected configuration.
+			config, _ := results["config"].(string)
+			t.Logf("config=%s desc=%s", config, results["configDesc"])
+
+			// All browsers should detect crossOriginIsolated (server sets COOP+COEP).
+			assertBoolCap(t, caps, "crossOriginIsolated", true)
+
+			// All browsers should have BroadcastChannel.
+			assertBoolCap(t, caps, "broadcastChannelAvailable", true)
+
+			// All browsers should have WebLocks.
+			assertBoolCap(t, caps, "webLocksAvailable", true)
+
+			// SAB should be available on all browsers when cross-origin isolated.
+			assertBoolCap(t, caps, "sabAvailable", true)
+
+			// OPFS available on Chromium and Firefox over localhost.
+			// WebKit may not grant OPFS to insecure local origins (requires https
+			// or localhost). This is a known WebKit limitation.
+			if browser != "webkit" {
+				assertBoolCap(t, caps, "opfsAvailable", true)
+			} else {
+				opfs, _ := caps["opfsAvailable"].(bool)
+				t.Logf("webkit opfsAvailable=%v (may be false on http://127.0.0.1)", opfs)
+			}
+
+			// Config verification per browser.
+			switch browser {
+			case "chromium", "firefox":
+				// Should get Config C (SAB + OPFS snapshot recovery).
+				if config != "C" {
+					t.Errorf("expected config C on %s, got %s", browser, config)
+				}
+			case "webkit":
+				// WebKit: SAB available but no OPFS in headless mode.
+				// Expects Config B (SAB without OPFS) or A (fallback).
+				if config != "B" && config != "A" && config != "C" {
+					t.Errorf("unexpected config on webkit: %s", config)
+				}
+			}
+		})
+	}
+}
+
+// TestSabRing verifies SabRingStream point-to-point communication.
+// SAB requires cross-origin isolation, which is not viable on WebKit
+// in this test environment, so we run on Chromium and Firefox only.
+func TestSabRing(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Check the SAB ring fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the sab-ring fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "sab-ring")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("sab-ring failed: %v", results["detail"])
+			}
+
+			// Assert every step of the SabRing round-trip.
+			assertBoolResult(t, results, "sendRecv", true)
+			assertBoolResult(t, results, "bidirectional", true)
+			assertBoolResult(t, results, "close", true)
+			assertBoolResult(t, results, "pairDefault", true)
+			assertBoolResult(t, results, "maxPayload", true)
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestDedicatedWorker verifies DedicatedWorker hosting: plugin-host wrapper
+// receives worker comms config without eager SAB bus fields and loads the
+// plugin script.
+func TestDedicatedWorker(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Check DedicatedWorker hosting in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the dedicated fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "dedicated")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("dedicated worker failed: %v", results["detail"])
+			}
+
+			// Assert the worker comms config and plugin startup contract.
+			assertBoolResult(t, results, "noStartupSab", true)
+			assertBoolResult(t, results, "pluginStarted", true)
+			assertBoolResult(t, results, "configReceived", true)
+			assertBoolResult(t, results, "manyWorkersStarted", true)
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestGoScriptPluginRuntime verifies that the GoScript plugin runtime wrapper
+// uses the same browser worker start-info and bidirectional stream contract as
+// the WebHost plugin worker path.
+func TestGoScriptPluginRuntime(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Check the GoScript plugin runtime fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the goscript-plugin-runtime fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "goscript-plugin-runtime")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("GoScript plugin runtime fixture failed: %v", results["detail"])
+			}
+
+			// Assert the worker start-info and bidirectional stream contract.
+			assertBoolResult(t, results, "workerReady", true)
+			assertBoolResult(t, results, "startInfo", true)
+			assertBoolResult(t, results, "pluginToHostStream", true)
+			assertBoolResult(t, results, "hostToPluginStream", true)
+
+			// Fail on any runtime failure reason and log the fixture detail.
+			if failureReason, _ := results["failureReason"].(string); failureReason != "" {
+				t.Fatalf("unexpected runtime failure: %s", failureReason)
+			}
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestGoScriptResourceService verifies that a GoScript-generated browser
+// worker can serve native ResourceService code without project-local gs
+// overrides, and that releasing a client reference to a child resource reaches
+// the Go server release callback.
+func TestGoScriptResourceService(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Check the GoScript resource service fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Build the fixture worker once and run the resource service page.
+			t.Parallel()
+			ensureGoScriptFixtureWorker(t, &resourceServiceGoScriptFixtureWorker)
+			results := runFixture(t, browser, "goscript-resource-service")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("GoScript resource service fixture failed: %v", results["detail"])
+			}
+
+			// Assert the resource service and release propagation contract.
+			assertBoolResult(t, results, "workerReady", true)
+			assertBoolResult(t, results, "startInfo", true)
+			assertBoolResult(t, results, "rootResource", true)
+			assertBoolResult(t, results, "registered", true)
+			assertBoolResult(t, results, "releaseRemoved", true)
+
+			// Fail on any runtime failure reason and log the fixture detail.
+			if failureReason, _ := results["failureReason"].(string); failureReason != "" {
+				t.Fatalf("unexpected runtime failure: %s", failureReason)
+			}
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestStartupFailures verifies bounded rejection for startup failure paths:
+// slow registration, close during startup, worker pre-registration death, and
+// plugin import failure.
+func TestStartupFailures(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Check the startup failure paths in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the startup-failures fixture, allowing the expected
+			// ServiceWorker connection errors.
+			t.Parallel()
+			results := runFixtureWith(t, browser, "startup-failures", fixtureRun{
+				allowedBrowserFailures: []string{
+					"ServiceWorker: connecting via WebDocument failed: startup-failures-slow-doc",
+					"ServiceWorker: connecting via WebDocument failed: startup-failures-close-doc",
+				},
+			})
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("startup failures fixture failed: %v", results["detail"])
+			}
+
+			// Assert each startup failure path is rejected or closed.
+			assertBoolResult(t, results, "slowRegistrationRejected", true)
+			assertBoolResult(t, results, "closeDuringStartupRejected", true)
+			assertBoolResult(t, results, "workerPreRegistrationRejected", true)
+			assertBoolResult(t, results, "importFailureClosed", true)
+			assertBoolResult(t, results, "importFailureReady", false)
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestTransportFactory verifies that the transport factory selects the correct
+// transports based on detected worker comms config.
+func TestTransportFactory(t *testing.T) {
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Check the transport factory selection in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the transport fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "transport")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("transport factory failed: %v", results["detail"])
+			}
+
+			// Assert the factory was created and read the comms config.
+			assertBoolResult(t, results, "factoryCreated", true)
+			config, _ := results["config"].(string)
+			hasPair, _ := results["hasPairStream"].(bool)
+
+			// SAB pair streams are available on any config with SAB (B, C).
+			switch config {
+			case "B", "C":
+				if !hasPair {
+					t.Errorf("expected hasPairStream=true on %s (config=%s)", browser, config)
+				}
+			case "A", "F":
+				if hasPair {
+					t.Errorf("unexpected hasPairStream=true on %s (config=%s)", browser, config)
+				}
+			}
+
+			// Log the selected config and pair stream availability.
+			t.Logf("config=%s hasPairStream=%v", config, hasPair)
+		})
+	}
+}
+
+// waitForDone waits for #log to show "DONE".
+func waitForDone(t *testing.T, page playwright.Page, label string) {
+	t.Helper()
+	logSel := page.Locator("#log")
+	if err := logSel.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(30000),
+	}); err != nil {
+		t.Fatalf("%s: wait for #log visible: %v", label, err)
+	}
+	if err := playwright.NewPlaywrightAssertions().Locator(logSel).ToContainText("DONE", playwright.LocatorAssertionsToContainTextOptions{
+		Timeout: playwright.Float(30000),
+	}); err != nil {
+		text, _ := logSel.TextContent()
+		t.Fatalf("%s: fixture did not complete (text=%q): %v", label, text, err)
+	}
+}
+
+func waitForCondition(t *testing.T, page playwright.Page, label, expr string) {
+	t.Helper()
+	if _, err := page.WaitForFunction(expr, nil); err != nil {
+		results := extractResults(t, page)
+		t.Fatalf("%s: wait for condition failed: %v (results=%v)", label, err, results)
+	}
+}
+
+func waitForPeerCount(t *testing.T, page playwright.Page, label string, expected int) {
+	t.Helper()
+	waitForCondition(
+		t,
+		page,
+		label,
+		fmt.Sprintf("() => Number(window.__results?.peerCount ?? 0) >= %d", expected),
+	)
+}
+
+func waitForMessageText(t *testing.T, page playwright.Page, label, msg string) {
+	t.Helper()
+	waitForCondition(
+		t,
+		page,
+		label,
+		fmt.Sprintf(
+			`() => Array.isArray(window.__results?.messagesReceived) && window.__results.messagesReceived.includes(%q)`,
+			msg,
+		),
+	)
+}
+
+// toFloat64 converts a Playwright evaluate result to float64.
+// Playwright-Go may return int, float64, or a string-backed number depending
+// on the value and browser.
+func toFloat64(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case fmt.Stringer:
+		f, err := strconv.ParseFloat(n.String(), 64)
+		if err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
+// extractResults reads window.__results from a page.
+func extractResults(t *testing.T, page playwright.Page) map[string]any {
+	// Evaluate window.__results and fail on an evaluate error.
+	t.Helper()
+	results, err := page.Evaluate("window.__results")
+	if err != nil {
+		t.Fatalf("evaluate window.__results: %v", err)
+	}
+
+	// Return the results as an object.
+	resultsMap, ok := results.(map[string]any)
+	if !ok {
+		t.Fatalf("window.__results is not an object: %T", results)
+	}
+	return resultsMap
+}
+
+// assertBoolResult asserts a bool field in the results map.
+func assertBoolResult(t *testing.T, results map[string]any, key string, expected bool) {
+	t.Helper()
+	val, ok := results[key].(bool)
+	if !ok {
+		t.Errorf("result %s: not a bool (%T)", key, results[key])
+		return
+	}
+	if val != expected {
+		t.Errorf("result %s: got %v, want %v", key, val, expected)
+	}
+}
+
+// assertBoolCap asserts a capability value in the caps map.
+func assertBoolCap(t *testing.T, caps map[string]any, key string, expected bool) {
+	t.Helper()
+	val, ok := caps[key].(bool)
+	if !ok {
+		t.Errorf("cap %s: not a bool (%T)", key, caps[key])
+		return
+	}
+	if val != expected {
+		t.Errorf("cap %s: got %v, want %v", key, val, expected)
+	}
+}
+
+// TestCrossTab verifies cross-tab MessagePort brokering via ServiceWorker.
+// Two pages in the same browser context each register with the SW and get
+// a direct MessagePort channel to the other. Messages flow directly.
+func TestCrossTab(t *testing.T) {
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Run the cross-tab brokering fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Launch a browser and a context that close with the test.
+			bt := browserType(browser)
+			bw, err := bt.Launch(playwright.BrowserTypeLaunchOptions{
+				Headless: new(true),
+			})
+			if err != nil {
+				t.Fatalf("launch %s: %v", browser, err)
+			}
+			defer bw.Close()
+
+			// Open a context in the browser.
+			ctx, err := bw.NewContext()
+			if err != nil {
+				t.Fatalf("new context: %v", err)
+			}
+			defer ctx.Close()
+
+			// Open two pages (tabs) in the same context.
+			pageA, err := ctx.NewPage()
+			if err != nil {
+				t.Fatalf("new page A: %v", err)
+			}
+			pageA.On("console", func(msg playwright.ConsoleMessage) {
+				t.Logf("[%s A console.%s] %s", browser, msg.Type(), msg.Text())
+			})
+			pageA.On("pageerror", func(err error) {
+				t.Logf("[%s A pageerror] %s", browser, err.Error())
+			})
+
+			// Open the second page with the same console logging.
+			pageB, err := ctx.NewPage()
+			if err != nil {
+				t.Fatalf("new page B: %v", err)
+			}
+			pageB.On("console", func(msg playwright.ConsoleMessage) {
+				t.Logf("[%s B console.%s] %s", browser, msg.Type(), msg.Text())
+			})
+			pageB.On("pageerror", func(err error) {
+				t.Logf("[%s B pageerror] %s", browser, err.Error())
+			})
+
+			// Point both pages at the cross-tab fixture.
+			url := fmt.Sprintf("%s/cross-tab.html", testServer.url)
+
+			// Navigate page A first, wait for SW registration.
+			if _, err := pageA.Goto(url); err != nil {
+				t.Fatalf("goto A: %v", err)
+			}
+			waitForDone(t, pageA, "page A")
+
+			// Check page A registered with the ServiceWorker.
+			resultsA := extractResults(t, pageA)
+			assertBoolResult(t, resultsA, "swRegistered", true)
+
+			// Navigate page B, wait for SW registration.
+			if _, err := pageB.Goto(url); err != nil {
+				t.Fatalf("goto B: %v", err)
+			}
+			waitForDone(t, pageB, "page B")
+
+			// Check page B registered with the ServiceWorker.
+			resultsB := extractResults(t, pageB)
+			assertBoolResult(t, resultsB, "swRegistered", true)
+
+			// Wait for both pages to receive a peer channel.
+			// Page B's "hello" triggers channel creation for both.
+			err = playwright.NewPlaywrightAssertions().Page(pageA).ToHaveTitle("cross-tab", playwright.PageAssertionsToHaveTitleOptions{
+				Timeout: playwright.Float(100),
+			})
+			_ = err // ignore title check, just need a small delay
+
+			// Wait for each page to see one brokered peer.
+			waitForPeerCount(t, pageA, "page A", 1)
+			waitForPeerCount(t, pageB, "page B", 1)
+
+			// Re-read the results and fail on a missing peer.
+			resultsA = extractResults(t, pageA)
+			resultsB = extractResults(t, pageB)
+			pcA := toFloat64(resultsA["peerCount"])
+			pcB := toFloat64(resultsB["peerCount"])
+			if pcA < 1 {
+				t.Fatalf("page A: expected peerCount >= 1, got %v", resultsA["peerCount"])
+			}
+			if pcB < 1 {
+				t.Fatalf("page B: expected peerCount >= 1, got %v", pcB)
+			}
+
+			// Send a message from A to B.
+			if _, err := pageA.Evaluate("window.sendToPeers('hello from A')"); err != nil {
+				t.Fatalf("sendToPeers A: %v", err)
+			}
+
+			// Send a message from B to A.
+			if _, err := pageB.Evaluate("window.sendToPeers('hello from B')"); err != nil {
+				t.Fatalf("sendToPeers B: %v", err)
+			}
+
+			// Wait for each page to receive the other's message.
+			waitForMessageText(t, pageA, "page A", `{"text":"hello from B"}`)
+			waitForMessageText(t, pageB, "page B", `{"text":"hello from A"}`)
+
+			// Re-read the received message lists.
+			resultsA = extractResults(t, pageA)
+			resultsB = extractResults(t, pageB)
+			msgsA, _ := resultsA["messagesReceived"].([]any)
+			msgsB, _ := resultsB["messagesReceived"].([]any)
+
+			// Fail when either page received no message.
+			if len(msgsA) < 1 {
+				t.Errorf("page A: expected >= 1 message, got %d", len(msgsA))
+			} else {
+				t.Logf("page A received: %v", msgsA)
+			}
+			if len(msgsB) < 1 {
+				t.Errorf("page B: expected >= 1 message, got %d", len(msgsB))
+			} else {
+				t.Logf("page B received: %v", msgsB)
+			}
+		})
+	}
+}
+
+// TestCrossTabCleanup verifies that clients.matchAll() excludes closed tabs.
+// Opens 3 pages (all-to-all channels), closes one, opens a new page, and
+// verifies the new page only gets channels to the 2 remaining pages.
+func TestCrossTabCleanup(t *testing.T) {
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Run the closed-tab cleanup fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Launch a browser and a context that close with the test.
+			bt := browserType(browser)
+			bw, err := bt.Launch(playwright.BrowserTypeLaunchOptions{
+				Headless: new(true),
+			})
+			if err != nil {
+				t.Fatalf("launch %s: %v", browser, err)
+			}
+			defer bw.Close()
+
+			// Open a context in the browser.
+			ctx, err := bw.NewContext()
+			if err != nil {
+				t.Fatalf("new context: %v", err)
+			}
+			defer ctx.Close()
+
+			// Point every page at the cross-tab fixture.
+			url := fmt.Sprintf("%s/cross-tab.html", testServer.url)
+
+			// Helper to create a page with console logging.
+			newPage := func(label string) playwright.Page {
+				p, err := ctx.NewPage()
+				if err != nil {
+					t.Fatalf("new page %s: %v", label, err)
+				}
+				p.On("console", func(msg playwright.ConsoleMessage) {
+					t.Logf("[%s %s console.%s] %s", browser, label, msg.Type(), msg.Text())
+				})
+				return p
+			}
+
+			// Open page A and wait for its SW registration.
+			pageA := newPage("A")
+			if _, err := pageA.Goto(url); err != nil {
+				t.Fatalf("goto A: %v", err)
+			}
+			waitForDone(t, pageA, "page A")
+
+			// Open page B and wait for its SW registration.
+			pageB := newPage("B")
+			if _, err := pageB.Goto(url); err != nil {
+				t.Fatalf("goto B: %v", err)
+			}
+			waitForDone(t, pageB, "page B")
+
+			// Open page C and wait for its SW registration.
+			pageC := newPage("C")
+			if _, err := pageC.Goto(url); err != nil {
+				t.Fatalf("goto C: %v", err)
+			}
+			waitForDone(t, pageC, "page C")
+
+			// Wait for all-to-all channels (each page should have 2 peers).
+			pollPeerCount := func(pages []playwright.Page, labels []string, expected int) {
+				for j, p := range pages {
+					waitForPeerCount(t, p, "page "+labels[j], expected)
+				}
+			}
+
+			// Wait until all three pages see two peers.
+			pollPeerCount(
+				[]playwright.Page{pageA, pageB, pageC},
+				[]string{"A", "B", "C"},
+				2,
+			)
+
+			// Close page C.
+			if err := pageC.Close(); err != nil {
+				t.Fatalf("close C: %v", err)
+			}
+
+			// Open a new page D and wait for its SW registration.
+			pageD := newPage("D")
+			if _, err := pageD.Goto(url); err != nil {
+				t.Fatalf("goto D: %v", err)
+			}
+			waitForDone(t, pageD, "page D")
+
+			// D should get channels to A and B only (not C which is closed).
+			// clients.matchAll() returns only live clients.
+			pollPeerCount(
+				[]playwright.Page{pageD},
+				[]string{"D"},
+				2,
+			)
+
+			// Check page D sees exactly the two remaining peers.
+			resultsD := extractResults(t, pageD)
+			pcD := toFloat64(resultsD["peerCount"])
+			if pcD != 2 {
+				t.Errorf("page D: expected peerCount == 2, got %v", pcD)
+			}
+
+			// Verify D can exchange messages with the remaining pages.
+			if _, err := pageD.Evaluate("window.sendToPeers('hello from D')"); err != nil {
+				t.Fatalf("sendToPeers D: %v", err)
+			}
+
+			// Wait for pages A and B to receive D's message.
+			waitForMessageText(t, pageA, "page A", `{"text":"hello from D"}`)
+			waitForMessageText(t, pageB, "page B", `{"text":"hello from D"}`)
+
+			// A and B should receive D's message.
+			rA := extractResults(t, pageA)
+			rB := extractResults(t, pageB)
+			msgsA, _ := rA["messagesReceived"].([]any)
+			msgsB, _ := rB["messagesReceived"].([]any)
+
+			// A and B may have earlier messages from the all-to-all phase,
+			// so just check the latest includes D's message.
+			// Scan both message lists for D's message.
+			foundA := false
+			for _, m := range msgsA {
+				if s, ok := m.(string); ok && s == `{"text":"hello from D"}` {
+					foundA = true
+				}
+			}
+			foundB := false
+			for _, m := range msgsB {
+				if s, ok := m.(string); ok && s == `{"text":"hello from D"}` {
+					foundB = true
+				}
+			}
+
+			// Fail when either page missed D's message.
+			if !foundA {
+				t.Errorf("page A did not receive message from D, msgs: %v", msgsA)
+			}
+			if !foundB {
+				t.Errorf("page B did not receive message from D, msgs: %v", msgsB)
+			}
+		})
+	}
+}
+
+// TestCrossTabSWRestart verifies that existing MessagePorts survive
+// ServiceWorker unregister/re-register, and new tabs get fresh channels.
+func TestCrossTabSWRestart(t *testing.T) {
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Run the ServiceWorker restart fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Launch a browser and a context that close with the test.
+			bt := browserType(browser)
+			bw, err := bt.Launch(playwright.BrowserTypeLaunchOptions{
+				Headless: new(true),
+			})
+			if err != nil {
+				t.Fatalf("launch %s: %v", browser, err)
+			}
+			defer bw.Close()
+
+			// Open a context in the browser.
+			ctx, err := bw.NewContext()
+			if err != nil {
+				t.Fatalf("new context: %v", err)
+			}
+			defer ctx.Close()
+
+			// Point every page at the cross-tab fixture.
+			url := fmt.Sprintf("%s/cross-tab.html", testServer.url)
+
+			// Helper to create a page with console logging.
+			newPage := func(label string) playwright.Page {
+				p, err := ctx.NewPage()
+				if err != nil {
+					t.Fatalf("new page %s: %v", label, err)
+				}
+				p.On("console", func(msg playwright.ConsoleMessage) {
+					t.Logf("[%s %s console.%s] %s", browser, label, msg.Type(), msg.Text())
+				})
+				return p
+			}
+
+			// Open page A and wait for its SW registration.
+			pageA := newPage("A")
+			if _, err := pageA.Goto(url); err != nil {
+				t.Fatalf("goto A: %v", err)
+			}
+			waitForDone(t, pageA, "page A")
+
+			// Open page B and wait for its SW registration.
+			pageB := newPage("B")
+			if _, err := pageB.Goto(url); err != nil {
+				t.Fatalf("goto B: %v", err)
+			}
+			waitForDone(t, pageB, "page B")
+
+			// Wait for both pages to see one brokered peer.
+			waitForPeerCount(t, pageA, "page A", 1)
+			waitForPeerCount(t, pageB, "page B", 1)
+
+			// Verify messages flow before SW restart.
+			if _, err := pageA.Evaluate("window.sendToPeers('pre-restart')"); err != nil {
+				t.Fatalf("sendToPeers A: %v", err)
+			}
+			waitForMessageText(t, pageB, "page B", `{"text":"pre-restart"}`)
+
+			// Check page B recorded the pre-restart message.
+			rB := extractResults(t, pageB)
+			msgsB, _ := rB["messagesReceived"].([]any)
+			if len(msgsB) < 1 {
+				t.Fatalf("page B: no messages before SW restart")
+			}
+
+			// Unregister and re-register the ServiceWorker.
+			_, err = pageA.Evaluate(`(async () => {
+				const regs = await navigator.serviceWorker.getRegistrations();
+				for (const reg of regs) { await reg.unregister(); }
+				const reg = await navigator.serviceWorker.register('/cross-tab-sw.js');
+				const sw = reg.installing || reg.waiting || reg.active;
+				if (!sw) throw new Error('no SW after re-register');
+				await new Promise(resolve => {
+					if (sw.state === 'activated') { resolve(); return; }
+					sw.addEventListener('statechange', () => {
+						if (sw.state === 'activated') resolve();
+					});
+				});
+			})()`)
+			if err != nil {
+				t.Fatalf("SW restart: %v", err)
+			}
+
+			// Existing ports should still work (they are direct tab-to-tab).
+			// Send and wait after the restart.
+			if _, err := pageA.Evaluate("window.sendToPeers('post-restart')"); err != nil {
+				t.Fatalf("sendToPeers A post-restart: %v", err)
+			}
+			waitForMessageText(t, pageB, "page B", `{"text":"post-restart"}`)
+
+			// Check page B received the post-restart message.
+			rB = extractResults(t, pageB)
+			msgsB, _ = rB["messagesReceived"].([]any)
+			found := false
+			for _, m := range msgsB {
+				if s, ok := m.(string); ok && s == `{"text":"post-restart"}` {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("page B did not receive post-restart message, msgs: %v", msgsB)
+			}
+
+			// New tab connecting after restart should get fresh channels.
+			pageC := newPage("C")
+			if _, err := pageC.Goto(url); err != nil {
+				t.Fatalf("goto C: %v", err)
+			}
+			waitForDone(t, pageC, "page C")
+
+			// Wait for page C to see one fresh peer.
+			waitForPeerCount(t, pageC, "page C", 1)
+
+			// Check page C's peer count.
+			rC := extractResults(t, pageC)
+			pcC := toFloat64(rC["peerCount"])
+			if pcC < 1 {
+				t.Errorf("page C: expected peerCount >= 1 after SW restart, got %v", pcC)
+			}
+
+			// Verify C can send messages.
+			if _, err := pageC.Evaluate("window.sendToPeers('from C')"); err != nil {
+				t.Fatalf("sendToPeers C: %v", err)
+			}
+
+			// Wait for page A to receive C's message.
+			waitForMessageText(t, pageA, "page A", `{"text":"from C"}`)
+
+			// Check page A received C's message.
+			rA := extractResults(t, pageA)
+			msgsA, _ := rA["messagesReceived"].([]any)
+			foundC := false
+			for _, m := range msgsA {
+				if s, ok := m.(string); ok && s == `{"text":"from C"}` {
+					foundC = true
+				}
+			}
+			if !foundC {
+				t.Errorf("page A did not receive message from C after SW restart, msgs: %v", msgsA)
+			}
+		})
+	}
+}
+
+// TestCrossTabRpc verifies StarPC echo RPC over brokered cross-tab
+// MessagePort channels. Two pages each run a StarPC echo server on
+// incoming relay connections. Page A opens a sub-channel to B and
+// calls Echo. All 3 browsers.
+func TestCrossTabRpc(t *testing.T) {
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Run the cross-tab RPC fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Launch a browser and a context that close with the test.
+			t.Parallel()
+			bt := browserType(browser)
+			bw, err := bt.Launch(playwright.BrowserTypeLaunchOptions{
+				Headless: new(true),
+			})
+			if err != nil {
+				t.Fatalf("launch %s: %v", browser, err)
+			}
+			defer bw.Close()
+
+			// Open a context in the browser.
+			ctx, err := bw.NewContext()
+			if err != nil {
+				t.Fatalf("new context: %v", err)
+			}
+			defer ctx.Close()
+
+			// Point both pages at the cross-tab RPC fixture.
+			url := fmt.Sprintf("%s/cross-tab-rpc.html", testServer.url)
+
+			// Open page A with console logging.
+			pageA, err := ctx.NewPage()
+			if err != nil {
+				t.Fatalf("new page A: %v", err)
+			}
+			pageA.On("console", func(msg playwright.ConsoleMessage) {
+				t.Logf("[%s A console.%s] %s", browser, msg.Type(), msg.Text())
+			})
+			pageA.On("pageerror", func(err error) {
+				t.Logf("[%s A pageerror] %s", browser, err.Error())
+			})
+
+			// Open page B with console logging.
+			pageB, err := ctx.NewPage()
+			if err != nil {
+				t.Fatalf("new page B: %v", err)
+			}
+			pageB.On("console", func(msg playwright.ConsoleMessage) {
+				t.Logf("[%s B console.%s] %s", browser, msg.Type(), msg.Text())
+			})
+			pageB.On("pageerror", func(err error) {
+				t.Logf("[%s B pageerror] %s", browser, err.Error())
+			})
+
+			// Navigate both pages and wait for their SW registration.
+			if _, err := pageA.Goto(url); err != nil {
+				t.Fatalf("goto A: %v", err)
+			}
+			waitForDone(t, pageA, "page A")
+			if _, err := pageB.Goto(url); err != nil {
+				t.Fatalf("goto B: %v", err)
+			}
+			waitForDone(t, pageB, "page B")
+
+			// Wait for both pages to see one brokered peer.
+			waitForPeerCount(t, pageA, "page A", 1)
+			waitForPeerCount(t, pageB, "page B", 1)
+
+			// Fail when either page reports no peers.
+			rA := extractResults(t, pageA)
+			rB := extractResults(t, pageB)
+			if toFloat64(rA["peerCount"]) < 1 {
+				t.Fatalf("page A: no peers")
+			}
+			if toFloat64(rB["peerCount"]) < 1 {
+				t.Fatalf("page B: no peers")
+			}
+
+			// Get B's peer ID as seen by A.
+			peerIDs, err := pageA.Evaluate("Array.from(window.__peers?.keys?.() ?? [])")
+			if err != nil {
+				// Fall back: read the peer ID from the results on page B.
+				t.Logf("could not read peers from A: %v", err)
+			}
+			peerIDList, _ := peerIDs.([]any)
+			if len(peerIDList) == 0 {
+				t.Fatalf("page A has no peer IDs")
+			}
+			targetPeerId, _ := peerIDList[0].(string)
+			t.Logf("calling Echo from A to B (peer %s)", targetPeerId)
+
+			// Call Echo from A to B.
+			result, err := pageA.Evaluate(fmt.Sprintf(
+				"window.callEcho(%q, 'hello cross-tab')",
+				targetPeerId,
+			))
+			if err != nil {
+				t.Fatalf("callEcho: %v", err)
+			}
+
+			// Check the echo response body.
+			body, _ := result.(string)
+			if body != "hello cross-tab" {
+				t.Errorf("unexpected echo body: %q", body)
+			}
+			t.Logf("echo response: %q", body)
+		})
+	}
+}
+
+// TestTransportStreams verifies the transport factory openPairStream().
+// On Config B/C (Chromium, Firefox): creates a pair stream, sends data, verifies
+// round-trip through the factory's returned PacketStream.
+// On Config A/F (WebKit): verifies openPairStream is unavailable.
+func TestTransportStreams(t *testing.T) {
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Run the transport streams fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the transport-streams fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "transport-streams")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("transport-streams failed: %v", results["detail"])
+			}
+
+			// Log the detected comms config.
+			config, _ := results["config"].(string)
+			t.Logf("config=%s", config)
+
+			// Check pair stream expectations per browser.
+			switch browser {
+			case "chromium", "firefox":
+				assertBoolResult(t, results, "hasPairStream", true)
+				assertBoolResult(t, results, "pairStreamRoundTrip", true)
+			case "webkit":
+				// WebKit gets Config B (SAB available) or A (fallback).
+				hasPair, _ := results["hasPairStream"].(bool)
+				if config == "A" || config == "F" {
+					if hasPair {
+						t.Errorf("expected no pair stream on config %s", config)
+					}
+				}
+			}
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestSabRpc verifies StarPC echo RPC over a SAB pair stream between two
+// DedicatedWorkers. Server and client receive opposite ends of one bounded
+// SAB pair and run a full StarPC Echo round-trip.
+// Chromium + Firefox only (SAB requires cross-origin isolation).
+func TestSabRpc(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Run the SAB RPC fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the sab-rpc fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "sab-rpc")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("sab-rpc failed: %v", results["detail"])
+			}
+
+			// Check the echo body of the StarPC round-trip.
+			echoBody, _ := results["echoBody"].(string)
+			if echoBody != "hello via SAB pair" {
+				t.Errorf("unexpected echo body: %q", echoBody)
+			}
+
+			// Check the reported pair MTU bytes.
+			switch mtuBytes := results["mtuBytes"].(type) {
+			case int:
+				if mtuBytes != 32*1024 {
+					t.Errorf("unexpected pair MTU bytes: %v", mtuBytes)
+				}
+			case float64:
+				if mtuBytes != 32*1024 {
+					t.Errorf("unexpected pair MTU bytes: %v", mtuBytes)
+				}
+			default:
+				t.Errorf("unexpected pair MTU type: %T", results["mtuBytes"])
+			}
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestOpfsVolume verifies the full volume lifecycle: create, write, read,
+// persistence across reopen, WebLock isolation, and delete.
+func TestOpfsVolume(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Run the OPFS volume fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the opfs-volume fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "opfs-volume")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("opfs volume failed: %v", results["detail"])
+			}
+
+			// Assert each step of the volume lifecycle.
+			assertBoolResult(t, results, "createVolume", true)
+			assertBoolResult(t, results, "writeEntries", true)
+			assertBoolResult(t, results, "readEntries", true)
+			assertBoolResult(t, results, "persistence", true)
+			assertBoolResult(t, results, "deleteVolume", true)
+			assertBoolResult(t, results, "webLockIsolation", true)
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestOpfsKvtx verifies OPFS kvtx.Store operations: WebLock transactions,
+// read/write/delete, prefix scan, iteration, size, and crash recovery.
+func TestOpfsKvtx(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Run the OPFS kvtx fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the opfs-kvtx fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "opfs-kvtx")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("opfs kvtx failed: %v", results["detail"])
+			}
+
+			// Assert each kvtx.Store operation.
+			assertBoolResult(t, results, "readTx", true)
+			assertBoolResult(t, results, "writeTx", true)
+			assertBoolResult(t, results, "deleteTx", true)
+			assertBoolResult(t, results, "scanPrefix", true)
+			assertBoolResult(t, results, "scanPrefixKeys", true)
+			assertBoolResult(t, results, "iterate", true)
+			assertBoolResult(t, results, "size", true)
+			assertBoolResult(t, results, "crashRecovery", true)
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestOpfsPrimitives verifies OPFS file operations: directory creation,
+// file read/write/delete, listing, and error handling (NotFoundError).
+// OPFS requires a secure context; WebKit may not support it on localhost.
+func TestOpfsPrimitives(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Run the OPFS primitives fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the opfs-primitives fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "opfs-primitives")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("opfs primitives failed: %v", results["detail"])
+			}
+
+			// Assert the directory and file operations.
+			assertBoolResult(t, results, "getRoot", true)
+			assertBoolResult(t, results, "createDir", true)
+			assertBoolResult(t, results, "nestedDir", true)
+			assertBoolResult(t, results, "writeRead", true)
+			assertBoolResult(t, results, "overwrite", true)
+			assertBoolResult(t, results, "deleteFile", true)
+			assertBoolResult(t, results, "listDir", true)
+
+			// Assert the NotFoundError handling paths.
+			assertBoolResult(t, results, "notFoundFile", true)
+			assertBoolResult(t, results, "notFoundDir", true)
+			assertBoolResult(t, results, "deleteNotFound", true)
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestOpfsPerFileLock verifies the per-file WebLock protocol used by hydra's
+// OPFS volume stores: per-file exclusive locks, parallel writes to distinct
+// files, serialized writes to the same file, block store shard pattern, and
+// object store readers-writer ACID isolation.
+func TestOpfsPerFileLock(t *testing.T) {
+	browsers := []string{"chromium", "firefox"}
+	for _, browser := range browsers {
+		// Run the per-file WebLock fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Run the opfs-perfile-lock fixture and collect its results.
+			t.Parallel()
+			results := runFixture(t, browser, "opfs-perfile-lock")
+
+			// Fail when the fixture did not pass.
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("opfs per-file lock failed: %v", results["detail"])
+			}
+
+			// Assert each WebLock isolation pattern.
+			assertBoolResult(t, results, "perFileLock", true)
+			assertBoolResult(t, results, "parallelDistinct", true)
+			assertBoolResult(t, results, "serialSameFile", true)
+			assertBoolResult(t, results, "blockStorePattern", true)
+			assertBoolResult(t, results, "objStoreReadWrite", true)
+			assertBoolResult(t, results, "objStoreAcid", true)
+
+			// Log the fixture detail.
+			t.Logf("detail: %s", results["detail"])
+		})
+	}
+}
+
+// TestConfigAFallback verifies that without Cross-Origin Isolation headers,
+// detection returns Config A (no SAB, no SharedWorker hosting for plugins).
+// Uses a separate test server without COOP/COEP headers.
+func TestConfigAFallback(t *testing.T) {
+	if os.Getenv("RUN_NO_COI_E2E") == "" {
+		t.Skip("set RUN_NO_COI_E2E=1 to run the no-COI fallback browser test")
+	}
+
+	browsers := []string{"chromium", "firefox", "webkit"}
+	for _, browser := range browsers {
+		// Run the no-COI fallback fixture in a parallel subtest.
+		t.Run(browser, func(t *testing.T) {
+			// Start a test server without COOP/COEP headers.
+			t.Parallel()
+			noCOIServer, err := newTestServerNoCOI(distDir)
+			if err != nil {
+				t.Fatalf("create no-COI server: %v", err)
+			}
+			defer noCOIServer.Close()
+			noCOIURL := noCOIServer.URL
+
+			// Launch a browser and a context that close with the test.
+			bt := browserType(browser)
+			bw, err := bt.Launch(playwright.BrowserTypeLaunchOptions{
+				Headless: new(true),
+			})
+			if err != nil {
+				t.Fatalf("launch %s: %v", browser, err)
+			}
+			defer bw.Close()
+
+			// Open a context in the browser.
+			ctx, err := bw.NewContext()
+			if err != nil {
+				t.Fatalf("new context: %v", err)
+			}
+			defer ctx.Close()
+
+			// Open a page with console logging.
+			page, err := ctx.NewPage()
+			if err != nil {
+				t.Fatalf("new page: %v", err)
+			}
+			page.On("console", func(msg playwright.ConsoleMessage) {
+				t.Logf("[%s console.%s] %s", browser, msg.Type(), msg.Text())
+			})
+
+			// Load the detection page on the no-COI server.
+			url := fmt.Sprintf("%s/detect.html", noCOIURL)
+			if _, err := page.Goto(url); err != nil {
+				t.Fatalf("goto: %v", err)
+			}
+
+			// Wait for the fixture to complete.
+			logSel := page.Locator("#log")
+			if err := playwright.NewPlaywrightAssertions().Locator(logSel).ToContainText("DONE", playwright.LocatorAssertionsToContainTextOptions{
+				Timeout: playwright.Float(30000),
+			}); err != nil {
+				t.Fatalf("fixture did not complete: %v", err)
+			}
+
+			// Fail when the fixture did not pass.
+			results := extractResults(t, page)
+			if pass, ok := results["pass"].(bool); !ok || !pass {
+				t.Fatalf("detection failed: %v", results["detail"])
+			}
+
+			// Read the config and capability map.
+			config, _ := results["config"].(string)
+			caps, _ := results["caps"].(map[string]any)
+
+			// Without COI headers, crossOriginIsolated should be false.
+			coi, _ := caps["crossOriginIsolated"].(bool)
+			if coi {
+				t.Errorf("expected crossOriginIsolated=false without COI headers")
+			}
+
+			// SAB should be unavailable without cross-origin isolation.
+			sab, _ := caps["sabAvailable"].(bool)
+			if sab {
+				t.Errorf("expected sabAvailable=false without COI headers")
+			}
+
+			// Config should be A or F (fallback).
+			if config != "A" && config != "F" {
+				t.Errorf("expected config A or F, got %s", config)
+			}
+
+			// Log the fallback config.
+			t.Logf("config=%s (without COI headers)", config)
+		})
+	}
+}

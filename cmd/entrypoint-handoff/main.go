@@ -1,0 +1,64 @@
+//go:build !js
+
+package main
+
+import (
+	"context"
+	"io"
+	"os"
+
+	appcli "github.com/aperturerobotics/cli"
+	"github.com/s4wave/spacewave/cmd/entrypoint-handoff/handoff"
+)
+
+func main() {
+	// Configure the handoff command defaults and artifact flags.
+	args := &handoff.Args{}
+	args.FillDefaults()
+	app := appcli.NewApp()
+	app.Name = "entrypoint-handoff"
+	app.Usage = "build entrypoint release handoff artifacts"
+	app.Flags = []appcli.Flag{
+		&appcli.StringFlag{Name: "version", Usage: "release version", Destination: &args.Version},
+		&appcli.StringFlag{Name: "rev", Usage: "release revision for handoff manifest", Destination: &args.Rev},
+		&appcli.StringFlag{Name: "tag", Usage: "release tag for handoff manifest", Destination: &args.Tag},
+		&appcli.StringFlag{Name: "release-environment", Usage: "release environment for handoff manifest", Destination: &args.ReleaseEnvironment},
+		&appcli.StringFlag{Name: "git-sha", Usage: "source git SHA for handoff manifest", Destination: &args.GitSHA},
+		&appcli.StringFlag{Name: "run-id", Usage: "source GitHub run id for handoff manifest", Destination: &args.RunID},
+		&appcli.StringFlag{Name: "run-attempt", Usage: "source GitHub run attempt for handoff manifest", Destination: &args.RunAttempt},
+		&appcli.StringFlag{Name: "source-repo", Usage: "source GitHub repository for handoff manifest", Destination: &args.SourceRepo},
+		&appcli.StringFlag{Name: "workflow", Usage: "source GitHub workflow for handoff manifest", Destination: &args.Workflow},
+		&appcli.StringFlag{Name: "platforms", Usage: "comma-separated target platforms", Destination: &args.PlatformsCSV},
+		&appcli.StringFlag{Name: "out-dir", Usage: "path to the staged handoff output dir", Destination: &args.OutDir},
+		&appcli.StringFlag{Name: "browser-staging-dir", Usage: "browser staging tree for handoff manifest", Destination: &args.BrowserStagingDir},
+		&appcli.BoolFlag{Name: "react-dev", Usage: "build browser entrypoint in dev mode", Destination: &args.ReactDev},
+		&appcli.BoolFlag{Name: "skip-notarize", Usage: "skip Apple notarization during packaging", Destination: &args.SkipNotarize},
+		&appcli.BoolFlag{Name: "include-browser", Usage: "include browser staging tree", Destination: &args.IncludeBrowser},
+		&appcli.BoolFlag{Name: "browser-only", Usage: "build only browser staging tree", Destination: &args.BrowserOnly},
+		&appcli.BoolFlag{Name: "write-handoff-manifest", Usage: "write entrypoint-handoff.v1 manifest.json for a staged handoff root", Destination: &args.WriteHandoffManifest},
+		&appcli.BoolFlag{Name: "write-cli-handoff-manifest", Usage: "write cli-handoff.v1 manifest.json and staged CLI handoff root", Destination: &args.WriteCLIHandoffManifest},
+		&appcli.StringFlag{Name: "cli-artifacts-dir", Usage: "public CLI artifact directory for cli-handoff.v1", Destination: &args.CLIArtifactsDir},
+		&appcli.BoolFlag{Name: "skip-build", Usage: "skip helper and entrypoint builds and package existing artifacts", Destination: &args.SkipBuild},
+		&appcli.BoolFlag{Name: "skip-package", Usage: "skip installer packaging", Destination: &args.SkipPackage},
+		&appcli.BoolFlag{Name: "stage-build-inputs", Usage: "stage raw dist/helper/icon inputs into out-dir", Destination: &args.StageBuildInputs},
+		&appcli.BoolFlag{Name: "manifest-pack-produce", Usage: "produce one manifest-pack artifact and exit", Destination: &args.ManifestPackProduce},
+		&appcli.StringFlag{Name: "manifest-pack-import-dirs", Usage: "comma-separated manifest-pack artifact dirs to import before building", Destination: &args.ManifestPackImportDirsCSV},
+		&appcli.StringFlag{Name: "manifest-id", Usage: "manifest-pack manifest id", Destination: &args.ManifestID},
+		&appcli.StringFlag{Name: "manifest-platform", Usage: "manifest-pack platform id", Destination: &args.ManifestPlatformID},
+		&appcli.StringFlag{Name: "manifest-object-key", Usage: "manifest-pack bundle object key", Destination: &args.ManifestObjectKey},
+		&appcli.StringFlag{Name: "manifest-link-object-keys", Usage: "comma-separated manifest-pack link object keys", Destination: &args.ManifestLinkObjectKeysCSV},
+		&appcli.StringFlag{Name: "manifest-producer-target", Usage: "manifest-pack producer target name", Destination: &args.ManifestProducerTarget},
+		&appcli.StringFlag{Name: "manifest-cache-schema", Usage: "manifest-pack cache schema", Destination: &args.ManifestCacheSchema},
+		&appcli.StringFlag{Name: "manifest-dist-dir", Usage: "packaged directory replacing the produced manifest contents", Destination: &args.ManifestDistDir},
+		&appcli.StringFlag{Name: "manifest-entrypoint", Usage: "entrypoint path within --manifest-dist-dir", Destination: &args.ManifestEntrypoint},
+	}
+
+	// Run the handoff operation and report command failures to stderr.
+	app.Action = func(ctx *appcli.Context) error {
+		return handoff.Run(context.Background(), args)
+	}
+	if err := app.Run(os.Args); err != nil {
+		_, _ = io.WriteString(os.Stderr, err.Error()+"\n")
+		os.Exit(1)
+	}
+}

@@ -1,0 +1,311 @@
+package block
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestDecodedBlockCacheInvalidatedStoreTokenSkipsStore(t *testing.T) {
+	// Create a decoded cache and candidate entry for invalidation.
+	ctx := context.Background()
+	decodedBlocks := newTestDecodedBlockCache(t)
+	ref, key, blk, data := newDecodedBlockCacheTestEntry(t, "removed before store")
+
+	// Invalidate the candidate token before submitting its block.
+	token := decodedBlocks.storeToken(key.ref)
+	decodedBlocks.InvalidateRef(ctx, ref)
+	if err := decodedBlocks.Store(ctx, nil, token, key, blk, len(data), DurableReadGeneration(), false); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Verify the invalidated token cannot populate the cache.
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || ok {
+		t.Fatalf("invalidated store token lookup ok=%v err=%v, want miss", ok, err)
+	}
+}
+
+func TestDecodedBlockCacheInvalidationMakesEntriesStale(t *testing.T) {
+	// Create a decoded cache and reusable entry for invalidation checks.
+	ctx := context.Background()
+	decodedBlocks := newTestDecodedBlockCache(t)
+	ref, key, blk, data := newDecodedBlockCacheTestEntry(t, "cached entry")
+
+	// Store the entry and verify reference invalidation removes its hit.
+	storeDecodedBlockCacheTestEntry(t, decodedBlocks, key, blk, data)
+	if snap := decodedBlocks.Snapshot(); snap.Entries != 1 || snap.RetainedCost <= 0 {
+		t.Fatalf("snapshot after store entries=%d retained=%d, want 1 and a cost", snap.Entries, snap.RetainedCost)
+	}
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || !ok {
+		t.Fatalf("stored lookup ok=%v err=%v, want hit", ok, err)
+	}
+	decodedBlocks.InvalidateRef(ctx, ref)
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || ok {
+		t.Fatalf("lookup after InvalidateRef ok=%v err=%v, want miss", ok, err)
+	}
+	if snap := decodedBlocks.Snapshot(); snap.Entries != 0 {
+		t.Fatalf("snapshot after InvalidateRef entries=%d, want 0", snap.Entries)
+	}
+
+	// Restore the entry and verify whole-cache invalidation removes its hit.
+	storeDecodedBlockCacheTestEntry(t, decodedBlocks, key, blk, data)
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || !ok {
+		t.Fatalf("restored lookup ok=%v err=%v, want hit", ok, err)
+	}
+	decodedBlocks.InvalidateAll(ctx)
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || ok {
+		t.Fatalf("lookup after InvalidateAll ok=%v err=%v, want miss", ok, err)
+	}
+}
+
+func TestDecodedBlockCacheScopesShareBudgetNotEntries(t *testing.T) {
+	// Create independent decoded-cache scopes and a shared test entry.
+	ctx := context.Background()
+	first, second := NewDecodedBlockCache(), NewDecodedBlockCache()
+	defer first.Close()
+	defer second.Close()
+	_, key, blk, data := newDecodedBlockCacheTestEntry(t, "scoped entry")
+
+	// Verify cache scopes share their pool but keep entries isolated.
+	storeDecodedBlockCacheTestEntry(t, first, key, blk, data)
+	if _, ok, err := first.Lookup(ctx, nil, key, false); err != nil || !ok {
+		t.Fatalf("owning scope lookup ok=%v err=%v, want hit", ok, err)
+	}
+	if _, ok, err := second.Lookup(ctx, nil, key, false); err != nil || ok {
+		t.Fatalf("other scope lookup ok=%v err=%v, want miss", ok, err)
+	}
+	if first.pool != second.pool {
+		t.Fatal("NewDecodedBlockCache scopes use different pools")
+	}
+
+	// Close the first scope and verify the second scope retains its entries.
+	storeDecodedBlockCacheTestEntry(t, second, key, blk, data)
+	first.Close()
+	if _, ok, err := first.Lookup(ctx, nil, key, false); err != nil || ok {
+		t.Fatalf("closed scope lookup ok=%v err=%v, want miss", ok, err)
+	}
+	if _, ok, err := second.Lookup(ctx, nil, key, false); err != nil || !ok {
+		t.Fatalf("closing a scope cleared the shared pool: ok=%v err=%v", ok, err)
+	}
+}
+
+// newTestDecodedBlockCache constructs a cache with a private default pool.
+func newTestDecodedBlockCache(t *testing.T) *DecodedBlockCache {
+	// Create a private decoded cache and register its cleanup.
+	t.Helper()
+	decodedBlocks, err := NewDecodedBlockCacheWithOptions(DefaultDecodedBlockCacheOptions())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	t.Cleanup(decodedBlocks.Close)
+	return decodedBlocks
+}
+
+// newDecodedBlockCacheTestEntry builds a block holding contents with its ref
+// and cache key.
+func newDecodedBlockCacheTestEntry(
+	t testing.TB,
+	contents string,
+) (*BlockRef, decodedBlockCacheKey, *decodedBlockCacheTestBlock, []byte) {
+	// Create the decoded-cache test block, serialized bytes, and reference.
+	t.Helper()
+	blk := &decodedBlockCacheTestBlock{data: []byte(contents)}
+	data, err := blk.MarshalVT()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	ref, err := BuildBlockRef(data, nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Build the exact decoded-cache key from the block reference.
+	refKey, ok := decodedBlockCacheRefKey(ref)
+	if !ok {
+		t.Fatal("decoded block cache ref key was empty")
+	}
+	key := decodedBlockCacheKey{
+		ref:       refKey,
+		blockType: "db/block.decodedBlockCacheTestBlock",
+		transform: DecodedBlockCacheNoTransformKey,
+		trust:     decodedBlockCacheTrustKey,
+	}
+	return ref, key, blk, data
+}
+
+// storeDecodedBlockCacheTestEntry stores blk with a current token.
+func storeDecodedBlockCacheTestEntry(
+	t testing.TB,
+	decodedBlocks *DecodedBlockCache,
+	key decodedBlockCacheKey,
+	blk *decodedBlockCacheTestBlock,
+	data []byte,
+) {
+	t.Helper()
+	token := decodedBlocks.storeToken(key.ref)
+	if err := decodedBlocks.Store(context.Background(), nil, token, key, blk, len(data), DurableReadGeneration(), false); err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+type decodedBlockCacheTestBlock struct {
+	data []byte
+}
+
+func (b *decodedBlockCacheTestBlock) MarshalVT() ([]byte, error) {
+	return append([]byte(nil), b.data...), nil
+}
+
+func (b *decodedBlockCacheTestBlock) UnmarshalVT(data []byte) error {
+	b.data = append(b.data[:0], data...)
+	return nil
+}
+
+func (b *decodedBlockCacheTestBlock) CloneBlock() (Block, error) {
+	return &decodedBlockCacheTestBlock{data: append([]byte(nil), b.data...)}, nil
+}
+
+func (b *decodedBlockCacheTestBlock) SizeVT() int {
+	return len(b.data)
+}
+
+// TestSetSharedDecodedBlockCacheMaxCost resizes the process-wide pool.
+func TestSetSharedDecodedBlockCacheMaxCost(t *testing.T) {
+	// Raise the budget, restoring it afterward.
+	cache := NewDecodedBlockCache()
+	defer SetSharedDecodedBlockCacheMaxCost(cache.MaxCost())
+	SetSharedDecodedBlockCacheMaxCost(1 << 30)
+
+	// Expect every scope to report the new budget.
+	if got := cache.MaxCost(); got != 1<<30 {
+		t.Fatalf("max cost %d, want %d", got, 1<<30)
+	}
+	if got := cache.Snapshot().MaxCost; got != 1<<30 {
+		t.Fatalf("snapshot max cost %d, want %d", got, 1<<30)
+	}
+}
+
+// TestDecodedBlockCacheKeyExactLength checks that a pool key length-prefixes
+// each part, including parts whose lengths cross a digit, and that building
+// one allocates only the key.
+func TestDecodedBlockCacheKeyExactLength(t *testing.T) {
+	// Encode parts of 0, 9, 10 and 100 bytes.
+	c := &DecodedBlockCache{scope: "s/"}
+	key := decodedBlockCacheKey{
+		ref:       strings.Repeat("r", 9),
+		blockType: strings.Repeat("b", 10),
+		transform: strings.Repeat("x", 100),
+	}
+	want := "s/9:" + key.ref + "10:" + key.blockType + "100:" + key.transform + "0:"
+	if got := c.cacheKey(key); got != want {
+		t.Fatalf("cache key %q, want %q", got, want)
+	}
+
+	// Building the key allocates it once.
+	if allocs := testing.AllocsPerRun(100, func() { _ = c.cacheKey(key) }); allocs != 1 {
+		t.Fatalf("building a cache key allocates %v times, want 1", allocs)
+	}
+}
+
+// TestDisableSharedDecodedBlockCache checks that the shared pool serves
+// nothing once a process turns it off, neither an entry stored before nor one
+// stored after. Turning the pool off lasts for the process, so the test runs
+// in a child process of the test binary.
+func TestDisableSharedDecodedBlockCache(t *testing.T) {
+	// Rerun this test in a child process, and check that it ran and passed.
+	const childEnv = "SPACEWAVE_TEST_DISABLE_SHARED_DECODED_BLOCK_CACHE"
+	if os.Getenv(childEnv) == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestDisableSharedDecodedBlockCache$", "-test.v")
+		cmd.Env = append(os.Environ(), childEnv+"=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "--- PASS: TestDisableSharedDecodedBlockCache") {
+			t.Fatalf("child process err=%v output:\n%s", err, out)
+		}
+		return
+	}
+
+	// Store an entry in a scope of the shared pool, which serves it.
+	ctx := context.Background()
+	decodedBlocks := NewDecodedBlockCache()
+	t.Cleanup(decodedBlocks.Close)
+	_, key, blk, data := newDecodedBlockCacheTestEntry(t, "cached before off")
+	storeDecodedBlockCacheTestEntry(t, decodedBlocks, key, blk, data)
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || !ok {
+		t.Fatalf("lookup before off ok=%v err=%v, want hit", ok, err)
+	}
+
+	// Turn the pool off: the stored entry and a new store both miss.
+	DisableSharedDecodedBlockCache()
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || ok {
+		t.Fatalf("lookup after off ok=%v err=%v, want miss", ok, err)
+	}
+	storeDecodedBlockCacheTestEntry(t, decodedBlocks, key, blk, data)
+	if _, ok, err := decodedBlocks.Lookup(ctx, nil, key, false); err != nil || ok {
+		t.Fatalf("lookup of a store after off ok=%v err=%v, want miss", ok, err)
+	}
+}
+
+// TestDecodedBlockHitObserver checks that a read served by a decoded-block
+// cache reports its ref to the observer, and that a miss reports nothing.
+func TestDecodedBlockHitObserverAndHolds(t *testing.T) {
+	// Start a decoded cache, an observer and two holds on one read context.
+	ctx := context.Background()
+	cache, err := NewDecodedBlockCacheWithOptions(DecodedBlockCacheOptions{MaxCost: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cache.Close)
+	var seen []*BlockRef
+	SetDecodedBlockHitObserver(func(ref *BlockRef) { seen = append(seen, ref) })
+	t.Cleanup(func() { SetDecodedBlockHitObserver(nil) })
+	EnableRefHolds()
+	ref, key, blk, data := newDecodedBlockCacheTestEntry(t, "observed")
+	ctx = WithDecodedBlockCache(ctx, cache)
+	view, part := NewRefHold(), NewRefHold()
+	view.Keep(part)
+
+	// A miss reaches neither the observer nor the hold.
+	if _, ok, err := lookupDecodedBlock(WithRefHold(ctx, view), ref, key, true); err != nil || ok || len(seen) != 0 || Held(ref.GetHash()) {
+		t.Fatalf("miss: ok=%v err=%v observed %d held %v", ok, err, len(seen), Held(ref.GetHash()))
+	}
+
+	// A hit reaches the observer and holds the block in each hold it reads in.
+	storeDecodedBlockCacheTestEntry(t, cache, key, blk, data)
+	for _, h := range []*RefHold{view, view, part} {
+		if _, ok, err := lookupDecodedBlock(WithRefHold(ctx, h), ref, key, true); err != nil || !ok {
+			t.Fatalf("hit: ok=%v err=%v", ok, err)
+		}
+	}
+	if len(seen) != 3 || !seen[0].EqualsRef(ref) || view.Len() != 1 || part.Len() != 1 || !Held(ref.GetHash()) {
+		t.Fatalf("hits: observed %d, view %d part %d held %v", len(seen), view.Len(), part.Len(), Held(ref.GetHash()))
+	}
+
+	// Releasing one hold leaves the block held by the other, and a released
+	// hold records no later read.
+	view.Release()
+	if !Held(ref.GetHash()) {
+		t.Fatal("block dropped while the part still holds it")
+	}
+	if _, _, err := lookupDecodedBlock(WithRefHold(ctx, view), ref, key, true); err != nil || view.Len() != 0 {
+		t.Fatalf("released hold recorded a read: len %d err %v", view.Len(), err)
+	}
+
+	// A hold nothing references releases its blocks once collected.
+	part = nil
+	for i := 0; i < 50 && Held(ref.GetHash()); i++ {
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+	if Held(ref.GetHash()) {
+		t.Fatal("block still held after its last hold was collected")
+	}
+
+	// The two holds shared one slot, which the last release freed.
+	if st := ReadRefHoldStats(); st.Blocks != 0 || st.Slots != 1 {
+		t.Fatalf("held table: %+v", st)
+	}
+}

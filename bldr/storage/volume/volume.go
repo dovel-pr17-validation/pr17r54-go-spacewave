@@ -1,0 +1,115 @@
+package storage_volume
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/config"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/controllerbus/controller/loader"
+	"github.com/aperturerobotics/controllerbus/controller/resolver"
+	"github.com/aperturerobotics/controllerbus/directive"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/bldr/storage"
+	"github.com/s4wave/spacewave/db/volume"
+	"github.com/sirupsen/logrus"
+)
+
+// ControllerID identifies the storage volume controller.
+const ControllerID = "bldr/storage/volume"
+
+// Version is the version of the redis implementation.
+var Version = controller.MustParseVersion("0.0.1")
+
+// BuildVolumeControllerConfig builds a new storage volume config by accessing the Storage on the bus.
+func BuildVolumeControllerConfig(
+	ctx context.Context,
+	le *logrus.Entry,
+	b bus.Bus,
+	conf *Config,
+) (config.Config, storage.Storage, error) {
+	volumeConf, av, _, ref, err := bus.ExecOneOffWithXfrmTyped(
+		ctx,
+		b,
+		storage.NewLookupStorage(conf.GetStorageId()),
+		nil,
+		nil,
+		func(val directive.TypedAttachedValue[storage.LookupStorageValue]) (config.Config, bool, error) {
+			// true above sets waitOne (wait for at least one)
+			volConf, err := val.GetValue().BuildVolumeConfig(conf.GetStorageVolumeId(), conf.GetVolumeConfig())
+			if err != nil {
+				return nil, false, err
+			}
+			if volConf == nil {
+				return nil, false, nil
+			}
+			return volConf, true, nil
+		},
+	)
+	// we can release the LookupStorage once we match it.
+	if ref != nil {
+		ref.Release()
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// st is the selected storage
+	return volumeConf, av.GetValue(), nil
+}
+
+// BuildVolumeController executes BuildVolumeControllerConfig followed by ExLoadFactoryByConfig then constructs the controller.
+func BuildVolumeController(ctx context.Context, le *logrus.Entry, b bus.Bus, conf *Config) (volume.Controller, storage.Storage, error) {
+	// Resolve the storage selection into a volume controller configuration.
+	volConf, st, err := BuildVolumeControllerConfig(ctx, le, b, conf)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Retain the factory that constructs the selected volume controller.
+	factory, factoryRef, err := resolver.ExLoadFactoryByConfig(ctx, b, volConf)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer factoryRef.Release()
+
+	// Construct the selected volume controller with its storage logger.
+	ctrl, err := factory.Construct(ctx, volConf, controller.ConstructOpts{
+		Logger: le,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Require a volume controller before returning the selected storage.
+	volCtrl, volCtrlOk := ctrl.(volume.Controller)
+	if !volCtrlOk {
+		_ = ctrl.Close()
+		return nil, nil, errors.Errorf("storage %q returned volume config that was not a volume controller: %s", conf.GetStorageId(), volConf.GetConfigID())
+	}
+
+	return volCtrl, st, err
+}
+
+// ExecVolumeController executes the volume controller on the bus and returns the volume controller.
+func ExecVolumeController(ctx context.Context, b bus.Bus, conf *Config) (volume.Controller, directive.Reference, error) {
+	// Wait for the configured volume controller to run on the bus.
+	volCtrli, _, ref, err := loader.WaitExecControllerRunning(
+		ctx,
+		b,
+		resolver.NewLoadControllerWithConfig(conf),
+		nil,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Require a volume controller before transferring its directive reference.
+	volCtrl, ok := volCtrli.(volume.Controller)
+	if !ok {
+		ref.Release()
+		return nil, nil, errors.New("volume controller returned invalid value")
+	}
+
+	return volCtrl, ref, nil
+}

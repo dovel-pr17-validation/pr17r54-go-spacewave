@@ -1,0 +1,219 @@
+package cdn_sharedobject
+
+import (
+	"context"
+
+	"github.com/aperturerobotics/controllerbus/bus"
+	"github.com/aperturerobotics/controllerbus/controller"
+	"github.com/aperturerobotics/util/routine"
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/core/sobject"
+	"github.com/s4wave/spacewave/db/block"
+	block_transform "github.com/s4wave/spacewave/db/block/transform"
+	transform_all "github.com/s4wave/spacewave/db/block/transform/all"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	world_block "github.com/s4wave/spacewave/db/world/block"
+	"github.com/sirupsen/logrus"
+)
+
+// WorldEngine is the read-only world engine constructed for a CdnSharedObject.
+// A background routine watches the CDN block store's root pointer and advances
+// Engine via SetRootRef whenever the pointer changes. The store replaces its
+// pack manifest with each new pointer, including the TTL refresh made by any
+// block read, and a reclaimed root drops the packs of the previous head, so
+// the head must follow every pointer the store publishes.
+type WorldEngine struct {
+	// Engine is the read-only world block engine. The engine's own root ref
+	// (via GetRootRef) is authoritative for the currently applied head.
+	Engine *world_block.Engine
+	// Cursor is the underlying root bucket cursor held by the engine. Release
+	// via WorldEngine.Release when done; Engine itself does not own it.
+	Cursor *bucket_lookup.Cursor
+
+	// so is the shared object whose published head Engine follows.
+	so *CdnSharedObject
+	// bucketID is the CDN block store ID that authored refs resolve through.
+	bucketID string
+	// refresh runs the root pointer watcher goroutine; owned by Release.
+	refresh *routine.RoutineContainer
+}
+
+// NewWorldEngine builds a read-only *world_block.Engine against the CDN
+// SharedObject's current published head. Returns an error when the CDN Space
+// has no published root yet, when decoding the head state fails, or when the
+// head ref lacks a transform config. The returned engine is suitable for
+// wrapping in a resource.space SpaceSharedObjectBody.
+//
+// The caller owns the returned WorldEngine and must call Release when done.
+// Operation lookup belongs to the resource serving this engine.
+//
+// A background routine is started to watch the block store's root pointer
+// and advance the engine's root ref via SetRootRef whenever the pointer
+// changes. The routine exits when Release is called.
+func NewWorldEngine(
+	ctx context.Context,
+	le *logrus.Entry,
+	b bus.Bus,
+	so *CdnSharedObject,
+) (*WorldEngine, error) {
+	// Require a published head before constructing a readable world.
+	inner, err := so.GetHeadInnerState()
+	if err != nil {
+		return nil, errors.Wrap(err, "load cdn head inner state")
+	}
+	if inner == nil || inner.GetHeadRef() == nil {
+		if refreshErr := so.RefreshSnapshot(ctx); refreshErr != nil {
+			return nil, errors.Wrap(refreshErr, "fetch cdn root pointer")
+		}
+		inner, err = so.GetHeadInnerState()
+		if err != nil {
+			return nil, errors.Wrap(err, "load cdn head inner state")
+		}
+		if inner == nil || inner.GetHeadRef() == nil {
+			return nil, sobject.NewSharedObjectHealthError(
+				sobject.NewSharedObjectLoadingHealth(
+					sobject.SharedObjectHealthLayer_SHARED_OBJECT_HEALTH_LAYER_SHARED_OBJECT,
+				),
+				errors.New("cdn shared object has no published head"),
+			)
+		}
+	}
+
+	// Route authored bucket references through the CDN block store.
+	headRef := inner.GetHeadRef().CloneVT()
+	bucketID := so.GetBlockStore().GetID()
+	headRef.BucketId = bucketID
+
+	// Decode the published head with its declared transform chain.
+	sfs := transform_all.BuildFactorySet()
+	transformConf := headRef.GetTransformConf()
+	xfrm := block_transform.NewTransformerWithSteps(nil)
+	if len(transformConf.GetSteps()) != 0 {
+		xfrm, err = block_transform.NewTransformer(
+			controller.ConstructOpts{Logger: le},
+			sfs,
+			transformConf,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "build transformer")
+		}
+	}
+
+	// Share decoded blocks with sibling engines over this store.
+	blockStore := so.GetBlockStore()
+	decodedBlocks := blockStore.GetDecodedBlockCache()
+	if decodedBlocks == nil {
+		decodedBlocks = block.NewDecodedBlockCache()
+	}
+
+	// Hold the CDN cursor for every read and subsequent head update.
+	cursor := bucket_lookup.NewCursor(
+		ctx,
+		b,
+		le,
+		sfs,
+		blockStore,
+		xfrm,
+		headRef,
+		&bucket.BucketOpArgs{
+			BucketId: bucketID,
+			VolumeId: bucketID,
+		},
+		transformConf,
+	)
+	cursor.SetBucketIDOverride(bucketID)
+	cursor.SetDecodedBlockCache(decodedBlocks)
+
+	// Build state access without importing application operation handlers.
+	bengine, err := world_block.NewEngine(ctx, le, cursor, nil, nil, false)
+	if err != nil {
+		cursor.Release()
+		return nil, errors.Wrap(err, "new world engine")
+	}
+
+	// Retain the engine and cursor for release after the caller finishes reading.
+	w := &WorldEngine{
+		Engine:   bengine,
+		Cursor:   cursor,
+		so:       so,
+		bucketID: bucketID,
+	}
+
+	// Follow the root pointer for the lifetime of the returned engine.
+	w.refresh = routine.NewRoutineContainerWithLogger(le)
+	w.refresh.SetRoutine(func(rctx context.Context) error {
+		ptr := so.bs.Pointer()
+		for {
+			// Apply the head of the current pointer.
+			if err := w.applyHead(rctx); err != nil {
+				if rctx.Err() != nil {
+					return rctx.Err()
+				}
+				le.WithError(err).Warn("cdn engine refresh failed")
+			}
+
+			// Wait for the store to publish another pointer.
+			next, err := so.bs.WaitPointer(rctx, ptr)
+			if err != nil {
+				return err
+			}
+			ptr = next
+		}
+	})
+	w.refresh.SetContext(ctx, true)
+	return w, nil
+}
+
+// Release stops the refresh routine, waits for it to exit, and releases the
+// underlying cursor.
+// Safe to call more than once; the cursor's own Release guards against
+// double-release.
+func (w *WorldEngine) Release() {
+	// Stop head updates before releasing their backing resources.
+	if w == nil {
+		return
+	}
+	if w.refresh != nil {
+		// Wait for a head update in flight, which reads through the cursor.
+		if exited, _ := w.refresh.SetRoutine(nil); exited != nil {
+			<-exited
+		}
+		w.refresh = nil
+	}
+
+	// Drop the cursor reference held for this engine.
+	if w.Cursor != nil {
+		w.Cursor.Release()
+		w.Cursor = nil
+	}
+}
+
+// Refresh fetches the published root pointer and advances Engine to its head
+// before returning. The refresh routine applies the same head when it observes
+// the new pointer, so a caller that must read the new head right away, such
+// as the writer of the root pointer, calls Refresh instead of waiting for it.
+func (w *WorldEngine) Refresh(ctx context.Context) error {
+	if err := w.so.RefreshSnapshot(ctx); err != nil {
+		return err
+	}
+	return w.applyHead(ctx)
+}
+
+// applyHead advances Engine to the shared object's published head. It does
+// nothing before the first published head.
+func (w *WorldEngine) applyHead(ctx context.Context) error {
+	// Decode the published head.
+	inner, err := w.so.GetHeadInnerState()
+	if err != nil {
+		return errors.Wrap(err, "decode cdn head inner state")
+	}
+	if inner.GetHeadRef() == nil {
+		return nil
+	}
+
+	// Resolve the head through the CDN bucket and apply it to the engine.
+	ref := inner.GetHeadRef().CloneVT()
+	ref.BucketId = w.bucketID
+	return errors.Wrap(w.Engine.SetRootRef(ctx, ref), "set cdn head")
+}

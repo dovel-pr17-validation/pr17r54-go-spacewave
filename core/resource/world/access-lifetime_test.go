@@ -1,0 +1,267 @@
+//go:build !js
+
+package resource_world_test
+
+import (
+	"context"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	resource_server "github.com/s4wave/spacewave/bldr/resource/server"
+	resource_world "github.com/s4wave/spacewave/core/resource/world"
+	"github.com/s4wave/spacewave/db/bucket"
+	bucket_lookup "github.com/s4wave/spacewave/db/bucket/lookup"
+	"github.com/s4wave/spacewave/db/world"
+	s4wave_bucket_lookup "github.com/s4wave/spacewave/sdk/bucket/lookup"
+	s4wave_world "github.com/s4wave/spacewave/sdk/world"
+	"github.com/sirupsen/logrus"
+)
+
+// lifetimeEngine counts open read transactions and AccessWorldState callbacks.
+type lifetimeEngine struct {
+	world.Engine
+	openTxs       atomic.Int32
+	openCallbacks atomic.Int32
+}
+
+func (e *lifetimeEngine) NewTransaction(ctx context.Context, write bool) (world.Tx, error) {
+	tx, err := e.Engine.NewTransaction(ctx, write)
+	if err != nil {
+		return nil, err
+	}
+	e.openTxs.Add(1)
+	return &lifetimeTx{Tx: tx, engine: e}, nil
+}
+
+func (e *lifetimeEngine) AccessWorldState(ctx context.Context, ref *bucket.ObjectRef, cb func(*bucket_lookup.Cursor) error) error {
+	return e.Engine.AccessWorldState(ctx, ref, func(c *bucket_lookup.Cursor) error {
+		e.openCallbacks.Add(1)
+		defer e.openCallbacks.Add(-1)
+		return cb(c)
+	})
+}
+
+type lifetimeTx struct {
+	world.Tx
+	engine    *lifetimeEngine
+	discarded atomic.Bool
+}
+
+func (tx *lifetimeTx) Discard() {
+	if tx.discarded.CompareAndSwap(false, true) {
+		tx.engine.openTxs.Add(-1)
+	}
+	tx.Tx.Discard()
+}
+
+// watchWorldStateTestStream records WatchWorldState responses.
+type watchWorldStateTestStream struct {
+	srpc.Stream
+	ctx  context.Context
+	sent chan *s4wave_world.WatchWorldStateResponse
+}
+
+func (s *watchWorldStateTestStream) Context() context.Context { return s.ctx }
+
+func (s *watchWorldStateTestStream) Send(resp *s4wave_world.WatchWorldStateResponse) error {
+	s.sent <- resp
+	return nil
+}
+
+func (s *watchWorldStateTestStream) SendAndClose(resp *s4wave_world.WatchWorldStateResponse) error {
+	return s.Send(resp)
+}
+
+func waitForCount(t *testing.T, name string, count *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for count.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %d, want %d", name, count.Load(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestWatchWorldStateDiscardsTrackedTransaction proves each tracked
+// WatchWorldState snapshot transaction is discarded when the watch ends.
+func TestWatchWorldStateDiscardsTrackedTransaction(t *testing.T) {
+
+	// context ctx.
+	ctx := t.Context()
+	tb, cleanup := setupWorldTestbed(ctx, t)
+	defer cleanup()
+
+	// Record engine.
+	engine := &lifetimeEngine{Engine: tb.Engine}
+	resourceCtx := &worldStateOperationResourceContext{ctx: ctx}
+	watchCtx, watchCancel := context.WithCancel(resource_server.WithResourceClientContext(ctx, resourceCtx))
+	defer watchCancel()
+
+	// newEntry le via logrus.
+	le := logrus.NewEntry(logrus.New())
+	engineResource := resource_world.NewEngineResource(le, tb.Bus, engine, nil, nil)
+	defer engineResource.Close()
+
+	// make stream.
+	stream := &watchWorldStateTestStream{ctx: watchCtx, sent: make(chan *s4wave_world.WatchWorldStateResponse, 1)}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engineResource.WatchWorldState(&s4wave_world.WatchWorldStateRequest{}, stream)
+	}()
+
+	// Perform the action.
+	var tracked *s4wave_world.WatchWorldStateResponse
+	select {
+	case tracked = <-stream.sent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for tracked world state")
+	}
+	if got := engine.openTxs.Load(); got != 1 {
+		t.Fatalf("open transactions while watching = %d, want 1", got)
+	}
+
+	// Open a child resource from the tracked world state.
+	trackedClient, err := resourceCtx.GetAttachedResource(tracked.GetResourceId())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	trackedService := s4wave_world.NewSRPCWorldStateResourceServiceClient(trackedClient)
+	child, err := trackedService.AccessWorldState(resource_server.WithResourceClientContext(ctx, resourceCtx), &s4wave_world.AccessWorldStateRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// watchCancel.
+	watchCancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for watch to return")
+	}
+
+	// The adopted child keeps the snapshot transaction open.
+	if got := engine.openTxs.Load(); got != 1 {
+		t.Fatalf("open transactions with live child = %d, want 1", got)
+	}
+	if !resourceCtx.ReleaseResource(child.GetResourceId()) {
+		t.Fatal("child resource was not registered")
+	}
+	waitForCount(t, "open transactions after child release", &engine.openTxs, 0)
+}
+
+// TestAccessWorldStateCursorLivesUntilRelease proves the AccessWorldState
+// cursor stays inside its engine callback until the resource is released.
+func TestAccessWorldStateCursorLivesUntilRelease(t *testing.T) {
+
+	// context ctx.
+	ctx := t.Context()
+	tb, cleanup := setupWorldTestbed(ctx, t)
+	defer cleanup()
+
+	// Record engine.
+	engine := &lifetimeEngine{Engine: tb.Engine}
+	resourceCtx := &worldStateOperationResourceContext{ctx: ctx}
+	rpcCtx := resource_server.WithResourceClientContext(ctx, resourceCtx)
+
+	// newEntry le via logrus.
+	le := logrus.NewEntry(logrus.New())
+	engineResource := resource_world.NewEngineResource(le, tb.Bus, engine, nil, nil)
+	defer engineResource.Close()
+
+	// accessWorldState resp,err via engineResource.
+	resp, err := engineResource.AccessWorldState(rpcCtx, &s4wave_world.AccessWorldStateRequest{})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if got := engine.openCallbacks.Load(); got != 1 {
+		t.Fatalf("open AccessWorldState callbacks = %d, want 1", got)
+	}
+
+	// The cursor remains usable after the RPC returns.
+	client, err := resourceCtx.GetAttachedResource(resp.GetResourceId())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	cursorService := s4wave_bucket_lookup.NewSRPCBucketLookupCursorResourceServiceClient(client)
+	if _, err := cursorService.GetRef(ctx, &s4wave_bucket_lookup.GetRefRequest{}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Check the condition before continuing.
+	if !resourceCtx.ReleaseResource(resp.GetResourceId()) {
+		t.Fatal("cursor resource was not registered")
+	}
+	waitForCount(t, "open AccessWorldState callbacks after release", &engine.openCallbacks, 0)
+}
+
+// replacementOrderStream records, for each WatchWorldState response, whether
+// the previously sent snapshot resource was still registered at send time.
+type replacementOrderStream struct {
+	watchWorldStateTestStream
+	resourceCtx *worldStateOperationResourceContext
+	prevID      uint32
+	prevLive    chan bool
+}
+
+func (s *replacementOrderStream) Send(resp *s4wave_world.WatchWorldStateResponse) error {
+	// Report whether the superseded snapshot is still registered.
+	if s.prevID != 0 {
+		_, live := s.resourceCtx.releases[s.prevID]
+		s.prevLive <- live
+	}
+	s.prevID = resp.GetResourceId()
+	return s.watchWorldStateTestStream.Send(resp)
+}
+
+// TestWatchWorldStateSendsReplacementBeforeRelease proves a change publishes
+// the replacement snapshot before the watch releases the superseded one.
+func TestWatchWorldStateSendsReplacementBeforeRelease(t *testing.T) {
+	// Start a World testbed.
+	ctx := t.Context()
+	tb, cleanup := setupWorldTestbed(ctx, t)
+	defer cleanup()
+
+	// Start the watch against a recording resource context.
+	resourceCtx := &worldStateOperationResourceContext{ctx: ctx}
+	rpcCtx := resource_server.WithResourceClientContext(ctx, resourceCtx)
+	engineResource := resource_world.NewEngineResource(logrus.NewEntry(logrus.New()), tb.Bus, tb.Engine, nil, nil)
+	defer engineResource.Close()
+	stream := &replacementOrderStream{
+		watchWorldStateTestStream: watchWorldStateTestStream{ctx: rpcCtx, sent: make(chan *s4wave_world.WatchWorldStateResponse, 1)},
+		resourceCtx:               resourceCtx,
+		prevLive:                  make(chan bool, 1),
+	}
+	go func() {
+		_ = engineResource.WatchWorldState(&s4wave_world.WatchWorldStateRequest{}, stream)
+	}()
+
+	// Track a missing object through the first snapshot.
+	first := <-stream.sent
+	trackedClient, err := resourceCtx.GetAttachedResource(first.GetResourceId())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	objKey := "watch-replacement-object"
+	trackedService := s4wave_world.NewSRPCWorldStateResourceServiceClient(trackedClient)
+	if _, err := trackedService.GetObject(rpcCtx, &s4wave_world.GetObjectRequest{ObjectKey: objKey}); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Create the object to supersede the first snapshot.
+	obj, err := world.NewEngineWorldState(tb.Engine, true).CreateObject(ctx, objKey, &bucket.ObjectRef{})
+	world.ReleaseObjectState(obj)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// The first snapshot is still registered when its replacement is sent.
+	if !<-stream.prevLive {
+		t.Fatal("watch released the superseded snapshot before sending its replacement")
+	}
+	if second := <-stream.sent; second.GetResourceId() == first.GetResourceId() {
+		t.Fatal("replacement reused the superseded resource ID")
+	}
+}

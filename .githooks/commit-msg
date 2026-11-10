@@ -1,0 +1,118 @@
+#!/bin/sh
+# Reject a commit message that is too wide or carries no sign-off.
+#
+# Wrapped bodies read cleanly in git log, email review, and the GitHub
+# commit view. Trailers and raw URL lines are exempt because wrapping
+# breaks them; comment lines are stripped by git anyway.
+#
+# A commit names its author and Signed-off-by and credits no co-author,
+# person or tool, so a Co-authored-by trailer is rejected.
+#
+# The sign-off rule is the one CONTRIBUTING.md states and the DCO workflow
+# checks, moved to commit time so the author sees it while the commit is
+# still cheap to amend rather than after a push and a CI round.
+
+set -eu
+
+msg=${1:?commit message path required}
+max_columns=${COMMIT_MSG_MAX_COLUMNS:-80}
+
+case "$max_columns" in
+	*[!0-9]*|"")
+		printf 'commit-msg: COMMIT_MSG_MAX_COLUMNS must be a positive integer\n' >&2
+		exit 1
+		;;
+esac
+
+failed=0
+
+awk -v max_columns="$max_columns" '
+function ignored_line(line) {
+	if (line ~ /^[ \t]*$/) {
+		return 1
+	}
+	if (line ~ /^#/) {
+		return 1
+	}
+	if (line ~ /^[ \t]*https?:\/\//) {
+		return 1
+	}
+	if (line ~ /^(Acked-by|Cc|Co-authored-by|Fixes|Reported-by|Reviewed-by|Signed-off-by|Suggested-by|Tested-by): /) {
+		return 1
+	}
+	return 0
+}
+
+/^# -+ >8 -+/ {
+	stop = 1
+}
+
+/^diff --git / {
+	stop = 1
+}
+
+stop {
+	next
+}
+
+!ignored_line($0) && length($0) > max_columns {
+	if (!failed) {
+		printf "commit-msg: commit message prose exceeds %d columns\n", max_columns > "/dev/stderr"
+	}
+	printf "  line %d: %d columns\n", NR, length($0) > "/dev/stderr"
+	failed = 1
+}
+
+END {
+	if (failed) {
+		printf "Wrap commit message prose at %d columns.\n", max_columns > "/dev/stderr"
+		printf "Trailer lines and raw URLs are exempt because wrapping breaks them.\n", max_columns > "/dev/stderr"
+		exit 1
+	}
+}
+' "$msg" || failed=1
+
+if sed '/^# -* >8 -*$/q' "$msg" | grep -v '^#' | grep -qi '^[[:space:]]*co-authored-by:'; then
+	printf 'commit-msg: remove the Co-authored-by trailer; the author and\n' >&2
+	printf 'Signed-off-by identify who wrote the commit.\n' >&2
+	failed=1
+fi
+
+# Two things have to hold, and each one catches what the other misses.
+#
+# The trailer has to sit in the trailer block, so a Signed-off-by line quoted
+# inside the prose cannot satisfy the rule. interpret-trailers drops the comment
+# lines and the scissors block on its own. The separator is pinned because
+# trailer.separators is a personal preference and git commit -s writes a colon
+# whatever it says, so honoring it here would reject a signed commit.
+#
+# The line also has to be written the way .github/workflows/dco.yml demands,
+# which is the exact case-sensitive unfolded form. --parse implies --unfold and
+# canonicalizes what it hands back, so a lowercase or folded sign-off reaches
+# the loop below looking correct and then fails the workflow after a push. That
+# push is the round trip this hook exists to prevent, so the raw message is
+# checked against the workflow's own pattern as well.
+signed_off=0
+trailers=$(git -c trailer.separators=: interpret-trailers --parse "$msg" | grep -i '^Signed-off-by:' || true)
+while IFS= read -r trailer; do
+	value=$(printf '%s' "$trailer" | sed -e 's/^[^:]*:[[:space:]]*//')
+	case "$value" in
+		?*\ \<?*@?*\>) signed_off=1; break ;;
+	esac
+done <<EOF
+$trailers
+EOF
+
+if [ "$signed_off" -ne 1 ]; then
+	printf 'commit-msg: no Developer Certificate of Origin sign-off\n' >&2
+	printf 'Commit with git commit -s, or amend with git commit --amend --signoff --no-edit.\n' >&2
+	printf 'See CONTRIBUTING.md and https://developercertificate.org.\n' >&2
+	failed=1
+elif ! grep -qE '^Signed-off-by: .+ <.+>$' "$msg"; then
+	printf 'commit-msg: sign-off is not written the way the DCO check reads it\n' >&2
+	printf 'It must be one unfolded line, capitalized exactly: Signed-off-by: Name <email>\n' >&2
+	printf 'Amend with git commit --amend --signoff --no-edit.\n' >&2
+	failed=1
+fi
+
+exit "$failed"

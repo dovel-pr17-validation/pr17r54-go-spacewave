@@ -1,0 +1,352 @@
+package account_settings
+
+import (
+	"slices"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/core/space"
+)
+
+// FindStorageBackend returns the storage backend with the id, or nil.
+func (s *AccountSettings) FindStorageBackend(id string) *StorageBackend {
+	for _, backend := range s.GetStorageBackends() {
+		if backend.GetId() == id {
+			return backend
+		}
+	}
+	return nil
+}
+
+// FindStorageBackendByName returns the storage backend with the display
+// name, or nil.
+func (s *AccountSettings) FindStorageBackendByName(name string) *StorageBackend {
+	for _, backend := range s.GetStorageBackends() {
+		if backend.GetDisplayName() == name {
+			return backend
+		}
+	}
+	return nil
+}
+
+// FindBlockStorePlacement returns the placement of the block store, or nil
+// when the block store is on the account's own storage.
+func (s *AccountSettings) FindBlockStorePlacement(blockStoreID string) *BlockStorePlacement {
+	for _, placement := range s.GetBlockStorePlacements() {
+		if placement.GetBlockStoreId() == blockStoreID {
+			return placement
+		}
+	}
+	return nil
+}
+
+// PlacedBlockStoreIDs returns the ids of the block stores that use the storage
+// backend, as the backend holding them or as their read fallback.
+func (s *AccountSettings) PlacedBlockStoreIDs(backendID string) []string {
+	var ids []string
+	for _, placement := range s.GetBlockStorePlacements() {
+		if placement.GetStorageBackendId() == backendID || placement.GetFallbackStorageBackendId() == backendID {
+			ids = append(ids, placement.GetBlockStoreId())
+		}
+	}
+	return ids
+}
+
+// CheckStorageBackendUnused returns a StorageBackendInUseError naming the
+// Spaces placed on the backend, or nil when it holds none.
+func (s *AccountSettings) CheckStorageBackendUnused(backendID string) error {
+	// Return nil when no block store is placed on the backend.
+	placed := s.PlacedBlockStoreIDs(backendID)
+	if len(placed) == 0 {
+		return nil
+	}
+
+	// Name each placed block store's Space for the in-use error.
+	spaces := make([]string, len(placed))
+	for i, blockStoreID := range placed {
+		spaces[i] = blockStoreID
+		if _, name := s.FindSpaceByBlockStore(blockStoreID); name != "" {
+			spaces[i] = name
+		}
+	}
+	return &StorageBackendInUseError{Spaces: spaces}
+}
+
+// upsertStorageBackend adds a storage backend or replaces the one with its id.
+func (s *AccountSettings) upsertStorageBackend(backend *StorageBackend) error {
+	// Validate the backend and reject a duplicate display name.
+	if err := backend.Validate(); err != nil {
+		return err
+	}
+	if other := s.FindStorageBackendByName(backend.GetDisplayName()); other != nil && other.GetId() != backend.GetId() {
+		return errors.Errorf("a storage backend named %q already exists", backend.GetDisplayName())
+	}
+
+	// Replace the backend's stored copy with the incoming one.
+	s.StorageBackends = slices.DeleteFunc(s.StorageBackends, func(current *StorageBackend) bool {
+		return current.GetId() == backend.GetId()
+	})
+	s.StorageBackends = append(s.StorageBackends, backend.CloneVT())
+	return nil
+}
+
+// removeStorageBackend removes a storage backend that holds no block store.
+// Removing the default backend returns new Spaces to the account's storage.
+// Pending releases on the backend are dropped with it.
+func (s *AccountSettings) removeStorageBackend(id string) error {
+	// Require an id and an unused backend.
+	if id == "" {
+		return errors.New("storage_backend_id is required")
+	}
+	if err := s.CheckStorageBackendUnused(id); err != nil {
+		return err
+	}
+
+	// Remove the backend, its pending releases, and any default selection.
+	s.StorageBackends = slices.DeleteFunc(s.StorageBackends, func(current *StorageBackend) bool {
+		return current.GetId() == id
+	})
+	s.StorageReleases = slices.DeleteFunc(s.StorageReleases, func(release *BlockStorePlacement) bool {
+		return release.GetStorageBackendId() == id
+	})
+	if s.GetDefaultStorageBackendId() == id {
+		s.DefaultStorageBackendId = ""
+	}
+	return nil
+}
+
+// setDefaultStorageBackend selects the default storage backend, or the
+// account's own storage when id is empty.
+func (s *AccountSettings) setDefaultStorageBackend(id string) error {
+	if id != "" && s.FindStorageBackend(id) == nil {
+		return ErrStorageBackendNotFound
+	}
+	s.DefaultStorageBackendId = id
+	return nil
+}
+
+// setBlockStorePlacement places a block store on a storage backend, or
+// returns it to the account's own storage when the backend id is empty.
+//
+// Leaving a backend releases the store's objects there. Returning to a
+// backend cancels its pending release, since the store writes there again, and
+// so does naming it as the read fallback, since the store still reads there.
+func (s *AccountSettings) setBlockStorePlacement(placement *BlockStorePlacement) error {
+	// Require a block store id and an existing target backend.
+	blockStoreID := placement.GetBlockStoreId()
+	if blockStoreID == "" {
+		return errors.New("block_store_id is required")
+	}
+	backendID := placement.GetStorageBackendId()
+	if backendID != "" && s.FindStorageBackend(backendID) == nil {
+		return ErrStorageBackendNotFound
+	}
+	if err := s.checkReadFallback(placement); err != nil {
+		return err
+	}
+
+	// Apply the new placement, canceling a pending release on the backend.
+	s.unplaceBlockStore(blockStoreID)
+	if backendID != "" {
+		s.BlockStorePlacements = append(s.BlockStorePlacements, placement.CloneVT())
+		s.dropStorageRelease(placement)
+
+		// A backend the store still reads as its fallback is not released.
+		if fallbackID := placement.GetFallbackStorageBackendId(); fallbackID != "" {
+			s.dropStorageRelease(&BlockStorePlacement{BlockStoreId: blockStoreID, StorageBackendId: fallbackID})
+		}
+	}
+	return nil
+}
+
+// checkReadFallback requires that a placement's read fallback is an SQL
+// backend beside an S3 or FTPS backend that holds the store, so an SQL backend
+// is never both the store's primary and its fallback.
+func (s *AccountSettings) checkReadFallback(placement *BlockStorePlacement) error {
+	// Accept a placement without a fallback.
+	fallbackID := placement.GetFallbackStorageBackendId()
+	if fallbackID == "" {
+		return nil
+	}
+
+	// Require a bucket or FTPS backend to hold the store.
+	primary := s.FindStorageBackend(placement.GetStorageBackendId())
+	if primary.GetS3() == nil && primary.GetFtps() == nil {
+		return errors.New("a read fallback needs a block store placed on an S3 or FTPS backend")
+	}
+
+	// Require the fallback to exist and to be an SQL backend.
+	fallback := s.FindStorageBackend(fallbackID)
+	if fallback == nil {
+		return errors.Wrap(ErrStorageBackendNotFound, fallbackID)
+	}
+	if fallback.GetSql() == nil {
+		return errors.New("the read fallback must be an SQL backend")
+	}
+	return nil
+}
+
+// unplaceBlockStore removes the block store's placement and releases its
+// objects on the backend it leaves. The release keeps only the ids, so
+// returning with other cache settings still cancels it.
+func (s *AccountSettings) unplaceBlockStore(blockStoreID string) {
+	// Find the current placement, if any.
+	placement := s.FindBlockStorePlacement(blockStoreID)
+	if placement == nil {
+		return
+	}
+
+	// Remove it and record the release by ids.
+	s.BlockStorePlacements = slices.DeleteFunc(s.BlockStorePlacements, func(current *BlockStorePlacement) bool {
+		return current.GetBlockStoreId() == blockStoreID
+	})
+	release := &BlockStorePlacement{
+		BlockStoreId:     blockStoreID,
+		StorageBackendId: placement.GetStorageBackendId(),
+	}
+	if !slices.ContainsFunc(s.StorageReleases, release.sameStore) {
+		s.StorageReleases = append(s.StorageReleases, release)
+	}
+}
+
+// completeStorageRelease records that a released block store's objects are
+// gone from the backend's bucket.
+func (s *AccountSettings) completeStorageRelease(release *BlockStorePlacement) error {
+	if release.GetBlockStoreId() == "" || release.GetStorageBackendId() == "" {
+		return errors.New("block_store_id and storage_backend_id are required")
+	}
+	s.dropStorageRelease(release)
+	return nil
+}
+
+// dropStorageRelease removes a pending release, if any.
+func (s *AccountSettings) dropStorageRelease(release *BlockStorePlacement) {
+	s.StorageReleases = slices.DeleteFunc(s.StorageReleases, release.sameStore)
+}
+
+// sameStore reports whether two placements name the same block store on the
+// same backend, whatever their cache settings.
+func (p *BlockStorePlacement) sameStore(other *BlockStorePlacement) bool {
+	return p.GetBlockStoreId() == other.GetBlockStoreId() &&
+		p.GetStorageBackendId() == other.GetStorageBackendId()
+}
+
+// Validate checks that the storage backend is complete.
+func (b *StorageBackend) Validate() error {
+	// Require an id and a display name.
+	if b.GetId() == "" {
+		return errors.New("storage backend id is required")
+	}
+	if b.GetDisplayName() == "" {
+		return errors.New("storage backend display_name is required")
+	}
+
+	// Validate the one location, S3, SQL or FTPS, and the credential reference.
+	// An FTPS backend logs in from a netrc file and has no credential Secret.
+	locations := 0
+	for _, set := range []bool{b.GetS3() != nil, b.GetSql() != nil, b.GetFtps() != nil} {
+		if set {
+			locations++
+		}
+	}
+	if locations > 1 {
+		return errors.New("storage backend sets more than one of s3, sql and ftps")
+	}
+	switch {
+	case b.GetFtps() != nil:
+		return errors.Wrap(b.GetFtps().Validate(), "ftps")
+	case b.GetSql() != nil:
+		if err := b.GetSql().Validate(); err != nil {
+			return errors.Wrap(err, "sql")
+		}
+	default:
+		if err := b.GetS3().Validate(); err != nil {
+			return errors.Wrap(err, "s3")
+		}
+	}
+	if err := b.GetCredential().GetRef().Validate(); err != nil {
+		return errors.Wrap(err, "credential")
+	}
+	return nil
+}
+
+// Validate checks that the S3 location names an endpoint and bucket, and that
+// any price list override is valid.
+func (l *S3Location) Validate() error {
+	if l.GetEndpoint() == "" {
+		return errors.New("endpoint is required")
+	}
+	if l.GetBucket() == "" {
+		return errors.New("bucket is required")
+	}
+	return errors.Wrap(l.GetPricing().Validate(), "pricing")
+}
+
+// Validate checks that the SQL location names a host and a database.
+func (l *SqlLocation) Validate() error {
+	if l.GetHost() == "" {
+		return errors.New("host is required")
+	}
+	if l.GetDatabase() == "" {
+		return errors.New("database is required")
+	}
+	if l.GetPort() > 65535 {
+		return errors.Errorf("port %d is out of range", l.GetPort())
+	}
+	return nil
+}
+
+// Validate checks that the FTPS location names a host, a login file and a
+// root directory.
+func (l *FtpsLocation) Validate() error {
+	// Check the required fields, then the ports.
+	if l.GetHost() == "" {
+		return errors.New("host is required")
+	}
+	if l.GetNetrcPath() == "" {
+		return errors.New("netrc_path is required")
+	}
+	if l.GetRoot() == "" {
+		return errors.New("root is required")
+	}
+	if l.GetPort() > 65535 {
+		return errors.Errorf("port %d is out of range", l.GetPort())
+	}
+	if l.GetFtpsPort() > 65535 {
+		return errors.Errorf("ftps_port %d is out of range", l.GetFtpsPort())
+	}
+	if l.GetFtpsPort() != 0 && !l.GetSftp() {
+		return errors.New("ftps_port needs sftp")
+	}
+	return nil
+}
+
+// BlocksTable returns the name of the table that holds the blocks.
+func (l *SqlLocation) BlocksTable() string {
+	return l.GetTablePrefix() + "blocks"
+}
+
+// BlockStorePrefix returns the key prefix of the block store's objects.
+func (l *S3Location) BlockStorePrefix(blockStoreID string) string {
+	return l.GetObjectPrefix() + blockStoreID + "/"
+}
+
+// FindSpaceByBlockStore returns the id and name of the cataloged Space whose
+// blocks live in the block store. Both are empty when no live Space uses it.
+func (s *AccountSettings) FindSpaceByBlockStore(blockStoreID string) (spaceID, name string) {
+	for _, catalogEntry := range s.GetCatalog() {
+		entry := catalogEntry.GetEntry()
+		if catalogEntry.GetDeleted() || entry.GetRef().GetBlockStoreId() != blockStoreID {
+			continue
+		}
+		meta := entry.GetMeta()
+		if meta.GetBodyType() != space.SpaceBodyType {
+			continue
+		}
+		spaceMeta := &space.SpaceSoMeta{}
+		if err := spaceMeta.UnmarshalVT(meta.GetBodyMeta()); err != nil {
+			continue
+		}
+		return entry.GetRef().GetProviderResourceRef().GetId(), spaceMeta.GetName()
+	}
+	return "", ""
+}

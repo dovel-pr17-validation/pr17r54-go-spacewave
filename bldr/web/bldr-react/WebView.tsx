@@ -1,0 +1,742 @@
+import React, {
+  Activity,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import type {
+  WebDocument as BldrWebDocument,
+  WebView as BldrWebView,
+  WebViewRegistration,
+} from '@aptre/bldr'
+import {
+  randomId,
+  RenderMode,
+  SetRenderModeRequest,
+  SetRenderModeResponse,
+  SetHtmlLinksRequest,
+  SetHtmlLinksResponse,
+  HtmlLink,
+} from '@aptre/bldr'
+
+import { BldrContext, IBldrContext, useBldrContext } from './bldr-context.js'
+import { FunctionComponentContainer } from './web-view-function.js'
+import { ReactComponentContainer } from './web-view-react.js'
+import { DebugInfo } from './DebugInfo.js'
+import { useLatestRef } from './hooks.js'
+import { markStartupBoundary } from '../bldr/startup-marks.js'
+import { beginBootDownload, failBootDownload } from '../bldr/boot-downloads.js'
+import { bindWebPkgImports } from '../bldr/web-pkg-imports.js'
+
+// webViewRevealDeadlineMillis bounds how long a startup-critical web view may
+// wait for the plugin's SetRenderMode/SetHtmlLinks calls and component
+// readiness before boot reports a terminal failure instead of stalling.
+const webViewRevealDeadlineMillis = 90_000
+
+// RemoveWebViewFunc is a function to remove a web view.
+type RemoveWebViewFunc = (view: BldrWebView) => void
+
+interface IWebViewProps {
+  // uuid is the unique identifier for the web view.
+  // if unset, a random id will be generated.
+  uuid?: string
+  // webDocument overrides the webDocument provided by context.
+  webDocument?: BldrWebDocument
+  // isPermanent indicates closing this web view will close the window.
+  // calls window.close() when removing the web view.
+  // if the window cannot be script-closed, marks view as permanent.
+  isPermanent?: boolean
+  // onRemove is a callback to remove the WebView, if possible.
+  // if both isPermanent and onRemove are unset, marks the view as permanent
+  onRemove?: RemoveWebViewFunc
+  // showDebugInfo shows debug information about the WebView.
+  showDebugInfo?: boolean
+  // loading is rendered when the web view is not ready yet (loading).
+  loading?: React.ReactNode
+  // startupProgress indicates this WebView is the startup-critical root view.
+  startupProgress?: boolean
+  // children are rendered when renderMode is REACT_CHILDREN.
+  // If children are passed and no SetRenderMode has been called,
+  // the initial renderMode defaults to REACT_CHILDREN instead of NONE.
+  children?: React.ReactNode
+}
+
+interface IWebViewHtmlLink {
+  id: string
+  link: HtmlLink
+  // loaded indicates this stylesheet has fired its onload event.
+  loaded?: boolean
+}
+
+interface IWebViewState {
+  // ready indicates the registration is ready.
+  ready?: boolean
+  // renderMode is the current rendering mode.
+  // defaults to NONE.
+  renderMode?: RenderMode
+  // refreshNonce is the number of times we have refreshed.
+  refreshNonce: number
+  // scriptPath is the script path to lazy load.
+  scriptPath?: string
+  // props is the binary props field.
+  props?: Uint8Array
+  // htmlLinks is the set of html link components.
+  htmlLinks: IWebViewHtmlLink[]
+  // reg is the web view registration
+  reg?: WebViewRegistration
+  // cssLoaded indicates all stylesheet links have finished loading.
+  cssLoaded?: boolean
+}
+
+interface IWebViewRuntimePresentation {
+  generation: string
+  neutralFrame: boolean
+  revealed: boolean
+}
+
+// canCloseWindow checks if window.close will (probably) work.
+// https://stackoverflow.com/a/50593730
+export function canCloseWindow() {
+  return window.opener != null || window.history.length == 1
+}
+
+// useMemoManual signals to the React Compiler we want this to be manually memoized.
+// see: https://github.com/facebook/react/issues/34172#issuecomment-3367496138
+const useMemoManual = useMemo
+
+interface IStylesheetLinkProps {
+  id: string
+  href: string
+  onLoad: (id: string) => void
+}
+
+// StylesheetLink renders a stylesheet link and handles the load event.
+// It checks if the stylesheet is already loaded from cache on mount.
+function StylesheetLink({ id, href, onLoad }: IStylesheetLinkProps) {
+  const ref = useRef<HTMLLinkElement>(null)
+
+  useEffect(() => {
+    const link = ref.current
+    if (!link) {
+      return
+    }
+    // Check if the stylesheet is already loaded (cached).
+    // When a stylesheet is cached, onload may fire before we attach the handler.
+    // The sheet property is set once the stylesheet is fully loaded and parsed.
+    if (link.sheet) {
+      onLoad(id)
+    }
+  }, [id, href, onLoad])
+
+  const handleLoad = useCallback(() => {
+    onLoad(id)
+  }, [id, onLoad])
+
+  return (
+    <link
+      ref={ref}
+      href={href}
+      rel="stylesheet"
+      onLoad={handleLoad}
+      onError={handleLoad}
+    />
+  )
+}
+
+// WebView represents a portion of the page which the Go webDocument controls.
+// It is exposed as a WebView to the Go stack.
+export const WebView: React.FC<IWebViewProps> = (props) => {
+  const bldrContext = useBldrContext()
+  const bldrWebDocument =
+    props.webDocument || bldrContext?.webDocument || undefined
+
+  // uuid is the web view uuid
+  const uuid = useMemo(() => props.uuid || randomId(), [props.uuid])
+
+  // parentUuid is the parent web view uuid
+  const parentUuid = bldrContext?.webView?.getUuid() || undefined
+
+  const [runtimePresentation, setRuntimePresentation] =
+    useState<IWebViewRuntimePresentation>()
+  const runtimePresentationRef = useRef(runtimePresentation)
+  runtimePresentationRef.current = runtimePresentation
+  // parentUuidRef is the current parent uuid ref.
+  const parentUuidRef = useLatestRef(parentUuid)
+  const setHtmlLinksSeenRef = useRef(false)
+  const markedStylesheetReadyRef = useRef(false)
+  const markedComponentReadyRef = useRef(false)
+  const markedRevealedRef = useRef(false)
+
+  const resetComponentRevealStartupMarks = useCallback(() => {
+    markedComponentReadyRef.current = false
+    markedRevealedRef.current = false
+  }, [])
+
+  const resetStylesheetStartupMarks = useCallback(() => {
+    markedStylesheetReadyRef.current = false
+  }, [])
+
+  // removable marks if this is removable or not
+  const removable = useMemo(
+    () =>
+      // removable by callback
+      !!props.onRemove ||
+      // removable by window.close
+      (!!props.isPermanent && canCloseWindow()),
+    [props.onRemove, props.isPermanent],
+  )
+
+  // removableRef is a ref to the latest removable value
+  const removableRef = useLatestRef(removable)
+
+  // webViewState contains the current web view state.
+  // Default to REACT_CHILDREN if children are passed, otherwise NONE.
+  const [webViewState, setWebViewState] = useState<IWebViewState>(() => ({
+    renderMode: props.children
+      ? RenderMode.RenderMode_REACT_CHILDREN
+      : RenderMode.RenderMode_NONE,
+    htmlLinks: [],
+    refreshNonce: 0,
+    cssLoaded: true,
+  }))
+  const webViewStateRef = useRef(webViewState)
+  webViewStateRef.current = webViewState
+  const [isComponentReady, setIsComponentReady] = useState(false)
+
+  // TODO: hack: improve this
+
+  useEffect(() => {
+    setIsComponentReady(false)
+  }, [webViewState.scriptPath, webViewState.refreshNonce])
+
+  // onRemoveRef is a ref to the latest onRemove callback
+  const onRemoveRef = useLatestRef(props.onRemove)
+  const markWebViewStartupBoundary = useCallback(
+    (label: string, detail: Record<string, unknown> = {}) => {
+      markStartupBoundary(`webview.${label}`, {
+        source: 'webview',
+        webViewId: uuid,
+        ...(parentUuid ? { parentWebViewId: parentUuid } : {}),
+        startupRelevant: props.startupProgress === true,
+        ...detail,
+      })
+    },
+    [parentUuid, props.startupProgress, uuid],
+  )
+
+  const readRuntimePresentation = useCallback(
+    (reset = false) => {
+      if (props.startupProgress !== true) {
+        return
+      }
+      const documentWithPresentation = bldrWebDocument as
+        | (BldrWebDocument & {
+            getRuntimePresentationState?: () => {
+              connected: boolean
+              generation?: string
+            }
+          })
+        | undefined
+      const state = documentWithPresentation?.getRuntimePresentationState?.()
+      if (!state?.connected || !state.generation) {
+        setRuntimePresentation(undefined)
+        return
+      }
+      const generation = state.generation
+      setRuntimePresentation((previous) =>
+        !reset && previous?.generation === generation
+          ? previous
+          : {
+              generation,
+              neutralFrame: false,
+              revealed: false,
+            },
+      )
+    },
+    [bldrWebDocument, props.startupProgress],
+  )
+
+  const resetRuntimePresentation = useCallback(() => {
+    markedRevealedRef.current = false
+    readRuntimePresentation(true)
+  }, [readRuntimePresentation])
+
+  useEffect(() => {
+    const documentWithEvents = bldrWebDocument as
+      | (BldrWebDocument & {
+          on?: BldrWebDocument['on']
+          removeListener?: BldrWebDocument['removeListener']
+        })
+      | undefined
+    if (
+      !documentWithEvents ||
+      typeof documentWithEvents.on !== 'function' ||
+      typeof documentWithEvents.removeListener !== 'function'
+    ) {
+      return
+    }
+    const onRuntimeConnected = () => readRuntimePresentation()
+    const onRuntimeInvalidated = (generation?: string) => {
+      const current = runtimePresentationRef.current
+      if (!current || !generation || current.generation === generation) {
+        markedRevealedRef.current = false
+        setRuntimePresentation(undefined)
+      }
+    }
+    documentWithEvents.on('runtimeconnected', onRuntimeConnected)
+    documentWithEvents.on('runtimeinvalidated', onRuntimeInvalidated)
+    readRuntimePresentation()
+    return () => {
+      documentWithEvents.removeListener?.(
+        'runtimeconnected',
+        onRuntimeConnected,
+      )
+      documentWithEvents.removeListener?.(
+        'runtimeinvalidated',
+        onRuntimeInvalidated,
+      )
+    }
+  }, [bldrWebDocument, readRuntimePresentation])
+
+  useEffect(() => {
+    if (!runtimePresentation || runtimePresentation.neutralFrame) {
+      return
+    }
+    setRuntimePresentation((previous) =>
+      previous?.generation === runtimePresentation.generation
+        ? { ...previous, neutralFrame: true }
+        : previous,
+    )
+    markWebViewStartupBoundary('neutral-frame', {
+      runtimeGeneration: runtimePresentation.generation,
+    })
+  }, [markWebViewStartupBoundary, runtimePresentation])
+
+  const bldrWebViewRef = useRef<BldrWebView | null>(null)
+  const bldrWebView: BldrWebView = useMemoManual(
+    () => ({
+      // getUuid returns the web-view unique identifier.
+      getUuid(): string {
+        return uuid
+      },
+      // getParentUuid returns the parent web-view unique identifier.
+      // may be empty
+      getParentUuid(): string | undefined {
+        return parentUuidRef.current ?? undefined
+      },
+      // getPermanent checks if the web-view is permanent.
+      getPermanent(): boolean {
+        return !removableRef.current
+      },
+      // setRenderMode sets the render mode of the view.
+      // if wait=true, should wait for op to complete before returning.
+      async setRenderMode(
+        options: SetRenderModeRequest,
+      ): Promise<SetRenderModeResponse | void> {
+        bindWebPkgImports(options.webPkgPaths)
+        console.log(`WebView: set render mode: ${uuid}`, options)
+        if (options.frontendBinding && !bldrWebDocument) {
+          throw new Error('A live frontend requires a Bldr document')
+        }
+        const frontendPath = options.frontendBinding?.entrypoint
+          ? await bldrWebDocument?.resolveFrontend(
+              options.frontendBinding.entrypoint,
+            )
+          : undefined
+        const scriptPath =
+          frontendPath ||
+          (options.renderMode !== RenderMode.RenderMode_NONE &&
+            options.scriptPath?.trim()) ||
+          undefined
+        const prev = webViewStateRef.current
+        const renderTargetChanged =
+          options.refresh ||
+          prev.renderMode !== options.renderMode ||
+          prev.scriptPath !== scriptPath
+        if (renderTargetChanged) {
+          setIsComponentReady(false)
+          resetComponentRevealStartupMarks()
+          resetRuntimePresentation()
+          if (options.refresh) {
+            resetStylesheetStartupMarks()
+          }
+        }
+        setWebViewState((prev) => ({
+          ...prev,
+          renderMode: options.renderMode,
+          refreshNonce: options.refresh
+            ? prev.refreshNonce + 1
+            : prev.refreshNonce,
+          scriptPath,
+          props: options.props,
+        }))
+      },
+      // setHtmlLinks sets or updates the list of HTML links.
+      async setHtmlLinks(
+        options: SetHtmlLinksRequest,
+      ): Promise<SetHtmlLinksResponse | void> {
+        console.log(`WebView: set html links: ${uuid}`, options)
+        setHtmlLinksSeenRef.current = true
+        if (options.clear) {
+          resetRuntimePresentation()
+          resetStylesheetStartupMarks()
+          markedRevealedRef.current = false
+        }
+        setWebViewState((prev) => {
+          // Build lookup of previously loaded hrefs to preserve loaded state
+          // when the same stylesheet is re-set (e.g. on manifest re-commit).
+          const prevLoadedHrefs = new Set<string>()
+          if (options.clear) {
+            for (const link of prev.htmlLinks) {
+              if (link.loaded && link.link.href) {
+                prevLoadedHrefs.add(link.link.href)
+              }
+            }
+          }
+          const links: IWebViewHtmlLink[] = [
+            ...((!options.clear && prev.htmlLinks) || []),
+          ]
+          const removeLink = (id: string) => {
+            for (let i = 0; i < links.length; i++) {
+              if (links[i].id === id) {
+                links.splice(i, 1)
+                break
+              }
+            }
+          }
+          for (const removeID of options.remove ?? []) {
+            removeLink(removeID)
+          }
+          if (options.setLinks) {
+            for (const addID of Object.keys(options.setLinks)) {
+              removeLink(addID)
+              const link = options.setLinks[addID]
+              if (link) {
+                const loaded = prevLoadedHrefs.has(link.href ?? '')
+                links.push({ id: addID, link, loaded })
+              }
+            }
+          }
+          const hasUnloadedStylesheets = links.some(
+            (l) => l.link.rel === 'stylesheet' && !l.loaded,
+          )
+          return {
+            ...prev,
+            htmlLinks: links,
+            cssLoaded: !hasUnloadedStylesheets,
+          }
+        })
+      },
+      // resetView resets the web view to the initial state.
+      async resetView(): Promise<void> {
+        setIsComponentReady(false)
+        setHtmlLinksSeenRef.current = false
+        resetComponentRevealStartupMarks()
+        resetStylesheetStartupMarks()
+        resetRuntimePresentation()
+        setWebViewState((prev) => {
+          const next = { ...prev }
+          next.refreshNonce++
+          if (next.htmlLinks.length) {
+            next.htmlLinks = []
+          }
+          next.cssLoaded = true
+          if (next.renderMode != null) {
+            next.renderMode = RenderMode.RenderMode_NONE
+          }
+          delete next.scriptPath
+          return next
+        })
+      },
+      // remove removes the web view, if !permanent.
+      // returns if the web view was removed successfully.
+      async remove(): Promise<boolean> {
+        if (!removableRef.current) {
+          return false
+        }
+        if (onRemoveRef.current && bldrWebViewRef.current) {
+          onRemoveRef.current(bldrWebViewRef.current)
+          return true
+        }
+        if (canCloseWindow()) {
+          window.close()
+          return true
+        }
+        return false
+      },
+    }),
+    [
+      uuid,
+      removableRef,
+      parentUuidRef,
+      onRemoveRef,
+      bldrWebViewRef,
+      setHtmlLinksSeenRef,
+      resetComponentRevealStartupMarks,
+      resetStylesheetStartupMarks,
+      resetRuntimePresentation,
+      webViewStateRef,
+    ],
+  )
+
+  useEffect(() => {
+    bldrWebViewRef.current = bldrWebView
+  }, [bldrWebView])
+
+  const childContext = useMemo<IBldrContext>(
+    () => ({
+      webView: bldrWebView,
+      webDocument: bldrWebDocument,
+    }),
+    [bldrWebView, bldrWebDocument],
+  )
+
+  // onLinkLoad marks a stylesheet as loaded and updates cssLoaded state.
+  const onLinkLoad = useCallback((linkId: string) => {
+    setWebViewState((prev) => {
+      const links = prev.htmlLinks.map((link) =>
+        link.id === linkId ? { ...link, loaded: true } : link,
+      )
+      const hasUnloadedStylesheets = links.some(
+        (l) => l.link.rel === 'stylesheet' && !l.loaded,
+      )
+      return { ...prev, htmlLinks: links, cssLoaded: !hasUnloadedStylesheets }
+    })
+  }, [])
+
+  useLayoutEffect(() => {
+    let nextReg: WebViewRegistration | null = null
+    if (bldrWebDocument) {
+      nextReg = bldrWebDocument.registerWebView(bldrWebView)
+      setWebViewState((prev) => ({
+        ...prev,
+        ready: true,
+        reg: nextReg ?? undefined,
+      }))
+      console.log(
+        `WebView: mounted ${uuid} to document ${bldrWebDocument.webDocumentUuid} runtime ${bldrWebDocument.webRuntimeId}`,
+      )
+      markWebViewStartupBoundary('registered', {
+        webDocumentId: bldrWebDocument.webDocumentUuid,
+        webRuntimeId: bldrWebDocument.webRuntimeId,
+      })
+      // see: this.reg.webViewHost
+    } else {
+      console.error('Runtime is empty in WebView.')
+    }
+
+    return () => {
+      if (nextReg) {
+        nextReg.release()
+        setWebViewState((prev) => ({ ...prev, ready: false, reg: undefined }))
+      }
+    }
+  }, [uuid, bldrWebDocument, bldrWebView, markWebViewStartupBoundary])
+
+  const stylesheetCount = webViewState.htmlLinks.filter(
+    (link) => link.link.rel === 'stylesheet',
+  ).length
+  useEffect(() => {
+    if (
+      markedStylesheetReadyRef.current ||
+      !webViewState.ready ||
+      !webViewState.cssLoaded ||
+      (!setHtmlLinksSeenRef.current && stylesheetCount === 0)
+    ) {
+      return
+    }
+    markedStylesheetReadyRef.current = true
+    markWebViewStartupBoundary('stylesheet-ready', {
+      stylesheetCount,
+    })
+  }, [
+    markWebViewStartupBoundary,
+    stylesheetCount,
+    webViewState.cssLoaded,
+    webViewState.ready,
+    webViewState.refreshNonce,
+  ])
+
+  // Boot-ladder deadline: if this startup-critical view never receives a
+  // render mode, html links, or component readiness, the loading screen would
+  // wait forever behind a frozen progress bar. After webViewRevealDeadlineMillis
+  // without progress, surface a terminal boot-download failure instead.
+  useEffect(() => {
+    if (!props.startupProgress || !webViewState.ready || isComponentReady) {
+      return
+    }
+    const timer = setTimeout(() => {
+      if (markedRevealedRef.current || markedComponentReadyRef.current) {
+        return
+      }
+      const message = `web view did not become ready within ${webViewRevealDeadlineMillis / 1000}s (no render mode, html links, or component-ready)`
+      console.error(`WebView ${uuid}: ${message}`)
+      beginBootDownload('webview-frame', 'Interface frame')
+      failBootDownload('webview-frame', message)
+    }, webViewRevealDeadlineMillis)
+    return () => clearTimeout(timer)
+  }, [props.startupProgress, uuid, webViewState.ready, isComponentReady])
+
+  const handleComponentReady = useCallback(() => {
+    setIsComponentReady(true)
+    if (markedComponentReadyRef.current) {
+      return
+    }
+    markedComponentReadyRef.current = true
+    markWebViewStartupBoundary('component-ready', {
+      renderMode: webViewState.renderMode,
+      scriptPath: webViewState.scriptPath,
+    })
+  }, [
+    markWebViewStartupBoundary,
+    webViewState.renderMode,
+    webViewState.scriptPath,
+  ])
+
+  const runtimePresentationOwner =
+    props.startupProgress === true &&
+    typeof (
+      bldrWebDocument as
+        | (BldrWebDocument & {
+            getRuntimePresentationState?: unknown
+          })
+        | undefined
+    )?.getRuntimePresentationState === 'function'
+  useEffect(() => {
+    if (
+      markedRevealedRef.current ||
+      !webViewState.ready ||
+      !webViewState.cssLoaded ||
+      !isComponentReady ||
+      (runtimePresentationOwner && !runtimePresentation?.neutralFrame)
+    ) {
+      return
+    }
+    markedRevealedRef.current = true
+    markWebViewStartupBoundary('revealed', {
+      renderMode: webViewState.renderMode,
+      stylesheetCount,
+      ...(runtimePresentation
+        ? { runtimeGeneration: runtimePresentation.generation }
+        : {}),
+    })
+    if (runtimePresentation) {
+      setRuntimePresentation((previous) =>
+        previous?.generation === runtimePresentation.generation
+          ? { ...previous, revealed: true }
+          : previous,
+      )
+    }
+  }, [
+    bldrWebDocument,
+    isComponentReady,
+    markWebViewStartupBoundary,
+    runtimePresentation,
+    runtimePresentationOwner,
+    stylesheetCount,
+    webViewState.cssLoaded,
+    webViewState.ready,
+    webViewState.renderMode,
+  ])
+
+  const runtimeTransitionActive = runtimePresentation?.revealed === true
+  const activityVisible = runtimePresentationOwner
+    ? runtimePresentation?.neutralFrame === true
+    : webViewState.cssLoaded
+  return (
+    <BldrContext.Provider value={childContext}>
+      {props.showDebugInfo ? (
+        <DebugInfo>
+          WebView ID: {uuid} <br />
+          {parentUuid ? (
+            <>
+              Parent WebView ID: {parentUuid}
+              <br />
+            </>
+          ) : undefined}
+          Ready: {webViewState.ready ? 'true' : 'false'}
+          <br />
+          Render Mode: {webViewState.renderMode}
+          <br />
+          CSS Loaded: {webViewState.cssLoaded ? 'true' : 'false'}
+          <br />
+          {webViewState.scriptPath ? (
+            <>
+              Script Path: {webViewState.scriptPath}
+              <br />
+            </>
+          ) : undefined}
+        </DebugInfo>
+      ) : undefined}
+      {/* Show loading while CSS is loading or component not ready */}
+      {(runtimePresentationOwner
+        ? !runtimeTransitionActive
+        : !webViewState.ready ||
+          !webViewState.cssLoaded ||
+          !isComponentReady) && props.loading
+        ? props.loading
+        : null}
+      {/* Render stylesheets immediately when ready with onload tracking */}
+      {webViewState.ready
+        ? webViewState.htmlLinks.flatMap((ilink) =>
+            ilink.link.rel === 'stylesheet' && ilink.link.href
+              ? [
+                  <StylesheetLink
+                    key={`${webViewState.refreshNonce} -> ${ilink.id}`}
+                    id={ilink.id}
+                    href={ilink.link.href}
+                    onLoad={onLinkLoad}
+                  />,
+                ]
+              : [],
+          )
+        : undefined}
+      {/* Render non-stylesheet links immediately */}
+      {webViewState.ready
+        ? webViewState.htmlLinks.flatMap((ilink) =>
+            ilink.link.rel !== 'stylesheet' && ilink.link.href
+              ? [
+                  <link
+                    key={ilink.id}
+                    href={ilink.link.href}
+                    rel={ilink.link.rel}
+                  />,
+                ]
+              : [],
+          )
+        : undefined}
+      {/* Render component inside Activity - hidden until CSS loads */}
+      {webViewState.ready &&
+      webViewState.renderMode === RenderMode.RenderMode_REACT_COMPONENT &&
+      webViewState.scriptPath ? (
+        <Activity mode={activityVisible ? 'visible' : 'hidden'}>
+          <ReactComponentContainer
+            key={`${webViewState.refreshNonce} -> ${webViewState.scriptPath}`}
+            scriptPath={webViewState.scriptPath}
+            componentProps={webViewState.props}
+            onReady={handleComponentReady}
+          />
+        </Activity>
+      ) : undefined}
+      {webViewState.ready &&
+      webViewState.renderMode === RenderMode.RenderMode_FUNCTION &&
+      webViewState.scriptPath ? (
+        <Activity mode={activityVisible ? 'visible' : 'hidden'}>
+          <FunctionComponentContainer
+            key={`${webViewState.refreshNonce} -> ${webViewState.scriptPath}`}
+            scriptPath={webViewState.scriptPath}
+            componentProps={webViewState.props}
+            onReady={handleComponentReady}
+          />
+        </Activity>
+      ) : undefined}
+      {/* Render React children when in REACT_CHILDREN mode */}
+      {webViewState.ready &&
+        webViewState.renderMode === RenderMode.RenderMode_REACT_CHILDREN &&
+        props.children}
+    </BldrContext.Provider>
+  )
+}

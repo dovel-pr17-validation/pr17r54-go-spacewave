@@ -1,0 +1,140 @@
+package store_kvkey
+
+import (
+	"bytes"
+	"strconv"
+)
+
+// FormatVersion is the version of the key layout KVKey builds.
+//
+// Version 0 keyed each block by the base58 text of its marshaled ref.
+// Version 1 keys each block by the marshaled ref bytes.
+// Version 2 stores the reference graph as edge records instead of a Cayley
+// quad store.
+// Version 3 encodes each block node of the graph as its hash type and digest
+// instead of its base58 IRI.
+// Version 4 keeps the edges from each block in one child list record instead
+// of a record per direction for each edge.
+// Version 5 keys are those of version 4. Every build that opens it logs the
+// blocks each graph write creates or changes in the young log, so a record
+// that the log is complete survives restarts.
+// Version 6 keys are those of version 5. Its graph keeps the shared counts,
+// complete or being built by the sharing walk, whose state record says which.
+// Version 7 keeps liveness in child lists, named roots, count records and a
+// journal under the prefix the graph held; it keeps the graph's child lists in
+// place and carries its named roots across.
+// Version 8 keys are those of version 7. A cache fill journals its children's
+// holders in a fill record instead of writing a fill mark, so a version 7
+// store opens unadopted and its adoption counts the lists format 7's fills
+// left without holders.
+// Version 9 keys are those of version 8. A block at zero keeps a zero count
+// record with its ripe sequence and a key in the ripe queue, a due cascade
+// keeps a cascade record, and the journal keeps no up index, so a version 7
+// or 8 store opens unadopted and its adoption counts in the new encoding.
+const FormatVersion = 9
+
+// formatVersionKey names the key holding the store's format version.
+var formatVersionKey = []byte("format")
+
+// KVKey is the key/value key generator.
+type KVKey struct {
+	conf *Config
+}
+
+// NewKVKey builds a new KV key generator from a config.
+// Can pass nil to use default.
+func NewKVKey(conf *Config) (*KVKey, error) {
+	if conf == nil {
+		conf = DefaultConfig()
+	} else {
+		if err := conf.Validate(); err != nil {
+			return nil, err
+		}
+	}
+
+	return &KVKey{conf: conf}, nil
+}
+
+// NewDefaultKVKey constructs a KVKey with a default config.
+func NewDefaultKVKey() *KVKey {
+	return &KVKey{conf: DefaultConfig()}
+}
+
+// GetBlockFullPrefix returns the prefix for all blocks.
+func (k *KVKey) GetBlockFullPrefix() []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		k.conf.GetBlockPrefix(),
+	}, nil)
+}
+
+// GetBlockKey returns the key for the given block.
+func (k *KVKey) GetBlockKey(refMarshalKey []byte) []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		k.conf.GetBlockPrefix(),
+		refMarshalKey,
+	}, nil)
+}
+
+// GetFormatVersionKey returns the key holding the store's format version.
+func (k *KVKey) GetFormatVersionKey() []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		formatVersionKey,
+	}, nil)
+}
+
+// MarshalFormatVersion encodes a format version as the value of the format
+// version key.
+func MarshalFormatVersion(version uint64) []byte {
+	return strconv.AppendUint(nil, version, 10)
+}
+
+// ParseFormatVersion decodes the value of the format version key.
+func ParseFormatVersion(data []byte) (uint64, error) {
+	return strconv.ParseUint(string(data), 10, 64)
+}
+
+// GetBucketConfigFullPrefix returns the prefix for all bucket configs.
+func (k *KVKey) GetBucketConfigFullPrefix() []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		k.conf.GetBucketConfigPrefix(),
+	}, nil)
+}
+
+// GetBucketConfigKey returns the key for the given id.
+func (k *KVKey) GetBucketConfigKey(id string) []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		k.conf.GetBucketConfigPrefix(),
+		[]byte(id),
+	}, nil)
+}
+
+// GetPeerPrivKey returns the key to use for the peer private key.
+func (k *KVKey) GetPeerPrivKey() []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		k.conf.GetPeerPrivKey(),
+	}, nil)
+}
+
+// GetObjectStoreFullPrefix returns the prefix for all object stores.
+func (k *KVKey) GetObjectStoreFullPrefix() []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		k.conf.GetObjectStorePrefix(),
+	}, nil)
+}
+
+// GetObjectStorePrefixByID returns the prefix to use for an object store with an id.
+func (k *KVKey) GetObjectStorePrefixByID(objStoreID string) []byte {
+	return bytes.Join([][]byte{
+		k.conf.GetPrefix(),
+		k.conf.GetObjectStorePrefix(),
+		[]byte(objStoreID),
+		[]byte("/"),
+	}, nil)
+}

@@ -1,0 +1,110 @@
+package identity
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	"github.com/s4wave/spacewave/db/block"
+	"github.com/s4wave/spacewave/net/crypto"
+	"github.com/s4wave/spacewave/net/peer"
+	"github.com/s4wave/spacewave/net/util/confparse"
+)
+
+// NewKeypair constructs a new keypair.
+//
+// authMethodID and authMethodParams can be empty.
+func NewKeypair(
+	pubKey crypto.PubKey,
+	authMethodID string,
+	authMethodParams []byte,
+) (*Keypair, error) {
+	// Derive the keypair peer ID from its public key.
+	pid, err := peer.IDFromPublicKey(pubKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// Encode the public key for the keypair record.
+	pkData, err := confparse.MarshalPublicKey(pubKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Keypair{
+		PeerId:           pid.String(),
+		PubKey:           pkData,
+		AuthMethodId:     authMethodID,
+		AuthMethodParams: authMethodParams,
+	}, nil
+}
+
+// EntitiesToKeypairs parses all keypairs from the entities.
+func EntitiesToKeypairs(ents []*Entity) ([]*Keypair, error) {
+	ekps, err := EntitiesToEntityKeypairs(ents)
+	if err != nil {
+		return nil, err
+	}
+	return EntityKeypairsToKeypairs(ekps), nil
+}
+
+// UnmarshalKeypair unmarshals a Keypair from a cursor.
+// If empty, returns nil, nil
+func UnmarshalKeypair(ctx context.Context, bcs *block.Cursor) (*Keypair, error) {
+	return block.UnmarshalBlock[Keypair](ctx, bcs)
+}
+
+// Validate validates the keypair.
+func (k *Keypair) Validate() error {
+	// Require a valid peer ID in the keypair record.
+	peerID, err := k.ParsePeerID()
+	if err != nil {
+		return err
+	}
+	if len(peerID) == 0 {
+		return peer.ErrEmptyPeerID
+	}
+
+	// Require a public key in the keypair record.
+	pubKey, err := k.ParsePubKey()
+	if err != nil {
+		return err
+	}
+	if pubKey == nil {
+		return errors.New("pub_key field cannot be empty")
+	}
+
+	// Verify that the keypair public key identifies the recorded peer.
+	if !peerID.MatchesPublicKey(pubKey) {
+		pubKeyPeerID, err := peer.IDFromPublicKey(pubKey)
+		if err != nil {
+			return errors.Wrap(err, "pub_key")
+		}
+		return errors.Errorf(
+			"pub_key id %s does not match peer_id %s",
+			pubKeyPeerID.String(),
+			peerID.String(),
+		)
+	}
+
+	// Require an authentication method for keypair authentication parameters.
+	if k.GetAuthMethodId() == "" {
+		if len(k.GetAuthMethodParams()) != 0 {
+			return errors.New("auth provider params cannot be set unless auth provider id is set")
+		}
+	}
+
+	return nil
+}
+
+// ParsePeerID parses the peer id field.
+func (k *Keypair) ParsePeerID() (peer.ID, error) {
+	return confparse.ParsePeerID(k.GetPeerId())
+}
+
+// ParsePubKey parses the public key field.
+func (k *Keypair) ParsePubKey() (crypto.PubKey, error) {
+	return confparse.ParsePublicKey(k.GetPubKey())
+}
+
+// _ is a type assertion
+var _ block.Block = (*Keypair)(nil)

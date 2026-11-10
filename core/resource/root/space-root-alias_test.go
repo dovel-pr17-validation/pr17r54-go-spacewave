@@ -1,0 +1,437 @@
+//go:build !js
+
+package resource_root
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/aperturerobotics/starpc/srpc"
+	entrypoint_state "github.com/s4wave/spacewave/bldr/entrypoint/state"
+	plugin "github.com/s4wave/spacewave/bldr/plugin"
+	"github.com/s4wave/spacewave/core/provider"
+	"github.com/s4wave/spacewave/core/session"
+	db_testbed "github.com/s4wave/spacewave/db/testbed"
+	volume_controller "github.com/s4wave/spacewave/db/volume/controller"
+	volume_kvtxinmem "github.com/s4wave/spacewave/db/volume/kvtxinmem"
+	s4wave_root "github.com/s4wave/spacewave/sdk/root"
+	"github.com/sirupsen/logrus"
+)
+
+func TestSpaceRootAliasRegistryPersistsAndRemoves(t *testing.T) {
+	// Create the root alias server and an existing state directory.
+	ctx := t.Context()
+	server, cancel := setupSpaceRootAliasServer(ctx, t)
+	defer cancel()
+	rootPath := makeSpaceRootAliasDir(t)
+
+	// Save the root alias and verify its ready status.
+	record, err := server.UpsertSpaceRootAlias(ctx, &s4wave_root.UpsertSpaceRootAliasRequest{
+		Record: &s4wave_root.SpaceRootAliasRecord{
+			AliasId:     "company",
+			DisplayName: "Company",
+			Kind:        s4wave_root.SpaceRootKind_SpaceRootKind_NATIVE_DIRECTORY,
+			OpenMode:    s4wave_root.SpaceRootOpenMode_SpaceRootOpenMode_OPEN_EXISTING,
+			Native:      &s4wave_root.NativeSpaceRootMetadata{Path: rootPath},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.GetRecord().GetStatus() != s4wave_root.SpaceRootStatus_SpaceRootStatus_READY {
+		t.Fatalf("status = %s, want ready", record.GetRecord().GetStatus())
+	}
+
+	// Verify the saved root alias appears in the store snapshot.
+	records, err := server.snapshotSpaceRootAliases(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].GetAliasId() != "company" || records[0].GetNative().GetPath() != rootPath {
+		t.Fatalf("records = %#v, want company at %s", records, rootPath)
+	}
+
+	// Remove the saved alias and verify it was found.
+	removeResp, err := server.RemoveSpaceRootAlias(ctx, &s4wave_root.RemoveSpaceRootAliasRequest{
+		AliasId: "company",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removeResp.GetNotFound() {
+		t.Fatal("remove should find existing alias")
+	}
+
+	// Verify the store snapshot is empty after removal.
+	records, err = server.snapshotSpaceRootAliases(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records after remove = %#v, want empty", records)
+	}
+}
+
+func TestSpaceRootAliasRegistryRejectsUnsupportedSelections(t *testing.T) {
+	// Create a root alias server for invalid selections.
+	ctx := t.Context()
+	server, cancel := setupSpaceRootAliasServer(ctx, t)
+	defer cancel()
+
+	// Verify a missing state file cannot become a root alias.
+	if _, err := server.UpsertSpaceRootAlias(ctx, &s4wave_root.UpsertSpaceRootAliasRequest{
+		Record: &s4wave_root.SpaceRootAliasRecord{
+			AliasId:  "file",
+			Kind:     s4wave_root.SpaceRootKind_SpaceRootKind_S4WAVE_FILE,
+			OpenMode: s4wave_root.SpaceRootOpenMode_SpaceRootOpenMode_OPEN_EXISTING,
+			Native:   &s4wave_root.NativeSpaceRootMetadata{Path: filepath.Join(t.TempDir(), "x.s4wave")},
+		},
+	}); err == nil {
+		t.Fatal("expected .s4wave rejection")
+	}
+
+	// Verify an ordinary directory cannot become a root alias.
+	plainDir := t.TempDir()
+	if _, err := server.UpsertSpaceRootAlias(ctx, &s4wave_root.UpsertSpaceRootAliasRequest{
+		Record: &s4wave_root.SpaceRootAliasRecord{
+			AliasId:  "plain",
+			Kind:     s4wave_root.SpaceRootKind_SpaceRootKind_NATIVE_DIRECTORY,
+			OpenMode: s4wave_root.SpaceRootOpenMode_SpaceRootOpenMode_OPEN_EXISTING,
+			Native:   &s4wave_root.NativeSpaceRootMetadata{Path: plainDir},
+		},
+	}); err == nil {
+		t.Fatal("expected non-root directory rejection")
+	}
+}
+
+func TestSpaceRootFileAliasUsesItsContainingStateRoot(t *testing.T) {
+	// Create the alias server and its state catalog fixture.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	server, serverCancel := setupSpaceRootAliasServer(t.Context(), t)
+	defer serverCancel()
+	statePath := makeSpaceRootAliasDir(t)
+	filePath := filepath.Join(statePath, entrypoint_state.Filename)
+	if err := os.WriteFile(filePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save the state file alias and verify its ready status.
+	record, err := server.UpsertSpaceRootAlias(t.Context(), &s4wave_root.UpsertSpaceRootAliasRequest{
+		Record: &s4wave_root.SpaceRootAliasRecord{
+			AliasId:  "file",
+			Kind:     s4wave_root.SpaceRootKind_SpaceRootKind_S4WAVE_FILE,
+			OpenMode: s4wave_root.SpaceRootOpenMode_SpaceRootOpenMode_OPEN_EXISTING,
+			Native:   &s4wave_root.NativeSpaceRootMetadata{Path: filePath},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.GetRecord().GetStatus() != s4wave_root.SpaceRootStatus_SpaceRootStatus_READY {
+		t.Fatalf("file status = %s", record.GetRecord().GetStatus())
+	}
+
+	// Supply a runtime fixture that verifies the containing root path.
+	previous := connectSpaceRootRuntimeFunc
+	connectSpaceRootRuntimeFunc = func(_ context.Context, gotPath string) (*spaceRootRuntimeClient, error) {
+		if gotPath != statePath {
+			t.Fatalf("runtime path = %q, want %q", gotPath, statePath)
+		}
+		return &spaceRootRuntimeClient{root: &testSpaceRootRuntimeRoot{
+			sessions: []*session.SessionListEntry{{SessionIndex: 7}},
+		}}, nil
+	}
+	t.Cleanup(func() { connectSpaceRootRuntimeFunc = previous })
+	stream := &testSpaceRootRuntimeStream{
+		ctx: ctx,
+		onSend: func(resp *s4wave_root.WatchSpaceRootRuntimeResponse) {
+			if resp.GetStatus() == s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_READY {
+				cancel()
+			}
+		},
+	}
+	if err := server.WatchSpaceRootRuntime(&s4wave_root.WatchSpaceRootRuntimeRequest{AliasId: "file"}, stream); err != nil {
+		t.Fatal(err)
+	}
+	if len(stream.sent) != 2 || len(stream.sent[1].GetSessions()) != 1 {
+		t.Fatalf("runtime responses = %#v", stream.sent)
+	}
+}
+
+func TestSpaceRootFileSelectsItsAccountSessions(t *testing.T) {
+	entries := []*session.SessionListEntry{
+		{SessionIndex: 1, SessionRef: &session.SessionRef{ProviderResourceRef: &provider.ProviderResourceRef{
+			ProviderId: "local", ProviderAccountId: "first",
+		}}},
+		{SessionIndex: 2, SessionRef: &session.SessionRef{ProviderResourceRef: &provider.ProviderResourceRef{
+			ProviderId: "local", ProviderAccountId: "second",
+		}}},
+	}
+	selected := sessionsFromSpaceRootFile("/state/p_local_second.s4wave", entries)
+	if len(selected) != 1 || selected[0].GetSessionIndex() != 2 {
+		t.Fatalf("selected sessions = %#v", selected)
+	}
+}
+
+func TestSpaceRootRuntimeReportsMissingDaemon(t *testing.T) {
+	// Create the root alias server and an existing state directory.
+	ctx := t.Context()
+	server, cancel := setupSpaceRootAliasServer(ctx, t)
+	defer cancel()
+	rootPath := makeSpaceRootAliasDir(t)
+
+	// Save the root alias whose daemon is absent.
+	_, err := server.UpsertSpaceRootAlias(ctx, &s4wave_root.UpsertSpaceRootAliasRequest{
+		Record: &s4wave_root.SpaceRootAliasRecord{
+			AliasId:  "company",
+			Kind:     s4wave_root.SpaceRootKind_SpaceRootKind_NATIVE_DIRECTORY,
+			OpenMode: s4wave_root.SpaceRootOpenMode_SpaceRootOpenMode_OPEN_EXISTING,
+			Native:   &s4wave_root.NativeSpaceRootMetadata{Path: rootPath},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Watch the configured root whose daemon is absent.
+	strm := &testSpaceRootRuntimeStream{ctx: ctx}
+	if err := server.WatchSpaceRootRuntime(&s4wave_root.WatchSpaceRootRuntimeRequest{
+		AliasId: "company",
+	}, strm); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the stream reports a connection attempt and actionable failure.
+	if len(strm.sent) != 2 {
+		t.Fatalf("sent %d responses, want connecting and error", len(strm.sent))
+	}
+	if strm.sent[0].GetStatus() != s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_CONNECTING {
+		t.Fatalf("first status = %s, want connecting", strm.sent[0].GetStatus())
+	}
+	if strm.sent[1].GetStatus() != s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_ERROR {
+		t.Fatalf("second status = %s, want error", strm.sent[1].GetStatus())
+	}
+	if strm.sent[1].GetError() == "" {
+		t.Fatal("expected actionable runtime error")
+	}
+}
+
+func TestSpaceRootRuntimeStreamsSelectedRootSessions(t *testing.T) {
+	// Create the root alias server and a cancellable runtime watch.
+	watchCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	server, serverCancel := setupSpaceRootAliasServer(t.Context(), t)
+	defer serverCancel()
+	rootPath := makeSpaceRootAliasDir(t)
+
+	// Save the root alias used by the runtime watch.
+	_, err := server.UpsertSpaceRootAlias(t.Context(), &s4wave_root.UpsertSpaceRootAliasRequest{
+		Record: &s4wave_root.SpaceRootAliasRecord{
+			AliasId:  "company",
+			Kind:     s4wave_root.SpaceRootKind_SpaceRootKind_NATIVE_DIRECTORY,
+			OpenMode: s4wave_root.SpaceRootOpenMode_SpaceRootOpenMode_OPEN_EXISTING,
+			Native:   &s4wave_root.NativeSpaceRootMetadata{Path: rootPath},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Supply a daemon fixture with Session metadata.
+	prev := connectSpaceRootRuntimeFunc
+	connectSpaceRootRuntimeFunc = func(context.Context, string) (*spaceRootRuntimeClient, error) {
+		return &spaceRootRuntimeClient{
+			root: &testSpaceRootRuntimeRoot{
+				sessions: []*session.SessionListEntry{{SessionIndex: 7}},
+				metadata: map[uint32]*session.SessionMetadata{
+					7: {DisplayName: "External Account"},
+				},
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		connectSpaceRootRuntimeFunc = prev
+	})
+
+	// Watch the selected root until the ready snapshot arrives.
+	strm := &testSpaceRootRuntimeStream{
+		ctx: watchCtx,
+		onSend: func(resp *s4wave_root.WatchSpaceRootRuntimeResponse) {
+			if resp.GetStatus() == s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_READY {
+				cancel()
+			}
+		},
+	}
+	if err := server.WatchSpaceRootRuntime(&s4wave_root.WatchSpaceRootRuntimeRequest{
+		AliasId: "company",
+	}, strm); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the stream includes the selected Session and its metadata.
+	if len(strm.sent) != 2 {
+		t.Fatalf("sent %d responses, want connecting and ready", len(strm.sent))
+	}
+	ready := strm.sent[1]
+	if ready.GetStatus() != s4wave_root.SpaceRootRuntimeStatus_SpaceRootRuntimeStatus_READY {
+		t.Fatalf("second status = %s, want ready", ready.GetStatus())
+	}
+	if len(ready.GetSessions()) != 1 || ready.GetSessions()[0].GetSessionIndex() != 7 {
+		t.Fatalf("sessions = %#v, want session 7", ready.GetSessions())
+	}
+	if len(ready.GetRuntimeSessions()) != 1 || ready.GetRuntimeSessions()[0].GetMetadata().GetDisplayName() != "External Account" {
+		t.Fatalf("runtime sessions = %#v, want enriched session", ready.GetRuntimeSessions())
+	}
+
+	// Verify watching the runtime preserves the configured root alias.
+	records, err := server.snapshotSpaceRootAliases(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].GetAliasId() != "company" {
+		t.Fatalf("records after runtime watch = %#v, want unchanged alias", records)
+	}
+}
+
+func setupSpaceRootAliasServer(
+	ctx context.Context,
+	t *testing.T,
+) (*CoreRootServer, context.CancelFunc) {
+	// Create a cancellable context for the root alias testbed.
+	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+
+	// Start the in-memory volume testbed for the root alias server.
+	tb, err := db_testbed.NewTestbed(ctx, logrus.NewEntry(logrus.New()), db_testbed.WithVolumeConfig(
+		&volume_kvtxinmem.Config{
+			VolumeConfig: &volume_controller.Config{
+				VolumeIdAlias: []string{plugin.PluginVolumeID},
+			},
+		},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tb.Release)
+
+	return NewCoreRootServer(logrus.NewEntry(logrus.New()), tb.Bus), cancel
+}
+
+func makeSpaceRootAliasDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "plugin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+type testSpaceRootRuntimeStream struct {
+	ctx    context.Context
+	onSend func(*s4wave_root.WatchSpaceRootRuntimeResponse)
+	sent   []*s4wave_root.WatchSpaceRootRuntimeResponse
+}
+
+func (s *testSpaceRootRuntimeStream) Context() context.Context {
+	return s.ctx
+}
+
+func (s *testSpaceRootRuntimeStream) MsgSend(srpc.Message) error {
+	return nil
+}
+
+func (s *testSpaceRootRuntimeStream) MsgRecv(srpc.Message) error {
+	return nil
+}
+
+func (s *testSpaceRootRuntimeStream) CloseSend() error {
+	return nil
+}
+
+func (s *testSpaceRootRuntimeStream) Close() error {
+	return nil
+}
+
+func (s *testSpaceRootRuntimeStream) Send(resp *s4wave_root.WatchSpaceRootRuntimeResponse) error {
+	s.sent = append(s.sent, resp.CloneVT())
+	if s.onSend != nil {
+		s.onSend(resp)
+	}
+	return nil
+}
+
+func (s *testSpaceRootRuntimeStream) SendAndClose(resp *s4wave_root.WatchSpaceRootRuntimeResponse) error {
+	if resp != nil {
+		return s.Send(resp)
+	}
+	return nil
+}
+
+type testSpaceRootRuntimeRoot struct {
+	sessions []*session.SessionListEntry
+	metadata map[uint32]*session.SessionMetadata
+}
+
+func (r *testSpaceRootRuntimeRoot) WatchSessions(ctx context.Context) (s4wave_root.SRPCRootResourceService_WatchSessionsClient, error) {
+	return &testSpaceRootRuntimeWatch{sessions: r.sessions, ctx: ctx}, nil
+}
+
+func (r *testSpaceRootRuntimeRoot) MountSessionByIdx(context.Context, uint32) (*s4wave_root.MountSessionByIdxResponse, error) {
+	return &s4wave_root.MountSessionByIdxResponse{NotFound: true}, nil
+}
+
+func (r *testSpaceRootRuntimeRoot) GetSessionMetadata(_ context.Context, idx uint32) (*session.SessionMetadata, bool, error) {
+	meta, ok := r.metadata[idx]
+	return meta, !ok, nil
+}
+
+type testSpaceRootRuntimeWatch struct {
+	sessions []*session.SessionListEntry
+	sent     bool
+	ctx      context.Context
+}
+
+func (w *testSpaceRootRuntimeWatch) Context() context.Context {
+	if w.ctx != nil {
+		return w.ctx
+	}
+	return context.Background()
+}
+
+func (w *testSpaceRootRuntimeWatch) MsgSend(srpc.Message) error {
+	return nil
+}
+
+func (w *testSpaceRootRuntimeWatch) MsgRecv(srpc.Message) error {
+	return nil
+}
+
+func (w *testSpaceRootRuntimeWatch) CloseSend() error {
+	return nil
+}
+
+func (w *testSpaceRootRuntimeWatch) Close() error {
+	return nil
+}
+
+func (w *testSpaceRootRuntimeWatch) Recv() (*s4wave_root.WatchSessionsResponse, error) {
+	if w.sent {
+		<-w.Context().Done()
+		return nil, w.Context().Err()
+	}
+	w.sent = true
+	return &s4wave_root.WatchSessionsResponse{Sessions: w.sessions}, nil
+}
+
+func (w *testSpaceRootRuntimeWatch) RecvTo(resp *s4wave_root.WatchSessionsResponse) error {
+	next, err := w.Recv()
+	if err != nil {
+		return err
+	}
+	resp.Sessions = next.GetSessions()
+	return nil
+}

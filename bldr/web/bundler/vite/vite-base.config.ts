@@ -1,0 +1,89 @@
+import { defineConfig } from 'vite'
+import { resolve } from 'path'
+import { existsSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { buildGoAliases, goTsResolver } from './go-ts-resolver.js'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// Detect if we are running in a monorepo checkout or a generated .bldr tree.
+const bldrProjectRoot =
+  process.env['BLDR_PROJECT_ROOT'] || resolve(__dirname, '../../../../')
+const bldrSourceRoot = resolve(__dirname, '../../../')
+const bldrDistRoot =
+  process.env['BLDR_DIST_ROOT'] || resolve(bldrSourceRoot, '.bldr/src')
+
+function resolveBldrDistPath(...segments: string[]) {
+  // Local SDK imports and public aliases must share module identity. Packaged
+  // sources supply the SDK only when the project does not contain Bldr itself.
+  const projectRoot = resolve(bldrProjectRoot, 'bldr')
+  if (existsSync(resolve(projectRoot, 'sdk/plugin.ts'))) {
+    return resolve(projectRoot, ...segments)
+  }
+  const monorepoRoot = resolve(bldrDistRoot, 'bldr')
+  if (existsSync(monorepoRoot)) {
+    const monorepoPath = resolve(monorepoRoot, ...segments)
+    return monorepoPath
+  }
+  return resolve(bldrDistRoot, ...segments)
+}
+
+// Use inline sourcemaps in development for faster builds.
+const isDevelopment = process.env.NODE_ENV !== 'production'
+
+// https://vite.dev/config/
+export default defineConfig({
+  build: {
+    outDir: './vite-dist',
+    rolldownOptions: {
+      output: {},
+    },
+    minify: false,
+    sourcemap: isDevelopment ? 'inline' : true,
+    cssCodeSplit: true, // set to true by Go as well.
+    manifest: true, // set to true by Go as well.
+  },
+  // Lower syntax to Vite's baseline-widely-available build target in every
+  // mode. The dev server otherwise serves newer syntax such as using
+  // declarations as written, which WebKit cannot parse. Rolldown supplies
+  // the helpers that lowered modules import.
+  oxc: {
+    target: ['chrome111', 'edge111', 'firefox114', 'safari16.4', 'ios16.4'],
+  },
+  define: {
+    'process.env.NODE_ENV': JSON.stringify(
+      process.env.NODE_ENV || 'development',
+    ),
+  },
+  resolve: {
+    alias: [
+      ...buildGoAliases(bldrProjectRoot, bldrDistRoot),
+      {
+        find: /^@aptre\/bldr$/,
+        replacement: resolveBldrDistPath('web/bldr/index.js'),
+      },
+      // The Bldr harness ships the SDK inside the dist root; map both the
+      // plugin entry and explicit .js imports onto the packaged sources so
+      // apps need no local SDK install or tsconfig paths. The .js imports
+      // resolve to an extensionless path so Vite picks the packaged .ts or
+      // .tsx module.
+      {
+        find: /^@aptre\/bldr-sdk$/,
+        replacement: resolveBldrDistPath('sdk/plugin.ts'),
+      },
+      {
+        find: /^@aptre\/bldr-sdk\/(.*)\.js$/,
+        replacement: resolveBldrDistPath('sdk/$1'),
+      },
+      {
+        find: /^@aptre\/bldr-react$/,
+        replacement: resolveBldrDistPath('web/bldr-react/index.js'),
+      },
+    ],
+  },
+  plugins: [
+    // This plugin fixes issues with resolving paths like @go/foo/bar/baz.js where baz.ts exists only.
+    goTsResolver(bldrProjectRoot, bldrDistRoot),
+  ],
+})

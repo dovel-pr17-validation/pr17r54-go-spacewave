@@ -1,0 +1,35 @@
+
+
+	blocktype
+db/blocktype
+#
+download
+space/http/download
+
+export
+space/http/export
+o
+provider-local]
+provider/localI{"signalingUrl":"https://spacewave.app","signalingEnvPrefix":"spacewave"}
+§
+provider-spacewaveç
+provider/spacewaveu{"endpoint":"https://spacewave.app","accountEndpoint":"https://account.spacewave.app","signingEnvPrefix":"spacewave"}
+L
+resource-listener7
+resource/listener {"storageProjectId":"spacewave"}
+m
+root-resource\
+resource/rootI{"appPluginIds":["spacewave-core","spacewave-web","spacewave-app","web"]}
+
+session-list
+session
+5
+space-sobject$
+space/sobject{"verbose":false}
+&
+space-world-ops
+space/world/ops
+W
+
+store-peerI
+object/peer8{"objectStoreId":"s4wave-peer","volumeId":"plugin-host"}

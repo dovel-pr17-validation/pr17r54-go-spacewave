@@ -1,0 +1,19 @@
+# Login offers each session source and keeps explicit shortcuts available.
+spacewave login --help
+stdout "add a Spacewave session to this device"
+stdout "create a local offline account"
+stdout "sign in via the browser handoff flow"
+stdout "add an account using a code from another device"
+stdout "open an existing .s4wave Session volume"
+stdout "--username value"
+stdout "--pem-file value"
+
+! spacewave login
+stderr "choose a login method"
+
+spacewave login browser --help
+stdout "sign in via the browser handoff flow"
+stdout "prefill the browser auth flow with this username"
+
+! spacewave login --username cli@example.test --password test-pass --state-path $WORK/state
+stderr "no daemon listening"

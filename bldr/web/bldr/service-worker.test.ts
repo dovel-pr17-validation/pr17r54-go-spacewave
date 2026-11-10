@@ -1,0 +1,2435 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { proxyFetch } from '../fetch/fetch.js'
+import { createEmptyBrowserReleaseState } from './browser-release-state.js'
+import type {
+  BrowserReleaseDescriptor,
+  BrowserReleaseState,
+} from './browser-release-state.js'
+import {
+  classifyBrowserFetchSource,
+  classifyBrowserRuntimeFetchError,
+  getBrowserControlCacheRow,
+  handleBrowserReleaseRequest,
+  handleServiceWorkerMessage,
+  parseDevFrontendSession,
+  refreshBrowserIndexCache,
+  resetServiceWorkerTestState,
+  resolveBrowserRuntimeFetchClientId,
+  syncLatestBrowserRelease,
+  swFetch,
+  swActivate,
+} from './service-worker.js'
+import {
+  type OpenWebRuntimePortResult,
+  WebDocumentTracker,
+} from './web-document-tracker.js'
+
+vi.mock('../fetch/fetch.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../fetch/fetch.js')>()
+  return {
+    ...actual,
+    proxyFetch: vi.fn(),
+  }
+})
+
+type FakeCachePutFailure = (
+  cacheName: string,
+  request: Request,
+  response: Response,
+) => Error | undefined
+type FakeCacheDeleteFailure = (cacheName: string) => Error | undefined
+
+class FakeCache {
+  private readonly entries = new Map<string, Response>()
+
+  public constructor(
+    private readonly name: string,
+    private readonly failPut?: FakeCachePutFailure,
+  ) {}
+
+  public async match(request: Request): Promise<Response | undefined> {
+    return this.entries.get(request.url)?.clone()
+  }
+
+  public async put(request: Request, response: Response): Promise<void> {
+    const error = this.failPut?.(this.name, request, response)
+    if (error) {
+      throw error
+    }
+    this.entries.set(request.url, response.clone())
+  }
+}
+
+class FakeCacheStorage {
+  private readonly caches = new Map<string, FakeCache>()
+
+  public constructor(
+    private readonly failPut?: FakeCachePutFailure,
+    private readonly failDelete?: FakeCacheDeleteFailure,
+  ) {}
+
+  public async open(name: string): Promise<FakeCache> {
+    const existing = this.caches.get(name)
+    if (existing) {
+      return existing
+    }
+    const cache = new FakeCache(name, this.failPut)
+    this.caches.set(name, cache)
+    return cache
+  }
+
+  public async keys(): Promise<string[]> {
+    return Array.from(this.caches.keys())
+  }
+
+  public async delete(name: string): Promise<boolean> {
+    const error = this.failDelete?.(name)
+    if (error) {
+      throw error
+    }
+    return this.caches.delete(name)
+  }
+}
+
+interface FetchEventHarness {
+  ev: FetchEvent
+  waitUntilPromises: Promise<unknown>[]
+}
+
+interface Deferred<T> {
+  promise: Promise<T>
+  resolve(value: T): void
+}
+
+function buildRelease(generationId: string): BrowserReleaseDescriptor {
+  return {
+    schemaVersion: 1,
+    generationId,
+    shellAssets: {
+      entrypoint: `/entrypoint/${generationId}/entrypoint.mjs`,
+      serviceWorker: `/sw-${generationId}.mjs`,
+      sharedWorker: `/shw-${generationId}.mjs`,
+      wasm: `/entrypoint/${generationId}/runtime.wasm.gz`,
+      css: [],
+    },
+    prerenderedRoutes: ['/'],
+    requiredStaticAssets: [],
+  }
+}
+
+function newDeferred<T>(): Deferred<T> {
+  let resolve: (value: T) => void = () => {}
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+function newCachePutError(): Error {
+  const error = new Error('Cache.put() encountered a network error')
+  error.name = 'NetworkError'
+  return error
+}
+
+function buildFetchEvent(url: string): FetchEventHarness {
+  const waitUntilPromises: Promise<unknown>[] = []
+  return {
+    ev: {
+      request: new Request(url),
+      waitUntil(promise: Promise<unknown>) {
+        waitUntilPromises.push(promise)
+      },
+    } as FetchEvent,
+    waitUntilPromises,
+  }
+}
+
+async function writeBrowserReleaseState(
+  caches: FakeCacheStorage,
+  state: BrowserReleaseState,
+): Promise<void> {
+  const cache = await caches.open('bldr-control')
+  await cache.put(
+    new Request(
+      new URL('/__bldr/browser-release-state.json', self.location.href),
+    ),
+    new Response(JSON.stringify(state)),
+  )
+}
+
+async function writeGenerationCacheResponse(
+  caches: FakeCacheStorage,
+  generationId: string,
+  path: string,
+  response: Response,
+): Promise<void> {
+  const cache = await caches.open(`bldr-generation-${generationId}`)
+  await cache.put(new Request(new URL(path, self.location.href)), response)
+}
+
+// pluginAssetCachePath builds the root-scoped generation-cache key for a
+// static plugin asset.
+function pluginAssetCachePath(path: string, rootHash: string): string {
+  return `${path}?__bldr_plugin_root=${encodeURIComponent(rootHash)}`
+}
+
+async function writeControlCacheResponse(
+  caches: FakeCacheStorage,
+  path: string,
+  response: Response,
+): Promise<void> {
+  const cache = await caches.open('bldr-control')
+  await cache.put(new Request(new URL(path, self.location.href)), response)
+}
+
+function buildMessageEvent(data: unknown): ExtendableMessageEvent {
+  return {
+    data,
+    source: {
+      id: 'client-a',
+    },
+    waitUntil: vi.fn(),
+  } as unknown as ExtendableMessageEvent
+}
+
+function buildMessageDeps() {
+  return {
+    clients: buildTestClients(),
+    fetchTracker: {
+      abortClient: vi.fn(),
+    },
+    webDocumentTracker: {
+      handleWebDocumentMessage: vi.fn(),
+    },
+    syncLatestBrowserRelease: vi.fn(),
+    refreshBrowserIndexCache: vi.fn(),
+    handleCrossTabMessage: vi.fn(),
+  }
+}
+
+async function announcePluginRoot(
+  pluginId: string,
+  rootHash: string,
+): Promise<void> {
+  const ev = buildMessageEvent({
+    bldrPluginManifestRoot: { pluginId, rootHash },
+  })
+  handleServiceWorkerMessage(ev, buildMessageDeps())
+  expect(ev.waitUntil).toHaveBeenCalledWith(expect.any(Promise))
+  await vi.mocked(ev.waitUntil).mock.calls[0][0]
+}
+
+function buildTestClients(): Clients {
+  return {
+    claim: () => Promise.resolve(),
+    get: () => Promise.resolve(undefined),
+    matchAll: () => Promise.resolve([]),
+    openWindow: () => Promise.resolve(null),
+  }
+}
+
+function buildFetchOnlyEvent(
+  path: string,
+  init?: RequestInit,
+  clientId?: string,
+): FetchEvent {
+  return {
+    request: new Request(new URL(path, self.location.href), init),
+    clientId,
+    waitUntil() {},
+  } as unknown as FetchEvent
+}
+
+function buildExplicitCacheModeFetchEvent(
+  path: string,
+  cacheMode: RequestCache,
+): FetchEvent {
+  const ev = buildFetchOnlyEvent(path)
+  Object.defineProperty(ev.request, 'cache', {
+    configurable: true,
+    value: cacheMode,
+  })
+  return ev
+}
+
+function buildClientFetchEvent(
+  path: string,
+  clientId: string,
+): FetchEventHarness {
+  const waitUntilPromises: Promise<unknown>[] = []
+  return {
+    ev: {
+      request: new Request(new URL(path, self.location.href)),
+      clientId,
+      waitUntil(promise: Promise<unknown>) {
+        waitUntilPromises.push(promise)
+      },
+    } as unknown as FetchEvent,
+    waitUntilPromises,
+  }
+}
+
+function buildMalformedFetchEvent(url: string): FetchEvent {
+  return {
+    request: {
+      url,
+      method: 'GET',
+      headers: new Headers(),
+    } as unknown as Request,
+  } as FetchEvent
+}
+
+function requireShellWasm(release: BrowserReleaseDescriptor): string {
+  const { wasm } = release.shellAssets
+  if (!wasm) {
+    throw new Error('test release missing wasm shell asset')
+  }
+  return wasm
+}
+
+describe('service worker browser release requests', () => {
+  beforeEach(() => {
+    resetServiceWorkerTestState()
+    vi.stubGlobal('BLDR_DEBUG', false)
+    vi.stubGlobal('caches', new FakeCacheStorage())
+    vi.stubGlobal('fetch', vi.fn())
+    Object.defineProperty(self, 'clients', {
+      configurable: true,
+      value: {
+        claim: vi.fn(),
+        matchAll: vi.fn().mockResolvedValue([]),
+      },
+    })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it.each([
+    ['bytes=2-5', 206, '2345', 'bytes 2-5/10'],
+    ['bytes=-3', 206, '789', 'bytes 7-9/10'],
+    ['bytes=8-', 206, '89', 'bytes 8-9/10'],
+    ['bytes=20-30', 416, '', 'bytes */10'],
+  ])(
+    'serves cached pack ranges without transferring the whole pack: %s',
+    async (range, status, body, contentRange) => {
+      const caches = globalThis.caches as unknown as FakeCacheStorage
+      const release = buildRelease('range-release')
+      release.requiredStaticAssets = ['/assets.kvfile']
+      await writeBrowserReleaseState(caches, {
+        ...createEmptyBrowserReleaseState(),
+        promotedCurrent: release,
+      })
+      await writeGenerationCacheResponse(
+        caches,
+        release.generationId,
+        '/assets.kvfile',
+        new Response('0123456789'),
+      )
+      const response = await swFetch(
+        buildFetchOnlyEvent('/assets.kvfile', { headers: { Range: range } }),
+      )
+      expect(response.status).toBe(status)
+      expect(response.headers.get('Content-Range')).toBe(contentRange)
+      expect(await response.text()).toBe(body)
+      expect(fetch).not.toHaveBeenCalled()
+      const whole = await swFetch(buildFetchOnlyEvent('/assets.kvfile'))
+      expect(await whole.text()).toBe('0123456789')
+    },
+  )
+
+  it('activates without waiting for any offline-cache download', async () => {
+    vi.mocked(fetch).mockImplementation(() => new Promise(() => {}))
+    await swActivate()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('returns the complete cached generation while staging a fresh manifest', async () => {
+    const cachedRelease = buildRelease('gen-a')
+    const freshRelease = buildRelease('gen-b')
+    await writeBrowserReleaseState(
+      globalThis.caches as unknown as FakeCacheStorage,
+      {
+        ...createEmptyBrowserReleaseState(),
+        promotedCurrent: cachedRelease,
+      },
+    )
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify(freshRelease), { status: 200 }),
+    )
+    vi.mocked(fetch).mockImplementation(() =>
+      Promise.resolve(new Response('asset', { status: 200 })),
+    )
+    const { ev, waitUntilPromises } = buildFetchEvent(
+      'https://example.test/browser-release.json',
+    )
+
+    const response = await handleBrowserReleaseRequest(ev)
+
+    expect(await response.json()).toEqual(cachedRelease)
+    expect(waitUntilPromises).toHaveLength(1)
+    await waitUntilPromises[0]
+  })
+
+  it('does not promote a browser release when generation cache writes fail', async () => {
+    const caches = new FakeCacheStorage((cacheName) => {
+      if (cacheName.startsWith('bldr-generation-')) {
+        return newCachePutError()
+      }
+      return undefined
+    })
+    vi.stubGlobal('caches', caches)
+    const release = buildRelease('gen-b')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify(release), { status: 200 }),
+    )
+    vi.mocked(fetch).mockImplementation(() =>
+      Promise.resolve(new Response('asset', { status: 200 })),
+    )
+    const { ev, waitUntilPromises } = buildFetchEvent(
+      'https://example.test/browser-release.json',
+    )
+
+    const response = await handleBrowserReleaseRequest(ev)
+
+    expect(await response.json()).toEqual(release)
+    expect(waitUntilPromises).toHaveLength(1)
+    await expect(waitUntilPromises[0]).resolves.toBeUndefined()
+
+    const cache = await caches.open('bldr-control')
+    const stateResponse = await cache.match(
+      new Request(
+        new URL('/__bldr/browser-release-state.json', self.location.href),
+      ),
+    )
+    if (!stateResponse) {
+      throw new Error('browser release state was not written')
+    }
+    await expect(stateResponse.json()).resolves.toMatchObject({
+      discovered: {
+        generationId: 'gen-b',
+      },
+      staged: null,
+      promotedCurrent: null,
+    })
+    expect(warn).toHaveBeenCalledWith(
+      'ServiceWorker: %s: cache write failed: operation=%s cache=%s%s%s url=%s: %s',
+      expect.any(String),
+      'stage browser release',
+      'bldr-generation-gen-b',
+      ' generation=gen-b',
+      '',
+      expect.any(String),
+      'Cache.put() encountered a network error',
+    )
+  })
+
+  it('returns the cached manifest without waiting for a stalled network', async () => {
+    const cachedRelease = buildRelease('gen-a')
+    const freshRelease = buildRelease('gen-b')
+    await writeBrowserReleaseState(
+      globalThis.caches as unknown as FakeCacheStorage,
+      {
+        ...createEmptyBrowserReleaseState(),
+        promotedCurrent: cachedRelease,
+      },
+    )
+    const network = newDeferred<Response>()
+    vi.mocked(fetch).mockReturnValueOnce(network.promise)
+    vi.mocked(fetch).mockImplementation(() =>
+      Promise.resolve(new Response('asset', { status: 200 })),
+    )
+    const { ev, waitUntilPromises } = buildFetchEvent(
+      'https://example.test/browser-release.json',
+    )
+
+    const response = await handleBrowserReleaseRequest(ev)
+
+    expect(await response.json()).toEqual(cachedRelease)
+    expect(waitUntilPromises).toHaveLength(1)
+
+    network.resolve(
+      new Response(JSON.stringify(freshRelease), {
+        status: 200,
+      }),
+    )
+    await waitUntilPromises[0]
+  })
+
+  it('returns the cached manifest when the network is offline', async () => {
+    const cachedRelease = buildRelease('gen-a')
+    await writeBrowserReleaseState(
+      globalThis.caches as unknown as FakeCacheStorage,
+      {
+        ...createEmptyBrowserReleaseState(),
+        promotedCurrent: cachedRelease,
+      },
+    )
+    const pendingFetch = newDeferred<Response>()
+    vi.mocked(fetch).mockRejectedValueOnce(new Error('offline'))
+    vi.mocked(fetch).mockReturnValue(pendingFetch.promise)
+    const { ev, waitUntilPromises } = buildFetchEvent(
+      'https://example.test/browser-release.json',
+    )
+
+    const response = await handleBrowserReleaseRequest(ev)
+
+    expect(await response.json()).toEqual(cachedRelease)
+    expect(waitUntilPromises).toHaveLength(1)
+  })
+
+  it('returns the network manifest when no promoted cache exists', async () => {
+    const release = buildRelease('gen-b')
+    const pendingFetch = newDeferred<Response>()
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify(release), { status: 200 }),
+    )
+    vi.mocked(fetch).mockReturnValue(pendingFetch.promise)
+    const { ev, waitUntilPromises } = buildFetchEvent(
+      'https://example.test/browser-release.json',
+    )
+
+    const response = await handleBrowserReleaseRequest(ev)
+
+    expect(await response.json()).toEqual(release)
+    expect(waitUntilPromises).toHaveLength(1)
+  })
+
+  it('errors when the network is offline and no cache exists', async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new Error('offline'))
+    const { ev, waitUntilPromises } = buildFetchEvent(
+      'https://example.test/browser-release.json',
+    )
+
+    await expect(handleBrowserReleaseRequest(ev)).rejects.toThrow(
+      'browser release manifest unavailable',
+    )
+    expect(waitUntilPromises).toHaveLength(0)
+  })
+
+  it('budgets lifecycle release sync probes and keeps direct manifest refresh strong', async () => {
+    vi.useFakeTimers()
+    const release = buildRelease('gen-a')
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const rawURL = input instanceof Request ? input.url : String(input)
+      const pathname = new URL(rawURL, self.location.href).pathname
+      if (pathname === '/browser-release.json') {
+        return Promise.resolve(
+          new Response(JSON.stringify(release), { status: 200 }),
+        )
+      }
+      return Promise.resolve(new Response('asset', { status: 200 }))
+    })
+
+    await syncLatestBrowserRelease({ lifecycleProbe: true })
+    await syncLatestBrowserRelease({ lifecycleProbe: true })
+
+    const freshBudgetPaths = vi.mocked(fetch).mock.calls.map(([input]) => {
+      const rawURL = input instanceof Request ? input.url : String(input)
+      return new URL(rawURL, self.location.href).pathname
+    })
+    expect(
+      freshBudgetPaths.filter((path) => path === '/boot.mjs'),
+    ).toHaveLength(1)
+    expect(
+      freshBudgetPaths.filter((path) => path === '/browser-release.json'),
+    ).toHaveLength(1)
+
+    const { ev, waitUntilPromises } = buildFetchEvent(
+      'https://example.test/browser-release.json',
+    )
+    const response = await handleBrowserReleaseRequest(ev)
+    expect(await response.json()).toEqual(release)
+    expect(waitUntilPromises).toHaveLength(1)
+    await waitUntilPromises[0]
+
+    vi.advanceTimersByTime(30000)
+    await syncLatestBrowserRelease({ lifecycleProbe: true })
+
+    const allPaths = vi.mocked(fetch).mock.calls.map(([input]) => {
+      const rawURL = input instanceof Request ? input.url : String(input)
+      return new URL(rawURL, self.location.href).pathname
+    })
+    expect(allPaths.filter((path) => path === '/boot.mjs')).toHaveLength(3)
+    expect(
+      allPaths.filter((path) => path === '/browser-release.json'),
+    ).toHaveLength(3)
+  })
+})
+
+describe('service worker fetch release cache routing', () => {
+  beforeEach(() => {
+    resetServiceWorkerTestState()
+    vi.clearAllMocks()
+    vi.stubGlobal('BLDR_DEBUG', false)
+    vi.stubGlobal('caches', new FakeCacheStorage())
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('serves promoted generation assets from the generation cache', async () => {
+    const release = buildRelease('gen-a')
+    const wasm = requireShellWasm(release)
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: release,
+    })
+    await writeGenerationCacheResponse(
+      caches,
+      release.generationId,
+      wasm,
+      new Response('cached wasm', { status: 200 }),
+    )
+    vi.mocked(fetch).mockResolvedValue(new Response('network', { status: 200 }))
+
+    const response = await swFetch(buildFetchOnlyEvent(wasm))
+
+    expect(await response.text()).toBe('cached wasm')
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('uses native fetch for explicit cache refresh requests to promoted generation assets', async () => {
+    const release = buildRelease('gen-a')
+    const wasm = requireShellWasm(release)
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: release,
+    })
+    await writeGenerationCacheResponse(
+      caches,
+      release.generationId,
+      wasm,
+      new Response('stale cached wasm', { status: 200 }),
+    )
+    vi.mocked(fetch).mockImplementation(() =>
+      Promise.resolve(new Response('fresh network wasm', { status: 200 })),
+    )
+
+    for (const cacheMode of ['reload', 'no-cache'] as const) {
+      const response = await swFetch(
+        buildExplicitCacheModeFetchEvent(wasm, cacheMode),
+      )
+
+      expect(await response.text()).toBe('fresh network wasm')
+    }
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses native fetch for non-promoted paths', async () => {
+    const release = buildRelease('gen-a')
+    await writeBrowserReleaseState(
+      globalThis.caches as unknown as FakeCacheStorage,
+      {
+        ...createEmptyBrowserReleaseState(),
+        promotedCurrent: release,
+      },
+    )
+    vi.mocked(fetch).mockResolvedValue(new Response('network', { status: 200 }))
+
+    const response = await swFetch(buildFetchOnlyEvent('/other.wasm'))
+
+    expect(await response.text()).toBe('network')
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses native fetch on promoted generation cache miss', async () => {
+    const release = buildRelease('gen-a')
+    const wasm = requireShellWasm(release)
+    await writeBrowserReleaseState(
+      globalThis.caches as unknown as FakeCacheStorage,
+      {
+        ...createEmptyBrowserReleaseState(),
+        promotedCurrent: release,
+      },
+    )
+    vi.mocked(fetch).mockResolvedValue(new Response('network', { status: 200 }))
+
+    const response = await swFetch(buildFetchOnlyEvent(wasm))
+
+    expect(await response.text()).toBe('network')
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('caches the runtime browser index and falls back to it on refresh failure', async () => {
+    vi.mocked(proxyFetch)
+      .mockResolvedValueOnce(new Response('runtime index', { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response('runtime unavailable', { status: 503 }),
+      )
+
+    const firstResponse = await swFetch(buildFetchOnlyEvent('/b/__index.html'))
+
+    const secondResponse = await swFetch(buildFetchOnlyEvent('/b/__index.html'))
+
+    expect(await firstResponse.text()).toBe('runtime index')
+    expect(await secondResponse.text()).toBe('runtime index')
+    expect(proxyFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses native fetch for root navigation requests with only the runtime browser index cached', async () => {
+    await writeControlCacheResponse(
+      globalThis.caches as unknown as FakeCacheStorage,
+      '/b/__index.html',
+      new Response('runtime index', { status: 200 }),
+    )
+    vi.mocked(fetch).mockResolvedValue(
+      new Response('network root', { status: 200 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent('/', {
+        headers: { Accept: 'text/html' },
+      }),
+    )
+
+    expect(await response.text()).toBe('network root')
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('serves root navigation requests from the cached root response', async () => {
+    await writeControlCacheResponse(
+      globalThis.caches as unknown as FakeCacheStorage,
+      '/',
+      new Response('cached root', { status: 200 }),
+    )
+    vi.mocked(fetch).mockRejectedValue(new Error('network unavailable'))
+
+    const response = await swFetch(
+      buildFetchOnlyEvent('/', {
+        headers: { Accept: 'text/html' },
+      }),
+    )
+
+    expect(await response.text()).toBe('cached root')
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('caches successful native root navigation responses', async () => {
+    const caches = new FakeCacheStorage()
+    vi.stubGlobal('caches', caches)
+    vi.mocked(fetch).mockResolvedValue(
+      new Response('network root', { status: 200 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent('/', {
+        headers: { Accept: 'text/html' },
+      }),
+    )
+
+    expect(await response.text()).toBe('network root')
+    const cache = await caches.open('bldr-control')
+    const rootResponse = await cache.match(
+      new Request(new URL('/', self.location.href)),
+    )
+    expect(await rootResponse?.text()).toBe('network root')
+  })
+
+  it('uses native fetch for root navigation requests on runtime browser index cache miss', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response('network root', { status: 200 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent('/', {
+        headers: { Accept: 'text/html' },
+      }),
+    )
+
+    expect(await response.text()).toBe('network root')
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('returns bad request for malformed request URLs', async () => {
+    const response = await swFetch(buildMalformedFetchEvent(''))
+
+    expect(response.status).toBe(400)
+    expect(await response.text()).toBe('malformed request URL')
+    expect(fetch).not.toHaveBeenCalled()
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('classifies browser fetch sources before routing', () => {
+    expect(
+      classifyBrowserFetchSource(
+        new Request(new URL('/', self.location.href), {
+          headers: { Accept: 'text/html' },
+        }),
+      ).kind,
+    ).toBe('root-document')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(new URL('/b/__index.html', self.location.href)),
+      ).kind,
+    ).toBe('browser-index')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(new URL('/boot.mjs', self.location.href)),
+      ).kind,
+    ).toBe('boot-asset')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(new URL('/browser-release.json', self.location.href)),
+      ).kind,
+    ).toBe('release-asset')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(new URL('/b/pd/plugin/app.mjs', self.location.href)),
+      ).kind,
+    ).toBe('plugin-dist')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(
+          new URL('/b/pkg/sonner/dist/index.mjs', self.location.href),
+        ),
+      ).kind,
+    ).toBe('plugin-assets')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(new URL('/b/pa/plugin/style.css', self.location.href)),
+      ).kind,
+    ).toBe('plugin-assets')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(
+          new URL('/p/spacewave-core/fs/file.txt', self.location.href),
+        ),
+      ).kind,
+    ).toBe('plugin-assets')
+    expect(
+      classifyBrowserFetchSource(
+        new Request(new URL('/other.wasm', self.location.href)),
+      ).kind,
+    ).toBe('native-fetch')
+  })
+
+  it('keeps root navigation and browser index in distinct control cache rows', () => {
+    const rootRow = getBrowserControlCacheRow('root-document')
+    const indexRow = getBrowserControlCacheRow('browser-index')
+
+    expect(rootRow.cacheName).toBe('bldr-control')
+    expect(indexRow.cacheName).toBe('bldr-control')
+    expect(rootRow.kind).toBe('root-document')
+    expect(indexRow.kind).toBe('browser-index')
+    expect(rootRow.path).toBe('/')
+    expect(indexRow.path).toBe('/b/__index.html')
+    expect(rootRow.path).not.toBe(indexRow.path)
+  })
+
+  it('serves retained root navigation with the app import map from the root row', async () => {
+    await writeControlCacheResponse(
+      globalThis.caches as unknown as FakeCacheStorage,
+      '/',
+      new Response(
+        '<script type="importmap">{"imports":{"@spacewave/app":"/entrypoint/gen-a/app.mjs"}}</script>',
+        { status: 200 },
+      ),
+    )
+    await writeControlCacheResponse(
+      globalThis.caches as unknown as FakeCacheStorage,
+      '/b/__index.html',
+      new Response(
+        '<script type="importmap">{"imports":{"@bldr/runtime":"/b/runtime.mjs"}}</script>',
+        { status: 200 },
+      ),
+    )
+    vi.mocked(fetch).mockRejectedValue(new Error('network unavailable'))
+
+    const response = await swFetch(
+      buildFetchOnlyEvent('/', {
+        headers: { Accept: 'text/html' },
+      }),
+    )
+
+    const body = await response.text()
+    expect(body).toContain('@spacewave/app')
+    expect(body).not.toContain('@bldr/runtime')
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('returns typed runtime-unavailable for plugin fetches without a client', async () => {
+    const response = await swFetch(
+      buildFetchOnlyEvent('/p/spacewave-core/fs/u/1/so/space/-/file.txt'),
+    )
+
+    expect(response.status).toBe(503)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'runtime-unavailable',
+    )
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'runtime-unavailable',
+    )
+    expect(await response.json()).toMatchObject({
+      code: 'runtime-unavailable',
+      source: 'plugin-assets',
+      pluginAssetFetchResult: 'runtime-unavailable',
+    })
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('uses the service worker runtime client for static plugin assets when a relay exists', () => {
+    const source = classifyBrowserFetchSource(
+      new Request(
+        new URL(
+          '/p/spacewave-core/fs/u/1/so/space/-/file.txt',
+          self.location.href,
+        ),
+      ),
+    )
+
+    expect(
+      resolveBrowserRuntimeFetchClientId(
+        '',
+        source,
+        { hasRuntimeFetchRelay: () => true },
+        'service-worker-runtime',
+      ),
+    ).toBe('service-worker-runtime')
+    expect(
+      resolveBrowserRuntimeFetchClientId(
+        'client-a',
+        source,
+        { hasRuntimeFetchRelay: () => true },
+        'service-worker-runtime',
+      ),
+    ).toBe('client-a')
+
+    const assetSource = classifyBrowserFetchSource(
+      new Request(
+        new URL(
+          '/b/pa/spacewave-app/v/b/fe/app/App-next.mjs',
+          self.location.href,
+        ),
+      ),
+    )
+
+    expect(
+      resolveBrowserRuntimeFetchClientId(
+        'client-a',
+        assetSource,
+        { hasRuntimeFetchRelay: () => true },
+        'service-worker-runtime',
+      ),
+    ).toBe('service-worker-runtime')
+    expect(
+      resolveBrowserRuntimeFetchClientId(
+        'client-a',
+        assetSource,
+        { hasRuntimeFetchRelay: () => false },
+        'service-worker-runtime',
+      ),
+    ).toBe('client-a')
+    expect(
+      resolveBrowserRuntimeFetchClientId(
+        '',
+        source,
+        { hasRuntimeFetchRelay: () => false },
+        'service-worker-runtime',
+      ),
+    ).toBe('')
+  })
+
+  it('returns typed runtime-unavailable for plugin worker import timeouts', async () => {
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(
+        'WebRuntimeClient: client-a: timeout opening stream with host',
+        {
+          status: 500,
+        },
+      ),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/backend.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(503)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-dist')
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'runtime-unavailable',
+    )
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'runtime-unavailable',
+    )
+    expect(await response.json()).toMatchObject({
+      code: 'runtime-unavailable',
+      source: 'plugin-dist',
+      path: '/b/pd/spacewave-app/backend.mjs',
+      pluginAssetFetchResult: 'runtime-unavailable',
+    })
+  })
+
+  it.each([
+    ['/b/pd/spacewave-app/child.mjs', 'plugin-dist'],
+    ['/b/pa/spacewave-app/v/b/fe/child.mjs', 'plugin-assets'],
+    ['/b/pkg/sonner/child.mjs', 'plugin-assets'],
+  ])(
+    'returns the fresh module body after retrying a classified runtime-unavailable 503: %s',
+    async (path, sourceKind) => {
+      // mockReset clears queued mockResolvedValueOnce entries that a previous
+      // failing case left unconsumed; clearAllMocks does not reset queues.
+      vi.mocked(proxyFetch).mockReset()
+      const body = 'export const child = "fresh"\n'
+      vi.mocked(proxyFetch)
+        .mockResolvedValueOnce(
+          new Response(
+            'WebRuntimeClient: client-a: timeout opening stream with host',
+            { status: 500 },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(body, {
+            status: 200,
+            headers: { 'Content-Type': 'application/javascript' },
+          }),
+        )
+
+      const response = await swFetch(
+        buildFetchOnlyEvent(path, undefined, 'client-a'),
+      )
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe(body)
+      expect(proxyFetch).toHaveBeenCalledTimes(2)
+      expect(response.headers.get('X-Bldr-Fetch-Source')).toBe(sourceKind)
+    },
+  )
+
+  it('retries a plugin fetch lost with its runtime once the successor announces the root', async () => {
+    vi.mocked(proxyFetch).mockReset()
+    const body = 'export const child = "fresh"\n'
+    vi.mocked(proxyFetch)
+      .mockResolvedValueOnce(
+        new Response(
+          'WebRuntimeClient: client-a: runtime client generation 2 closed: runtime-disconnected',
+          { status: 500 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(body, { status: 200 }))
+
+    const pending = swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/child.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+    await vi.waitFor(() => expect(proxyFetch).toHaveBeenCalledOnce())
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(proxyFetch).toHaveBeenCalledOnce()
+
+    await announcePluginRoot('spacewave-app', '2abc')
+    const response = await pending
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe(body)
+    expect(proxyFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns 503 after retrying a persistent runtime-unavailable timeout', async () => {
+    // mockReset clears queued mockResolvedValueOnce entries that a previous
+    // failing case left unconsumed; clearAllMocks does not reset queues.
+    vi.mocked(proxyFetch).mockReset()
+    vi.mocked(proxyFetch).mockImplementation(
+      async () =>
+        new Response(
+          'WebRuntimeClient: client-a: timeout opening stream with host',
+          { status: 500 },
+        ),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/child.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(503)
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'runtime-unavailable',
+    )
+    expect(proxyFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns a classified header timeout without a second attempt once the header deadline expires', async () => {
+    vi.mocked(proxyFetch).mockReset()
+    const realNow = Date.now()
+    let clockCalls = 0
+    // The first three Date.now reads set the deadline, clamp the first
+    // attempt, and pass the first retry guard below the deadline; the next
+    // loop-top read is past the deadline, so no second attempt may start.
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      clockCalls += 1
+      return clockCalls <= 3 ? realNow : realNow + 2 * 65000
+    })
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(
+        'WebRuntimeClient: client-a: timeout opening stream with host',
+        { status: 500 },
+      ),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/child.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    nowSpy.mockRestore()
+    expect(response.status).toBe(503)
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'runtime-unavailable',
+    )
+    expect(proxyFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries a HEAD request classified runtime-unavailable', async () => {
+    vi.mocked(proxyFetch).mockReset()
+    vi.mocked(proxyFetch)
+      .mockResolvedValueOnce(
+        new Response(
+          'WebRuntimeClient: client-a: timeout opening stream with host',
+          { status: 500 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/child.mjs',
+        { method: 'HEAD' },
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(proxyFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns 499 with a single attempt when the request is canceled mid-flight', async () => {
+    vi.mocked(proxyFetch).mockReset()
+    const controller = new AbortController()
+    // The request carries the controller's signal, so aborting the
+    // controller cancels the in-flight request; the proxy observes the
+    // canceled attempt and returns a fresh timeout response.
+    vi.mocked(proxyFetch).mockImplementation(() => {
+      controller.abort()
+      return Promise.resolve(
+        new Response(
+          'WebRuntimeClient: client-a: timeout opening stream with host',
+          { status: 500 },
+        ),
+      )
+    })
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/child.mjs',
+        { signal: controller.signal },
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(499)
+    expect(proxyFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns live plugin asset lease state for successful plugin fetches', async () => {
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('export const ok = true', { status: 200 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/backend.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-dist')
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'live',
+    )
+    expect(await response.text()).toBe('export const ok = true')
+  })
+
+  it('preserves successful web package module bodies through runtime fetch', async () => {
+    const body = `${'x'.repeat(32 * 1024)}export const toast = "sonner"\n`
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: {
+          'Content-Length': String(body.length),
+          'Content-Type': 'application/javascript',
+        },
+      }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pkg/sonner/dist/index.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'live',
+    )
+    expect(response.headers.get('Content-Length')).toBe(String(body.length))
+    expect(await response.text()).toBe(body)
+  })
+
+  it('preserves successful frontend asset module bodies through runtime fetch', async () => {
+    const body = `${'x'.repeat(32 * 1024)}const App = () => null\nexport { App as default }\n`
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: {
+          'Content-Length': String(body.length),
+          'Content-Type': 'application/javascript',
+        },
+      }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pa/spacewave-app/v/b/fe/app/App-livehash.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'live',
+    )
+    expect(response.headers.get('Content-Length')).toBe(String(body.length))
+    expect(await response.text()).toBe(body)
+  })
+
+  it('returns a typed plugin asset missing response for missing plugin assets', async () => {
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('plugin asset missing', { status: 404 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pa/spacewave-app/style.css',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(404)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'plugin-asset-missing',
+    )
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'missing',
+    )
+    expect(await response.json()).toMatchObject({
+      code: 'plugin-asset-missing',
+      pluginAssetFetchResult: 'missing',
+    })
+  })
+
+  it('returns a typed owner result for stale advertised frontend assets against a newer mount', async () => {
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('404 page not found', { status: 404 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pa/spacewave-app/v/b/fe/app/App-oldhash.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(404)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'plugin-asset-missing',
+    )
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'missing',
+    )
+    expect(await response.json()).toMatchObject({
+      code: 'plugin-asset-missing',
+      source: 'plugin-assets',
+      path: '/b/pa/spacewave-app/v/b/fe/app/App-oldhash.mjs',
+      pluginAssetFetchResult: 'missing',
+    })
+  })
+
+  it('returns a typed plugin asset unavailable response for non-missing failures', async () => {
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('plugin asset unavailable', { status: 503 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pa/spacewave-app/style.css',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(503)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'plugin-asset-unavailable',
+    )
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'unavailable',
+    )
+  })
+
+  it('serves a redirected web package file under the requested URL', async () => {
+    const pinned = '/b/pa/spacewave-core/manifest/root/bldr-web-pkgs/index.mjs'
+    const body = 'export const toast = "sonner"\n'
+    vi.mocked(proxyFetch)
+      .mockResolvedValueOnce(
+        new Response(null, { status: 307, headers: { Location: pinned } }),
+      )
+      .mockResolvedValueOnce(
+        new Response(body, {
+          status: 200,
+          headers: { 'Content-Type': 'application/javascript' },
+        }),
+      )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pkg/sonner/dist/index.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(response.url).toBe('')
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(await response.text()).toBe(body)
+    const requests = vi.mocked(proxyFetch).mock.calls.map((call) => call[1])
+    expect(requests.map((req) => new URL(req.url).pathname)).toEqual([
+      '/b/pkg/sonner/dist/index.mjs',
+      pinned,
+    ])
+  })
+
+  it('passes a web package redirect to another package path through', async () => {
+    const target = '/b/pkg/sonner/dist/other.mjs'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(null, { status: 307, headers: { Location: target } }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pkg/sonner/dist/index.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(307)
+    expect(response.headers.get('Location')).toBe(target)
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBeNull()
+  })
+
+  it('returns a typed generation-closed response for closed plugin asset generations', async () => {
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('WebRuntimeClientInstance is closed', { status: 500 }),
+    )
+
+    const response = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pa/spacewave-app/style.css',
+        undefined,
+        'client-a',
+      ),
+    )
+
+    expect(response.status).toBe(410)
+    expect(response.headers.get('X-Bldr-Fetch-Source')).toBe('plugin-assets')
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'generation-closed',
+    )
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'generation-closed',
+    )
+    expect(await response.json()).toMatchObject({
+      code: 'generation-closed',
+      pluginAssetFetchResult: 'generation-closed',
+    })
+  })
+
+  it('classifies retained runtime and cancellation failures with bounded codes', () => {
+    expect(
+      classifyBrowserRuntimeFetchError(
+        { kind: 'plugin-assets', path: '/p/spacewave-core/fs/file.txt' },
+        { message: 'resume-ready unavailable', status: 503 },
+      ),
+    ).toMatchObject({
+      code: 'runtime-unavailable',
+      status: 503,
+      pluginAssetFetchResult: 'runtime-unavailable',
+    })
+    expect(
+      classifyBrowserRuntimeFetchError(
+        { kind: 'plugin-dist', path: '/b/pd/plugin/app.mjs' },
+        { message: 'WebRuntimeClientInstance is closed', status: 500 },
+      ),
+    ).toMatchObject({
+      code: 'generation-closed',
+      status: 410,
+      pluginAssetFetchResult: 'generation-closed',
+    })
+    expect(
+      classifyBrowserRuntimeFetchError(
+        { kind: 'plugin-dist', path: '/b/pd/plugin/app.mjs' },
+        { message: 'service worker client closed', aborted: true, status: 500 },
+      ),
+    ).toMatchObject({
+      code: 'request-canceled',
+      status: 499,
+      pluginAssetFetchResult: 'canceled',
+    })
+    expect(
+      classifyBrowserRuntimeFetchError(
+        { kind: 'plugin-assets', path: '/b/pa/plugin/missing.css' },
+        { message: '404 page not found', status: 404 },
+      ),
+    ).toMatchObject({
+      code: 'plugin-asset-missing',
+      status: 404,
+      pluginAssetFetchResult: 'missing',
+    })
+    expect(
+      classifyBrowserRuntimeFetchError(
+        { kind: 'plugin-assets', path: '/b/pa/plugin/closed.css' },
+        { message: '404 not found', status: 404 },
+      ),
+    ).toMatchObject({
+      code: 'plugin-asset-unavailable',
+      status: 404,
+      pluginAssetFetchResult: 'unavailable',
+    })
+  })
+
+  it('caches a successful static plugin asset and serves it across a relay gap', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: buildRelease('gen-a'),
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const body = 'export const App2 = () => null\n'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+
+    const warm = buildClientFetchEvent(
+      '/b/pa/spacewave-app/v/b/fe/app/App2.mjs',
+      'client-a',
+    )
+    const warmResponse = await swFetch(warm.ev)
+    expect(warmResponse.status).toBe(200)
+    expect(await warmResponse.text()).toBe(body)
+    await Promise.all(warm.waitUntilPromises)
+    const generationCache = await caches.open('bldr-generation-gen-a')
+    const cached = await generationCache.match(
+      new Request(
+        new URL(
+          pluginAssetCachePath(
+            '/b/pa/spacewave-app/v/b/fe/app/App2.mjs',
+            '2abc',
+          ),
+          self.location.href,
+        ),
+      ),
+    )
+    expect(await cached?.text()).toBe(body)
+
+    // Relay gap: no client id and no relay, so no runtime fetch can be issued.
+    // The cached asset must serve instead of failing the lazy chunk import.
+    vi.mocked(proxyFetch).mockClear()
+    const gapResponse = await swFetch(
+      buildFetchOnlyEvent('/b/pa/spacewave-app/v/b/fe/app/App2.mjs'),
+    )
+    expect(gapResponse.status).toBe(200)
+    expect(await gapResponse.text()).toBe(body)
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('serves a current-generation static hit without a runtime fetch', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    const release = buildRelease('gen-a')
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: release,
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const path = '/b/pd/spacewave-app/backend.mjs'
+    await writeGenerationCacheResponse(
+      caches,
+      release.generationId,
+      pluginAssetCachePath(path, '2abc'),
+      new Response('cached app', { status: 200 }),
+    )
+    vi.mocked(proxyFetch).mockClear()
+
+    const fetchEvent = buildClientFetchEvent(path, 'client-a')
+    const response = await swFetch(fetchEvent.ev)
+
+    expect(await response.text()).toBe('cached app')
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Cache')).toBe('generation')
+    expect(proxyFetch).not.toHaveBeenCalled()
+    expect(fetchEvent.waitUntilPromises).toHaveLength(0)
+  })
+
+  it('caches a manifest-pinned plugin file before its root is announced', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: buildRelease('gen-a'),
+    })
+    const path = '/b/pd/spacewave-core/manifest/3pin/chunks/plugin.gs.mjs'
+    const body = 'export const main = () => {}\n'
+    vi.mocked(proxyFetch).mockResolvedValue(new Response(body, { status: 200 }))
+
+    const cold = buildClientFetchEvent(path, 'client-a')
+    expect(await (await swFetch(cold.ev)).text()).toBe(body)
+    await Promise.all(cold.waitUntilPromises)
+
+    // Another announced root does not invalidate files its path pins.
+    await announcePluginRoot('spacewave-core', '4next')
+    vi.mocked(proxyFetch).mockClear()
+    const warm = await swFetch(buildClientFetchEvent(path, 'client-a').ev)
+
+    expect(await warm.text()).toBe(body)
+    expect(warm.headers.get('X-Bldr-Plugin-Asset-Cache')).toBe('generation')
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('rejects a cache hit when promotion changes between resolve and match', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    const oldRelease = buildRelease('gen-a')
+    const currentRelease = buildRelease('gen-b')
+    const path = '/b/pd/spacewave-app/backend.mjs'
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: oldRelease,
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    await writeGenerationCacheResponse(
+      caches,
+      oldRelease.generationId,
+      pluginAssetCachePath(path, '2abc'),
+      new Response('old generation', { status: 200 }),
+    )
+    const controlCache = await caches.open('bldr-control')
+    const originalMatch = controlCache.match.bind(controlCache)
+    let releaseStateReads = 0
+    vi.spyOn(controlCache, 'match').mockImplementation(async (request) => {
+      if (
+        new URL(request.url).pathname !== '/__bldr/browser-release-state.json'
+      ) {
+        return originalMatch(request)
+      }
+      releaseStateReads++
+      return new Response(
+        JSON.stringify({
+          ...createEmptyBrowserReleaseState(),
+          promotedCurrent:
+            releaseStateReads === 1 ? oldRelease : currentRelease,
+        }),
+      )
+    })
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('current generation', { status: 200 }),
+    )
+
+    const fetchEvent = buildClientFetchEvent(path, 'client-a')
+    const response = await swFetch(fetchEvent.ev)
+
+    expect(await response.text()).toBe('current generation')
+    expect(releaseStateReads).toBeGreaterThanOrEqual(2)
+    expect(proxyFetch).toHaveBeenCalledOnce()
+    await Promise.all(fetchEvent.waitUntilPromises)
+  })
+
+  it('does not cache a response after its resolved generation is replaced', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    const oldRelease = buildRelease('gen-a')
+    const currentRelease = buildRelease('gen-b')
+    const path = '/b/pd/spacewave-app/backend.mjs'
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: oldRelease,
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const runtimeResponse = newDeferred<Response>()
+    vi.mocked(proxyFetch).mockReturnValue(runtimeResponse.promise)
+
+    const fetchEvent = buildClientFetchEvent(path, 'client-a')
+    const responsePromise = swFetch(fetchEvent.ev)
+    await vi.waitFor(() => expect(proxyFetch).toHaveBeenCalledOnce())
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: currentRelease,
+    })
+    runtimeResponse.resolve(
+      new Response('old generation response', { status: 200 }),
+    )
+
+    const response = await responsePromise
+    expect(await response.text()).toBe('old generation response')
+    await Promise.all(fetchEvent.waitUntilPromises)
+    const oldCache = await caches.open('bldr-generation-gen-a')
+    const cached = await oldCache.match(
+      new Request(new URL(path, self.location.href)),
+    )
+    expect(cached).toBeUndefined()
+  })
+
+  it('does not serve a static asset from a previous promoted generation', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    const oldRelease = buildRelease('gen-a')
+    const currentRelease = buildRelease('gen-b')
+    const path = '/b/pa/spacewave-app/v/b/fe/app/App.mjs'
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: oldRelease,
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('old generation', { status: 200 }),
+    )
+
+    const warm = buildClientFetchEvent(path, 'client-a')
+    const warmResponse = await swFetch(warm.ev)
+    expect(await warmResponse.text()).toBe('old generation')
+    await Promise.all(warm.waitUntilPromises)
+
+    vi.mocked(proxyFetch).mockClear()
+    const cachedOldResponse = await swFetch(buildFetchOnlyEvent(path))
+    expect(await cachedOldResponse.text()).toBe('old generation')
+    expect(proxyFetch).not.toHaveBeenCalled()
+
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: currentRelease,
+    })
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('current generation', { status: 200 }),
+    )
+
+    const fetchEvent = buildClientFetchEvent(path, 'client-a')
+    const response = await swFetch(fetchEvent.ev)
+
+    expect(await response.text()).toBe('current generation')
+    expect(proxyFetch).toHaveBeenCalledOnce()
+    await Promise.all(fetchEvent.waitUntilPromises)
+  })
+
+  it('retries a pinned plugin asset whose body failed mid-stream', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    const release = buildRelease('gen-a')
+    const path = '/b/pd/spacewave-app/backend.mjs'
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: release,
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const waitReady = vi
+      .spyOn(WebDocumentTracker.prototype, 'waitForRuntimeClientReady')
+      .mockResolvedValue(true)
+    const brokenBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('export const partial'))
+        controller.error(new Error('runtime-disconnected'))
+      },
+    })
+    vi.mocked(proxyFetch)
+      .mockResolvedValueOnce(new Response(brokenBody, { status: 200 }))
+      .mockResolvedValueOnce(new Response('complete app', { status: 200 }))
+
+    const fetchEvent = buildClientFetchEvent(path, 'client-a')
+    const pending = swFetch(fetchEvent.ev)
+    await vi.waitFor(() => expect(proxyFetch).toHaveBeenCalledOnce())
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(proxyFetch).toHaveBeenCalledOnce()
+
+    await announcePluginRoot('spacewave-app', '2abc')
+    const response = await pending
+
+    expect(await response.text()).toBe('complete app')
+    expect(proxyFetch).toHaveBeenCalledTimes(2)
+    expect(waitReady).toHaveBeenCalledOnce()
+    await Promise.all(fetchEvent.waitUntilPromises)
+    waitReady.mockRestore()
+  })
+
+  it('keeps dynamic plugin HTTP outside the static asset cache-first path', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    const release = buildRelease('gen-a')
+    const path = '/p/spacewave-core/fs/file.txt'
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: release,
+    })
+    await writeGenerationCacheResponse(
+      caches,
+      release.generationId,
+      path,
+      new Response('stale dynamic response', { status: 200 }),
+    )
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('runtime dynamic response', { status: 200 }),
+    )
+
+    const fetchEvent = buildClientFetchEvent(path, 'client-a')
+    const response = await swFetch(fetchEvent.ev)
+
+    expect(await response.text()).toBe('runtime dynamic response')
+    expect(proxyFetch).toHaveBeenCalledOnce()
+    expect(fetchEvent.waitUntilPromises).toHaveLength(0)
+  })
+
+  it('does not reactivate a persisted plugin root after a restart', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: buildRelease('gen-a'),
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const warmBody = 'export const AppA = () => null\n'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(warmBody, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+
+    const warm = buildClientFetchEvent(
+      '/b/pd/spacewave-app/backend.mjs',
+      'client-a',
+    )
+    const warmResponse = await swFetch(warm.ev)
+    expect(warmResponse.status).toBe(200)
+    expect(await warmResponse.text()).toBe(warmBody)
+    await Promise.all(warm.waitUntilPromises)
+    const generationCache = await caches.open('bldr-generation-gen-a')
+    const cached = await generationCache.match(
+      new Request(
+        new URL(
+          pluginAssetCachePath('/b/pd/spacewave-app/backend.mjs', '2abc'),
+          self.location.href,
+        ),
+      ),
+    )
+    expect(await cached?.text()).toBe(warmBody)
+
+    // Simulate a ServiceWorker restart without deleting CacheStorage. The
+    // persisted root must not reactivate; the request proxies to the runtime,
+    // which serves its current root.
+    resetServiceWorkerTestState()
+    vi.mocked(proxyFetch).mockClear()
+    const restartedBody = 'export const AppB = () => null\n'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(restartedBody, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+    const restartedResponse = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/backend.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+    expect(restartedResponse.status).toBe(200)
+    expect(await restartedResponse.text()).toBe(restartedBody)
+    expect(proxyFetch).toHaveBeenCalledOnce()
+
+    // A later announcement is required before any root activates again. The
+    // stale root-2abc cache entry cannot satisfy the new root-3def request,
+    // so the fetch proxies instead of serving warm bytes.
+    await announcePluginRoot('spacewave-app', '3def')
+    vi.mocked(proxyFetch).mockClear()
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(restartedBody, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+    const announcedResponse = await swFetch(
+      buildClientFetchEvent('/b/pd/spacewave-app/backend.mjs', 'client-a').ev,
+    )
+    expect(announcedResponse.status).toBe(200)
+    expect(await announcedResponse.text()).toBe(restartedBody)
+    expect(proxyFetch).toHaveBeenCalledOnce()
+  })
+
+  it('never serves root A bytes after root B activates', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    const path = '/b/pd/spacewave-app/backend.mjs'
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: buildRelease('gen-a'),
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const bodyA = 'export const backend = "a"\n'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(bodyA, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+
+    const warm = buildClientFetchEvent(path, 'client-a')
+    expect(await (await swFetch(warm.ev)).text()).toBe(bodyA)
+    await Promise.all(warm.waitUntilPromises)
+
+    await announcePluginRoot('spacewave-app', '3def')
+    const bodyB = 'export const backend = "b"\n'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(bodyB, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+
+    const fetchB = buildClientFetchEvent(path, 'client-a')
+    const response = await swFetch(fetchB.ev)
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe(bodyB)
+    await Promise.all(fetchB.waitUntilPromises)
+
+    // The stale root-A entry stays in place but can never satisfy requests.
+    const generationCache = await caches.open('bldr-generation-gen-a')
+    const staleA = await generationCache.match(
+      new Request(
+        new URL(pluginAssetCachePath(path, '2abc'), self.location.href),
+      ),
+    )
+    expect(await staleA?.text()).toBe(bodyA)
+    const freshB = await generationCache.match(
+      new Request(
+        new URL(pluginAssetCachePath(path, '3def'), self.location.href),
+      ),
+    )
+    expect(await freshB?.text()).toBe(bodyB)
+    const unkeyed = await generationCache.match(
+      new Request(new URL(path, self.location.href)),
+    )
+    expect(unkeyed).toBeUndefined()
+  })
+
+  it('classifies a fetch across a root transition as plugin-root-changed', async () => {
+    const path = '/b/pd/spacewave-app/backend.mjs'
+    await writeBrowserReleaseState(
+      globalThis.caches as unknown as FakeCacheStorage,
+      {
+        ...createEmptyBrowserReleaseState(),
+        promotedCurrent: buildRelease('gen-a'),
+      },
+    )
+    await announcePluginRoot('spacewave-app', '2abc')
+    const firstProxy = newDeferred<Response>()
+    const secondProxy = newDeferred<Response>()
+    vi.mocked(proxyFetch)
+      .mockImplementationOnce(() => firstProxy.promise)
+      .mockImplementation(() => secondProxy.promise)
+
+    const fetchEvent = buildClientFetchEvent(path, 'client-a')
+    const responsePromise = swFetch(fetchEvent.ev)
+    await vi.waitFor(() => expect(proxyFetch).toHaveBeenCalledOnce())
+
+    await announcePluginRoot('spacewave-app', '3def')
+    firstProxy.resolve(
+      new Response('export const backend = "a"\n', {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+
+    // The retry re-resolves to the new active root; a second transition while
+    // that attempt is in flight fails the request with the classified code.
+    await vi.waitFor(() => expect(proxyFetch).toHaveBeenCalledTimes(2))
+    await announcePluginRoot('spacewave-app', '4abc')
+    secondProxy.resolve(
+      new Response('export const backend = "b"\n', {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+
+    const response = await responsePromise
+    expect(response.status).toBe(409)
+    expect(response.headers.get('X-Bldr-Runtime-Fetch-Error')).toBe(
+      'plugin-root-changed',
+    )
+    expect(response.headers.get('X-Bldr-Plugin-Asset-Fetch-Result')).toBe(
+      'root-changed',
+    )
+    const body = (await response.json()) as { code?: string }
+    expect(body.code).toBe('plugin-root-changed')
+  })
+
+  it('keeps static plugin asset fetches successful when cache writes fail', async () => {
+    const caches = new FakeCacheStorage((cacheName) => {
+      if (cacheName.startsWith('bldr-generation-')) {
+        return newCachePutError()
+      }
+      return undefined
+    })
+    vi.stubGlobal('caches', caches)
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: buildRelease('gen-a'),
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const body = 'export const App2 = () => null\n'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+
+    const warm = buildClientFetchEvent(
+      '/b/pa/spacewave-app/v/b/fe/app/App2.mjs',
+      'client-a',
+    )
+    const response = await swFetch(warm.ev)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe(body)
+    await expect(Promise.all(warm.waitUntilPromises)).resolves.toEqual([
+      undefined,
+    ])
+    const cache = await caches.open('bldr-generation-gen-a')
+    const cached = await cache.match(
+      new Request(
+        new URL('/b/pa/spacewave-app/v/b/fe/app/App2.mjs', self.location.href),
+      ),
+    )
+    expect(cached).toBeUndefined()
+    expect(warn).toHaveBeenCalledWith(
+      'ServiceWorker: %s: cache write failed: operation=%s cache=%s%s%s url=%s: %s',
+      expect.any(String),
+      'cache static plugin asset',
+      'bldr-generation-gen-a',
+      ' generation=gen-a',
+      '',
+      expect.any(String),
+      'Cache.put() encountered a network error',
+    )
+  })
+
+  it('falls back to the cached static plugin asset when a mid-handover runtime fetch fails', async () => {
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    await writeBrowserReleaseState(caches, {
+      ...createEmptyBrowserReleaseState(),
+      promotedCurrent: buildRelease('gen-a'),
+    })
+    await announcePluginRoot('spacewave-app', '2abc')
+    const body = 'export const chunk = 1\n'
+    vi.mocked(proxyFetch).mockResolvedValueOnce(
+      new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript' },
+      }),
+    )
+    const warm = buildClientFetchEvent(
+      '/b/pd/spacewave-app/backend.mjs',
+      'client-a',
+    )
+    expect((await swFetch(warm.ev)).status).toBe(200)
+    await Promise.all(warm.waitUntilPromises)
+
+    // The next page still has a client id, but its runtime relay is tearing
+    // down, so the forwarded fetch fails. The cached asset must still serve.
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(
+        'WebRuntimeClient: client-a: timeout opening stream with host',
+        { status: 500 },
+      ),
+    )
+    const handoverResponse = await swFetch(
+      buildFetchOnlyEvent(
+        '/b/pd/spacewave-app/backend.mjs',
+        undefined,
+        'client-a',
+      ),
+    )
+    expect(handoverResponse.status).toBe(200)
+    expect(await handoverResponse.text()).toBe(body)
+  })
+
+  it('serves an immutable dev frontend module from the session cache', async () => {
+    // The dev server marks optimized dependencies immutable.
+    const path = '/b/fe/sess1/.bldr/frontend/vite-cache/deps/react.js?v=1a2b'
+    const body = 'export default {}\n'
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { 'Cache-Control': 'max-age=31536000, immutable' },
+      }),
+    )
+
+    // The first load stores the module.
+    const cold = buildClientFetchEvent(path, 'client-a')
+    expect(await (await swFetch(cold.ev)).text()).toBe(body)
+    await Promise.all(cold.waitUntilPromises)
+
+    // The next load serves it without a runtime request.
+    vi.mocked(proxyFetch).mockClear()
+    const warm = await swFetch(buildClientFetchEvent(path, 'client-a').ev)
+    expect(await warm.text()).toBe(body)
+    expect(proxyFetch).not.toHaveBeenCalled()
+  })
+
+  it('revalidates a cached dev frontend module by its ETag', async () => {
+    // The first load stores a source module with its ETag.
+    const path = '/b/fe/sess1/app/App.tsx'
+    const body = 'export const App = () => null\n'
+    vi.mocked(proxyFetch).mockResolvedValueOnce(
+      new Response(body, {
+        status: 200,
+        headers: { 'Cache-Control': 'no-cache', ETag: 'W/"1-a"' },
+      }),
+    )
+    const cold = buildClientFetchEvent(path, 'client-a')
+    expect(await (await swFetch(cold.ev)).text()).toBe(body)
+    await Promise.all(cold.waitUntilPromises)
+
+    // The next load sends the ETag and serves the cached body on 304.
+    vi.mocked(proxyFetch).mockResolvedValueOnce(
+      new Response(null, { status: 304 }),
+    )
+    const warm = await swFetch(buildClientFetchEvent(path, 'client-a').ev)
+    expect(warm.status).toBe(200)
+    expect(await warm.text()).toBe(body)
+    const forwarded = vi.mocked(proxyFetch).mock.calls[1][1]
+    expect(forwarded.headers.get('If-None-Match')).toBe('W/"1-a"')
+  })
+
+  it('drops the module cache of an earlier dev frontend session', async () => {
+    // Load one module in each of two sessions.
+    const caches = globalThis.caches as unknown as FakeCacheStorage
+    vi.mocked(proxyFetch).mockImplementation(
+      async () => new Response('m', { status: 200, headers: { ETag: '"m"' } }),
+    )
+    for (const session of ['sess1', 'sess2']) {
+      const ev = buildClientFetchEvent(`/b/fe/${session}/a.ts`, 'client-a')
+      await swFetch(ev.ev)
+      await Promise.all(ev.waitUntilPromises)
+    }
+
+    // Only the later session's cache remains.
+    expect(await caches.keys()).toEqual(['bldr-dev-frontend-sess2'])
+  })
+})
+
+describe('parseDevFrontendSession', () => {
+  it('returns the session of a module path and null otherwise', () => {
+    // Session module paths name a session; other Bldr paths do not.
+    expect(parseDevFrontendSession('/b/fe/sess1/src/a.ts')).toBe('sess1')
+    expect(parseDevFrontendSession('/b/fe/sess1/')).toBeNull()
+    expect(parseDevFrontendSession('/b/fe/rpc/c2Vydg/a.ts')).toBeNull()
+    expect(parseDevFrontendSession('/b/fe/entrypoint/app.tsx')).toBeNull()
+    expect(parseDevFrontendSession('/b/pd/plugin/a.mjs')).toBeNull()
+  })
+})
+
+describe('service worker messages', () => {
+  beforeEach(() => {
+    resetServiceWorkerTestState()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('runs one sync per in-flight window for bldrSyncManifest messages', async () => {
+    const firstSync = newDeferred<BrowserReleaseState>()
+    const secondSync = newDeferred<BrowserReleaseState>()
+    const syncLatestBrowserRelease = vi
+      .fn()
+      .mockReturnValueOnce(firstSync.promise)
+      .mockReturnValueOnce(secondSync.promise)
+    const deps = {
+      clients: buildTestClients(),
+      fetchTracker: {
+        abortClient: vi.fn(),
+      },
+      webDocumentTracker: {
+        handleWebDocumentMessage: vi.fn(),
+      },
+      syncLatestBrowserRelease,
+      refreshBrowserIndexCache: vi.fn(),
+      handleCrossTabMessage: vi.fn(),
+    }
+
+    const firstEv = buildMessageEvent({ bldrSyncManifest: true })
+    const duplicateEv = buildMessageEvent({ bldrSyncManifest: true })
+    handleServiceWorkerMessage(firstEv, deps)
+    handleServiceWorkerMessage(duplicateEv, deps)
+
+    expect(syncLatestBrowserRelease).toHaveBeenCalledTimes(1)
+    expect(syncLatestBrowserRelease).toHaveBeenCalledWith({
+      lifecycleProbe: true,
+    })
+    expect(firstEv.waitUntil).toHaveBeenCalledWith(expect.any(Promise))
+    expect(duplicateEv.waitUntil).not.toHaveBeenCalled()
+    expect(deps.handleCrossTabMessage).not.toHaveBeenCalled()
+    expect(
+      deps.webDocumentTracker.handleWebDocumentMessage,
+    ).not.toHaveBeenCalled()
+
+    firstSync.resolve(createEmptyBrowserReleaseState())
+    await vi.mocked(firstEv.waitUntil).mock.calls[0][0]
+
+    const rearmedEv = buildMessageEvent({ bldrSyncManifest: true })
+    handleServiceWorkerMessage(rearmedEv, deps)
+
+    expect(syncLatestBrowserRelease).toHaveBeenCalledTimes(2)
+    expect(rearmedEv.waitUntil).toHaveBeenCalledWith(expect.any(Promise))
+
+    secondSync.resolve(createEmptyBrowserReleaseState())
+    await vi.mocked(rearmedEv.waitUntil).mock.calls[0][0]
+  })
+
+  it('owns bldrSyncManifest sync failures inside waitUntil', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const syncLatestBrowserRelease = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('cache write failed'))
+      .mockResolvedValueOnce(createEmptyBrowserReleaseState())
+    const deps = {
+      clients: buildTestClients(),
+      fetchTracker: {
+        abortClient: vi.fn(),
+      },
+      webDocumentTracker: {
+        handleWebDocumentMessage: vi.fn(),
+      },
+      syncLatestBrowserRelease,
+      refreshBrowserIndexCache: vi.fn(),
+      handleCrossTabMessage: vi.fn(),
+    }
+
+    const firstEv = buildMessageEvent({ bldrSyncManifest: true })
+    handleServiceWorkerMessage(firstEv, deps)
+
+    expect(firstEv.waitUntil).toHaveBeenCalledWith(expect.any(Promise))
+    await expect(
+      vi.mocked(firstEv.waitUntil).mock.calls[0][0],
+    ).resolves.toBeUndefined()
+    expect(warn).toHaveBeenCalledWith(
+      'ServiceWorker: %s: browser release sync failed: %s',
+      expect.any(String),
+      'cache write failed',
+    )
+
+    const secondEv = buildMessageEvent({ bldrSyncManifest: true })
+    handleServiceWorkerMessage(secondEv, deps)
+
+    expect(syncLatestBrowserRelease).toHaveBeenCalledTimes(2)
+    expect(secondEv.waitUntil).toHaveBeenCalledWith(expect.any(Promise))
+    await vi.mocked(secondEv.waitUntil).mock.calls[0][0]
+  })
+
+  it('refreshes the runtime browser index cache from a message', async () => {
+    vi.stubGlobal('BLDR_DEBUG', false)
+    vi.stubGlobal('caches', new FakeCacheStorage())
+    vi.mocked(proxyFetch).mockResolvedValue(
+      new Response('runtime index', { status: 200 }),
+    )
+    const deps = {
+      clients: buildTestClients(),
+      fetchTracker: {
+        abortClient: vi.fn(),
+      },
+      webDocumentTracker: {
+        handleWebDocumentMessage: vi.fn(),
+      },
+      syncLatestBrowserRelease: vi.fn(),
+      refreshBrowserIndexCache,
+      handleCrossTabMessage: vi.fn(),
+    }
+
+    const ev = buildMessageEvent({ bldrRefreshBrowserIndex: true })
+    handleServiceWorkerMessage(ev, deps)
+
+    expect(ev.waitUntil).toHaveBeenCalledWith(expect.any(Promise))
+    await vi.mocked(ev.waitUntil).mock.calls[0][0]
+
+    const cache = await (globalThis.caches as unknown as FakeCacheStorage).open(
+      'bldr-control',
+    )
+    const rootResponse = await cache.match(
+      new Request(new URL('/', self.location.href)),
+    )
+    const indexResponse = await cache.match(
+      new Request(new URL('/b/__index.html', self.location.href)),
+    )
+
+    expect(rootResponse).toBeUndefined()
+    expect(await indexResponse?.text()).toBe('runtime index')
+    expect(proxyFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Request),
+      'client-a',
+    )
+  })
+
+  it('proxies attached DedicatedWorker documents to the elected runtime host relay', async () => {
+    const runtimeChannel = new MessageChannel()
+    const responseChannel = new MessageChannel()
+    const tracker = {
+      handleWebDocumentMessage: vi.fn(),
+      openWebRuntimePortWithResult: vi.fn().mockResolvedValue({
+        webRuntimePort: runtimeChannel.port1,
+        hostDocumentId: 'host-document',
+        hostGeneration: 'host-generation-1',
+      } satisfies OpenWebRuntimePortResult),
+    }
+    const deps = {
+      clients: buildTestClients(),
+      fetchTracker: {
+        abortClient: vi.fn(),
+      },
+      webDocumentTracker: tracker,
+      syncLatestBrowserRelease: vi.fn(),
+      refreshBrowserIndexCache: vi.fn(),
+      handleCrossTabMessage: vi.fn(),
+    }
+    const ack = new Promise<MessageEvent>((resolve) => {
+      responseChannel.port1.onmessage = resolve
+      responseChannel.port1.start()
+    })
+    const init = new Uint8Array([1, 2, 3])
+    const ev = buildMessageEvent({
+      from: 'attached-document',
+      connectDedicatedRuntimeHost: {
+        webRuntimeId: 'runtime-1',
+        init,
+        port: responseChannel.port2,
+      },
+    })
+
+    handleServiceWorkerMessage(ev, deps)
+    await vi.mocked(ev.waitUntil).mock.calls[0][0]
+    expect(tracker.openWebRuntimePortWithResult).toHaveBeenCalledWith(
+      init,
+      'attached-document',
+      expect.any(AbortSignal),
+    )
+    const ackEvent = await ack
+    expect(ackEvent.data).toMatchObject({
+      from: expect.stringMatching(/^service-worker-/),
+    })
+    const openedPort = ackEvent.data.webRuntimePort ?? ackEvent.ports?.[0]
+    expect(openedPort).toBeDefined()
+    const delivered = new Promise<unknown>((resolve) => {
+      runtimeChannel.port2.onmessage = (messageEvent: MessageEvent) =>
+        resolve(messageEvent.data)
+      runtimeChannel.port2.start()
+    })
+    openedPort.postMessage({ relayed: true })
+    await expect(delivered).resolves.toEqual({ relayed: true })
+
+    openedPort.close()
+    runtimeChannel.port2.close()
+    responseChannel.port1.close()
+  })
+
+  it('reports relay failure without returning warm connection metadata', async () => {
+    const responseChannel = new MessageChannel()
+    const ack = new Promise<MessageEvent>((resolve) => {
+      responseChannel.port1.onmessage = resolve
+      responseChannel.port1.start()
+    })
+    const tracker = {
+      handleWebDocumentMessage: vi.fn(),
+      openWebRuntimePortWithResult: vi
+        .fn()
+        .mockRejectedValue(new Error('relay unavailable')),
+    }
+    const deps = {
+      clients: buildTestClients(),
+      fetchTracker: {
+        abortClient: vi.fn(),
+      },
+      webDocumentTracker: tracker,
+      syncLatestBrowserRelease: vi.fn(),
+      refreshBrowserIndexCache: vi.fn(),
+      handleCrossTabMessage: vi.fn(),
+    }
+    const ev = buildMessageEvent({
+      from: 'attached-document',
+      connectDedicatedRuntimeHost: {
+        webRuntimeId: 'runtime-1',
+        init: new Uint8Array([1, 2, 3]),
+        port: responseChannel.port2,
+      },
+    })
+
+    handleServiceWorkerMessage(ev, deps)
+    await vi.mocked(ev.waitUntil).mock.calls[0][0]
+    const ackEvent = await ack
+    expect(ackEvent.data).toMatchObject({
+      error: 'relay unavailable',
+    })
+    expect(ackEvent.data.webRuntimePort).toBeUndefined()
+    expect(ackEvent.data.hostDocumentId).toBeUndefined()
+    expect(ackEvent.data.hostGeneration).toBeUndefined()
+    responseChannel.port1.close()
+  })
+
+  it('aborts a pending elected-host lookup when the requester cancels', async () => {
+    let connectSignal: AbortSignal | undefined
+    const responseChannel = new MessageChannel()
+    const openWebRuntimePortWithResult = vi.fn(
+      (_init: Uint8Array, _from?: string, signal?: AbortSignal) =>
+        new Promise<OpenWebRuntimePortResult>((_resolve, reject) => {
+          connectSignal = signal
+          signal?.addEventListener(
+            'abort',
+            () => {
+              const reason = signal.reason
+              reject(
+                reason instanceof Error
+                  ? reason
+                  : new DOMException('relay canceled', 'AbortError'),
+              )
+            },
+            { once: true },
+          )
+        }),
+    )
+    const deps = {
+      clients: buildTestClients(),
+      fetchTracker: {
+        abortClient: vi.fn(),
+      },
+      webDocumentTracker: {
+        handleWebDocumentMessage: vi.fn(),
+        openWebRuntimePortWithResult,
+      },
+      syncLatestBrowserRelease: vi.fn(),
+      refreshBrowserIndexCache: vi.fn(),
+      handleCrossTabMessage: vi.fn(),
+    }
+    const ev = buildMessageEvent({
+      from: 'attached-document',
+      connectDedicatedRuntimeHost: {
+        webRuntimeId: 'runtime-1',
+        init: new Uint8Array([1, 2, 3]),
+        port: responseChannel.port2,
+      },
+    })
+
+    handleServiceWorkerMessage(ev, deps)
+    await vi.waitFor(() => {
+      expect(connectSignal).toBeDefined()
+    })
+    responseChannel.port1.postMessage({
+      cancelDedicatedRuntimeHostConnect: true,
+    })
+    await vi.mocked(ev.waitUntil).mock.calls[0][0]
+
+    expect(connectSignal?.aborted).toBe(true)
+    responseChannel.port1.close()
+  })
+
+  it('aborts outstanding fetch waiters when a client says goodbye', () => {
+    const deps = {
+      clients: buildTestClients(),
+      fetchTracker: {
+        abortClient: vi.fn(),
+      },
+      webDocumentTracker: {
+        handleWebDocumentMessage: vi.fn(),
+      },
+      syncLatestBrowserRelease: vi.fn(),
+      refreshBrowserIndexCache: vi.fn(),
+      handleCrossTabMessage: vi.fn().mockResolvedValue(undefined),
+    }
+
+    const ev = buildMessageEvent({ crossTab: 'goodbye' })
+    handleServiceWorkerMessage(ev, deps)
+
+    expect(deps.fetchTracker.abortClient).toHaveBeenCalledWith(
+      'client-a',
+      expect.objectContaining({
+        message: 'service worker client closed',
+      }),
+    )
+    expect(ev.waitUntil).toHaveBeenCalledWith(expect.any(Promise))
+  })
+
+  it('updates only cached browser index content when the browser index cache is refreshed', async () => {
+    const caches = new FakeCacheStorage()
+
+    vi.stubGlobal('BLDR_DEBUG', false)
+    vi.stubGlobal('caches', caches)
+    vi.mocked(proxyFetch)
+      .mockResolvedValueOnce(new Response('stale index', { status: 200 }))
+      .mockResolvedValueOnce(new Response('fresh index', { status: 200 }))
+
+    await refreshBrowserIndexCache('client-a')
+    await refreshBrowserIndexCache('client-a')
+
+    const cache = await caches.open('bldr-control')
+    const rootResponse = await cache.match(
+      new Request(new URL('/', self.location.href)),
+    )
+    const indexResponse = await cache.match(
+      new Request(new URL('/b/__index.html', self.location.href)),
+    )
+
+    expect(rootResponse).toBeUndefined()
+    expect(await indexResponse?.text()).toBe('fresh index')
+  })
+})

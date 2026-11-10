@@ -1,0 +1,83 @@
+package kvtx_block
+
+import (
+	"github.com/s4wave/spacewave/db/block"
+	iavl "github.com/s4wave/spacewave/db/kvtx/block/iavl"
+	okra "github.com/s4wave/spacewave/db/kvtx/block/okra"
+)
+
+// DecodedBlockCacheTypeKey returns the decoded-block cache type key.
+func (k *KeyValueStore) DecodedBlockCacheTypeKey() string {
+	return "db/kvtx/block.KeyValueStore"
+}
+
+// NewKeyValueStoreSubBlockCtor returns the sub-block constructor.
+func NewKeyValueStoreSubBlockCtor(r **KeyValueStore) block.SubBlockCtor {
+	return block.NewSubBlockCtor(r, func() *KeyValueStore { return &KeyValueStore{} })
+}
+
+// IsNil checks if the object is nil.
+func (k *KeyValueStore) IsNil() bool {
+	return k == nil
+}
+
+// ApplySubBlock applies a sub-block change with a field id.
+func (k *KeyValueStore) ApplySubBlock(id uint32, next block.SubBlock) error {
+	switch id {
+	case 2:
+		v, ok := next.(*iavl.Node)
+		if !ok {
+			return block.ErrUnexpectedType
+		}
+		k.IavlRoot = v
+	case 3:
+		v, ok := next.(*okra.Root)
+		if !ok {
+			return block.ErrUnexpectedType
+		}
+		k.OkraRoot = v
+	}
+	return nil
+}
+
+// GetSubBlocks returns all constructed sub-blocks by ID.
+// May return nil, and values may also be nil.
+func (k *KeyValueStore) GetSubBlocks() map[uint32]block.SubBlock {
+	m := make(map[uint32]block.SubBlock)
+	switch k.GetImplType() {
+	case KVImplType_KV_IMPL_TYPE_IAVL:
+		m[2] = k.GetIavlRoot()
+	case KVImplType_KV_IMPL_TYPE_OKRA, KVImplType_KV_IMPL_TYPE_OKRA_INLINE:
+		m[3] = k.GetOkraRoot()
+	}
+	return m
+}
+
+// GetSubBlockCtor returns a function which creates or returns the existing
+// sub-block at reference id. Can return nil to indicate invalid reference id.
+func (k *KeyValueStore) GetSubBlockCtor(id uint32) block.SubBlockCtor {
+	switch id {
+	case 2:
+		return func(create bool) block.SubBlock {
+			x := k.IavlRoot
+			if x == nil && create {
+				x = &iavl.Node{}
+				k.IavlRoot = x
+			}
+			if x == nil {
+				return nil
+			}
+			return x
+		}
+	case 3:
+		return okra.NewRootSubBlockCtor(&k.OkraRoot)
+	}
+	return nil
+}
+
+// _ is a type assertion
+var (
+	_ block.Block                 = (*KeyValueStore)(nil)
+	_ block.DecodedBlockCacheable = (*KeyValueStore)(nil)
+	_ block.BlockWithSubBlocks    = (*KeyValueStore)(nil)
+)

@@ -1,0 +1,34 @@
+syntax = "proto3";
+package store.kvtx;
+
+import "github.com/s4wave/spacewave/net/hash/hash.proto";
+
+// Config is the configuration for the kvtx store.
+message Config {
+  // HashType is the hash type to use for block refs.
+  // If unset (0 value) will use the Spacewave default (SHA256).
+  .hash.HashType hash_type = 2;
+  // DisableHashGet disables hashing values for Get requests.
+  // This improves performance if the underlying store is trusted & consistent.
+  //
+  // If the store may return invalid data or mismatch the requested block ref,
+  // do not enable this option. It is important to hash the data for each read.
+  bool disable_hash_get = 3;
+  // CollectorFrees turns on the Volume collector's frees. Off, the collector
+  // still releases lapsed leases and nets the journal, so its counts stay
+  // current, and frees nothing. Turning it on also adopts an unadopted
+  // Volume, such as one upgraded from an older format, in the background at
+  // its next open. It stays off until a rehearsal on a restored copy of the
+  // Volume, covering that adoption, has shown the collector frees no live
+  // block.
+  bool collector_frees = 7;
+  // CollectorGraceDur is how old a journal record must be before the
+  // collector nets it, as a Go duration such as "15m". It must exceed the
+  // time a reader takes to pin a head it saw and the lease of a leased root.
+  // Empty uses the collector's default of 15 minutes.
+  string collector_grace_dur = 8;
+
+  // reserved: 1 mqueue_config
+  // reserved: 4 gc_mark_walk, 5 disable_hold_counts, 6 upgrade_shared_counts
+  reserved 4, 5, 6;
+}
