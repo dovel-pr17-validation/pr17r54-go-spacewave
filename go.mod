@@ -66,7 +66,7 @@ require (
 	github.com/jezek/xgb v1.3.1
 	github.com/jlaffaye/ftp v0.2.4
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/libp2p/go-yamux/v5 v5.1.0
 	github.com/manifoldco/promptui v0.9.0
 	github.com/mattn/go-isatty v0.0.24
